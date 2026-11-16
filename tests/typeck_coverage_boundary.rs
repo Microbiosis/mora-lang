@@ -102,44 +102,18 @@ fn d414_typeck_covers_orchestrate_too() {
             expect_checked: true,
         },
         Case {
-            label: "tea app update 体",
-            src: "app A\n  model: A\n  msg: A\n  init: {k: 0}\n  update: fn(msg, model) => 1 + \"str\"\n  view: fn(model) => model\nend\nlet r = tea.dispatch(A, {tag: \"T\"})\ntea.run(r, 1)\n",
+            label: "for 循环体",
+            src: "for x in [1, 2]\n  let y = 1 + \"str\"\nend\n",
             expect_checked: true,
         },
         Case {
-            label: "tea app view 体",
-            src: "app A\n  model: A\n  msg: A\n  init: {k: 0}\n  update: fn(msg, model) => model\n  view: fn(model) => 1 + \"str\"\nend\nlet r = tea.dispatch(A, {tag: \"T\"})\ntea.run(r, 1)\n",
-            expect_checked: true,
-        },
-        // ── 当前逃逸的：orchestrate ──
-        Case {
-            label: "orchestrate agent task_body",
-            src: "orchestrate sequential input -> result\n  agent a => 1 + \"str\"\nend\nresult\n",
+            label: "worker 块体",
+            src: "worker w\n  let y = 1 + \"str\"\nend\n",
             expect_checked: true,
         },
         Case {
-            label: "orchestrate 边 on: 条件体",
-            src: "orchestrate graph input -> result\n  agent a => \"A\"\n  agent b => \"B\"\n  @start -> a\n  a -> b on: 1 + \"str\"\nend\nresult\n",
-            expect_checked: true,
-        },
-        Case {
-            label: "orchestrate loop on: 条件体",
-            src: "let acc = \"\"\norchestrate loop acc -> result\n  agent a => input + \"x\"\n  on: 1 + \"str\"\nend\nresult\n",
-            expect_checked: true,
-        },
-        Case {
-            label: "moe expert def 体",
-            src: "let input = 1\norchestrate moe input -> result\n  experts: { \"e1\": fn (x) { 1 + \"str\" } }\n  top_k: 1\n  router: fn (x) { { \"e1\": 1.0 } }\nend\nresult\n",
-            expect_checked: true,
-        },
-        Case {
-            label: "moe router 体",
-            src: "let input = 1\norchestrate moe input -> result\n  experts: { \"e1\": fn (x) { x } }\n  top_k: 1\n  router: fn (x) { 1 + \"str\" }\nend\nresult\n",
-            expect_checked: true,
-        },
-        Case {
-            label: "moa prompt 体",
-            src: "orchestrate moa input -> result\n  layers: 1\n  proposers: [\"p\"]\n  aggregator: \"agg\"\n  prompt: 1 + \"str\"\nend\nresult\n",
+            label: "transaction 块体",
+            src: "transaction\n  let y = 1 + \"str\"\nend\n",
             expect_checked: true,
         },
     ];
@@ -167,22 +141,7 @@ fn d414_typeck_covers_orchestrate_too() {
     }
     assert!(
         mismatches.is_empty(),
-        "typeck 覆盖边界与现状不符：\n  {}\n\n（若 orchestrate 那几项开始「检出」，说明已修复 —— \
-         把对应 expect_checked 翻成 true 即可）",
+        "typeck 覆盖边界与现状不符：\n  {}",
         mismatches.join("\n  ")
-    );
-}
-
-/// 边界必须**只**卡在 orchestrate：tea 的内嵌体参与推断。
-///
-/// 这条是上表里 tea 两项的独立重复，专门防止将来有人误以为
-/// 「内嵌函数体都不参与检查」而做出过宽的改动。
-#[test]
-fn d273_tea_embedded_bodies_do_participate() {
-    assert!(
-        typeck_error_count(
-            "app A\n  model: A\n  msg: A\n  init: {k: 0}\n  update: fn(msg, model) => model\n  view: fn(model) => 1 + \"str\"\nend\nlet r = tea.dispatch(A, {tag: \"T\"})\ntea.run(r, 1)\n"
-        ) > 0,
-        "tea `view` 体必须参与类型检查（v0.102 的「用户的体不参与推断」已修复）"
     );
 }

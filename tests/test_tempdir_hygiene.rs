@@ -41,24 +41,8 @@ const ALLOWED: &[(&str, &str)] = &[
         "守卫自身：它的文档与断言里必须提到 temp_dir() 这个名字",
     ),
     (
-        "src/interpreter/builtins/ai.rs",
-        "HOME 兜底（读用户主目录），不是 scratch 空间",
-    ),
-    (
-        "tests/mcp_tool_catalog_honesty.rs",
-        "把 %TEMP% 当子进程 cwd（只跑命令，不创建文件）",
-    ),
-    (
-        "tests/skill_load_sandbox_guard.rs",
-        "把 %TEMP% 当子进程 cwd（只跑命令，不创建文件）",
-    ),
-    (
         "tests/repl_eof_exit.rs",
         "把 %TEMP% 当子进程 cwd（只跑 REPL，不创建文件）",
-    ),
-    (
-        "tests/document_methods_introspection.rs",
-        "只读一个既有路径（document 解析输入），不创建",
     ),
     (
         "tests/spec_builtin_surface.rs",

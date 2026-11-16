@@ -8,39 +8,33 @@
 //! 3. 可覆写：用户 `handle random_* { ... }` 按动态作用域截获；
 //! 4. 并发自然属性：实例/线程间序列按值隔离，无共享无锁。
 
-use mora::interpreter::Interpreter;
-use mora::mir::vm::execute;
 use mora::parser_v3::ParserV3;
-use mora::typeck::check_mir::check_program_witnesses_bidirectional;
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::execute_program;
+use mora::typeck::check_mir::check_program_witnesses;
 use mora::value::Value;
 
 /// 编译 + typeck + 运行，返回最后表达式值。任何失败 panic。
 fn compile_and_run(src: &str) -> Value {
-    let (func, witnesses) =
+    let (prog, witnesses) =
         ParserV3::compile(src).unwrap_or_else(|e| panic!("compile failed: {}", e));
-    let errs = check_program_witnesses_bidirectional(&witnesses);
+    let errs = check_program_witnesses(&witnesses);
     assert!(
         errs.is_empty(),
         "type errors: {:?}",
         errs.iter().map(|e| format!("{:?}", e)).collect::<Vec<_>>()
     );
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    let mut effects = mora::mir::effect::Effects::default();
-    execute(
-        &std::sync::Arc::new(func),
-        &mut interp,
-        &mut env,
-        &mut effects,
-    )
-    .unwrap_or_else(|e| panic!("run failed: {}", e))
+    let mut core = CoreRuntime::default();
+    execute_program(std::sync::Arc::new(prog), &mut core)
+        .map(|(v, _)| v)
+        .unwrap_or_else(|e| panic!("run failed: {}", e))
 }
 
 /// 编译 + typeck，返回 typeck 错误（用于断言拒绝）。
 fn type_errors(src: &str) -> Vec<String> {
     let (_func, witnesses) =
         ParserV3::compile(src).unwrap_or_else(|e| panic!("compile failed: {}", e));
-    check_program_witnesses_bidirectional(&witnesses)
+    check_program_witnesses(&witnesses)
         .into_iter()
         .map(|e| format!("{:?}", e))
         .collect()
@@ -179,36 +173,24 @@ fn interpreters_are_isolated_across_threads() {
     // v0.91 全局 Mutex 语义下两条线程共享同一序列，本断言在交错下
     // 不稳定；v0.99 状态按值隔离后成为稳定性质。
     let h1 = std::thread::spawn(|| {
-        let mut interp = Interpreter::new();
-        let mut env = interp.take_env();
-        let mut effects = mora::mir::effect::Effects::default();
-        let (func, _) = ParserV3::compile(
+        let mut core = CoreRuntime::default();
+        let (prog, _) = ParserV3::compile(
             "task main()\n  random.seed(123)\n  [random.random(), random.random()]\nend",
         )
         .unwrap();
-        execute(
-            &std::sync::Arc::new(func),
-            &mut interp,
-            &mut env,
-            &mut effects,
-        )
-        .unwrap()
+        execute_program(std::sync::Arc::new(prog), &mut core)
+            .unwrap()
+            .0
     });
     let h2 = std::thread::spawn(|| {
-        let mut interp = Interpreter::new();
-        let mut env = interp.take_env();
-        let mut effects = mora::mir::effect::Effects::default();
-        let (func, _) = ParserV3::compile(
+        let mut core = CoreRuntime::default();
+        let (prog, _) = ParserV3::compile(
             "task main()\n  random.seed(456)\n  [random.random(), random.random()]\nend",
         )
         .unwrap();
-        execute(
-            &std::sync::Arc::new(func),
-            &mut interp,
-            &mut env,
-            &mut effects,
-        )
-        .unwrap()
+        execute_program(std::sync::Arc::new(prog), &mut core)
+            .unwrap()
+            .0
     });
     let (a, _b) = (h1.join().unwrap(), h2.join().unwrap());
     // a 的序列 == 单线程同种子序列（未被其他线程推进）

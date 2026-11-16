@@ -66,24 +66,15 @@ use mora::test_support::TempDir;
 use std::path::Path;
 use std::process::Command;
 
-/// 三个模块的 `methods_of` 结果（修后应得的精确值）。
-const EXPECTED: &[(&str, &[&str])] = &[
-    ("ai", &["chat", "tokens", "critic"]),
-    ("agent", &["create", "critic"]),
-    (
-        "random",
-        &["rand_int", "rand_float", "rand_choice", "seed", "shuffle"],
-    ),
-];
+/// `random` 模块的 `methods_of` 结果（v0.110.0 仅保留 core `random` 模块）。
+const EXPECTED: &[(&str, &[&str])] = &[(
+    "random",
+    &["rand_int", "rand_float", "rand_choice", "seed", "shuffle"],
+)];
 
 /// 每个方法一个**可达**的调用表达式（用于判据①）。
 fn call_expr(module: &str, method: &str) -> Option<&'static str> {
     Some(match (module, method) {
-        ("ai", "chat") => "ai.chat(p\"x\")",
-        ("ai", "tokens") => "ai.tokens()",
-        ("ai", "critic") => "ai.critic(\"a\")",
-        ("agent", "create") => "agent.create(\"b\", {})",
-        ("agent", "critic") => "agent.critic(\"a\")",
         ("random", "rand_int") => "random.rand_int(1, 10)",
         ("random", "rand_float") => "random.rand_float(0.0, 1.0)",
         ("random", "rand_choice") => "random.rand_choice([\"a\"])",
@@ -94,22 +85,7 @@ fn call_expr(module: &str, method: &str) -> Option<&'static str> {
 }
 
 /// 已知**不可达**的方法名 —— 自省**不得**列出（判据②）。
-const MUST_NOT_LIST: &[(&str, &[&str])] = &[
-    // D59：实现存在、单测全绿，但源码路径不可达。
-    (
-        "ai",
-        &[
-            "retry",
-            "role",
-            "dag",
-            "heartbeat",
-            "context.trim",
-            "context.info",
-        ],
-    ),
-    // Agent **值**的方法，不是模块的方法。
-    ("agent", &["run", "name", "max_steps"]),
-];
+const MUST_NOT_LIST: &[(&str, &[&str])] = &[("random", &["__nope__", "length", "push"])];
 
 /// 探针目录：每条用例一个**独占子目录**，`Drop` 时删除。
 ///
@@ -141,7 +117,7 @@ impl Drop for ProbeDir {
 fn run_src(dir: &Path, src: &str) -> (String, i32) {
     let prog = dir.join("p.mora");
     std::fs::write(&prog, src).expect("写探针");
-    let mora = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+    let mora = env!("CARGO_BIN_EXE_mora");
     let out = Command::new(mora).arg(&prog).output().expect("跑 mora");
     let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
     s.push_str(&String::from_utf8_lossy(&out.stderr));

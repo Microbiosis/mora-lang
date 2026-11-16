@@ -36,7 +36,7 @@ use std::path::Path;
 /// 下界 20 保证扫描器**还活着**，上界 30 挡住新增。
 ///
 /// 增减都是**信号**：新增要判断是否需守卫；删除说明某处被收口了。
-const CAST_RANGE: std::ops::RangeInclusive<usize> = 20..=30;
+const CAST_RANGE: std::ops::RangeInclusive<usize> = 10..=25;
 
 /// 剥掉整行注释与行尾注释。
 fn code_only(src: &str) -> String {
@@ -86,16 +86,16 @@ fn count_int_casts(src: &str) -> usize {
 }
 
 fn builtin_files() -> Vec<std::path::PathBuf> {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/interpreter/builtins");
+    const DOMAIN_MODULES: &[&str] = &["exec.rs", "file.rs", "linalg.rs", "math.rs", "stats.rs"];
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/runtime/builtins");
     let mut v: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
-        .expect("读 builtins 目录")
+        .expect("读 runtime/builtins 目录")
         .flatten()
         .map(|e| e.path())
         .filter(|p| {
-            p.extension().and_then(|s| s.to_str()) == Some("rs")
-                && p.file_name()
-                    .and_then(|s| s.to_str())
-                    .is_some_and(|n| n != "mod.rs")
+            p.file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|n| DOMAIN_MODULES.contains(&n))
         })
         .collect();
     v.sort();
@@ -143,7 +143,7 @@ fn d407_int_cast_count_in_range() {
 #[test]
 fn d407_exec_parallel_guards_remain() {
     let src = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/interpreter/builtins/exec.rs"),
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/runtime/builtins/exec.rs"),
     )
     .expect("读 exec.rs");
     let code = code_only(&src);
@@ -156,59 +156,7 @@ fn d407_exec_parallel_guards_remain() {
     );
 }
 
-/// **`ai.retry` 的 `backoff_ms`** 仍走收口（D246）。
-///
-/// 修前 `Int(-1) as u64` 回绕成 `u64::MAX` ≈ 5.8 亿年
-/// ⇒ 任何带重试的调用**永远等不到退避结束**（静默挂死）。
-#[test]
-fn d407_ai_retry_guard_remains() {
-    let src = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/interpreter/builtins/ai.rs"),
-    )
-    .expect("读 ai.rs");
-    let code = code_only(&src);
-    assert!(
-        code.contains("value_as_usize"),
-        "`ai.retry` 的 backoff_ms 应走 `value_as_usize` 收口（D246）"
-    );
-    assert!(
-        !code.contains("attempts_n as u64"),
-        "`ai.retry` 出现了裸 `as u64` —— 守卫可能被回退"
-    );
-}
-
-// ── ③ 唯一的有意例外：钉住它、且不许它悄悄变多 ──
-
-/// **`ccr.marker` 的 size 饱和是 D339 的有意决定**，只此一处。
-///
-/// D404 曾把它改成报错，**随后回退** —— 因为 D339 明确记录
-/// 「改它属产品契约决定」。
-///
-/// 本条双向钉住：它**必须在**（决定仍生效），
-/// 且 builtins 层**不得再出现第二处**同形态的未设防饱和点
-/// —— 而「第二处」正是 `d407_int_cast_count_under_ceiling` 负责的。
-#[test]
-fn d407_ccr_marker_is_the_only_intentional_exception() {
-    let src = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/interpreter/builtins/ccr.rs"),
-    )
-    .expect("读 ccr.rs");
-    let code = code_only(&src);
-    assert!(
-        code.contains(".map(|n| n as usize)"),
-        "`ccr.marker` 的 size 已不再是 `as usize` 饱和 —— \
-         若是有意变更（改成报错），必须同时更新 D339 的判据与 CHANGELOG"
-    );
-    // 判据必须还在（钉住该决定的护栏）
-    let guard = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/tea_max_steps_guard.rs"),
-    )
-    .expect("读 tests/tea_max_steps_guard.rs");
-    assert!(
-        guard.contains("d339_ccr_marker_negative_size_still_becomes_zero_for_both_types"),
-        "D339 的钉住判据不见了 —— 该产品契约决定会失去护栏"
-    );
-}
+// `exec.parallel` 的两处守卫已由上方测试覆盖；其余 removed 模块（ai / ccr）已在 v0.110.0 移除。
 
 // ── ④ 端到端：D285 的守卫确实生效（行为钉） ──
 
@@ -218,7 +166,7 @@ fn d407_exec_parallel_negative_timeout_errors() {
     let dir = TempDir::new("mora_d407_exec");
     let script = dir.join("p.mora");
     std::fs::write(&script, "print(exec.parallel([\"echo hi\"], 1, -1))\n").expect("写探针");
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+    let exe = env!("CARGO_BIN_EXE_mora");
     let out = std::process::Command::new(exe)
         .arg(&script)
         .output()

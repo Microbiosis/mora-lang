@@ -138,8 +138,10 @@ impl ParserV3 {
             TokenType::Plus => Some(BinaryOp::Add),
             TokenType::Minus => Some(BinaryOp::Sub),
             TokenType::Star => Some(BinaryOp::Mul),
+            TokenType::StarStar => Some(BinaryOp::Pow),
             TokenType::Slash => Some(BinaryOp::Div),
             TokenType::Percent => Some(BinaryOp::Mod),
+            TokenType::At => Some(BinaryOp::MatMul),
             TokenType::Equal => Some(BinaryOp::Equal),
             TokenType::NotEqual => Some(BinaryOp::NotEqual),
             TokenType::Greater => Some(BinaryOp::Greater),
@@ -383,7 +385,7 @@ mod tests {
             let mut p = parser(src);
             assert_eq!(
                 p.consume_binary_op(std::slice::from_ref(tt)),
-                Some(expected.clone()),
+                Some(*expected),
                 "{src} 应映射到 {expected:?}"
             );
         }

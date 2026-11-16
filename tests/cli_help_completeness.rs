@@ -38,30 +38,14 @@ use std::process::Command;
 /// 新增子命令时**必须**同时加进这里，否则本测试会红。
 const SUBCOMMANDS: &[&str] = &[
     // 顶层
-    "run",
-    "install",
-    "snapshot",
-    "record",
-    "replay",
-    "diff",
-    "mcp",
-    // record 子命令
-    "record list",
-    "record stats",
-    "record timeline",
-    "record export",
-    "record audit",
-    "record report",
+    "run", "install",
 ];
 
 fn help_text() -> String {
-    let out = Command::new(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/target/debug/mora.exe"
-    ))
-    .arg("--help")
-    .output()
-    .expect("跑 mora --help");
+    let out = Command::new(env!("CARGO_BIN_EXE_mora"))
+        .arg("--help")
+        .output()
+        .expect("跑 mora --help");
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
@@ -81,7 +65,6 @@ fn d185_every_subcommand_appears_in_help_usage_lines() {
 
     let mut missing: Vec<&str> = Vec::new();
     for cmd in SUBCOMMANDS {
-        // 形如 `mora record audit <name> …` 或 `mora snapshot <file> …`
         let needle = format!("mora {cmd}");
         if !usage_lines.iter().any(|l| l.starts_with(&needle)) {
             missing.push(cmd);
@@ -89,42 +72,10 @@ fn d185_every_subcommand_appears_in_help_usage_lines() {
     }
     assert!(
         missing.is_empty(),
-        "这些子命令能跑，却没有 `--help` 用法条目:\n{:?}\n\n\
-         `mora record audit` 尤其重要 —— 它是**密钥扫描器**，\
-         修前在整段 help 里 `audit` 二字零匹配。\n\n{}",
+        "这些子命令能跑，却没有 `--help` 用法条目:\n{:?}\n\n{}",
         missing,
         help
     );
-}
-
-/// `mora record` 参数不足时自报的用法，同样必须涵盖全部子命令。
-///
-/// 那是用户**真的打错命令时**会看到的那一行。
-#[test]
-fn d185_record_usage_error_lists_all_subcommands() {
-    let out = Command::new(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/target/debug/mora.exe"
-    ))
-    .arg("record")
-    .output()
-    .expect("跑 mora record");
-    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-    text.push_str(&String::from_utf8_lossy(&out.stderr));
-
-    assert!(
-        text.contains("Usage"),
-        "`mora record`（缺参数）应自报用法:\n{}",
-        text
-    );
-    for sub in ["list", "stats", "timeline", "export", "audit", "report"] {
-        assert!(
-            text.contains(sub),
-            "`mora record` 的用法行漏了 `{}`:\n{}",
-            sub,
-            text
-        );
-    }
 }
 
 /// 负对照：`--help` 仍应列出原有的那些条目（防止「重写时把该有的删了」）。
@@ -134,10 +85,9 @@ fn d185_help_still_lists_the_original_entries() {
     for needle in [
         "mora <file.mora>",
         "mora --check <file>",
-        "mora record <file> <name>",
-        "mora replay <file> <name>",
-        "mora diff <a> <b>",
-        "mora mcp tool-list",
+        "mora --repl",
+        "mora run <file.mora>",
+        "mora install <url>",
         "mora --version",
         "mora --help",
     ] {

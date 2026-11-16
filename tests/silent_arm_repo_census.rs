@@ -42,22 +42,6 @@
 //! - 源码层：`dispatch.rs` 的最终兜底**含 `Err(`**
 //! - 行为层：错拼 flag 静默回落（D380 的结论仍然成立）
 
-use mora::test_support::TempDir;
-use std::process::Command;
-
-fn mora(dir: &std::path::Path, args: &[&str]) -> (i32, String) {
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
-    let out = Command::new(exe)
-        .current_dir(dir)
-        .args(args)
-        .output()
-        .expect("跑 mora");
-    let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
-    s.push('\n');
-    s.push_str(&String::from_utf8_lossy(&out.stderr));
-    (out.status.code().unwrap_or(-1), s)
-}
-
 /// 统计某文件里**独立成行的** `_ => {}` 数量。
 fn count_silent_arms(src: &str) -> usize {
     src.lines()
@@ -85,41 +69,31 @@ fn d381_repo_wide_silent_arm_census() {
     let mut total = 0usize;
     for f in [
         "src/main.rs",
-        "src/interpreter/dispatch.rs",
-        "src/interpreter/numeric_helpers.rs",
-        "src/mir/dag.rs",
-        "src/mir/ssa.rs",
-        "src/mir/pipeline.rs",
-        "src/mir/lower.rs",
-        // v0.104.6：src/mir/lmir_to_mir.rs 已删除（未声明的死代码 + UB 隐患）
+        "src/cli/repl.rs",
+        "src/runtime/builtins/numeric.rs",
+        "src/mir/control/opt.rs",
+        "src/mir/control/lower.rs",
+        "src/mir/control/ir.rs",
         "src/parser_v3/emit.rs",
         "src/value.rs",
-        "src/record/serialization.rs",
-        "src/lsp/json.rs",
+        "src/typeck/mod.rs",
+        "src/typeck/hm/infer.rs",
     ] {
         total += count_silent_arms(&read(f));
     }
     assert!(
-        total >= 12,
-        "抽查 12 个文件的 `_ => {{}}` 兜底数 {total} 过低 —— \
+        total >= 10,
+        "抽查 10 个保留文件的 `_ => {{}}` 兜底数 {total} 过低 —— \
          是不是有文件被移动/重命名了？需重新普查"
     );
     assert!(
-        total <= 40,
-        "抽查的兜底数 {total} 超过上限 40 —— \
+        total <= 30,
+        "抽查的兜底数 {total} 超过上限 30 —— \
          **必须重新普查**并分类（中途检查 / 最终兜底 / 解析层）"
     );
 }
 
-/// **`main.rs` 只剩 1 处**，且**不在** flag 解析上下文（**已修**）。
-///
-/// 修前是 3 处（`:123` / `:220` / `:269`），D380 把后两处改成了
-/// `unknown_flag(...)` 硬报错。第三处 `:123` 是 `--version` / `--help`
-/// **预扫描**的 match，主语是 `args[1]`，落进 `_` 的是文件名 / 子命令名等
-/// **正常输入** —— 保留兜底是**正确**的（删掉它会让 `mora file.mora` 直接报错）。
-///
-/// ⚠ 本条曾以「恰好 3 处」的形式**钉住缺陷本身**（`d381_only_three_silent_arms…`），
-/// 修好后必然变红 —— 这是有意的行为变更，不是回归。
+/// **`main.rs` 只剩 1 处**（`--version`/`--help` 预扫描）。
 #[test]
 fn d381_only_the_help_prescan_keeps_its_silent_arm() {
     let main = read("src/main.rs");
@@ -129,86 +103,21 @@ fn d381_only_the_help_prescan_keeps_its_silent_arm() {
         "`main.rs` 应只剩 1 处 `_ => {{}}`（`--version`/`--help` 预扫描）; 实得 {}",
         count_silent_arms(&main)
     );
-    // flag 解析区必须还有这些字面量（说明 flag 解析仍在，只是不再静默了）
-    for flag in ["--output", "--verify", "--version"] {
+    for flag in ["--version", "--help"] {
         assert!(main.contains(flag), "flag 解析区应仍含 `{flag}`");
     }
-    // 且三处 flag 循环都已改走 unknown_flag 出口
-    for sub in ["record export", "record audit", "record report"] {
-        assert!(
-            main.contains(&format!("\"{sub}\"")),
-            "`{sub}` 的 flag 循环应指名自己并走 unknown_flag"
-        );
-    }
-    assert!(
-        main.contains("fn unknown_flag("),
-        "唯一的报错出口 `unknown_flag` 应存在"
-    );
 }
 
 /// **函数分派的最终兜底**必须**明确报错**，不能静默。
 #[test]
 fn d381_call_dispatch_final_fallback_errors() {
-    let d = read("src/interpreter/dispatch.rs");
-    let line = d
-        .lines()
-        .map(str::trim)
-        .find(|l| l.contains("Value is not callable"))
-        .unwrap_or_else(|| panic!("`dispatch.rs` 的最终兜底应报错 *Value is not callable*"));
+    let b = read("src/runtime/vm/builtins.rs");
+    let idx = b.find("Cannot call value of type {}").unwrap_or_else(|| {
+        panic!("`runtime/vm/builtins.rs` 的最终兜底应报错 *Cannot call value of type*")
+    });
+    let window = &b[idx.saturating_sub(80)..idx];
     assert!(
-        line.contains("_ => Err("),
-        "最终兜底必须**返回 Err**（而不是 `_ => {{}}`）; 实得: {line}"
+        window.contains("return Err("),
+        "最终兜底必须**返回 Err**（而不是 `_ => {{}}`）; 实得: {window}"
     );
-}
-
-/// **行为层**：错拼的 flag 现在**被拒**（D380 已修；本条曾钉「仍静默回落」）。
-///
-/// ⚠ 这条原本断言 `code == 0` —— 也就是**把缺陷钉成了契约**。
-/// D380 收紧后它必然变红；红得对，改断言才是对的。
-#[test]
-fn d381_misspelled_flag_is_now_rejected() {
-    let dir = TempDir::new("d381probe");
-    std::fs::create_dir_all(dir.join(".mora").join("recordings")).unwrap();
-    std::fs::write(
-        dir.join(".mora").join("recordings").join("r1.jsonl"),
-        "{\"kind\":\"note\",\"id\":1,\"ts_ms\":100,\"message\":\"hi\"}\n",
-    )
-    .unwrap();
-
-    let (code, out) = mora(&dir, &["record", "export", "r1", "--formt", "md"]);
-    assert_ne!(
-        code, 0,
-        "错拼 flag 现在必须非零退出（修前是 exit 0 静默回落）; out={out}"
-    );
-    assert!(
-        out.contains("--formt"),
-        "报错必须**指名**错拼的那个 flag; out={out}"
-    );
-    assert!(
-        !out.lines()
-            .any(|l| l.trim_start().starts_with("# Recording")),
-        "错拼的 `--formt` 绝不能碰巧生效; out={out}"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// **反向对照**：正确用法必须产出 Markdown（证明上一条不是「怎么写都回落」）。
-#[test]
-fn d381_correct_flag_still_produces_markdown() {
-    let dir = TempDir::new("d381probe2");
-    std::fs::create_dir_all(dir.join(".mora").join("recordings")).unwrap();
-    std::fs::write(
-        dir.join(".mora").join("recordings").join("r1.jsonl"),
-        "{\"kind\":\"note\",\"id\":1,\"ts_ms\":100,\"message\":\"hi\"}\n",
-    )
-    .unwrap();
-
-    let (code, out) = mora(&dir, &["record", "export", "r1", "--format", "md"]);
-    assert_eq!(code, 0, "正常用法应成功; out={out}");
-    assert!(
-        out.lines()
-            .any(|l| l.trim_start().starts_with("# Recording")),
-        "`--format md` 应产出 Markdown（否则上一条的回落是恒真的）; out={out}"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
 }

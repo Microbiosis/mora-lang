@@ -1,15 +1,15 @@
-//! 最小手写 JSON Value + serialize/parse 子集
+//! v0.110.0: LSP JSON-RPC 2.0 轻量值表示。
 //!
-//! 只支持 LSP 用到的类型：
-//! - object: HashMap<String, Value>
-//! - array: `Vec<Value>`
-//! - string, number, bool, null
-//!
-//! 故意不支持：嵌套深度限制宽松（不做 strict JSON）、不做性能优化。
-//! 目的：让 LSP server 零依赖工作。
+//! 解析与字符串转义统一复用 `crate::flow::json` 的显式栈 RFC 8259 状态机
+//! 与 `escape_json_string`，仅保留 LSP 协议所需的 `Value`（`Number(f64)` 整数写法，
+//! 如 `6.0 -> "6"` 以符合 `Range.line` 等协议字段线格式）。
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::fmt::Write as _;
+
+use crate::error::{MoraError, MoraResult};
+use crate::flow::json::{JsonBuilder, parse_json_with, write_escaped_json_string};
 
 // ===================================================================
 // Value
@@ -64,350 +64,160 @@ impl Value {
 }
 
 // ===================================================================
-// Serialize
+// Serialize (显式栈 + 共享转义器)
 // ===================================================================
 
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_value(f, self)
+        f.write_str(&to_string(self))
     }
 }
 
-fn write_value(f: &mut fmt::Formatter<'_>, v: &Value) -> fmt::Result {
-    match v {
-        Value::Null => f.write_str("null"),
-        Value::Bool(b) => f.write_str(if *b { "true" } else { "false" }),
-        Value::Number(n) => {
-            if n.is_finite() {
-                // 整数 if 是整数，否则 %g
-                if n.fract() == 0.0 && n.abs() < 1e15 {
-                    write!(f, "{}", *n as i64)
-                } else {
-                    write!(f, "{}", n)
-                }
-            } else {
-                f.write_str("null")
-            }
-        }
-        Value::String_(s) => write!(f, "\"{}\"", escape_string(s)),
-        Value::Array(items) => {
-            f.write_str("[")?;
-            for (i, it) in items.iter().enumerate() {
-                if i > 0 {
-                    f.write_str(",")?;
-                }
-                write_value(f, it)?;
-            }
-            f.write_str("]")
-        }
-        Value::Object(map) => {
-            f.write_str("{")?;
-            for (i, (k, v)) in map.iter().enumerate() {
-                if i > 0 {
-                    f.write_str(",")?;
-                }
-                write!(f, "\"{}\":", escape_string(k))?;
-                write_value(f, v)?;
-            }
-            f.write_str("}")
-        }
+/// Value 转 JSON 字符串（显式栈迭代实现，复用共享 RFC 8259 转义）。
+pub fn to_string(v: &Value) -> String {
+    enum Step<'a> {
+        Val(&'a Value),
+        Raw(&'static str),
+        Key(&'a str),
     }
-}
 
-fn escape_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
+    let mut out = String::new();
+    let mut stack = vec![Step::Val(v)];
+
+    while let Some(step) = stack.pop() {
+        match step {
+            Step::Raw(s) => out.push_str(s),
+            Step::Key(k) => {
+                out.push('"');
+                write_escaped_json_string(&mut out, k);
+                out.push_str("\":");
+            }
+            Step::Val(cur) => match cur {
+                Value::Null => out.push_str("null"),
+                Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+                Value::Number(n) => {
+                    if n.is_finite() {
+                        if n.fract() == 0.0 && n.abs() < 1e15 {
+                            let _ = write!(out, "{}", *n as i64);
+                        } else {
+                            let _ = write!(out, "{}", n);
+                        }
+                    } else {
+                        out.push_str("null");
+                    }
+                }
+                Value::String_(s) => {
+                    out.push('"');
+                    write_escaped_json_string(&mut out, s);
+                    out.push('"');
+                }
+                Value::Array(items) => {
+                    out.push('[');
+                    stack.push(Step::Raw("]"));
+                    for (idx, it) in items.iter().enumerate().rev() {
+                        stack.push(Step::Val(it));
+                        if idx > 0 {
+                            stack.push(Step::Raw(","));
+                        }
+                    }
+                }
+                Value::Object(map) => {
+                    out.push('{');
+                    stack.push(Step::Raw("}"));
+                    for (idx, (k, val)) in map.iter().enumerate().rev() {
+                        stack.push(Step::Val(val));
+                        stack.push(Step::Key(k.as_str()));
+                        if idx > 0 {
+                            stack.push(Step::Raw(","));
+                        }
+                    }
+                }
+            },
         }
     }
+
     out
 }
 
 // ===================================================================
-// Parse
+// Parse (委托 flow::json 统一显式栈解析内核)
 // ===================================================================
 
+struct LspJsonBuilder;
+
+impl JsonBuilder for LspJsonBuilder {
+    type Output = Value;
+    type ArrayAcc = Vec<Value>;
+    type ObjectAcc = BTreeMap<String, Value>;
+
+    fn null() -> Self::Output {
+        Value::Null
+    }
+
+    fn bool(v: bool) -> Self::Output {
+        Value::Bool(v)
+    }
+
+    fn number(raw: &str, _has_decimal_or_exp: bool) -> MoraResult<Self::Output> {
+        let num: f64 = raw
+            .parse()
+            .map_err(|_| MoraError::Serialization(format!("Invalid number: {}", raw)))?;
+        if !num.is_finite() {
+            return Err(MoraError::Serialization(format!(
+                "Number literal overflow: {}",
+                raw
+            )));
+        }
+        Ok(Value::Number(num))
+    }
+
+    fn string(s: String) -> Self::Output {
+        Value::String_(s)
+    }
+
+    fn begin_array() -> Self::ArrayAcc {
+        Vec::new()
+    }
+
+    fn push_array(arr: &mut Self::ArrayAcc, val: Self::Output) {
+        arr.push(val);
+    }
+
+    fn finish_array(arr: Self::ArrayAcc) -> Self::Output {
+        Value::Array(arr)
+    }
+
+    fn begin_object() -> Self::ObjectAcc {
+        BTreeMap::new()
+    }
+
+    fn insert_object(obj: &mut Self::ObjectAcc, key: String, val: Self::Output) {
+        obj.insert(key, val);
+    }
+
+    fn finish_object(obj: Self::ObjectAcc) -> Self::Output {
+        Value::Object(obj)
+    }
+}
+
+/// 兼容历史调用形态 `Parser::new(s).parse_value()` 的零开销包装器（委托统一内核）。
 pub struct Parser<'a> {
-    bytes: &'a [u8],
-    pos: usize,
+    src: &'a str,
 }
 
 impl<'a> Parser<'a> {
     pub fn new(s: &'a str) -> Self {
-        Self {
-            bytes: s.as_bytes(),
-            pos: 0,
-        }
+        Self { src: s }
     }
 
-    pub fn parse_value(&mut self) -> Result<Value, String> {
-        self.skip_ws();
-        if self.pos >= self.bytes.len() {
-            return Err("unexpected end of input".to_string());
-        }
-        match self.bytes[self.pos] {
-            b'n' => self.parse_literal("null", Value::Null),
-            b't' => self.parse_literal("true", Value::Bool(true)),
-            b'f' => self.parse_literal("false", Value::Bool(false)),
-            b'"' => Ok(Value::String_(self.parse_string()?)),
-            b'[' => self.parse_array(),
-            b'{' => self.parse_object(),
-            b'-' | b'0'..=b'9' => self.parse_number(),
-            other => Err(format!("unexpected char: {}", other as char)),
-        }
-    }
-
-    fn parse_literal(&mut self, lit: &str, val: Value) -> Result<Value, String> {
-        let bytes = lit.as_bytes();
-        if self.bytes[self.pos..].starts_with(bytes) {
-            self.pos += bytes.len();
-            Ok(val)
-        } else {
-            Err(format!("expected literal '{}'", lit))
-        }
-    }
-
-    fn parse_string(&mut self) -> Result<String, String> {
-        if self.bytes[self.pos] != b'"' {
-            return Err("expected '\"'".to_string());
-        }
-        self.pos += 1;
-        let mut out = String::new();
-        while self.pos < self.bytes.len() {
-            let c = self.bytes[self.pos];
-            match c {
-                b'"' => {
-                    self.pos += 1;
-                    return Ok(out);
-                }
-                b'\\' => {
-                    self.pos += 1;
-                    if self.pos >= self.bytes.len() {
-                        return Err("unterminated escape".to_string());
-                    }
-                    let esc = self.bytes[self.pos];
-                    self.pos += 1;
-                    match esc {
-                        b'"' => out.push('"'),
-                        b'\\' => out.push('\\'),
-                        b'/' => out.push('/'),
-                        b'n' => out.push('\n'),
-                        b'r' => out.push('\r'),
-                        b't' => out.push('\t'),
-                        b'b' => out.push('\u{0008}'),
-                        b'f' => out.push('\u{000C}'),
-                        b'u' => {
-                            // 4 hex digits
-                            if self.pos + 4 > self.bytes.len() {
-                                return Err("short unicode escape".to_string());
-                            }
-                            let hex = std::str::from_utf8(&self.bytes[self.pos..self.pos + 4])
-                                .map_err(|e| e.to_string())?;
-                            self.pos += 4;
-                            let code = u32::from_str_radix(hex, 16).map_err(|e| e.to_string())?;
-                            // v0.104.6 D204：代理对。`😀` 在 JSON 里合法地写成
-                            // `\uD83D\uDE00`（两个 UTF-16 码元）。此前
-                            // `char::from_u32(0xD83D)` 返回 `None` → 整条消息
-                            // 解析失败 → 服务端 `continue` 丢弃它。
-                            if (0xD800..0xDC00).contains(&code) {
-                                let lo = self.parse_low_surrogate(code)?;
-                                match char::from_u32(lo) {
-                                    Some(c) => out.push(c),
-                                    None => {
-                                        return Err(format!("invalid unicode: {lo:#x}"));
-                                    }
-                                }
-                            } else if (0xDC00..0xE000).contains(&code) {
-                                return Err(format!("unpaired low surrogate: {code:#x}"));
-                            } else if let Some(ch) = char::from_u32(code) {
-                                out.push(ch);
-                            } else {
-                                return Err(format!("invalid unicode: {code}"));
-                            }
-                        }
-                        other => return Err(format!("unknown escape: \\{}", other as char)),
-                    }
-                }
-                // v0.104.6 D204：原始字节必须按 **UTF-8** 解码。
-                //
-                // 修前是 `out.push(c as char)` —— `c: u8`，而 Rust 的
-                // `u8 as char` 是 **Latin-1 解释**（把字节当成同数值的码点），
-                // 不是 UTF-8 解码。于是「你好世界」的 `E6 96 87 …`
-                // 变成三个码点 `U+00E6 U+0096 U+0087`，写出去时每个又编成
-                // 2 字节 → **双重编码乱码**：
-                //
-                // ```text
-                // 服务端收到: let s = "你好世界"
-                // 服务端回给客户端: let s = "Ã¤Â½ Ã¥Â¥Â½Ã¤Â¸Â§Â"
-                // ```
-                //
-                // 客户端把这份 `newText` 应用并存盘 → **用户的源码被改了**。
-                // 而且 `0xA0` 那类字节会变成 `U+00A0`（不换行空格），
-                // 连字符串**内容**都变了。
-                //
-                // 改为收集一段连续原始字节、按 UTF-8 解码；非法 UTF-8 **报错**
-                // （而不是静默产出错的字符串）。
-                _ => {
-                    let start = self.pos;
-                    while self.pos < self.bytes.len()
-                        && self.bytes[self.pos] != b'"'
-                        && self.bytes[self.pos] != b'\\'
-                    {
-                        self.pos += 1;
-                    }
-                    let chunk = std::str::from_utf8(&self.bytes[start..self.pos])
-                        .map_err(|e| format!("invalid UTF-8 in string at byte {start}: {e}"))?;
-                    out.push_str(chunk);
-                }
-            }
-        }
-        Err("unterminated string".to_string())
-    }
-
-    /// v0.104.6 D204：读到 `\uXXXX` 的**低代理**（`0xDC00..0xE000`），
-    /// 与已读到的 `hi` 合成一个码点。
-    fn parse_low_surrogate(&mut self, hi: u32) -> Result<u32, String> {
-        if self.pos + 6 > self.bytes.len() || self.bytes[self.pos] != b'\\' {
-            return Err("lone high surrogate".to_string());
-        }
-        let hex = std::str::from_utf8(&self.bytes[self.pos + 2..self.pos + 6])
-            .map_err(|e| e.to_string())?;
-        if self.bytes[self.pos + 1] != b'u' {
-            return Err("lone high surrogate".to_string());
-        }
-        let lo = u32::from_str_radix(hex, 16).map_err(|e| e.to_string())?;
-        self.pos += 6;
-        if !(0xDC00..0xE000).contains(&lo) {
-            return Err(format!(
-                "high surrogate {hi:#x} not followed by low surrogate"
-            ));
-        }
-        Ok(0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00))
-    }
-
-    fn parse_number(&mut self) -> Result<Value, String> {
-        let start = self.pos;
-        if self.bytes[self.pos] == b'-' {
-            self.pos += 1;
-        }
-        while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_digit() {
-            self.pos += 1;
-        }
-        if self.pos < self.bytes.len() && self.bytes[self.pos] == b'.' {
-            self.pos += 1;
-            while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_digit() {
-                self.pos += 1;
-            }
-        }
-        if self.pos < self.bytes.len()
-            && (self.bytes[self.pos] == b'e' || self.bytes[self.pos] == b'E')
-        {
-            self.pos += 1;
-            if self.pos < self.bytes.len()
-                && (self.bytes[self.pos] == b'+' || self.bytes[self.pos] == b'-')
-            {
-                self.pos += 1;
-            }
-            while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_digit() {
-                self.pos += 1;
-            }
-        }
-        let s = std::str::from_utf8(&self.bytes[start..self.pos]).map_err(|e| e.to_string())?;
-        s.parse::<f64>()
-            .map(Value::Number)
-            .map_err(|e| format!("invalid number: {}", e))
-    }
-
-    fn parse_array(&mut self) -> Result<Value, String> {
-        self.pos += 1; // consume '['
-        let mut items = Vec::new();
-        self.skip_ws();
-        if self.pos < self.bytes.len() && self.bytes[self.pos] == b']' {
-            self.pos += 1;
-            return Ok(Value::Array(items));
-        }
-        loop {
-            self.skip_ws();
-            items.push(self.parse_value()?);
-            self.skip_ws();
-            if self.pos >= self.bytes.len() {
-                return Err("unterminated array".to_string());
-            }
-            match self.bytes[self.pos] {
-                b',' => {
-                    self.pos += 1;
-                }
-                b']' => {
-                    self.pos += 1;
-                    return Ok(Value::Array(items));
-                }
-                _ => return Err("expected ',' or ']'".to_string()),
-            }
-        }
-    }
-
-    fn parse_object(&mut self) -> Result<Value, String> {
-        self.pos += 1; // consume '{'
-        let mut map = BTreeMap::new();
-        self.skip_ws();
-        if self.pos < self.bytes.len() && self.bytes[self.pos] == b'}' {
-            self.pos += 1;
-            return Ok(Value::Object(map));
-        }
-        loop {
-            self.skip_ws();
-            let key = self.parse_string()?;
-            self.skip_ws();
-            if self.pos >= self.bytes.len() || self.bytes[self.pos] != b':' {
-                return Err("expected ':'".to_string());
-            }
-            self.pos += 1;
-            self.skip_ws();
-            let val = self.parse_value()?;
-            map.insert(key, val);
-            self.skip_ws();
-            if self.pos >= self.bytes.len() {
-                return Err("unterminated object".to_string());
-            }
-            match self.bytes[self.pos] {
-                b',' => {
-                    self.pos += 1;
-                }
-                b'}' => {
-                    self.pos += 1;
-                    return Ok(Value::Object(map));
-                }
-                _ => return Err("expected ',' or '}'".to_string()),
-            }
-        }
-    }
-
-    fn skip_ws(&mut self) {
-        while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_whitespace() {
-            self.pos += 1;
-        }
+    pub fn parse_value(&mut self) -> MoraResult<Value> {
+        parse(self.src)
     }
 }
 
-// ===================================================================
-// 公共 API
-// ===================================================================
-
-/// 解析 JSON 字符串为 Value
-pub fn parse(s: &str) -> Result<Value, String> {
-    Parser::new(s).parse_value()
-}
-
-/// Value 转 JSON 字符串
-pub fn to_string(v: &Value) -> String {
-    format!("{}", v)
+/// 解析 JSON 字符串为 LSP [`Value`]。
+pub fn parse(s: &str) -> MoraResult<Value> {
+    parse_json_with::<LspJsonBuilder>(s)
 }
 
 #[cfg(test)]

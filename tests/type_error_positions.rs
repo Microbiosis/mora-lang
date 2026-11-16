@@ -35,11 +35,11 @@
 //! 本改动照搬：`compatible_with` 先判一次，不兼容就带实参 span 立即返回；
 //! 兼容的**照旧**压约束（TypeVar 绑定 / 数值提升仍由 `unify` 负责，本改动不碰）。
 
-use mora::typeck::check_mir::check_program_witnesses_bidirectional;
+use mora::typeck::check_mir::check_program_witnesses;
 
 fn typeck(src: &str) -> Vec<(usize, usize, String, String, String)> {
     let (_f, w) = mora::cli::compile_and_opt(src, None).expect("compile");
-    check_program_witnesses_bidirectional(&w)
+    check_program_witnesses(&w)
         .into_iter()
         .map(|e| {
             (

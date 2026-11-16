@@ -144,6 +144,5 @@ fn read_msg<R: Read>(r: &mut R) -> String {
 }
 
 fn json_string(s: &str) -> String {
-    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
-    format!("\"{}\"", escaped)
+    format!("\"{}\"", mora::flow::escape_json_string(s))
 }

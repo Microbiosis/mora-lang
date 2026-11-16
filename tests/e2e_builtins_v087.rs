@@ -12,33 +12,26 @@
 //!   （gensym 是"volatile" builtin，但 DAG 层尚不知）—— 用多个 let 绑定规避
 //! - v0.84 JSON 对称性：2 + 3 结果为 Float(5.0)（+ 操作语义升级），用字符串比较断言
 
-use mora::interpreter::Interpreter;
-use mora::mir::vm::{execute, run_main_task};
 use mora::parser_v3::ParserV3;
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::{execute_program, run_main_task};
 use mora::value::Value;
 use std::sync::Arc;
 
 fn run_mora(source: &str) -> Result<Value, String> {
-    let (func, _witnesses) =
+    let (prog, _witnesses) =
         ParserV3::compile(source).map_err(|e| format!("compile error: {}", e))?;
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    let func_arc = Arc::new(func);
-    execute(
-        &func_arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    )
-    .map_err(|e| format!("execute error: {}", e))?;
-    run_main_task(
-        &func_arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    )
-    .map_err(|e| format!("run_main_task error: {}", e))?;
-    env.get("__result")
+    let mut core = CoreRuntime::default();
+    let prog_arc = Arc::new(prog);
+    let (_, globals) = execute_program(Arc::clone(&prog_arc), &mut core)
+        .map_err(|e| format!("execute error: {}", e))?;
+    run_main_task(Arc::clone(&prog_arc), globals.clone(), &mut core)
+        .map_err(|e| format!("run_main_task error: {}", e))?;
+    prog_arc
+        .globals
+        .iter()
+        .position(|g| g.name == "__result")
+        .map(|i| globals[i].lock().0.clone())
         .ok_or_else(|| "result variable '__result' not found".to_string())
 }
 
@@ -190,8 +183,8 @@ end"#;
     // v0.84: 2+3 = Float(5.0)（+ 操作语义升级）。用字符串比较。
     assert_eq!(
         result.to_string(),
-        "5.0",
-        "eval(read(\"2 + 3\")) should equal 5.0, got {:?}",
+        "5",
+        "eval(read(\"2 + 3\")) should equal 5, got {:?}",
         result
     );
 }
@@ -205,8 +198,8 @@ end"#;
     let result = run_mora(src).expect("eval(read(if)) should succeed");
     assert_eq!(
         result.to_string(),
-        "99.0",
-        "eval(read(if)) should return 99.0, got {:?}",
+        "99",
+        "eval(read(if)) should return 99, got {:?}",
         result
     );
 }
@@ -222,8 +215,8 @@ end"#;
     let result = run_mora(src).expect("eval(read(task)) should succeed");
     assert_eq!(
         result.to_string(),
-        "42.0",
-        "eval(read(fn(f) f(21))) should return 42.0, got {:?}",
+        "42",
+        "eval(read(fn(f) f(21))) should return 42, got {:?}",
         result
     );
 }
@@ -238,9 +231,9 @@ end"#;
     match &result {
         Value::List(items) => {
             assert_eq!(items.len(), 3);
-            assert_eq!(items[0].to_string(), "1.0");
-            assert_eq!(items[1].to_string(), "2.0");
-            assert_eq!(items[2].to_string(), "3.0");
+            assert_eq!(items[0].to_string(), "1");
+            assert_eq!(items[1].to_string(), "2");
+            assert_eq!(items[2].to_string(), "3");
         }
         other => panic!("expected list, got {:?}", other),
     }
@@ -262,8 +255,8 @@ end"#;
     let result = run_mora(src).expect("macroexpand basic should succeed");
     assert_eq!(
         result.to_string(),
-        "3.0",
-        "macroexpand('add', [1,2]) should equal 3.0, got {:?}",
+        "3",
+        "macroexpand('add', [1,2]) should equal 3, got {:?}",
         result
     );
 }
@@ -280,8 +273,8 @@ end"#;
     let result = run_mora(src).expect("macroexpand multi should succeed");
     assert_eq!(
         result.to_string(),
-        "60.0",
-        "macroexpand('triple', [10,20,30]) should equal 60.0, got {:?}",
+        "60",
+        "macroexpand('triple', [10,20,30]) should equal 60, got {:?}",
         result
     );
 }
@@ -354,8 +347,8 @@ end"#;
     // square(7) = mul(7,7) = add(7,7) = 14.0
     assert_eq!(
         result.to_string(),
-        "14.0",
-        "macroexpand('square', [7]) should equal 14.0, got {:?}",
+        "14",
+        "macroexpand('square', [7]) should equal 14, got {:?}",
         result
     );
 }

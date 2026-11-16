@@ -1,9 +1,8 @@
 use super::*;
-use crate::mir::{MirFunction, Reg};
 
 impl ParserV3 {
     /// v0.75.40: 顶层语句循环 — emit 每条语句 + 顶层 witness。
-    pub(super) fn emit_program(&mut self) -> Result<(), String> {
+    pub(super) fn emit_program(&mut self) -> crate::error::MoraResult<()> {
         let mut guard = 0usize;
         while !self.is_at_end() {
             while self.match_token(&[TokenType::Newline]) {}
@@ -12,11 +11,9 @@ impl ParserV3 {
             }
             guard += 1;
             if guard > 10_000 {
-                return Err(ParseError(
+                return Err(crate::error::MoraError::Parse(
                     "parser_v3: aborted after 10k iterations".to_string(),
-                ))
-                .map(|_: ParseError| ())
-                .map_err(|e| e.0);
+                ));
             }
             match self.emit_statement_w() {
                 Some(w) => self.witnesses.push(w),
@@ -25,12 +22,14 @@ impl ParserV3 {
                     // 非法 bigint、未闭合字符串…）。解析器只把它当陌生物 token，
                     // 于是这些信息全被丢弃、只报一句 "Failed to parse at line N"。
                     // 先回头找词法层的真实诊断再决定报什么。
-                    return Err(match self.lexical_error_ahead() {
-                        Some((msg, line, col)) => {
-                            format!("{} at line {}, column {}", msg, line, col)
-                        }
-                        None => format!("Failed to parse at line {}", self.current_line()),
-                    });
+                    return Err(crate::error::MoraError::Parse(
+                        match self.lexical_error_ahead() {
+                            Some((msg, line, col)) => {
+                                format!("{} at line {}, column {}", msg, line, col)
+                            }
+                            None => format!("Failed to parse at line {}", self.current_line()),
+                        },
+                    ));
                 }
             }
         }
@@ -54,52 +53,18 @@ impl ParserV3 {
             TokenType::If => self.emit_if_w(),
             TokenType::For => self.emit_loop_w(),
             TokenType::Identifier(ref s) if s == "while" => self.emit_while_w(),
-            // v0.88: TEA app 块
-            TokenType::App => self.emit_app_def_w(),
-            // v0.103: 命名 section 声明
-            TokenType::Prompt => self.emit_section_w(true),
-            TokenType::Document => self.emit_section_w(false),
             // v0.103: export（标识符分派，spec §10.2）
             TokenType::Identifier(ref s) if s == "export" => self.emit_export_w(),
-            // v0.103: TEA 独立声明 `model Name ... end` / `msg Name ... end`
-            //（spec §9.6 / §14.2 EBNF）。前瞻守卫：仅 `model`/`msg` 后紧跟
-            // 标识符时拦截（不抢以 model/msg 命名的变量/调用语句）。
-            TokenType::Identifier(ref s)
-                if (s == "model" || s == "msg")
-                    && matches!(
-                        self.tokens.get(self.current + 1).map(|t| &t.token_type),
-                        Some(TokenType::Identifier(_))
-                    ) =>
-            {
-                if s == "model" {
-                    self.emit_model_def_w()
-                } else {
-                    self.emit_msg_def_w()
-                }
-            }
-            // v0.103: TEA 独立 `update(params) ... end`（spec §9.6 工作示例）。
-            //
-            // 守卫：`update` 后紧跟 `(` 且括号内**全为裸标识符**（形参表形态）。
-            // 普通调用 `update(a, b)` 与声明 `update(msg, model)` 在这一位置上
-            // 形似，故再要求「`)` 后是同语句体（换行/`{`/表达式）」不足以区分；
-            // 本守卫以「形参只能是标识符」为界 —— `update(x + 1, y)` 这类
-            // 含表达式的调用不受影响，而恰好「全部实参都是裸标识符」的语句级
-            // 调用会被解析为声明。这与 `model`/`msg` 的守卫同一取舍：为落地
-            // 规范承诺的声明形式，保留一个边界明确的名字。
-            // （接收者调用 `x.update(...)` 不受影响 —— 本分派只在语句首 token
-            // 是 `update` 时触发。）
-            TokenType::Identifier(ref s) if s == "update" && self.looks_like_update_decl() => {
-                self.emit_update_def_w()
-            }
-            // v0.103: 可观测性块
-            TokenType::Identifier(ref s) if s == "observe" => self.emit_observe_w(),
-            TokenType::Identifier(ref s) if s == "span" => self.emit_span_w(),
             // v0.103: 并行块 / worker
             TokenType::Identifier(ref s) if s == "parallel" => self.emit_parallel_w(),
             TokenType::Identifier(ref s) if s == "worker" => self.emit_worker_w(),
-            // v0.102: 声明式范式（逻辑式/关系式）
-            TokenType::Rel => self.emit_rel_def_w(),
-            TokenType::Solve => self.emit_solve_w(),
+            // Wave 2: Go-style concurrency primitives (`spawn` / `select`)
+            TokenType::Identifier(ref s) if s == "spawn" && self.is_spawn_form() => {
+                self.emit_spawn_w()
+            }
+            TokenType::Identifier(ref s) if s == "select" && self.is_select_form() => {
+                self.emit_select_w()
+            }
             // v0.75.81: 事务家族 + eval 断言（顶层同嵌套分发）
             // v0.104: `assign` 并入本组 —— 它是 spec §14.2 的一等语句
             //（assign_stmt），需在顶层与嵌套上下文都走同一分派。
@@ -143,9 +108,6 @@ impl ParserV3 {
             TokenType::Struct => self.emit_struct_def_w(),
             TokenType::Import => self.emit_import_w(),
             TokenType::Macro => self.emit_macro_def_w(),
-            TokenType::Orchestrate => self.emit_orchestrate_w(),
-            // v0.85: `with mock_llm = [...]` 配置桥接块（§19.4 spec 承诺）。
-            TokenType::With => self.emit_with_w(),
             _ => {
                 // 表达式语句（赋值/字面量/调用等）
                 self.emit_expr_w()
@@ -195,280 +157,260 @@ impl ParserV3 {
             }
             self.current = ident_start;
         }
-        let w = self.emit_or_w()?;
+        let w = self.emit_pratt_w()?;
         // v0.85: `as dyn Trait` coercion（§3.5 spec 承诺）— emit 路径中
         // 显式将 expression 包装为 Value::TraitObject。
         self.emit_dyn_coercion(w)
     }
 
-    fn emit_or_w(&mut self) -> Option<MirWitness> {
-        let mut left_w = self.emit_and_w()?;
-        while self
-            .peek()
-            .map(|t| matches!(&t.token_type, TokenType::Identifier(s) if s == "or"))
-            .unwrap_or(false)
-        {
-            self.advance();
-            let right_w = self.emit_and_w()?;
-            let span = self.span_of_current();
-            left_w = MirWitness {
-                kind: WitnessKind::Or {
-                    left: Box::new(left_w),
-                    right: Box::new(right_w),
-                },
-                span,
-            };
+    /// W2.3: 迭代式 Pratt（Shunting-Yard）二元/管道表达式解析，消除深层逻辑/算术嵌套时的 C 栈帧累积。
+    fn emit_pratt_w(&mut self) -> Option<MirWitness> {
+        #[derive(Clone, Copy)]
+        enum InfixOp {
+            Or,
+            And,
+            Eq(BinaryOp),
+            Pipe,
+            Cmp(BinaryOp),
+            AddSub(BinaryOp),
+            MulDivMod(BinaryOp),
         }
-        Some(left_w)
-    }
 
-    fn emit_and_w(&mut self) -> Option<MirWitness> {
-        let mut left_w = self.emit_equality_w()?;
-        while self
-            .peek()
-            .map(|t| matches!(&t.token_type, TokenType::Identifier(s) if s == "and"))
-            .unwrap_or(false)
-        {
-            self.advance();
-            let right_w = self.emit_equality_w()?;
-            let span = self.span_of_current();
-            left_w = MirWitness {
-                kind: WitnessKind::And {
-                    left: Box::new(left_w),
-                    right: Box::new(right_w),
-                },
-                span,
-            };
-        }
-        Some(left_w)
-    }
-
-    fn emit_equality_w(&mut self) -> Option<MirWitness> {
-        let mut left_w = self.emit_pipe_w()?;
-        while let Some(op) = self.consume_binary_op(&[TokenType::Equal, TokenType::NotEqual]) {
-            let right_w = self.emit_pipe_w()?;
-            let span = self.span_of_current();
-            left_w = MirWitness {
-                kind: WitnessKind::Binary {
-                    left: Box::new(left_w),
-                    op,
-                    right: Box::new(right_w),
-                },
-                span,
-            };
-        }
-        Some(left_w)
-    }
-
-    /// 管道 `|>` —— 两种形态（spec §7.6 / §18.1 / §18.2）：
-    ///
-    /// - `x |> f`        裸标识符 → **值应用** `f(x)`（§7.6 `5 |> double`）。
-    /// - `x |> f(args)`  调用形态 → **方法调用** `x.f(args)`。
-    ///
-    /// **缺陷（v0.104.2 修复）**：`x |> f(args)` 此前 witness 与 MIR 语义分叉 ——
-    /// witness 脱糖为 `Call{f, [x, ...args]}`（看起来是「f 接收 x 作为首参」），
-    /// 但 MIR 发的是 `Pipe(new_dst, x, rhs)`，而 **rhs 是 RHS 表达式已被求值的
-    /// 寄存器** —— 求值 `f(args)` 本身就是一次「自由函数调用」，对
-    /// `map`/`filter`/`upper`/`split`/`route`/`tool`/`serve`/`listen` 这些
-    /// **只有方法形态**的名字必然失败（"Undefined function or task: map"），
-    /// 于是 spec 里 6 处管道示例全部不可用：
-    ///   §2.1  `[1,2,3] |> map(fn(x) x*2 end)`
-    ///   §7.6  `"hello world" |> upper() |> split(" ") |> map(...) |> filter(...)`
-    ///   §18.1 `router |> route("POST", …) |> listen(…)`
-    ///   §18.2 `server |> tool(…) |> serve()`
-    /// 规范对这六处的形态高度一致：`f(args)` 一律是**接收者的方法**。
-    /// 现在按此实现 —— 就地把握手前刚发出的 `Call(dst, f, argv)` 改写为
-    /// `MethodCall(dst, x, f, argv)`，witness 同步为 `MethodCall`。
-    fn emit_pipe_w(&mut self) -> Option<MirWitness> {
-        let mut left_w = self.emit_comparison_w()?;
-        loop {
-            // D119：允许 `|>` **跨行**。spec 的管道示例一律是跨行形态 ——
-            //   §2.1  `[1,2,3] |> map(fn(x) x*2 end)`
-            //   §7.6  `let result = "hello world"` 换行 `|> upper()` 换行 `|> split(" ")` …
-            //   §18.1 `router` 换行 `|> route("POST", …)` 换行 `|> listen(…)`
-            //   §18.2 `server` 换行 `|> tool(…)` 换行 `|> serve()`
-            // 修复前换行一出现循环就退出、`|>` 残留，**整段报 parse error**。
-            //
-            // ⚠ 跳过的换行在**没看到 `|>` 时必须回退**：下一行若是普通语句
-            //   （`let a = 1` 换行 `print(6)`），已吞掉的换行就是语句分隔符，
-            //   不回退会把它并进前一条语句。`self.current` 是下标，直接复位即可。
-            let saved = self.current;
-            while self.match_token(&[TokenType::Newline]) {}
-            if !self.match_token_exact(TokenType::Pipe) {
-                self.current = saved;
-                break;
+        impl InfixOp {
+            fn precedence(self) -> u8 {
+                match self {
+                    InfixOp::Or => 1,
+                    InfixOp::And => 2,
+                    InfixOp::Eq(_) => 3,
+                    InfixOp::Pipe => 4,
+                    InfixOp::Cmp(_) => 5,
+                    InfixOp::AddSub(_) => 6,
+                    InfixOp::MulDivMod(_) => 7,
+                }
             }
-            // 记录 RHS 的发射起点，供「就地改写为方法调用」精确定位
-            let rhs_w = self.emit_comparison_w()?;
-            let span = self.span_of_current();
-            left_w = match rhs_w.kind {
-                // ── `x |> f(args)` → 方法调用 `x.f(args)` ──
-                WitnessKind::Call {
-                    callee: crate::mir::witness::WitnessCallee::Name(method),
-                    args,
-                } => {
-                    // v0.104.6 D474：原先在此**就地**把刚发射的
-                    // `Call(dst, f, argv)` 改写成 `MethodCall(dst, x, f, argv)`
-                    // —— 改的是 `self.emit.insts` 里的指令，属纯 MirInst 机制，
-                    // 且依赖「寄存器唯一生产者 + 发射区间」两个脆弱前提。
-                    //
-                    // 现在 parser **只产 witness**：`MethodCall` 指令由 9 层
-                    // 管线从 witness 降出（`mir/fcfg_lower.rs`），两侧同形。
-                    MirWitness {
-                        kind: WitnessKind::MethodCall {
-                            receiver: Box::new(left_w),
-                            method,
+        }
+
+        fn fold_infix(lhs: MirWitness, op: InfixOp, mut rhs: MirWitness, span: Span) -> MirWitness {
+            match op {
+                InfixOp::Or => MirWitness {
+                    kind: WitnessKind::Or {
+                        left: Box::new(lhs),
+                        right: Box::new(rhs),
+                    },
+                    span,
+                },
+                InfixOp::And => MirWitness {
+                    kind: WitnessKind::And {
+                        left: Box::new(lhs),
+                        right: Box::new(rhs),
+                    },
+                    span,
+                },
+                InfixOp::Eq(bop)
+                | InfixOp::Cmp(bop)
+                | InfixOp::AddSub(bop)
+                | InfixOp::MulDivMod(bop) => MirWitness {
+                    kind: WitnessKind::Binary {
+                        left: Box::new(lhs),
+                        op: bop,
+                        right: Box::new(rhs),
+                    },
+                    span,
+                },
+                InfixOp::Pipe => {
+                    let rhs_kind = std::mem::replace(&mut rhs.kind, WitnessKind::Commit);
+                    match rhs_kind {
+                        WitnessKind::Call {
+                            callee: crate::mir::witness::WitnessCallee::Name(method),
                             args,
+                        } => MirWitness {
+                            kind: WitnessKind::MethodCall {
+                                receiver: Box::new(lhs),
+                                method,
+                                args,
+                            },
+                            span,
                         },
-                        span,
+                        WitnessKind::Variable(name) => MirWitness {
+                            kind: WitnessKind::Pipe {
+                                left: Box::new(lhs),
+                                right: Box::new(MirWitness {
+                                    kind: WitnessKind::Variable(name),
+                                    span,
+                                }),
+                            },
+                            span,
+                        },
+                        other => MirWitness {
+                            kind: WitnessKind::Pipe {
+                                left: Box::new(lhs),
+                                right: Box::new(MirWitness { kind: other, span }),
+                            },
+                            span,
+                        },
                     }
                 }
-                // ── `x |> f`（裸标识符）→ 值应用 `f(x)` ──
-                WitnessKind::Variable(name) => {
-                    // v0.104.6 D472：witness 改为 `Pipe` —— 此前是
-                    // `Call{Name(f), [left]}`，与**实际发射的**
-                    // `MirInst::Pipe` 指令不同构 ⇒ 9 层降维出 `Call`、
-                    // emit 出 `Pipe`，差分必红。typeck 侧按「右侧是裸标识符
-                    // ⇒ 值应用 `f(x)`」保持推断口径不变。
-                    MirWitness {
-                        kind: WitnessKind::Pipe {
-                            left: Box::new(left_w),
-                            right: Box::new(MirWitness {
-                                kind: WitnessKind::Variable(name),
-                                span,
-                            }),
-                        },
-                        span,
-                    }
+            }
+        }
+
+        let peek_consume_infix = |this: &mut Self| -> Option<InfixOp> {
+            if this
+                .peek()
+                .map(|t| matches!(&t.token_type, TokenType::Identifier(s) if s == "or"))
+                .unwrap_or(false)
+            {
+                this.advance();
+                return Some(InfixOp::Or);
+            }
+            if this
+                .peek()
+                .map(|t| matches!(&t.token_type, TokenType::Identifier(s) if s == "and"))
+                .unwrap_or(false)
+            {
+                this.advance();
+                return Some(InfixOp::And);
+            }
+            if let Some(op) = this.consume_binary_op(&[TokenType::Equal, TokenType::NotEqual]) {
+                return Some(InfixOp::Eq(op));
+            }
+            if let Some(op) = this.consume_binary_op(&[
+                TokenType::Less,
+                TokenType::Greater,
+                TokenType::LessEqual,
+                TokenType::GreaterEqual,
+            ]) {
+                return Some(InfixOp::Cmp(op));
+            }
+            if let Some(op) = this.consume_binary_op(&[TokenType::Minus, TokenType::Plus]) {
+                return Some(InfixOp::AddSub(op));
+            }
+            if let Some(op) = this.consume_binary_op(&[
+                TokenType::Star,
+                TokenType::Slash,
+                TokenType::Percent,
+                TokenType::At,
+            ]) {
+                return Some(InfixOp::MulDivMod(op));
+            }
+            // D119: 允许 `|>` 跨行；没看到 `|>` 时必须回退跳过的前导换行，避免吞掉下一条语句分隔符。
+            let saved = this.current;
+            while this.match_token(&[TokenType::Newline]) {}
+            if this.match_token_exact(TokenType::Pipe) {
+                return Some(InfixOp::Pipe);
+            }
+            this.current = saved;
+            None
+        };
+
+        let first = self.emit_unary_w()?;
+        let mut operands: Vec<(MirWitness, Span)> = vec![(first, self.span_of_current())];
+        let mut ops: Vec<InfixOp> = Vec::new();
+
+        while let Some(op) = peek_consume_infix(self) {
+            let prec = op.precedence();
+            while let Some(&top_op) = ops.last() {
+                if top_op.precedence() >= prec {
+                    let top_op = ops.pop().expect("ops non-empty");
+                    let (rhs, span) = operands.pop().expect("rhs operand present");
+                    let (lhs, _) = operands.pop().expect("lhs operand present");
+                    operands.push((fold_infix(lhs, top_op, rhs, span), span));
+                } else {
+                    break;
                 }
-                // ── 其它 → 值应用（把 RHS 的值当可调用对象）──
-                other => {
-                    // 同上：witness 承载 `Pipe`（typeck 侧按「右侧是任意
-                    // 表达式 ⇒ 内建 `|>(x, expr)`」推断，口径不变）。
-                    MirWitness {
-                        kind: WitnessKind::Pipe {
-                            left: Box::new(left_w),
-                            right: Box::new(MirWitness { kind: other, span }),
-                        },
-                        span,
-                    }
-                }
-            };
-        }
-        Some(left_w)
-    }
-
-    fn emit_comparison_w(&mut self) -> Option<MirWitness> {
-        let mut left_w = self.emit_term_w()?;
-        while let Some(op) = self.consume_binary_op(&[
-            TokenType::Less,
-            TokenType::Greater,
-            TokenType::LessEqual,
-            TokenType::GreaterEqual,
-        ]) {
-            let right_w = self.emit_term_w()?;
+            }
+            ops.push(op);
+            let rhs = self.emit_unary_w()?;
             let span = self.span_of_current();
-            left_w = MirWitness {
-                kind: WitnessKind::Binary {
-                    left: Box::new(left_w),
-                    op,
-                    right: Box::new(right_w),
-                },
-                span,
-            };
+            operands.push((rhs, span));
         }
-        Some(left_w)
-    }
 
-    fn emit_term_w(&mut self) -> Option<MirWitness> {
-        let mut left_w = self.emit_factor_w()?;
-        while let Some(op) = self.consume_binary_op(&[TokenType::Minus, TokenType::Plus]) {
-            let right_w = self.emit_factor_w()?;
-            let span = self.span_of_current();
-            left_w = MirWitness {
-                kind: WitnessKind::Binary {
-                    left: Box::new(left_w),
-                    op,
-                    right: Box::new(right_w),
-                },
-                span,
-            };
+        while let Some(top_op) = ops.pop() {
+            let (rhs, span) = operands.pop().expect("rhs operand present");
+            let (lhs, _) = operands.pop().expect("lhs operand present");
+            operands.push((fold_infix(lhs, top_op, rhs, span), span));
         }
-        Some(left_w)
-    }
 
-    fn emit_factor_w(&mut self) -> Option<MirWitness> {
-        let mut left_w = self.emit_unary_w()?;
-        while let Some(op) =
-            self.consume_binary_op(&[TokenType::Star, TokenType::Slash, TokenType::Percent])
-        {
-            let right_w = self.emit_unary_w()?;
-            let span = self.span_of_current();
-            left_w = MirWitness {
-                kind: WitnessKind::Binary {
-                    left: Box::new(left_w),
-                    op,
-                    right: Box::new(right_w),
-                },
-                span,
-            };
-        }
-        Some(left_w)
+        operands.pop().map(|(w, _)| w)
     }
 
     fn emit_unary_w(&mut self) -> Option<MirWitness> {
-        let span = self.span_of_current();
+        #[derive(Clone, Copy)]
+        enum UnaryPrefix {
+            Not(Span),
+            Minus(Span),
+        }
 
-        // 'not' keyword → 0 == x
-        if self
-            .peek()
-            .map(|t| matches!(&t.token_type, TokenType::Identifier(s) if s == "not"))
-            .unwrap_or(false)
-        {
+        let mut prefixes = Vec::new();
+        loop {
+            let span = self.span_of_current();
+            if self
+                .peek()
+                .map(|t| {
+                    matches!(&t.token_type, TokenType::Identifier(s) if s == "not")
+                        || t.token_type == TokenType::Bang
+                })
+                .unwrap_or(false)
+            {
+                self.advance();
+                prefixes.push(UnaryPrefix::Not(span));
+            } else if self.match_token(&[TokenType::Minus]) {
+                prefixes.push(UnaryPrefix::Minus(span));
+            } else {
+                break;
+            }
+        }
+
+        let mut expr = self.emit_power_w()?;
+        for p in prefixes.into_iter().rev() {
+            expr = match p {
+                UnaryPrefix::Not(span) => MirWitness {
+                    kind: WitnessKind::Call {
+                        callee: crate::mir::witness::WitnessCallee::Builtin(
+                            crate::mir::witness::BuiltinOp::Not,
+                        ),
+                        args: vec![expr],
+                    },
+                    span,
+                },
+                UnaryPrefix::Minus(span) => MirWitness {
+                    kind: WitnessKind::Binary {
+                        left: Box::new(MirWitness {
+                            kind: WitnessKind::Literal(Literal::Int(0, span)),
+                            span,
+                        }),
+                        op: BinaryOp::Sub,
+                        right: Box::new(expr),
+                    },
+                    span,
+                },
+            };
+        }
+        Some(expr)
+    }
+
+    /// Right-associative power operator `**` (binds tighter than unary `-` on LHS).
+    fn emit_power_w(&mut self) -> Option<MirWitness> {
+        let lhs = self.emit_call_w()?;
+        if self.check(&TokenType::StarStar) {
+            let span = self.span_of_current();
             self.advance();
-            let operand_w = self.emit_unary_w()?;
-            let w = MirWitness {
+            let rhs = self.emit_unary_w()?;
+            return Some(MirWitness {
                 kind: WitnessKind::Binary {
-                    left: Box::new(MirWitness {
-                        kind: WitnessKind::Literal(Literal::Int(0, span)),
-                        span,
-                    }),
-                    op: BinaryOp::Equal,
-                    right: Box::new(operand_w),
+                    left: Box::new(lhs),
+                    op: BinaryOp::Pow,
+                    right: Box::new(rhs),
                 },
                 span,
-            };
-            return Some(w);
+            });
         }
-
-        // Unary minus / bang
-        if self.match_token(&[TokenType::Minus, TokenType::Bang]) {
-            // 镜像 parse_unary：-x → 0 - x；!x → 0 == x（truthiness）
-            let operand_w = self.emit_unary_w()?;
-            let w = MirWitness {
-                kind: WitnessKind::Binary {
-                    left: Box::new(MirWitness {
-                        kind: WitnessKind::Literal(Literal::Int(0, span)),
-                        span,
-                    }),
-                    op: BinaryOp::Sub,
-                    right: Box::new(operand_w),
-                },
-                span,
-            };
-            return Some(w);
-        }
-
-        let w = self.emit_call_w()?;
-        Some(w)
+        Some(lhs)
     }
 
     /// 调用链（witness 嵌套版）— 镜像 parse_call（函数/方法/索引/DynTrait）。
     fn emit_call_w(&mut self) -> Option<MirWitness> {
-        // v0.103: `Type::new(args)` 关联函数调用 —— CLI 帮助与 spec 承诺
-        // `Router::new()` / `McpServer::new()` / `Trait::new()`，而 `::` 此前
-        // 只被词法化为 TokenType::ColonColon、parser 从不消费（`::` 零使用点）。
-        // 编译为按名调用 "Type::new"（运行时 method_dispatch 以该键查表）。
+        // `Type::member(args)` 关联调用（例如 Enum::Variant / Trait::new），
+        // 编译为按名调用 "Type::member"，由 `runtime::vm::builtins` 分发。
         if let TokenType::Identifier(type_name) = self.peek()?.token_type.clone() {
             let save = self.current;
             let span = self.span_of_current();
@@ -605,12 +547,16 @@ impl ParserV3 {
     /// 主表达式 — 镜像 parse_primary。返回 (结果寄存器, 嵌套 witness)。
     /// v0.75.41: witness 递归构建（子节点嵌进父节点，typeck/LSP 消费树形）。
     fn emit_primary_w(&mut self) -> Option<MirWitness> {
+        if self.is_spawn_form() {
+            return self.emit_spawn_w();
+        }
+        if self.is_select_form() {
+            return self.emit_select_w();
+        }
         let token = self.peek().cloned()?;
         let span = crate::common::Span::new(token.line, token.column);
 
         let wit = match token.token_type {
-            // v0.102: solve 作为表达式（`let r = solve { ... }`）
-            TokenType::Solve => return self.emit_solve_w(),
             TokenType::Int(val) => {
                 self.advance();
 
@@ -624,15 +570,6 @@ impl ParserV3 {
 
                 MirWitness {
                     kind: WitnessKind::Literal(Literal::Float(val, span)),
-                    span,
-                }
-            }
-            // v0.91: BigInt 字面量
-            TokenType::BigInt(val) => {
-                self.advance();
-
-                MirWitness {
-                    kind: WitnessKind::Literal(Literal::BigInt(val, span)),
                     span,
                 }
             }
@@ -666,24 +603,6 @@ impl ParserV3 {
 
                 MirWitness {
                     kind: WitnessKind::Literal(Literal::String(s.clone(), span)),
-                    span,
-                }
-            }
-            TokenType::PromptString(ref s) => {
-                self.advance();
-                // p"..." 拆分为 parts 再 emit Prompt（parts 是纯树，非 token 流）。
-                // v0.92: parse_prompt_parts 直接返回 MirWitness。
-                let parts = parse_prompt_parts(s, span);
-                // v0.104.6 D474：原先此处还维护一份 `part_regs`（每段的寄存器），
-                // 只为发射 `MirInst::Prompt` 的 parts —— 现在 parser 只产 witness，
-                // 该寄存器表整体作废。
-                let mut part_wits = Vec::new();
-                for part in parts {
-                    part_wits.push(part);
-                }
-
-                MirWitness {
-                    kind: WitnessKind::Prompt { parts: part_wits },
                     span,
                 }
             }
@@ -740,10 +659,18 @@ impl ParserV3 {
                 // 字段（它靠 let-泛化成为多态），但形参标注里的 `T` 需被认作
                 // 类型变量 ⇒ 与 task 同理，进入/退出泛型作用域。
                 let saved_generic = std::mem::take(&mut self.generic_params);
-                if self.parse_generic_clause()?.is_empty() {
-                    // 非泛型：还原为空（无副作用），保持与此前一致。
-                    self.generic_params = saved_generic.clone();
-                }
+                let type_params = match self.parse_generic_clause() {
+                    Some(tp) => {
+                        if tp.is_empty() {
+                            self.generic_params = saved_generic.clone();
+                        }
+                        tp
+                    }
+                    None => {
+                        self.generic_params = saved_generic;
+                        return None;
+                    }
+                };
                 if !self.match_token_exact(TokenType::LParen) {
                     self.generic_params = saved_generic;
                     return None;
@@ -776,59 +703,23 @@ impl ParserV3 {
                     }
                 }
                 self.consume(TokenType::RParen, "Expected ')' after parameters")?;
-                // 子上下文：闭包体是独立寄存器空间（镜像 lower Closure 分支）
-                let parent =
-                    std::mem::replace(&mut self.emit, crate::mir::lower::EmitContext::new());
-                // v0.75.78: 非 FatArrow 闭包体走 emit_block_w（镜像 parse 侧
-                // parse_block_body）— 支持多语句与嵌套构造（if/for/match/let）。
-                // 修复前用 emit_expr_w：`fn(n) if n<=1 {..} else {..} end` 解析失败。
-                // emit_block_w 已消费 End，无需外部 consume。
-                // v0.90.3: 真实 body_w 进入 witness（此前是占位空 Sequence —
-                // witness 树无法重建闭包代码，9 层管线（witness→FCFG）断裂）。
-                // v0.104.6 D118：spec §14.2 的 `closure` 产生式是
-                //     closure = "fn" "(" params ")" ( expr | "{" … "}" ) ;
-                // —— **没有 `end`**，体就是单个表达式（§1.2 表里的示例也写作
-                // `fn(x) x + 1 end`，两种都得认）。
-                //
-                // 修复前只有 `=>` 走表达式路径；`fn(x) x + 1`（无 FatArrow）落到
-                // emit_block_w，而块终止集（is_block_end）不含 Newline 且 `end`
-                // 可选（v0.87 为支持行尾/实参位置而允许省略），于是它把**后续
-                // 全部顶层语句**当成自己的块体吞掉：`let g = fn(a) a + 1` +
-                // `print(g(1))` 编译通过、exit 0，但 print 被移进闭包体，
-                // 顶层零输出。
-                //
-                // 修法：`)` 与体首 token **同行**、且首 token 是表达式起点时，
-                // 直接按单表达式解析（只吃一个表达式，天然不会吞后续语句）。
-                // 其余情况（`return`/`let`/`if`/换行块/花括号块）保持原路径 ——
-                // `return` 不在 emit_expr_w 里，走表达式路径会让 `fn() return 1 end` 回归。
-                let body_w = if self.match_token_exact(TokenType::FatArrow)
-                    || self.inline_closure_body_is_expr()
-                {
-                    let w = self.emit_expr_w()?;
-                    // 可选的显式 `end`：§14.2 的产生式没有 `end`，但 §1.2 的表格
-                    // 与全仓既有代码写的是 `fn(x) x * 2 end`。expr 路径不经过
-                    // emit_block_w，消费 `end` 的那一行也在那里 —— 不补这句，
-                    // `end` 会残留成未解析 token（实测 `let f = fn(x) x * 2 end`
-                    // 变成 "Failed to parse at line 1"）。两种拼法都要认。
-                    self.match_token_exact(TokenType::End);
-                    w
-                } else {
-                    match self.emit_block_w() {
-                        Some(x) => x,
-                        None => {
-                            // v0.104.6：退出泛型作用域（体解析失败的早退路径）。
-                            self.generic_params = saved_generic;
-                            self.emit = parent;
-                            return None;
-                        }
+                // 子上下文：闭包体是独立作用域（`is_program_top = false`, `parse_loop_depth = 0`）
+                let body_res = self.in_nested_scope(|this| {
+                    if this.match_token_exact(TokenType::FatArrow)
+                        || this.inline_closure_body_is_expr()
+                    {
+                        let w = this.emit_expr_w()?;
+                        // 可选的显式 `end`：两种拼法都要认。
+                        this.match_token_exact(TokenType::End);
+                        Some(w)
+                    } else {
+                        this.emit_block_w()
                     }
-                };
-                // v0.104.6：退出泛型作用域 —— 体解析之后立即还原，**无论成败**
-                // （上面的早退分支已各自还原），避免 `generic_params` 泄漏到
-                // 后续无关标注。
+                });
+                // 退出泛型作用域 —— 无论体解析成功或失败都必须还原，
+                // 避免 `generic_params` 泄漏到后续无关标注。
                 self.generic_params = saved_generic;
-                let _body_mir = std::mem::replace(&mut self.emit, parent).finish();
-                let _param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
+                let body_w = body_res?;
                 let param_wits: Vec<crate::mir::witness::WitnessParam> = params
                     .iter()
                     .map(|p| crate::mir::witness::WitnessParam {
@@ -843,6 +734,7 @@ impl ParserV3 {
 
                 MirWitness {
                     kind: WitnessKind::Closure {
+                        type_params,
                         params: param_wits,
                         body: Box::new(body_w),
                     },
@@ -1213,7 +1105,6 @@ impl ParserV3 {
         self.advance(); // 'perform'
         let effect = self.consume_identifier("Expected effect name after 'perform'")?;
         let mut args: Vec<MirWitness> = Vec::new();
-        let _arg_regs: Vec<Reg> = Vec::new();
         if self.match_token_exact(TokenType::LParen) {
             if !self.check(&TokenType::RParen) {
                 loop {
@@ -1320,28 +1211,8 @@ impl ParserV3 {
         // 嵌套 handle 仍不完整 —— 即**把原本正常的 9 层嵌套 handle 弄坏**，
         // 净负面。
         //
-        // **前置工作**：让两条路径在嵌套 handle 上产出**一致的指令序列**
-        // （本仓库对所有其它构造都靠 `differential_check` 锁着等价性，
-        // 唯独嵌套 handle 这条不变量已经破了）。在那之前不动此处。
-        // v0.80 Stage 2.0: 直接在 parser 单遍编译中 emit MirInst::Handle。
-        // (parser → EmitContext 单遍，绕开 lower.rs::lower_expr 的 Handle 分支
-        //  —— 那个分支是给旧 parse 路径用的，主路径走 emit_program 直接 emit)
-        //
-        // 把 witness 子树 lower 为 IR 序列（independent EmitContext）
-        // 复用 lower.rs::lower_mir_exprs 的核心能力（body/handler 都是
-        // 一个 Sequence witness）。
-        use crate::mir::lower::lower_block_witness_to_mir;
-        let _body_mir = lower_block_witness_to_mir(&body_w);
-        let _handler_mir = lower_block_witness_to_mir(&handler_w);
-        // handle 块的整体返回值由 h_handle 在 body 执行后写入 regs[k_dst]
-        // （body 末尾表达式的值，不是空 Nil）。
-        // 第一版（Stage 2.0）single-shot：body 末尾表达式 = handle 整体返回值。
-        //
-        // v0.104.6 D35：此处**不要**把 `k_dst` 交出去。探针实测编译期
-        // `k_dst` 与 `Define` 引用的寄存器**本来就一致**（都是 0）；D35 的
-        // 错配是 **9 层管线的 `lower_fcfg` 重建 MirFunction 时**引入的
-        // （`MORA_9LAYER=0` 下现象消失），与本函数无关。
-        // 〔历史记档：`MORA_9LAYER=0` 已于 v0.104.6 D474 退役〕
+        // v0.104.6 D474: handle body/handler stay purely in witness form;
+        // backend lowering happens later in pipeline/compile.
         Some(MirWitness {
             kind: WitnessKind::Handle {
                 effect,
@@ -1386,42 +1257,26 @@ impl ParserV3 {
             }
             self.consume(TokenType::RParen, "Expected ')' after params")?;
         }
-        // v0.86: 宏体编译 — 同 emit_fn_def_w 模式：子 EmitContext 编译宏体，
-        // 父 EmitContext emit MacroDef 指令。宏体语句序列在子上下文中编译为
-        // MirFunction，尾部 emit Return(body_reg)。运行期 dispatch.rs 中
-        // Value::Macro 分支以 args 绑定 params，execute 执行 body。
-        let parent = std::mem::replace(&mut self.emit, crate::mir::lower::EmitContext::new());
-        // v0.104.6 D44：体发射失败时**必须还原父上下文**（见 emit_match_arm_w
-        // 处的完整说明）。体被包进闭包，使 `?` 只退出闭包而不是整个函数。
-        let body_res = (|| -> Option<MirWitness> {
-            let (_body_reg, body_w) = if self.match_token_exact(TokenType::Newline) {
+        // 子上下文：宏体是独立作用域（`is_program_top = false`, `parse_loop_depth = 0`）
+        let body_w = self.in_nested_scope(|this| {
+            if this.match_token_exact(TokenType::Newline) {
                 let mut stmt_wits = Vec::new();
-                let last = 0;
-                while self.match_token(&[TokenType::Newline]) {}
-                while !self.check(&TokenType::End) && !self.is_at_end() {
-                    let w = self.emit_statement_expr_w()?;
+                while this.match_token(&[TokenType::Newline]) {}
+                while !this.check(&TokenType::End) && !this.is_at_end() {
+                    let w = this.emit_statement_expr_w()?;
                     stmt_wits.push(w);
-                    while self.match_token(&[TokenType::Newline]) {}
+                    while this.match_token(&[TokenType::Newline]) {}
                 }
-                self.consume(TokenType::End, "Expected 'end' after macro body")?;
-                (last, Self::block_witness(stmt_wits, span))
+                this.consume(TokenType::End, "Expected 'end' after macro body")?;
+                Some(Self::block_witness(stmt_wits, span))
             } else {
-                self.consume(TokenType::End, "Expected 'end' after macro body")?;
-                (
-                    0,
-                    MirWitness {
-                        kind: WitnessKind::Sequence(Vec::new()),
-                        span,
-                    },
-                )
-            };
-            Some(body_w)
-        })();
-        let Some(body_w) = body_res else {
-            self.emit = parent;
-            return None;
-        };
-        let _body_mir = std::mem::replace(&mut self.emit, parent).finish();
+                this.consume(TokenType::End, "Expected 'end' after macro body")?;
+                Some(MirWitness {
+                    kind: WitnessKind::Sequence(Vec::new()),
+                    span,
+                })
+            }
+        })?;
         Some(MirWitness {
             kind: WitnessKind::MacroDef {
                 name,
@@ -1551,11 +1406,9 @@ impl ParserV3 {
             }
             Some(
                 TokenType::String(_)
-                | TokenType::PromptString(_)
                 | TokenType::Char(_)
                 | TokenType::Int(_)
                 | TokenType::Float(_)
-                | TokenType::BigInt(_)
                 | TokenType::True
                 | TokenType::False
                 | TokenType::Nil
@@ -1576,8 +1429,6 @@ impl ParserV3 {
     pub(super) fn emit_block_w(&mut self) -> Option<MirWitness> {
         let span = self.span_of_current();
         let mut stmt_wits = Vec::new();
-        // v0.104.2: `Option<Reg>` —— 空块不得返回哨兵 0（见下方 None 分支）。
-        let _last: Option<Reg> = None;
         if self.match_token_exact(TokenType::LBrace) {
             // v0.75.78: 与 parse_block_body/else 分支对称 —— 块内语句间允许
             // 换行（`if c {\n  stmt\n}`）。修复前 `{` 后不跳换行，多行
@@ -1710,37 +1561,18 @@ impl ParserV3 {
             {
                 self.emit_effect_sig_w()
             }
-            // v0.85: `with` 配置块（可嵌套在 task body 内）
-            TokenType::With => self.emit_with_w(),
-            TokenType::App => self.emit_app_def_w(),
-            // v0.103: 命名 section 声明（嵌套上下文）
-            TokenType::Prompt => self.emit_section_w(true),
-            TokenType::Document => self.emit_section_w(false),
             // v0.103: export（嵌套上下文）
             TokenType::Identifier(ref s) if s == "export" => self.emit_export_w(),
-            // v0.103: TEA 独立声明（嵌套上下文）
-            TokenType::Identifier(ref s)
-                if (s == "model" || s == "msg")
-                    && matches!(
-                        self.tokens.get(self.current + 1).map(|t| &t.token_type),
-                        Some(TokenType::Identifier(_))
-                    ) =>
-            {
-                if s == "model" {
-                    self.emit_model_def_w()
-                } else {
-                    self.emit_msg_def_w()
-                }
-            }
-            // v0.103: 可观测性块（嵌套上下文）
-            TokenType::Identifier(ref s) if s == "observe" => self.emit_observe_w(),
-            TokenType::Identifier(ref s) if s == "span" => self.emit_span_w(),
             // v0.103: 并行块 / worker（嵌套上下文）
             TokenType::Identifier(ref s) if s == "parallel" => self.emit_parallel_w(),
             TokenType::Identifier(ref s) if s == "worker" => self.emit_worker_w(),
-            // v0.102: 声明式范式（嵌套语句上下文）
-            TokenType::Rel => self.emit_rel_def_w(),
-            TokenType::Solve => self.emit_solve_w(),
+            // Wave 2: Go-style concurrency primitives (`spawn` / `select`)
+            TokenType::Identifier(ref s) if s == "spawn" && self.is_spawn_form() => {
+                self.emit_spawn_w()
+            }
+            TokenType::Identifier(ref s) if s == "select" && self.is_select_form() => {
+                self.emit_select_w()
+            }
             TokenType::Identifier(n) if n == "commit" => {
                 let span = self.span_of_current();
                 self.advance(); // 'commit'
@@ -1784,9 +1616,9 @@ impl ParserV3 {
         // v0.104.6 D474：循环深度 +1，让体里的 `break`/`continue` 通过
         // 「是否在循环内」的解析期判据。深度记在 `EmitContext` 里 —— 嵌套的
         // 函数体（task / closure / …）换用全新 `EmitContext`，深度自动归零。
-        self.emit.parse_loop_depth += 1;
+        self.scope.parse_loop_depth += 1;
         let body_res = self.emit_block_w();
-        self.emit.parse_loop_depth -= 1;
+        self.scope.parse_loop_depth -= 1;
         let body_w = body_res?;
         // v0.104.6 缺陷修复：只回填**本层**登记的 break/continue 索引。
         //
@@ -1824,9 +1656,9 @@ impl ParserV3 {
 
         // v0.104.6 D474：同 `emit_loop_w` —— 循环深度 +1，体的 `break`/
         // `continue` 才被认作「在循环内」。
-        self.emit.parse_loop_depth += 1;
+        self.scope.parse_loop_depth += 1;
         let body_res = self.emit_block_w();
-        self.emit.parse_loop_depth -= 1;
+        self.scope.parse_loop_depth -= 1;
         let body_w = body_res?;
         // v0.104.6 缺陷修复：同 emit_for_w —— 按作用域登记回填，不做全区间扫描。
         // while 无循环变量增量，故 `continue` 目标仍是 `loop_label`。
@@ -1859,72 +1691,38 @@ impl ParserV3 {
     fn emit_transaction_w(&mut self) -> Option<MirWitness> {
         let span = self.span_of_current();
         self.advance(); // 'transaction'
-        // 子上下文：事务体是独立寄存器空间（镜像 lower/closure/task 分支）
-        let parent = std::mem::replace(&mut self.emit, crate::mir::lower::EmitContext::new());
-        let mut body_wits = Vec::new();
-        // v0.104.2: `Option<Reg>` 而非哨兵 0 —— 空事务体（`transaction end`）
-        // 在**独立寄存器空间**里一个寄存器都没分配，此时引用 reg 0 会让
-        // `execute` 拿到 n_regs=0 的函数 → `node_ready` 用 reg_ready[0] 越界
-        // panic（"the len is 0 but the index is 0"）。与 emit_block_mir_and_wit /
-        // emit_section_w 的既有一致写法。
-        let _last: Option<Reg> = None;
-        // v0.104.6 D44：体发射失败时**还原父上下文**（见 emit_match_arm_w 处的
-        // 完整说明）。体包进闭包，使 `?` 只退出闭包而不是整个函数。
-        let body_ok = (|| -> Option<()> {
-            while self.match_token(&[TokenType::Newline]) {}
-            while !self.check(&TokenType::End)
-                && !self.peek_is_identifier("compensation")
-                && !self.is_at_end()
+        let body_wits = self.in_nested_scope(|this| {
+            let mut wits = Vec::new();
+            while this.match_token(&[TokenType::Newline]) {}
+            while !this.check(&TokenType::End)
+                && !this.peek_is_identifier("compensation")
+                && !this.is_at_end()
             {
-                let w = self.emit_statement_expr_w()?;
-                body_wits.push(w);
-                while self.match_token(&[TokenType::Newline]) {}
+                let w = this.emit_statement_expr_w()?;
+                wits.push(w);
+                while this.match_token(&[TokenType::Newline]) {}
             }
-            Some(())
-        })();
-        if body_ok.is_none() {
-            self.emit = parent;
-            return None;
-        }
-        let _body_mir = std::mem::replace(&mut self.emit, parent).finish();
+            Some(wits)
+        })?;
 
         // compensation 段（可选）：`compensation` 后语句循环到 `end`
-        let (_comp_mir, comp_wits) = if self.peek_is_identifier("compensation") {
+        let comp_wits = if self.peek_is_identifier("compensation") {
             self.advance(); // 'compensation'
-            let parent2 = std::mem::replace(&mut self.emit, crate::mir::lower::EmitContext::new());
-            let mut comp_wits = Vec::new();
-            let _comp_last: Option<Reg> = None;
-            let comp_ok = (|| -> Option<()> {
-                while self.match_token(&[TokenType::Newline]) {}
-                while !self.check(&TokenType::End) && !self.is_at_end() {
-                    let w = self.emit_statement_expr_w()?;
-                    comp_wits.push(w);
-                    while self.match_token(&[TokenType::Newline]) {}
+            self.in_nested_scope(|this| {
+                let mut wits = Vec::new();
+                while this.match_token(&[TokenType::Newline]) {}
+                while !this.check(&TokenType::End) && !this.is_at_end() {
+                    let w = this.emit_statement_expr_w()?;
+                    wits.push(w);
+                    while this.match_token(&[TokenType::Newline]) {}
                 }
-                Some(())
-            })();
-            if comp_ok.is_none() {
-                self.emit = parent2;
-                return None;
-            }
-            let cm = std::mem::replace(&mut self.emit, parent2).finish();
-            (cm, comp_wits)
+                Some(wits)
+            })?
         } else {
-            (
-                MirFunction {
-                    params: vec![],
-                    body: vec![],
-                    n_regs: 0,
-                    ..Default::default()
-                },
-                Vec::new(),
-            )
+            Vec::new()
         };
         self.consume(TokenType::End, "Expected 'end' after transaction")?;
 
-        // v0.104.6 D472：此前 compensation 的 witness 被 `extend` 进 body_wits
-        // ——「补偿段」与「事务体」在 witness 层**无法区分**，9 层降级链因而
-        // 产不出 `MirInst::Transaction`。现分列为两个 witness。
         let w = MirWitness {
             kind: WitnessKind::Transaction {
                 body: Box::new(Self::block_witness(body_wits, span)),
@@ -1932,16 +1730,6 @@ impl ParserV3 {
             },
             span,
         };
-        // v0.104.6 D40：返回**真实分配**的寄存器 —— 与上面 v0.104.2 的
-        // `last: Option<Reg>` / emit_tail_return 同一形状。那次只补了**内层**
-        // （事务体自己的寄存器空间），本行是**外层**：`transaction` 语句本身
-        // 在父上下文里只 emit 一条无 dst 的 `Transaction`，一个寄存器都没分配。
-        // 当它是所在块的唯一/末条语句时（`task w() / transaction / 1 / end /
-        // end`，嵌套 MirFunction = 独立寄存器空间 → 父函数 n_regs=0），
-        // 块级 `emit_tail_return(Some(0))` 引用 reg 0 → `run_dag` 拿到
-        // `reg_ready` 长度 0 → `node_ready` 的 `reg_ready[*r]` 越界 panic
-        // （"the len is 0 but the index is 0"，exit=101）。
-        // 与 commit / rollback 同款：unit 语句写入 Nil 到新分配的寄存器。
         Some(w)
     }
 
@@ -2167,20 +1955,8 @@ impl ParserV3 {
             && name == "when"
         {
             self.advance(); // consume "when"
-            // 独立寄存器空间（与 arm body 同规则）：守卫体自成 MirFunction
-            //
-            // v0.104.6 D44：无论体发射成功与否都**还原父上下文**。此前
-            // `emit_expr_w()?` 早退时父上下文被丢弃、`self.emit` 停留在一次性的
-            // 子上下文上 —— 此后**整个外层函数体的剩余部分都被发射进子上下文
-            // 然后丢掉**（静默，无任何报错）。
-            let guard_parent =
-                std::mem::replace(&mut self.emit, crate::mir::lower::EmitContext::new());
-            let guard_res = self.emit_expr_w();
-            let Some(guard_w) = guard_res else {
-                self.emit = guard_parent;
-                return None;
-            };
-            let guard_mir = std::mem::replace(&mut self.emit, guard_parent).finish();
+            // 独立作用域（与 arm body 同规则）
+            let guard_w = self.in_nested_scope(|this| this.emit_expr_w())?;
             if !self
                 .peek()
                 .map(|t| is_arrow(&t.token_type))
@@ -2189,7 +1965,7 @@ impl ParserV3 {
                 return None;
             }
             self.advance(); // consume '=>' 或 '->'
-            Some((Box::new(guard_mir), guard_w))
+            Some(guard_w)
         } else {
             if !self
                 .peek()
@@ -2201,19 +1977,11 @@ impl ParserV3 {
             self.advance(); // consume '=>' 或 '->'
             None
         };
-        // 子上下文：arm body 是独立寄存器空间（镜像 lower Match 分支）
-        //
-        // v0.104.6 D44：无论体发射成功与否都**还原父上下文**（同上，守卫那处）。
-        let parent = std::mem::replace(&mut self.emit, crate::mir::lower::EmitContext::new());
-        let arm_res = self.emit_expr_w();
-        let Some(body_w) = arm_res else {
-            self.emit = parent;
-            return None;
-        };
-        let _body_mir = std::mem::replace(&mut self.emit, parent).finish();
+        // 子上下文：arm body 是独立作用域（`is_program_top = false`, `parse_loop_depth = 0`）
+        let body_w = self.in_nested_scope(|this| this.emit_expr_w())?;
         let witness = crate::mir::witness::WitnessArm {
             pattern,
-            guard: guard.as_ref().map(|(_, w)| w.clone()),
+            guard,
             body: body_w,
         };
         Some(EmittedMatchArm { witness })
@@ -2223,24 +1991,6 @@ impl ParserV3 {
     fn emit_pattern(&mut self) -> Option<crate::mir::witness::WitnessPattern> {
         // 复用完整 pattern 解析器（通配/字面量/变量/元组/列表/dict/类型标注）
         self.parse_pattern()
-    }
-
-    fn emit_orchestrate_w(&mut self) -> Option<MirWitness> {
-        // v0.92: parse_orchestrate_statement 直接返回 MirWitness（Orchestrate 变体）
-        // —— orchestrate 是数据构造指令，运行时引擎执行，不参与递归 emit。
-        let witness = self.parse_orchestrate_statement()?;
-        if let WitnessKind::Orchestrate {
-            input_var: _,
-            result_var: _,
-            kind,
-        } = &witness.kind
-        {
-            // WitnessOrchestrateKind → MirOrchestrateKind（含 agent/edge/expert 转换）
-            let _mir_kind = crate::mir::orchestrate::MirOrchestrateKind::from_witness_kind(kind);
-            Some(witness)
-        } else {
-            None
-        }
     }
 
     /// v0.85: `as dyn Trait` coercion（§3.5 spec 承诺）。
@@ -2267,271 +2017,38 @@ impl ParserV3 {
         Some(src_w)
     }
 
-    /// v0.85: `with key = value, key2 = value2` body end — 配置桥接块（§19.4 spec 承诺）。
-    /// bindings 是 (name, value_reg) 列表，body 是嵌套 MirFunction。
-    /// MirInst::WithConfig 经解释器保存到 current_ai_config 中（mock_llm/mock_responses）。
-    /// 与 handle/perform 同模式（Identifier 派生），不引入新 TokenType。
-    /// v0.103: 命名 section 声明 —— `prompt "name" do ... end` /
-    /// `document "name" do ... end`。
-    ///
-    /// 与 `with` 块同构：独立寄存器空间求 body，产出
-    /// `MirInst::PromptSection`/`DocumentSection`（含 name）。运行时 h_* 把
-    /// `Value::PromptSection` 绑定到该名字下；typeck 亦登记同名类型。
-    ///
-    /// 缺陷背景：`prompt` 是词法关键字但 parser 从不消费（TokenType::Prompt
-    /// 零使用点）；`compose_prompt` 这个已注册的活 builtin 因此永远拿不到
-    /// section，其错误消息还指引用户写这个当时不存在的语法。
-    fn emit_section_w(&mut self, is_prompt: bool) -> Option<MirWitness> {
-        let span = self.span_of_current();
-        self.advance(); // 'prompt' / 'document'
-        // section 名：字符串字面量
-        let name = match self.peek()?.token_type.clone() {
-            TokenType::String(s) => {
-                self.advance();
-                s
-            }
-            // 允许裸标识符名（`prompt sys do ... end`）
-            TokenType::Identifier(s) => {
-                self.advance();
-                s
-            }
-            _ => return None,
-        };
-        // 可选 `do` 引导
-        let _ = self.match_token_exact(TokenType::Do);
-        let _ = self.match_token(&[TokenType::Newline]);
-
-        // 子上下文：body 是独立寄存器空间
-        let parent = std::mem::replace(&mut self.emit, crate::mir::lower::EmitContext::new());
-        let mut body_wits = Vec::new();
-        let _last: Option<Reg> = None;
-        // v0.104.6 D44：失败时还原父上下文（见 emit_match_arm_w 处的说明）
-        let sec_ok = (|| -> Option<()> {
-            while !self.check(&TokenType::End) && !self.is_at_end() {
-                // v0.104.6 D45：显式的「保证进度」不变量 —— 一轮循环必须至少
-                // 消费一个 token，否则报错。失败路径（None）已由下面处理；这一
-                // 条覆盖「返回 Some 却不消费」的情况，杜绝任何形式的空转。
-                let before = self.current;
-                match self.emit_statement_expr_w() {
-                    Some(w) => {
-                        body_wits.push(w);
-                    }
-                    // v0.104.6 D45：此前是 `if let Some(..) {}` —— 语句解析失败
-                    // 就**跳过**，而失败路径不消费任何 token → `while` 条件恒真
-                    // → **死循环，编译器永不返回**（实测 `prompt`/`document`
-                    // 块内放一条无法解析的语句即挂死）。
-                    // 改为报错：既保证进度，也不再静默吞语句（D44b 同原则）。
+    /// Shared parser for `end`-delimited nested block bodies (`parallel`, `worker`),
+    /// enforcing token progress inside a nested `ParserScope`.
+    fn emit_end_delimited_body_w(&mut self, block_kind: &str) -> Option<Vec<MirWitness>> {
+        self.in_nested_scope(|this| {
+            let mut body_wits = Vec::new();
+            while !this.check(&TokenType::End) && !this.is_at_end() {
+                let before = this.current;
+                match this.emit_statement_expr_w() {
+                    Some(w) => body_wits.push(w),
                     None => {
                         eprintln!(
-                            "Parse error: unparsable statement in section block \
-                             (line {})",
-                            self.current_line()
+                            "Parse error: unparsable statement in {block_kind} block (line {})",
+                            this.current_line()
                         );
                         return None;
                     }
                 }
-                while self.match_token(&[TokenType::Newline]) {}
-                if self.current == before {
+                while this.match_token(&[TokenType::Newline]) {}
+                if this.current == before {
                     eprintln!(
-                        "Parse error: parser made no progress in section block (line {})",
-                        self.current_line()
+                        "Parse error: parser made no progress in {block_kind} block (line {})",
+                        this.current_line()
                     );
                     return None;
                 }
             }
-            self.consume(TokenType::End, "Expected 'end' after section block")?;
-            Some(())
-        })();
-        if sec_ok.is_none() {
-            self.emit = parent;
-            return None;
-        }
-        // body 求值 → Return（h_* 取此值作为 section text）
-        let _body_mir = std::mem::replace(&mut self.emit, parent).finish();
-
-        let body_wit = Self::block_witness(body_wits, span);
-        Some(MirWitness {
-            kind: if is_prompt {
-                WitnessKind::PromptSection {
-                    name,
-                    body: Box::new(body_wit),
-                }
-            } else {
-                WitnessKind::DocumentSection {
-                    name,
-                    body: Box::new(body_wit),
-                }
-            },
-            span,
+            this.consume(
+                TokenType::End,
+                &format!("Expected 'end' after {block_kind} block"),
+            )?;
+            Some(body_wits)
         })
-    }
-
-    /// v0.103: `observe <kind> "<name>" do ... end` / `span "<name>" tags {..} do ... end`。
-    ///
-    /// spec §11.4 承诺的可观测性块。此前 MirInst::Observe/Span 有 handler
-    /// 但零 producer（parser 不产出），语法完全不可用。
-    fn emit_observe_w(&mut self) -> Option<MirWitness> {
-        let span = self.span_of_current();
-        self.advance(); // 'observe'
-        // kind：trace / metric / log（裸标识符）
-        let kind = self.consume_identifier("Expected observe kind (e.g. trace)")?;
-        // 名：字符串或裸标识符
-        let name = match self.peek()?.token_type.clone() {
-            TokenType::String(s) => {
-                self.advance();
-                s
-            }
-            TokenType::Identifier(s) => {
-                self.advance();
-                s
-            }
-            _ => String::new(),
-        };
-        let config = if name.is_empty() {
-            kind
-        } else {
-            format!("{} {}", kind, name)
-        };
-        let (_body_mir, body_wit) = self.emit_block_mir_and_wit("observe")?;
-        Some(MirWitness {
-            kind: WitnessKind::Observe {
-                config,
-                body: Box::new(body_wit),
-            },
-            span,
-        })
-    }
-
-    /// `span "<name>" tags {k: "v", ...} do ... end` —— 命名追踪 span。
-    fn emit_span_w(&mut self) -> Option<MirWitness> {
-        let span = self.span_of_current();
-        self.advance(); // 'span'
-        let name = match self.peek()?.token_type.clone() {
-            TokenType::String(s) => {
-                self.advance();
-                s
-            }
-            TokenType::Identifier(s) => {
-                self.advance();
-                s
-            }
-            _ => return None,
-        };
-        // 可选 `tags {k: "v", ...}`（键为标识符，值为字符串或标识符）
-        let mut tags: Vec<(String, String)> = Vec::new();
-        if matches!(self.peek().map(|t| &t.token_type), Some(TokenType::Identifier(s)) if s == "tags")
-        {
-            self.advance(); // 'tags'
-            self.consume(TokenType::LBrace, "Expected '{' after 'tags'")?;
-            while !self.check(&TokenType::RBrace) && !self.is_at_end() {
-                let k = self.emit_dict_key()?;
-                self.consume(TokenType::Colon, "Expected ':' in tags")?;
-                let v = match self.peek()?.token_type.clone() {
-                    TokenType::String(s) => {
-                        self.advance();
-                        s
-                    }
-                    TokenType::Identifier(s) => {
-                        self.advance();
-                        s
-                    }
-                    _ => String::new(),
-                };
-                tags.push((k, v));
-                if !self.match_token(&[TokenType::Comma]) {
-                    break;
-                }
-            }
-            self.consume(TokenType::RBrace, "Expected '}' after tags")?;
-        }
-        let (_body_mir, body_wit) = self.emit_block_mir_and_wit("span")?;
-        Some(MirWitness {
-            kind: WitnessKind::Span {
-                name,
-                tags,
-                body: Box::new(body_wit),
-            },
-            span,
-        })
-    }
-
-    /// 解析 `do? ... end` 块，返回 (MirFunction, witness)。
-    /// observe/span 共用（与 emit_section_w 的块处理同构）。
-    fn emit_block_mir_and_wit(&mut self, _label: &str) -> Option<(MirFunction, MirWitness)> {
-        let span = self.span_of_current();
-        let _ = self.match_token_exact(TokenType::Do);
-        let _ = self.match_token(&[TokenType::Newline]);
-        let parent = std::mem::replace(&mut self.emit, crate::mir::lower::EmitContext::new());
-        let mut body_wits = Vec::new();
-        let _last: Option<Reg> = None;
-        // v0.104.6 D44：失败时还原父上下文（见 emit_match_arm_w 处的说明）
-        let blk_ok = (|| -> Option<()> {
-            while !self.check(&TokenType::End) && !self.is_at_end() {
-                // v0.104.6 D45：保证进度（见 section 块同处说明）
-                let before = self.current;
-                match self.emit_statement_expr_w() {
-                    Some(w) => {
-                        body_wits.push(w);
-                    }
-                    // v0.104.6 D45：同 section 块 —— 静默跳过且不消费 token
-                    // 会让本循环**死循环**（observe / span 块实测挂死）。
-                    None => {
-                        eprintln!(
-                            "Parse error: unparsable statement in {} block (line {})",
-                            _label,
-                            self.current_line()
-                        );
-                        return None;
-                    }
-                }
-                while self.match_token(&[TokenType::Newline]) {}
-                if self.current == before {
-                    eprintln!(
-                        "Parse error: parser made no progress in {} block (line {})",
-                        _label,
-                        self.current_line()
-                    );
-                    return None;
-                }
-            }
-            self.consume(TokenType::End, "Expected 'end' after block")?;
-            Some(())
-        })();
-        if blk_ok.is_none() {
-            self.emit = parent;
-            return None;
-        }
-        let body_mir = std::mem::replace(&mut self.emit, parent).finish();
-        Some((body_mir, Self::block_witness(body_wits, span)))
-    }
-
-    /// v0.103: `update(params)` 是否为 TEA 更新函数声明（而非普通调用）。
-    ///
-    /// 判据（见分派处的守卫注释）：`(` 紧跟当前 token，括号内**全为裸标识符**
-    /// （允许逗号与空参表）。含任意表达式实参 → 不是声明。
-    fn looks_like_update_decl(&self) -> bool {
-        let mut i = self.current + 1; // 指向 '('
-        if !matches!(
-            self.tokens.get(i).map(|t| &t.token_type),
-            Some(TokenType::LParen)
-        ) {
-            return false;
-        }
-        i += 1;
-        loop {
-            match self.tokens.get(i).map(|t| &t.token_type) {
-                // 空参表 `update()`
-                Some(TokenType::RParen) => return true,
-                // 形参：裸标识符
-                Some(TokenType::Identifier(_)) => i += 1,
-                _ => return false,
-            }
-            match self.tokens.get(i).map(|t| &t.token_type) {
-                Some(TokenType::Comma) => i += 1,
-                Some(TokenType::RParen) => return true,
-                _ => return false,
-            }
-        }
     }
 
     /// v0.103: `parallel ... end` / `worker <name> do ... end`（spec §9.1/§9.2）。
@@ -2541,45 +2058,7 @@ impl ParserV3 {
         let span = self.span_of_current();
         self.advance(); // 'parallel'
         let _ = self.match_token(&[TokenType::Newline]);
-        let parent = std::mem::replace(&mut self.emit, crate::mir::lower::EmitContext::new());
-        let mut body_wits = Vec::new();
-        let _last: Option<Reg> = None;
-        // v0.104.6 D44：失败时还原父上下文（见 emit_match_arm_w 处的说明）
-        let par_ok = (|| -> Option<()> {
-            while !self.check(&TokenType::End) && !self.is_at_end() {
-                // v0.104.6 D45：保证进度（见 section 块同处说明）
-                let before = self.current;
-                match self.emit_statement_expr_w() {
-                    Some(w) => {
-                        body_wits.push(w);
-                    }
-                    // v0.104.6 D45：同 section 块 —— 静默跳过且不消费 token
-                    // 会让本循环**死循环**（parallel 块实测挂死）。
-                    None => {
-                        eprintln!(
-                            "Parse error: unparsable statement in parallel block (line {})",
-                            self.current_line()
-                        );
-                        return None;
-                    }
-                }
-                while self.match_token(&[TokenType::Newline]) {}
-                if self.current == before {
-                    eprintln!(
-                        "Parse error: parser made no progress in parallel block (line {})",
-                        self.current_line()
-                    );
-                    return None;
-                }
-            }
-            self.consume(TokenType::End, "Expected 'end' after parallel block")?;
-            Some(())
-        })();
-        if par_ok.is_none() {
-            self.emit = parent;
-            return None;
-        }
-        let _body_mir = std::mem::replace(&mut self.emit, parent).finish();
+        let body_wits = self.emit_end_delimited_body_w("parallel")?;
         Some(MirWitness {
             kind: WitnessKind::Parallel {
                 body: Box::new(Self::block_witness(body_wits, span)),
@@ -2595,51 +2074,10 @@ impl ParserV3 {
         let name = self.consume_identifier("Expected worker name after 'worker'")?;
         let _ = self.match_token_exact(TokenType::Do);
         let _ = self.match_token(&[TokenType::Newline]);
-        let parent = std::mem::replace(&mut self.emit, crate::mir::lower::EmitContext::new());
-        let mut body_wits = Vec::new();
-        let _last: Option<Reg> = None;
-        // v0.104.6 D44：失败时还原父上下文（见 emit_match_arm_w 处的说明）
-        let wrk_ok = (|| -> Option<()> {
-            while !self.check(&TokenType::End) && !self.is_at_end() {
-                // v0.104.6 D45：保证进度（见 section 块同处说明）
-                let before = self.current;
-                match self.emit_statement_expr_w() {
-                    Some(w) => {
-                        body_wits.push(w);
-                    }
-                    // v0.104.6 D45：同 section 块 —— 静默跳过且不消费 token
-                    // 会让本循环**死循环**（worker 块实测挂死）。
-                    None => {
-                        eprintln!(
-                            "Parse error: unparsable statement in worker block (line {})",
-                            self.current_line()
-                        );
-                        return None;
-                    }
-                }
-                while self.match_token(&[TokenType::Newline]) {}
-                if self.current == before {
-                    eprintln!(
-                        "Parse error: parser made no progress in worker block (line {})",
-                        self.current_line()
-                    );
-                    return None;
-                }
-            }
-            self.consume(TokenType::End, "Expected 'end' after worker block")?;
-            Some(())
-        })();
-        if wrk_ok.is_none() {
-            self.emit = parent;
-            return None;
-        }
-        let _body_mir = std::mem::replace(&mut self.emit, parent).finish();
-        // v0.104.6 D472：worker 的结构信息此前被压成扁平 Sequence ——
-        // 9 层降级链拿不到「这是一个 worker 块」，结构上产不出
-        // `MirInst::Worker`，必然回落旧路径。现把 worker 身份写进 witness。
+        let body_wits = self.emit_end_delimited_body_w("worker")?;
         Some(MirWitness {
             kind: WitnessKind::Worker {
-                name: name.clone(),
+                name,
                 body: Box::new(Self::block_witness(body_wits, span)),
             },
             span,
@@ -2660,10 +2098,6 @@ impl ParserV3 {
             TokenType::Enum => self.emit_enum_def_w(),
             TokenType::Type => self.emit_type_alias_w(),
             TokenType::Macro => self.emit_macro_def_w(),
-            TokenType::Rel => self.emit_rel_def_w(),
-            TokenType::Prompt => self.emit_section_w(true),
-            TokenType::Document => self.emit_section_w(false),
-            TokenType::App => self.emit_app_def_w(),
             _ => return None,
         }?;
         let names = Self::exported_names_of(&decl);
@@ -2691,11 +2125,7 @@ impl ParserV3 {
             | WitnessKind::StructDef { name, .. }
             | WitnessKind::EnumDef { name, .. }
             | WitnessKind::TypeAlias { name, .. }
-            | WitnessKind::MacroDef { name, .. }
-            | WitnessKind::RelDef { name, .. }
-            | WitnessKind::PromptSection { name, .. }
-            | WitnessKind::DocumentSection { name, .. }
-            | WitnessKind::AppDef { name, .. } => vec![name.clone()],
+            | WitnessKind::MacroDef { name, .. } => vec![name.clone()],
             // Sequence 可含多条声明（`export` 后跟块）—— 收集全部
             WitnessKind::Sequence(items) => {
                 items.iter().flat_map(Self::exported_names_of).collect()
@@ -2704,75 +2134,314 @@ impl ParserV3 {
         }
     }
 
-    fn emit_with_w(&mut self) -> Option<MirWitness> {
+    fn is_spawn_form(&self) -> bool {
+        let Some(tok) = self.peek() else {
+            return false;
+        };
+        if !matches!(&tok.token_type, TokenType::Identifier(s) if s == "spawn") {
+            return false;
+        }
+        let Some(next) = self.tokens.get(self.current + 1) else {
+            return false;
+        };
+        !matches!(
+            next.token_type,
+            TokenType::Assign
+                | TokenType::Dot
+                | TokenType::Comma
+                | TokenType::RParen
+                | TokenType::RBracket
+                | TokenType::RBrace
+                | TokenType::Newline
+                | TokenType::EOF
+                | TokenType::Plus
+                | TokenType::Minus
+                | TokenType::Star
+                | TokenType::StarStar
+                | TokenType::Slash
+                | TokenType::Percent
+                | TokenType::Equal
+                | TokenType::NotEqual
+                | TokenType::Greater
+                | TokenType::Less
+                | TokenType::GreaterEqual
+                | TokenType::LessEqual
+                | TokenType::Arrow
+                | TokenType::FatArrow
+                | TokenType::Colon
+        )
+    }
+
+    fn is_select_form(&self) -> bool {
+        let Some(tok) = self.peek() else {
+            return false;
+        };
+        if !matches!(&tok.token_type, TokenType::Identifier(s) if s == "select") {
+            return false;
+        }
+        let mut idx = self.current + 1;
+        while matches!(
+            self.tokens.get(idx).map(|t| &t.token_type),
+            Some(TokenType::Newline)
+        ) {
+            idx += 1;
+        }
+        matches!(
+            self.tokens.get(idx).map(|t| &t.token_type),
+            Some(TokenType::LBrace | TokenType::Identifier(_) | TokenType::LParen)
+        )
+    }
+
+    fn emit_spawn_w(&mut self) -> Option<MirWitness> {
+        use crate::mir::witness::WitnessSpawnTarget;
         let span = self.span_of_current();
-        self.advance(); // 'with'
-        // v0.104.6 D474：bindings 原本是 (name, reg, witness) 三元组，其中
-        // `reg` 只为发射 `MirInst::WithConfig` 的 bindings 而存在 ——
-        // parser 只产 witness 后降为 (name, witness) 二元组。
-        let mut bindings: Vec<(String, MirWitness)> = Vec::new();
-        loop {
-            let name = self.consume_identifier("Expected config key after 'with'")?;
-            self.consume(TokenType::Assign, "Expected '=' after config key")?;
-            let v_w = self.emit_expr_w()?;
-            bindings.push((name, v_w));
-            if !self.match_token(&[TokenType::Comma]) {
+        self.advance(); // consume 'spawn'
+
+        let target = if self.match_token_exact(TokenType::Do) {
+            let _ = self.match_token(&[TokenType::Newline]);
+            let body_wits = self.emit_end_delimited_body_w("spawn")?;
+            let closure = MirWitness {
+                kind: WitnessKind::Closure {
+                    type_params: Vec::new(),
+                    params: Vec::new(),
+                    body: Box::new(Self::block_witness(body_wits, span)),
+                },
+                span,
+            };
+            WitnessSpawnTarget::Expr(Box::new(closure))
+        } else if self.check(&TokenType::LBrace) {
+            let body = self.in_nested_scope(|this| this.emit_block_w())?;
+            let closure = MirWitness {
+                kind: WitnessKind::Closure {
+                    type_params: Vec::new(),
+                    params: Vec::new(),
+                    body: Box::new(body),
+                },
+                span,
+            };
+            WitnessSpawnTarget::Expr(Box::new(closure))
+        } else {
+            let mut expr = self.emit_expr_w()?;
+            let kind = std::mem::replace(&mut expr.kind, WitnessKind::Commit);
+            match kind {
+                WitnessKind::Call { callee, args } => WitnessSpawnTarget::Call { callee, args },
+                WitnessKind::MethodCall {
+                    receiver,
+                    method,
+                    args,
+                } => WitnessSpawnTarget::MethodCall {
+                    receiver,
+                    method,
+                    args,
+                },
+                other => WitnessSpawnTarget::Expr(Box::new(MirWitness {
+                    kind: other,
+                    span: expr.span,
+                })),
+            }
+        };
+
+        Some(MirWitness {
+            kind: WitnessKind::Spawn { target },
+            span,
+        })
+    }
+
+    fn emit_select_w(&mut self) -> Option<MirWitness> {
+        use crate::mir::witness::WitnessSelectArm;
+        let span = self.span_of_current();
+        self.advance(); // consume 'select'
+        while self.match_token(&[TokenType::Newline]) {}
+        let brace_mode = self.match_token_exact(TokenType::LBrace);
+        let is_close = |p: &ParserV3| -> bool {
+            if brace_mode {
+                p.check(&TokenType::RBrace)
+            } else {
+                p.check(&TokenType::End)
+            }
+        };
+
+        let mut arms = Vec::new();
+        while !is_close(self) && !self.is_at_end() {
+            while self.match_token(&[TokenType::Newline, TokenType::Comma]) {}
+            if is_close(self) || self.is_at_end() {
                 break;
             }
-        }
-        let _ = self.match_token(&[TokenType::Newline]);
-        // v0.104.6 D474：**保留**子上下文换入。
-        //
-        // 它现在**不再**承担「独立寄存器空间」的职责（parser 不再产指令，
-        // body 只以 witness 形式存在），而是**作用域标记**：
-        //
-        // - `is_program_top` 归零 ⇒ `with` 体里的 `return` 被接受
-        //   （`with` 体在实现里是独立函数体，见 `tests/return_scope.rs`）；
-        // - `parse_loop_depth` 归零 ⇒ `with` 体里的 `break`/`continue`
-        //   不会被误认成外层循环的（它们跳不出 `with` 体）。
-        //
-        // D474 一度把这个换入一并删掉（以为它只为寄存器空间服务），
-        // 于是 `with` 体的 `return` 被误拒 —— 由 `tests/return_scope.rs`
-        // 的 `return_in_other_function_bodies_is_not_rejected` 抓出。
-        let parent = std::mem::replace(&mut self.emit, crate::mir::lower::EmitContext::new());
-        let mut body_wits = Vec::new();
-        let with_ok = (|| -> Option<()> {
-            while !self.check(&TokenType::End) && !self.is_at_end() {
-                // v0.104.6 D45：保证进度（见 section 块同处说明）
-                let before = self.current;
-                match self.emit_statement_w() {
-                    Some(w) => body_wits.push(w),
-                    // v0.104.6 D45：同 section 块 —— 静默跳过且不消费 token
-                    // 会让本循环**死循环**（with 块实测挂死）。
-                    None => {
+            if matches!(
+                self.peek().map(|t| &t.token_type),
+                Some(TokenType::Identifier(s)) if s == "case"
+            ) {
+                self.advance();
+            }
+
+            let is_arrow = |t: &TokenType| matches!(t, TokenType::Arrow | TokenType::FatArrow);
+            let arm = if matches!(
+                self.peek().map(|t| &t.token_type),
+                Some(TokenType::Identifier(s)) if s == "default"
+            ) && self
+                .tokens
+                .get(self.current + 1)
+                .map(|t| is_arrow(&t.token_type))
+                .unwrap_or(false)
+            {
+                self.advance(); // 'default'
+                self.advance(); // '->' or '=>'
+                let body = self.emit_select_arm_body()?;
+                WitnessSelectArm::Default {
+                    body: Box::new(body),
+                }
+            } else if matches!(
+                self.peek().map(|t| &t.token_type),
+                Some(TokenType::Identifier(s)) if s == "timeout"
+            ) && matches!(
+                self.tokens.get(self.current + 1).map(|t| &t.token_type),
+                Some(TokenType::LParen)
+            ) {
+                self.advance(); // 'timeout'
+                self.consume(TokenType::LParen, "Expected '(' after timeout")?;
+                let ms = self.emit_expr_w()?;
+                self.consume(TokenType::RParen, "Expected ')' after timeout duration")?;
+                if !self
+                    .peek()
+                    .map(|t| is_arrow(&t.token_type))
+                    .unwrap_or(false)
+                {
+                    eprintln!(
+                        "Parse error: expected '->' or '=>' after timeout(...) in select (line {})",
+                        self.current_line()
+                    );
+                    return None;
+                }
+                self.advance(); // '->' or '=>'
+                let body = self.emit_select_arm_body()?;
+                WitnessSelectArm::Timeout {
+                    ms: Box::new(ms),
+                    body: Box::new(body),
+                }
+            } else if matches!(
+                self.peek().map(|t| &t.token_type),
+                Some(TokenType::Identifier(_))
+            ) && matches!(
+                self.tokens.get(self.current + 1).map(|t| &t.token_type),
+                Some(TokenType::Assign)
+            ) {
+                let binding = self.consume_plain_identifier("Expected variable name")?;
+                self.advance(); // '='
+                let mut op_expr = self.emit_expr_w()?;
+                let kind = std::mem::replace(&mut op_expr.kind, WitnessKind::Commit);
+                let WitnessKind::MethodCall {
+                    receiver,
+                    method,
+                    args,
+                } = kind
+                else {
+                    eprintln!(
+                        "Parse error: expected '<channel>.recv()' after '=' in select arm (line {})",
+                        self.current_line()
+                    );
+                    return None;
+                };
+                if method != "recv" || !args.is_empty() {
+                    eprintln!(
+                        "Parse error: select binding arm must call '.recv()' with no arguments (line {})",
+                        self.current_line()
+                    );
+                    return None;
+                }
+                if !self
+                    .peek()
+                    .map(|t| is_arrow(&t.token_type))
+                    .unwrap_or(false)
+                {
+                    eprintln!(
+                        "Parse error: expected '->' or '=>' after recv() in select arm (line {})",
+                        self.current_line()
+                    );
+                    return None;
+                }
+                self.advance(); // '->' or '=>'
+                let body = self.emit_select_arm_body()?;
+                WitnessSelectArm::Recv {
+                    binding: Some(binding),
+                    channel: receiver,
+                    body: Box::new(body),
+                }
+            } else {
+                let mut op_expr = self.emit_expr_w()?;
+                if !self
+                    .peek()
+                    .map(|t| is_arrow(&t.token_type))
+                    .unwrap_or(false)
+                {
+                    eprintln!(
+                        "Parse error: expected '->' or '=>' after select case condition (line {})",
+                        self.current_line()
+                    );
+                    return None;
+                }
+                self.advance(); // '->' or '=>'
+                let kind = std::mem::replace(&mut op_expr.kind, WitnessKind::Commit);
+                match kind {
+                    WitnessKind::MethodCall {
+                        receiver,
+                        method,
+                        mut args,
+                    } if method == "send" && args.len() == 1 => {
+                        let value = Box::new(args.remove(0));
+                        let body = self.emit_select_arm_body()?;
+                        WitnessSelectArm::Send {
+                            channel: receiver,
+                            value,
+                            body: Box::new(body),
+                        }
+                    }
+                    WitnessKind::MethodCall {
+                        receiver,
+                        method,
+                        args,
+                    } if method == "recv" && args.is_empty() => {
+                        let body = self.emit_select_arm_body()?;
+                        WitnessSelectArm::Recv {
+                            binding: None,
+                            channel: receiver,
+                            body: Box::new(body),
+                        }
+                    }
+                    _ => {
                         eprintln!(
-                            "Parse error: unparsable statement in with block (line {})",
+                            "Parse error: invalid select arm condition (expected ch.recv(), ch.send(v), timeout(ms), or default) at line {}",
                             self.current_line()
                         );
                         return None;
                     }
                 }
-                while self.match_token(&[TokenType::Newline]) {}
-                if self.current == before {
-                    eprintln!(
-                        "Parse error: parser made no progress in with block (line {})",
-                        self.current_line()
-                    );
-                    return None;
-                }
-            }
-            self.consume(TokenType::End, "Expected 'end' after with block")?;
-            Some(())
-        })();
-        // 无论体解析成功与否都还原父作用域（v0.104.6 D44 的约定）。
-        self.emit = parent;
-        with_ok?;
+            };
+            arms.push(arm);
+            let _ = self.match_token(&[TokenType::Comma]);
+        }
+
+        if brace_mode {
+            self.consume(TokenType::RBrace, "Expected '}' after select block")?;
+        } else {
+            self.consume(TokenType::End, "Expected 'end' after select block")?;
+        }
+
         Some(MirWitness {
-            kind: WitnessKind::WithConfig {
-                bindings,
-                body: Box::new(Self::block_witness(body_wits, span)),
-            },
+            kind: WitnessKind::Select { arms },
             span,
+        })
+    }
+
+    fn emit_select_arm_body(&mut self) -> Option<MirWitness> {
+        let span = self.span_of_current();
+        self.in_nested_scope(|this| {
+            if this.match_token_exact(TokenType::Do) {
+                let _ = this.match_token(&[TokenType::Newline]);
+                let body_wits = this.emit_end_delimited_body_w("select arm")?;
+                Some(Self::block_witness(body_wits, span))
+            } else {
+                this.emit_expr_w()
+            }
         })
     }
 }

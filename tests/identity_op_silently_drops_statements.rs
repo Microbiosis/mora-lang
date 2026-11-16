@@ -45,7 +45,7 @@ fn run(src: &str, tag: &str) -> (i32, Vec<String>) {
     let dir = TempDir::new(tag);
     let p = dir.join("p.mora");
     std::fs::write(&p, src).expect("写探针");
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+    let exe = env!("CARGO_BIN_EXE_mora");
     let out = Command::new(exe).arg(&p).output().expect("跑 mora");
     let s = String::from_utf8_lossy(&out.stdout).into_owned();
     let _ = std::fs::remove_dir_all(&dir);
@@ -59,6 +59,7 @@ fn run(src: &str, tag: &str) -> (i32, Vec<String>) {
                 && !l.contains("AI 原语")
                 && !l.contains("显式 API")
                 && !l.contains("Trait 系统")
+                && !l.contains("类型与执行")
                 && !l.contains("Built-in")
                 && !l.contains("v0.15 CLI")
                 && !l.contains("不兼容 v0.03")
@@ -162,7 +163,7 @@ fn basic_opt_level_also_executes_the_rest() {
         "print(\"A\")\nlet a = 100i + 0i\nprint(a)\nprint(\"B\")\n",
     )
     .expect("写");
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+    let exe = env!("CARGO_BIN_EXE_mora");
     let out = Command::new(exe)
         .arg("--opt=1")
         .arg(&p)

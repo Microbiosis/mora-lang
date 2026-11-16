@@ -1,30 +1,17 @@
-//! v0.52 ADR-001: 6 Domain Facade 容器模块
+//! v0.110.0: 核心运行时模块
 //!
-//! 每个 facade 是一个 BC 的状态 + 行为封装：
-//! - AiRuntime       (BC3)
-//! - OrchRuntime     (BC4)
-//! - PersistRuntime  (BC5)
-//! - SandboxRuntime  (BC7)
-//! - RegistryRuntime (BC8)
-//! - InfraRuntime    (BC9)
-//!
-//! 跨 facade 协作通过显式依赖注入（参数传 &mut facade），避免 borrow 摩擦。
+//! 保留语言核心状态（`core`）、确定性 PRNG 状态（`random`）、堆栈帧式连续体虚拟机（`vm`）
+//! 以及基于 `tokio` 的任务调度器（`scheduler`）与异步 I/O 多路复用器（`reactor`）。
 
-// v0.52 ADR-001: facade 模块 — Interpreter 字段 pub 让 binary crate 访问
-// 后续 Task 7 阶段会考虑加 accessor
-pub mod ai;
-// v0.75.25: 活 AI 基础设施（ContextWindow/SpeculativeVerifier/CacheWarmer）
-// 自 src/ai_infra.rs 迁入；12 个出生即死的规划类型随旧文件删除
-pub mod ai_infra;
+pub mod builtins;
 pub mod core;
-// v0.80: EffectHandler trait + EffectRegistry（Stage 2/4 algebraic effects 落地）
-pub mod effect;
-pub mod infra;
-pub mod orch;
-pub mod persist;
+pub use core::{CoreRuntime, EngineShared};
+// v0.110.0: 文件系统隔离策略、独立 virtual_cwd 与 CheckedPath 凭证
+pub mod fs;
 // v0.99: ambient random —— PRNG 纯值 + ambient effect 操作分发
-// （原 src/interpreter/builtins/random.rs 的进程级全局状态机数据流化）
 pub mod random;
-pub mod registry;
-pub mod sandbox;
-pub mod types;
+// Wave 2 W2.4: tokio-backed async I/O reactor and structured task scheduler
+pub mod reactor;
+pub mod scheduler;
+// Wave 2 W2.3: Heap-framed stackful VM & delimited continuations
+pub mod vm;

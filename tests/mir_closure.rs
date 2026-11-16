@@ -6,32 +6,22 @@
 //! 这些 runtime 测试验证 `MirInst::Closure` + `MirInst::TaskDef` →
 //! `execute` → `run_main_task` 真实端到端路径。
 
-use mora::interpreter::Interpreter;
-use mora::mir::vm::{execute, run_main_task};
 use mora::parser_v3::ParserV3;
-use mora::typeck::check_mir::check_program_witnesses_bidirectional;
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::{execute_program, run_main_task};
+use mora::typeck::check_mir::check_program_witnesses;
 
 fn run_via_execute(source: &str) -> Result<(), String> {
-    let (func, witnesses) = ParserV3::compile(source)?;
-    let type_errs = check_program_witnesses_bidirectional(&witnesses);
+    let (prog, witnesses) = ParserV3::compile(source).map_err(|e| e.to_string())?;
+    let type_errs = check_program_witnesses(&witnesses);
     if !type_errs.is_empty() {
         return Err(format!("typeck: {} error(s)", type_errs.len()));
     }
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    let func_arc = std::sync::Arc::new(func);
-    execute(
-        &func_arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    )?;
-    run_main_task(
-        &func_arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    )
+    let mut core = CoreRuntime::default();
+    let prog_arc = std::sync::Arc::new(prog);
+    let (_, globals) = execute_program(prog_arc.clone(), &mut core).map_err(|e| e.to_string())?;
+    let _ = run_main_task(prog_arc, globals, &mut core).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 // ─── 1. 闭包字面量定义 + 调用走 MIR ──────────────────────────────────

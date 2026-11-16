@@ -60,7 +60,7 @@ fn run(src: &str, tag: &str) -> (i32, String) {
     let dir = TempDir::new(tag);
     let p = dir.join("p.mora");
     std::fs::write(&p, src).expect("写探针");
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+    let exe = env!("CARGO_BIN_EXE_mora");
     let out = Command::new(exe).arg(&p).output().expect("跑 mora");
     let _ = std::fs::remove_dir_all(&dir);
     let text = String::from_utf8_lossy(&out.stdout).into_owned()
@@ -76,6 +76,7 @@ fn run(src: &str, tag: &str) -> (i32, String) {
                 && !l.starts_with("AI 原语")
                 && !l.starts_with("显式 API")
                 && !l.starts_with("Trait 系统")
+                && !l.starts_with("类型与执行")
                 && !l.starts_with("Built-in")
                 && !l.starts_with("v0.15 CLI")
                 && !l.starts_with('⚠')
@@ -142,13 +143,13 @@ fn d328_higher_order_methods_reject_wrong_arity_and_non_closures() {
     }
     // 正常路径不得回归
     for (src, want) in [
-        ("[1,2,3].map(fn(x) x * 2 end)", "[2.0, 4.0, 6.0]"),
-        ("[1,2,3].filter(fn(x) x > 1 end)", "[2.0, 3.0]"),
-        ("[1,2,3].reduce(fn(a,b) a + b end, 0)", "6.0"),
+        ("[1,2,3].map(fn(x) x * 2 end)", "[2, 4, 6]"),
+        ("[1,2,3].filter(fn(x) x > 1 end)", "[2, 3]"),
+        ("[1,2,3].reduce(fn(a,b) a + b end, 0)", "6"),
         ("[].map(fn(x) x end)", "[]"),
-        ("[].reduce(fn(a,b) a + b end, 0)", "0.0"),
-        ("apply(fn(a) a * 2 end, [4])", "8.0"),
-        ("apply(fn() 7 end, [])", "7.0"),
+        ("[].reduce(fn(a,b) a + b end, 0)", "0"),
+        ("apply(fn(a) a * 2 end, [4])", "8"),
+        ("apply(fn() 7 end, [])", "7"),
     ] {
         let (code, got) = run(&format!("print({src})\n"), src);
         assert_eq!(code, 0, "`{src}` 应成功; 实得 exit={code} out={got}");
@@ -168,34 +169,34 @@ fn d328_curry_partial_application_works_via_stepwise_let() {
         (
             "2元全应用",
             format!("let c = curry({f2}, 2)\nlet v = c(1,2)\nprint(v)\n"),
-            "3.0",
+            "3",
         ),
         (
             "2元分两步",
             format!("let c = curry({f2}, 2)\nlet c1 = c(1)\nlet v = c1(2)\nprint(v)\n"),
-            "3.0",
+            "3",
         ),
         (
             "3元分三步",
             format!(
                 "let c = curry({f3}, 3)\nlet c1 = c(1)\nlet c2 = c1(2)\nlet v = c2(3)\nprint(v)\n"
             ),
-            "6.0",
+            "6",
         ),
         (
             "3元分两步",
             format!("let c = curry({f3}, 3)\nlet c1 = c(1)\nlet v = c1(2,3)\nprint(v)\n"),
-            "6.0",
+            "6",
         ),
         (
             "uncurry 取回",
             format!("let c = curry({f2}, 2)\nlet f = uncurry(c)\nlet v = f(3,4)\nprint(v)\n"),
-            "7.0",
+            "7",
         ),
         (
             "1元对照组（既有判据覆盖的那格）",
             "let c = curry(fn(x) x + 1 end, 1)\nlet v = c(1)\nprint(v)\n".to_string(),
-            "2.0",
+            "2",
         ),
     ] {
         let (code, got) = run(&src, &format!("curry_{tag}"));
@@ -204,53 +205,43 @@ fn d328_curry_partial_application_works_via_stepwise_let() {
     }
 }
 
-/// **现状**：`partial` / `compose` 的返回值**无法被调用**。
-///
-/// `dispatch.rs` 写好了 `Value::Partial` 的调用分支（:246-250）与
-/// `Value::Compose` 的可调用登记（:973），但**类型系统禁止所有调用形式**
-/// ⇒ 这两个内建目前是**建得出、用不了**的死功能面。
-///
-/// 修它要改 typeck 签名（`functional_builtins_signatures.rs` 已因 D80 的
-/// 回归把 `compose` / `partial` 设为**变参**）⇒ 语义/路线图决定，只报告不实施。
+/// **Stage 3A-2 统一类型检查器下**：`partial` / `compose` 的合法应用畅通运行，
+/// 而错误元数的调用仍在运行期明确报错。
 #[test]
 fn d328_status_quo_partial_and_compose_results_are_unappliable() {
+    for (src, want) in [
+        (
+            "let p = partial(fn(a,b) a + b end, 1)\nlet v = p(2)\nprint(v)\n",
+            "3",
+        ),
+        (
+            "let c = compose(fn(x) x+1 end, fn(x) x*2 end)\nlet v = c(3)\nprint(v)\n",
+            "8",
+        ),
+    ] {
+        let (code, got) = run(src, "ok_case");
+        assert_eq!(
+            code, 0,
+            "`{src}` 应合法运行并产出 {want}; 实得 exit={code} out={got}"
+        );
+        assert_eq!(got, want);
+    }
     for src in [
-        "let p = partial(fn(a,b) a + b end, 1)\nlet v = p(2)\nprint(v)\n",
         "let p = partial(fn(x) x + 1 end, 1)\nlet v = p(2)\nprint(v)\n",
         "let p = partial(fn(x) x + 1 end, 1)\nlet p1 = p(2)\nlet v = p1(3)\nprint(v)\n",
-        "let c = compose(fn(x) x+1 end, fn(x) x*2 end)\nlet v = c(3)\nprint(v)\n",
         "let c = compose(fn(x) x+1 end, fn(x) x*2 end)\nlet v = c(1,2,3)\nprint(v)\n",
+        "let c = compose(fn(x) x+1 end, fn(x) x*2 end)\nlet v = c()\nprint(v)\n",
     ] {
-        let (code, got) = run(src, "case");
-        assert_eq!(
-            code, 2,
-            "**D328 现状**：`partial` / `compose` 的返回值当前**无法被调用**\
-             （typeck 拒：`expected partial, got fn` / `expected compose, got fn`）。\n\
-             ⚠ 若本条失败，说明**这两个内建变得可用了** —— 那是**语义变更**\
-             （需要同时给 typeck 补签名 + 确认 `dispatch.rs` 的调用分支正确），\
-             请勿只改本判据。\n  实得: exit={code} out={got}"
+        let (code, got) = run(src, "arity_err");
+        assert_ne!(
+            code, 0,
+            "错元数调用必须在运行期报错; 实得 exit={code} out={got}"
         );
     }
-    // 唯一漏网：零参调用能过 typeck，撞运行期元数错误
-    let (code, got) = run(
-        "let c = compose(fn(x) x+1 end, fn(x) x*2 end)\nlet v = c()\nprint(v)\n",
-        "compose_zero",
-    );
-    assert_ne!(
-        code, 0,
-        "`compose(...)()` 零参调用当前会漏过 typeck 并在运行期报元数错误; \
-         实得 exit={code} out={got}"
-    );
-    // 内联 postfix：v0.104.6 补齐后**已可用**（此前 D123 记为语法缺口）。
-    //
-    // ⚠ 本条走**真实 CLI**（含 typeck），所以它证明的不只是 `execute` 能算 ——
-    // 是「解析 + MIR 的 CallValue + typeck 的 Evaluated 被调者」三段都通。
-    // 实得 `3.0`（= `curry(x+1, 1)` 取回 1 元闭包，再喂 `2`）。
     let (code, got) = run("print(curry(fn(x) x+1 end, 1)(2))\n", "curry_inline");
     assert_eq!(
         (code, got.as_str()),
-        (0, "3.0"),
-        "内联 `curry(...)(...)` 自 v0.104.6 补齐 postfix 值调用后应可用且取值为 3; \
-         实得 exit={code} out={got}"
+        (0, "3"),
+        "内联 `curry(...)(...)` 应可用且取值为 3; 实得 exit={code} out={got}"
     );
 }

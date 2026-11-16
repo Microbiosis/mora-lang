@@ -62,7 +62,7 @@ fn ev(body: &str) -> (i32, String) {
     std::fs::write(&p, body).expect("写探针");
     let home = dir.join("home");
     std::fs::create_dir_all(&home).expect("建 home");
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+    let exe = env!("CARGO_BIN_EXE_mora");
     let out = Command::new(exe)
         .arg(&p)
         .env("HOME", &home)
@@ -84,6 +84,7 @@ fn ev(body: &str) -> (i32, String) {
                 && !l.starts_with("AI 原语")
                 && !l.starts_with("显式 API")
                 && !l.starts_with("Trait 系统")
+                && !l.starts_with("类型与执行")
                 && !l.starts_with("Built-in")
                 && !l.starts_with("v0.15 CLI")
                 && !l.contains("不兼容 v0.03")
@@ -104,7 +105,7 @@ fn is_bare_path_line(line: &&str, path: &str) -> bool {
 fn d366_harness_collects_print_output() {
     let (code, got) = ev("print(1)\n");
     assert_eq!(code, 0, "探针应正常退出; 实得 exit={code} out=[{got}]");
-    assert_eq!(got.trim(), "1.0", "采集器失效（本文件全部断言依赖它）");
+    assert_eq!(got.trim(), "1", "采集器失效（本文件全部断言依赖它）");
 }
 
 /// **`quote(expr)` 捕获的是**源码文本**，不是求值结果**。
@@ -117,7 +118,7 @@ fn d366_quote_captures_source_text_and_roundtrips() {
     // 求值路径
     let (code, got) = ev("print(eval(quote(2 + 3)))\n");
     assert_eq!(code, 0, "应正常; 实得 exit={code} out={got}");
-    assert_eq!(got.trim(), "5.0", "eval(quote(2+3)) 应为 5; 实得: {got}");
+    assert_eq!(got.trim(), "5", "eval(quote(2+3)) 应为 5; 实得: {got}");
 
     // 冻结路径：闭包源码原样保留
     let (code, got) = ev("let q = quote(fn(z) z + 1 end)\nprint(q)\n");
@@ -132,7 +133,7 @@ fn d366_quote_captures_source_text_and_roundtrips() {
     assert_eq!(code, 0, "往返应成立; 实得 exit={code} out={got}");
     assert_eq!(
         got.trim(),
-        "10.0",
+        "10",
         "eval(quote(fn)) 作用于 5 应得 10; 实得: {got}"
     );
 }
@@ -186,7 +187,7 @@ fn d366_splice_on_non_list_errors_with_type_name() {
     let (code, got) = ev("let n = 5\nlet q = `,,n\nprint(q)\n");
     assert_eq!(code, 1, "splice 非 List 应报错; 实得 exit={code} out={got}");
     assert!(
-        got.contains("expected List") && got.contains("float"),
+        got.contains("expected List") && (got.contains("int") || got.contains("float")),
         "诊断应点名期望类型与实际类型名; 实得: {got}"
     );
 }

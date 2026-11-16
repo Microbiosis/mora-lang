@@ -85,16 +85,13 @@ impl Drop for WorkDir {
 }
 
 fn mora(dir: &Path, args: &[&str]) -> (String, i32) {
-    let out = Command::new(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/target/debug/mora.exe"
-    ))
-    .current_dir(dir)
-    .args(args)
-    .env_remove("OPENAI_API_KEY")
-    .env_remove("MORA_AI_BASE_URL")
-    .output()
-    .expect("跑 mora");
+    let out = Command::new(env!("CARGO_BIN_EXE_mora"))
+        .current_dir(dir)
+        .args(args)
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("MORA_AI_BASE_URL")
+        .output()
+        .expect("跑 mora");
     let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
     s.push_str(&String::from_utf8_lossy(&out.stderr));
     (s, out.status.code().unwrap_or(-1))
@@ -102,19 +99,16 @@ fn mora(dir: &Path, args: &[&str]) -> (String, i32) {
 
 /// 起一个 `--repl`，喂入**精确字节**后关闭 stdin。
 fn run_repl(dir: &Path, body: &str, timeout_ms: u64) -> (String, bool) {
-    let mut child = Command::new(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/target/debug/mora.exe"
-    ))
-    .current_dir(dir)
-    .arg("--repl")
-    .env_remove("OPENAI_API_KEY")
-    .env_remove("MORA_AI_BASE_URL")
-    .stdin(std::process::Stdio::piped())
-    .stdout(std::process::Stdio::piped())
-    .stderr(std::process::Stdio::piped())
-    .spawn()
-    .expect("起 mora --repl");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mora"))
+        .current_dir(dir)
+        .arg("--repl")
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("MORA_AI_BASE_URL")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("起 mora --repl");
     {
         let stdin = child.stdin.as_mut().expect("stdin");
         stdin.write_all(body.as_bytes()).expect("写 stdin");
@@ -159,7 +153,11 @@ fn d191_bom_prefixed_file_runs() {
         "带 BOM 的文件应能运行（修前报 Unexpected character + BOM 字符）:\n{}",
         out
     );
-    assert!(out.contains("42.0"), "应正常输出:\n{}", out);
+    assert!(
+        out.contains("\n42\n") || out.contains("42\n"),
+        "应正常输出:\n{}",
+        out
+    );
     assert!(!out.contains("feff"), "不应再报 BOM 字符错误:\n{}", out);
 }
 
@@ -175,11 +173,11 @@ fn d191_bom_prefixed_repl_input_keeps_the_first_line() {
     let (out, exited) = run_repl(dir.path(), &body, 8000);
     assert!(exited, "REPL 应在 EOF 后退出");
     assert!(
-        out.contains("7.0"),
+        out.contains("7"),
         "**第一行被静默丢弃** —— 带 BOM 的管道输入下 `print(7)` 必须执行:\n{}",
         out
     );
-    assert!(out.contains("8.0"), "第二行也应执行:\n{}", out);
+    assert!(out.contains("8"), "第二行也应执行:\n{}", out);
 }
 
 /// **负对照**：无 BOM 输入完全不受影响。
@@ -189,7 +187,7 @@ fn d191_bomless_input_is_unaffected() {
     let (out, exited) = run_repl(dir.path(), "print(7)\nprint(8)\n", 8000);
     assert!(exited, "应正常退出");
     assert!(
-        out.contains("7.0") && out.contains("8.0"),
+        out.contains("7") && out.contains("8"),
         "两行都该执行:\n{}",
         out
     );
@@ -197,7 +195,7 @@ fn d191_bomless_input_is_unaffected() {
     let f = dir.script("n.mora", "print(42)\n", false);
     let (out, code) = mora(dir.path(), &[f.to_str().unwrap()]);
     assert_eq!(code, 0, "无 BOM 文件应照常运行:\n{}", out);
-    assert!(out.contains("42.0"), "应正常输出:\n{}", out);
+    assert!(out.contains("42"), "应正常输出:\n{}", out);
 }
 
 /// 只剥**开头**一个 —— 源码中间的 U+FEFF 仍是真实字符，应被拒。

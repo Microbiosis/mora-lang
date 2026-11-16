@@ -32,7 +32,7 @@ use std::collections::HashMap;
 use mora::flow::{json_to_value, value_to_json};
 use mora::value::Value;
 
-fn rt(v: &Value) -> Result<Value, String> {
+fn rt(v: &Value) -> mora::error::MoraResult<Value> {
     json_to_value(&value_to_json(v))
 }
 
@@ -156,32 +156,6 @@ fn d290_int_boundaries_round_trip() {
             Ok(Value::Int(g)) => assert_eq!(g, i, "Int {i} 往返不等"),
             Ok(g) => panic!("Int {i} 往返变成非 Int：{}", value_to_json(&g)),
             Err(e) => panic!("Int {i} 往返解析失败：{e}"),
-        }
-    }
-}
-
-/// `BigInt` 往返恒等；**小值降级为 `Int` 是数值塔的正常行为**。
-#[test]
-fn d290_bigint_round_trip() {
-    for s in [
-        "123456789012345678901234567890",
-        "-123456789012345678901234567890",
-        "170141183460469231731687303715884105727", // 2^127-1
-        "-170141183460469231731687303715884105728", // -2^127
-    ] {
-        let v = Value::BigInt(s.parse::<num_bigint::BigInt>().expect("应可解析"));
-        match rt(&v) {
-            Ok(got) => assert_eq!(got, v, "BigInt {s} 往返不等，读回 {}", value_to_json(&got)),
-            Err(e) => panic!("BigInt {s} 往返解析失败：{e}"),
-        }
-    }
-    // 小 BigInt 降级成 Int —— 数值塔的既定行为（`value_as_f64` 亦同）
-    for s in ["0", "1", "-1"] {
-        let v = Value::BigInt(s.parse::<num_bigint::BigInt>().expect("应可解析"));
-        match rt(&v) {
-            Ok(Value::Int(_)) => {}
-            Ok(got) => panic!("小 BigInt {s} 应降级为 Int，读回 {}", value_to_json(&got)),
-            Err(e) => panic!("小 BigInt {s} 往返解析失败：{e}"),
         }
     }
 }

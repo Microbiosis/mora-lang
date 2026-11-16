@@ -53,144 +53,52 @@ fn run(tag: &str, src: &str, opt: Option<&str>) -> (String, String, i32) {
     )
 }
 
-/// **强证人**：打印求解结果的 `rel` 程序。
-///
-/// `rel_*.mora` fixture 自身无输出，比不出对错 —— 这一条才有可观察结果。
-const REL_WITNESS: &str = concat!(
-    "rel edge(\"a\", \"b\")\n",
-    "rel edge(\"b\", \"c\")\n",
-    "rel edge(\"c\", \"d\")\n",
-    "let r = solve { edge(?x, ?y) }\n",
-    "print(\"edges:\")\n",
-    "print(r)\n",
-    "let p = solve { edge(?x, \"d\") }\n",
-    "print(\"reach-d:\")\n",
-    "print(p)\n",
-    "print(\"done\")\n",
-);
-
-/// `rel` 家族必须走上 9 层管线，且求解结果**可观察且正确**。
-#[test]
-fn rel_family_produces_its_expected_output() {
-    for opt in [None, Some("1"), Some("2")] {
-        let lbl = opt.unwrap_or("off");
-        let (stdout, stderr, code) = run("rel_witness", REL_WITNESS, opt);
-        assert_eq!(code, 0, "前提：opt={lbl} 应成功; stderr={stderr}");
-        assert_eq!(
-            stdout.trim_end(),
-            "edges:\n[[a, b], [b, c], [c, d]]\nreach-d:\n[c]\ndone",
-            "**D474**：`rel` 程序的求解结果必须是可观察且正确的（opt={lbl}）。\n  实得: {stdout:?}"
-        );
-    }
-}
-
-/// 块形态 —— 每种形态在每个优化档位下的期望输出。
+/// 块形态 —— 保留在语言中的块形态在每个优化档位下的期望输出。
 const BLOCK_FORMS: &[(&str, &str, Expect)] = &[
-    (
-        "span-1stmt",
-        "span \"s\" do\n  print(1)\nend\nprint(\"after\")\n",
-        Expect::Out("1.0\nafter"),
-    ),
-    (
-        "span-3stmt",
-        "span \"s\" do\n  print(1)\n  print(2)\n  print(3)\nend\nprint(\"after\")\n",
-        Expect::Out("1.0\n2.0\n3.0\nafter"),
-    ),
     (
         "parallel-3stmt",
         "parallel\n  print(1)\n  print(2)\n  print(3)\nend\nprint(\"after\")\n",
-        Expect::Out("1.0\n2.0\n3.0\nafter"),
+        Expect::Out("1\n2\n3\nafter"),
     ),
     (
-        // `span` 块的值是 **Nil**（块值被丢弃）⇒ 绑到 `let` 上是类型错误。
-        // 这条把「块的值不可用」钉住。
-        "span-in-value",
-        "let x = span \"s\" do\n  print(1)\nend\nprint(\"after\")\n",
+        // `parallel` 块的值是 **Nil** ⇒ 绑到 `let` 上是类型错误。
+        "parallel-in-value",
+        "let x = parallel\n  print(1)\nend\nprint(\"after\")\n",
         Expect::TypeErr,
-    ),
-    (
-        "span-nested",
-        "span \"o\" do\n  span \"i\" do\n    print(1)\n  end\n  print(2)\nend\nprint(\"after\")\n",
-        Expect::Out("1.0\n2.0\nafter"),
-    ),
-    (
-        "span-then-loop",
-        "span \"s\" do\n  print(1)\nend\nlet t = 0\nfor i in [1,2,3]\n  t = t + i\nend\nprint(t)\n",
-        Expect::Out("1.0\n6.0"),
-    ),
-    (
-        "span-then-3prints",
-        "span \"s\" do\n  print(1)\nend\nprint(\"a\")\nprint(\"b\")\nprint(\"c\")\n",
-        Expect::Out("1.0\na\nb\nc"),
-    ),
-    (
-        "observe-trace",
-        "observe trace \"t\" do\n  print(1)\nend\nprint(\"after\")\n",
-        Expect::Out("1.0\nafter"),
-    ),
-    (
-        "prompt-block",
-        "prompt \"p\" do\n  print(1)\nend\nprint(\"after\")\n",
-        Expect::Out("1.0\nafter"),
-    ),
-    (
-        "document-block",
-        "document \"d\" do\n  print(1)\nend\nprint(\"after\")\n",
-        Expect::Out("1.0\nafter"),
     ),
 ];
 
 /// 声明形态 —— 每种形态在每个优化档位下的期望输出。
 const DECLARATION_FORMS: &[(&str, &str, Expect)] = &[
     (
-        "msg-1print",
-        "msg CounterMsg\n  Increment\n  Decrement\nend\nprint(1)\n",
-        Expect::Out("1.0"),
-    ),
-    (
-        "msg-3print",
-        "msg M\n  Inc\nend\nprint(1)\nprint(2)\nprint(3)\n",
-        Expect::Out("1.0\n2.0\n3.0"),
-    ),
-    (
         "struct-1print",
         "struct P\n  x: number\nend\nprint(1)\n",
-        Expect::Out("1.0"),
+        Expect::Out("1"),
     ),
     (
         "struct-3print",
         "struct P\n  x: number\nend\nprint(1)\nprint(2)\nprint(3)\n",
-        Expect::Out("1.0\n2.0\n3.0"),
+        Expect::Out("1\n2\n3"),
     ),
     (
         "enum-1print",
         "enum E\n  A\n  B\nend\nprint(1)\n",
-        Expect::Out("1.0"),
+        Expect::Out("1"),
     ),
     (
         "enum-3print",
         "enum E\n  A\n  B\nend\nprint(1)\nprint(2)\nprint(3)\n",
-        Expect::Out("1.0\n2.0\n3.0"),
+        Expect::Out("1\n2\n3"),
     ),
     (
         "struct-then-let",
         "struct P\n  x: number\nend\nlet y = 1\nprint(y)\nprint(y + 1)\n",
-        Expect::Out("1.0\n2.0"),
+        Expect::Out("1\n2"),
     ),
     (
         "enum-then-for",
         "enum E\n  A\n  B\nend\nlet t = 0\nfor i in [1,2,3]\n  t = t + i\nend\nprint(t)\n",
-        Expect::Out("6.0"),
-    ),
-    (
-        "msg+struct+enum",
-        "struct P\n  x: number\nend\nmsg M\n  Inc\nend\nenum E\n  A\nend\nprint(1)\nprint(2)\n",
-        Expect::Out("1.0\n2.0"),
-    ),
-    (
-        "msg-then-span",
-        "msg M\n  Inc\nend\nspan \"s\" do\n  print(1)\nend\nprint(2)\n",
-        Expect::Out("1.0\n2.0"),
+        Expect::Out("6"),
     ),
 ];
 
@@ -241,13 +149,6 @@ fn block_and_declaration_forms_produce_expected_output_on_every_opt_level() {
 const KNOWN_FAILURES: &[(&str, i32)] = &[
     // 类型错误（编译期）
     ("lisp.mora", 2),
-    // 运行期错误
-    ("plan_update_partial.mora", 1),
-    ("sandbox_bad_capability.mora", 1),
-    ("sandbox_container_mount_bad_mode.mora", 1),
-    ("sandbox_container_mount_win.mora", 1),
-    ("schedule_surface.mora", 1),
-    ("toolplane_missing_plane.mora", 1),
 ];
 
 #[test]

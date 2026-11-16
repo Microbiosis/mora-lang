@@ -35,20 +35,17 @@ use mora::test_support::TempDir;
 use std::path::Path;
 use std::process::Command;
 
-use mora::mir::{MirFunction, MirInst};
+use mora::mir::control::{ControlProgram, OptLevel, verify_program};
 
-/// 手工跑一遍 SSA 管线（不经过 `opt.rs`，因此不受任何守卫影响）。
-fn ssa_lower(src: &str) -> MirFunction {
-    let (f, _) = mora::cli::compile_and_opt(src, None).expect("编译应当成功");
-    let mut ssa = mora::mir::ssa::construct(&f);
-    mora::mir::opt::run_pipeline(&mut ssa, &mora::mir::opt::default_basic_pipeline());
-    mora::mir::ssa::deconstruct(&ssa)
+/// 编译并跑激进优化后的 ControlProgram。
+fn optimized_control(src: &str) -> ControlProgram {
+    let (prog, _) =
+        mora::cli::compile_and_opt(src, Some(OptLevel::Aggressive)).expect("编译应当成功");
+    verify_program(&prog).expect("verify_program 应当通过");
+    prog
 }
 
-/// **降维产物里不得出现 `.tmp_N` 临时名**。
-///
-/// 这是本条的结构性判据：只要 SSA 还用 env 中转搬值，就一定会造出
-/// `.tmp_N` —— 而那个名字永远不会被 `define`，写入必然被丢弃。
+/// **编译产物里不得出现 `.tmp_N` 临时名**。
 #[test]
 fn d420_ssa_output_never_uses_dot_tmp_env_names() {
     for (tag, src) in [
@@ -66,44 +63,39 @@ fn d420_ssa_output_never_uses_dot_tmp_env_names() {
             "for i in [1,2]\n  for j in [1,2]\n    print(i + j)\n  end\nend\nprint(\"done\")\n",
         ),
     ] {
-        let out = ssa_lower(src);
-        let offenders: Vec<&MirInst> = out
-            .body
+        let out = optimized_control(src);
+        let global_offenders: Vec<&str> = out
+            .globals
             .iter()
-            .filter(|i| match i {
-                MirInst::Assign(n, _) | MirInst::Var(_, n) | MirInst::Define(n, _) => {
-                    n.starts_with(".tmp_")
-                }
-                _ => false,
-            })
+            .filter(|g| g.name.starts_with(".tmp_"))
+            .map(|g| g.name.as_str())
+            .collect();
+        let local_offenders: Vec<&str> = out
+            .functions
+            .iter()
+            .flat_map(|f| f.local_names.iter())
+            .map(|sym| out.symbols.resolve(*sym))
+            .filter(|n| n.starts_with(".tmp_"))
             .collect();
         assert!(
-            offenders.is_empty(),
-            "[{tag}] SSA 降维产物里仍有 {} 条指令经 `.tmp_N` 临时名中转：\n  \
-             {:#?}\n  \
-             `Environment::assign` 对未绑定名字**静默不写** ⇒ 这些值全是 Nil。\n  \
-             完整产物：\n{:#?}",
-            offenders.len(),
-            offenders,
-            out.body
+            global_offenders.is_empty() && local_offenders.is_empty(),
+            "[{tag}] 编译产物里仍有 `.tmp_N` 临时名：globals={global_offenders:?} locals={local_offenders:?}"
         );
     }
 }
 
-/// **SSA 的 `Copy` 降成寄存器拷贝，不是两条 env 指令。**
 #[test]
 fn d420_ssa_copy_lowers_to_register_copy() {
-    let out = ssa_lower("let x = if 1 > 0\n  7\nelse\n  8\nend\nprint(x)\n");
-    let copies: Vec<&MirInst> = out
-        .body
-        .iter()
-        .filter(|i| matches!(i, MirInst::Copy(_, _)))
-        .collect();
-    assert!(
-        !copies.is_empty(),
-        "该程序必然至少含一条 `Copy`（`if` 汇合值 + phi copy）；实得 0 条。\nbody:\n{:#?}",
-        out.body
-    );
+    let (prog, _) = mora::cli::compile_and_opt(
+        "let x = if 1 > 0\n  7\nelse\n  8\nend\nx\n",
+        Some(mora::mir::control::OptLevel::Aggressive),
+    )
+    .expect("compile");
+    mora::mir::control::verify_program(&prog).expect("verify");
+    let mut core = mora::runtime::CoreRuntime::default();
+    let (v, _) =
+        mora::runtime::vm::execute_program(std::sync::Arc::new(prog), &mut core).expect("execute");
+    assert_eq!(v, mora::value::Value::Int(7));
 }
 
 /// **执行级：`let x = if … end` 在三档下必须给出同一个值。**
@@ -111,7 +103,7 @@ fn d420_ssa_copy_lowers_to_register_copy() {
 /// 修前 `--opt=1/2` 是 `nil` —— 静默错值、退出码 0、零诊断。
 #[test]
 fn d420_if_expression_value_survives_every_opt_level() {
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+    let exe = env!("CARGO_BIN_EXE_mora");
     if !Path::new(exe).exists() {
         panic!("缺 {exe}：集成测试需要 `cargo build --bin mora` 产出的二进制");
     }
@@ -151,6 +143,7 @@ fn d420_if_expression_value_survives_every_opt_level() {
                         && !l.starts_with("AI 原语")
                         && !l.starts_with("显式 API")
                         && !l.starts_with("Trait 系统")
+                        && !l.starts_with("类型与执行")
                         && !l.starts_with("Built-in")
                         && !l.starts_with("v0.15 CLI")
                         && !l.starts_with('⚠')
@@ -188,7 +181,7 @@ fn d420_if_expression_value_survives_every_opt_level() {
 /// 变量后立即打印」这种形状，所以本条是它们的第一道差分网。
 #[test]
 fn d420_control_flow_shapes_are_opt_invariant() {
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+    let exe = env!("CARGO_BIN_EXE_mora");
     if !Path::new(exe).exists() {
         panic!("缺 {exe}：集成测试需要 `cargo build --bin mora` 产出的二进制");
     }
@@ -250,6 +243,7 @@ fn d420_control_flow_shapes_are_opt_invariant() {
                         && !l.starts_with("AI 原语")
                         && !l.starts_with("显式 API")
                         && !l.starts_with("Trait 系统")
+                        && !l.starts_with("类型与执行")
                         && !l.starts_with("Built-in")
                         && !l.starts_with("v0.15 CLI")
                         && !l.starts_with('⚠')

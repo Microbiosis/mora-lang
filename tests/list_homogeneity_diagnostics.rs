@@ -20,7 +20,7 @@
 //! `expected List(Float), got List(String)`，更让人摸不着头脑）。
 
 use mora::parser_v3::ParserV3;
-use mora::typeck::check_mir::check_program_witnesses_bidirectional;
+use mora::typeck::check_mir::check_program_witnesses;
 
 /// 一条诊断的「消息 + 位置」。
 ///
@@ -29,7 +29,7 @@ use mora::typeck::check_mir::check_program_witnesses_bidirectional;
 /// 取字段，**不**拼字符串 —— 拼了就把判据绑死在渲染格式上。
 fn typeck_errors(src: &str) -> Vec<(String, usize, usize)> {
     let (_f, wits) = ParserV3::compile(src).expect("语法应通过");
-    check_program_witnesses_bidirectional(&wits)
+    check_program_witnesses(&wits)
         .iter()
         .map(|e| (e.message.clone(), e.line, e.column))
         .collect()
@@ -58,7 +58,7 @@ fn d125_list_heterogeneity_error_explains_the_constraint_and_gives_the_index() {
         "诊断应同时给出 1-based 序数（只给下标时「第 0 个」读着别扭）: {msg}"
     );
     assert!(
-        msg.contains("Float") && msg.contains("String"),
+        msg.contains("int") && msg.contains("string"),
         "诊断应同时给出两种类型: {msg}"
     );
     assert!(

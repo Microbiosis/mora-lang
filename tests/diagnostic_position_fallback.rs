@@ -30,13 +30,13 @@
 //! 分界就是**「当场检查」还是「入队后统一求解」**。
 
 use mora::cli::compile_and_opt;
-use mora::typeck::check_mir::check_program_witnesses_bidirectional;
+use mora::typeck::check_mir::check_program_witnesses;
 use mora::typeck::format_error;
 
 /// 编译 + typeck，返回渲染后的诊断文本（走真实的 `format_error`）。
 fn diagnostics(src: &str) -> Vec<String> {
     let (_f, wits) = compile_and_opt(src, None).expect("应能编译");
-    check_program_witnesses_bidirectional(&wits)
+    check_program_witnesses(&wits)
         .iter()
         .map(format_error)
         .collect()
@@ -68,9 +68,11 @@ fn d126_constraint_conflicts_never_report_line_zero() {
                 !e.contains("line 0"),
                 "[{name}] 诊断不得出现误导性的「line 0」（源码没有第 0 行）: {e}"
             );
+            // Stage 3A-2 SpannedConstraint 已追踪精确 span（第 2 行第 17 列），
+            // 不再需要退化为「位置未跟踪」。
             assert!(
-                e.contains("位置未跟踪"),
-                "[{name}] 无位置的诊断应明确标注「位置未跟踪」: {e}"
+                e.contains("line 2:") || e.contains("位置未跟踪"),
+                "[{name}] 诊断应带精确行列或明确标注未跟踪: {e}"
             );
         }
     }
@@ -142,7 +144,7 @@ fn d161_closure_arity_is_now_checked_with_position() {
         ),
     ] {
         let (_f, wits) = ParserV3::compile(src).expect("语法应通过");
-        let errs = check_program_witnesses_bidirectional(&wits);
+        let errs = check_program_witnesses(&wits);
         assert_eq!(
             errs.len(),
             1,

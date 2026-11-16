@@ -28,22 +28,17 @@
 //! | `len("👨‍👩‍👧")` | `5` | ZWJ 组合 = 5 个 code point |
 //! | `"a日b".split("日")` | `[a, b]` | ✓ |
 
-use mora::mir::vm::execute;
 use mora::parser_v3::ParserV3;
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::execute_program;
 use std::sync::Arc;
 
 fn run(src: &str) -> Result<String, String> {
-    let (func, _w) = ParserV3::compile(src).map_err(|e| format!("COMPILE: {e}"))?;
-    let mut interp = mora::interpreter::Interpreter::new();
-    let mut env = interp.take_env();
-    let arc = Arc::new(func);
-    match execute(
-        &arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    ) {
-        Ok(v) => Ok(format!("{v}")),
+    let (prog, _w) = ParserV3::compile(src).map_err(|e| format!("COMPILE: {e}"))?;
+    let mut core = CoreRuntime::default();
+    let arc = Arc::new(prog);
+    match execute_program(arc, &mut core) {
+        Ok((v, _)) => Ok(format!("{v}")),
         Err(e) => Err(e.to_string()),
     }
 }
@@ -77,8 +72,8 @@ fn d129_index_bounds_are_all_reported_not_silent() {
 /// 对照组：合法索引正常，dict 缺键返回 `nil`（`get` 语义）。
 #[test]
 fn d129_valid_index_and_dict_get_still_work() {
-    assert_eq!(run("let xs = [1, 2]\nxs[0]\n").unwrap(), "1.0");
-    assert_eq!(run("let xs = [[1, 2], [3]]\nxs[0][1]\n").unwrap(), "2.0");
+    assert_eq!(run("let xs = [1, 2]\nxs[0]\n").unwrap(), "1");
+    assert_eq!(run("let xs = [[1, 2], [3]]\nxs[0][1]\n").unwrap(), "2");
     // dict 缺键 → nil，且**不中断**执行
     assert_eq!(run("let d = {a: 1}\nd[\"zzz\"]\n").unwrap(), "nil");
 }
@@ -161,7 +156,7 @@ fn d129_json_parsing_edges_are_all_sound() {
 /// 「若本测试失败，说明解析器已改为大整数感知」—— 正是本文件现在的状态，
 /// 故按该注记翻转断言。
 #[test]
-fn d197_json_large_integer_is_exact_via_bigint() {
+fn d197_json_large_integer_is_exact_without_silent_loss() {
     // i64 以内**精确**（type 是 int 不是 float）
     assert_eq!(run("json.parse(\"5\")\n").unwrap(), "5");
     assert_eq!(
@@ -169,35 +164,20 @@ fn d197_json_large_integer_is_exact_via_bigint() {
         "9223372036854775807"
     );
 
-    // i64::MAX + 1 —— 修前是 `9223372036854775808.0`（碰巧数值相同、类型已错），
-    // 现在是 BigInt（`Display` 带 `n` 后缀，与 bigint 字面量一致）。
-    assert_eq!(
-        run("json.parse(\"9223372036854775808\")\n").unwrap(),
-        "9223372036854775808n",
-        "超出 i64 应得到 BigInt（带 n 后缀），而不是静默降级为 f64"
-    );
+    // 超出 i64 显式报范围错误，绝不静默降级失真（v0.110.0 核心不含 BigInt，大整数转由 std/math/bigint 处理）
+    for big in [
+        "9223372036854775808",
+        "123456789012345678901234567890",
+        "18446744073709551615",
+    ] {
+        let err = run(&format!("json.parse(\"{big}\")\n"))
+            .expect_err("超出 i64 的 JSON 整数应显式报错，不得静默降级为有损 f64");
+        assert!(
+            err.contains("out of i64 range"),
+            "应报 out of i64 range，实得: {err}"
+        );
+    }
 
-    // **真正会失真**的情形（远超 f64 的 17 位有效数字）：
-    // 修前得到 `123456789012345677877719597056.0` —— 与原值差 5 位有效数字，
-    // 且**零提示**。现在必须逐位还原。
-    assert_eq!(
-        run("json.parse(\"123456789012345678901234567890\")\n").unwrap(),
-        "123456789012345678901234567890n",
-        "超长整数必须**逐位**保留 —— 修前静默失真"
-    );
-
-    // u64::MAX 这类「只差 1」的边界最能说明静默损坏的危害。
-    assert_eq!(
-        run("json.parse(\"18446744073709551615\")\n").unwrap(),
-        "18446744073709551615n",
-        "u64::MAX 修前变成 ...616（差 1）"
-    );
-
-    // 对照组：显式的 bigint 字面量行为不变（任意精度精确，`Display` 带 `n`）。
-    assert_eq!(
-        run("123456789012345678901234567890n\n").unwrap(),
-        "123456789012345678901234567890n"
-    );
-    // 对照组：浮点数仍是 Float，**不被**误升为 BigInt。
+    // 对照组：浮点数仍是 Float
     assert_eq!(run("json.parse(\"1.5\")\n").unwrap(), "1.5");
 }

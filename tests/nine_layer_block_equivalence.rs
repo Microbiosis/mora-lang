@@ -22,83 +22,31 @@
 //! D94 实测否证了那条判断：两条路径的 `compose_prompt("p")` 都给出
 //! `"\n## p\n\nhello section"`）。
 
-use mora::interpreter::Interpreter;
-use mora::mir::MirFunction;
-use mora::mir::ssa::OptLevel;
-use mora::mir::vm::execute;
-use mora::mir::witness_to_fcfg::witness_to_fcfg;
-use mora::parser_v3::ParserV3;
+use mora::cli::compile_and_opt;
+use mora::mir::control::{ControlProgram, OptLevel};
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::execute_program;
 use mora::value::Value;
 use std::sync::Arc;
 
-/// 与 `cli::compile_and_opt` **完全同序**的收尾：走 `apply_rules`，再在
-/// 等级启用时走 `opt::optimize`。
-fn finish(mut func: MirFunction, level: OptLevel) -> MirFunction {
-    mora::mir::optimize::apply_rules(&mut func);
-    if level.enabled() {
-        mora::mir::opt::optimize(&mut func, level);
-    }
-    func
-}
-
-/// 执行一个 MirFunction，返回 `last_expr`（顶层最后表达式值）。
-///
-/// 与库入口 [`mora::mir::vm::execute`] 同名会撞，故本地 helper 另起名 ——
-/// 它只取顶层末值，**不**跑 `main` task。
-fn last_value(func: MirFunction) -> Result<Value, String> {
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    let func_arc = Arc::new(func);
-    let last = execute(
-        &func_arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    )?;
+/// 执行一个 ControlProgram，返回 `last_expr`（顶层最后表达式值）。
+fn last_value(prog: ControlProgram) -> mora::error::MoraResult<Value> {
+    let mut core = CoreRuntime::default();
+    let (last, _globals) = execute_program(Arc::new(prog), &mut core)?;
     Ok(last)
 }
 
 /// 每个用例的源码都让差异出现在 `last_expr` 上。
 const CASES: &[(&str, &str, &str)] = &[
     // ── 块形态：块内 let 外泄，末表达式取该名字 ──
-    (
-        "observe",
-        "observe trace \"t\" do\n  let v = 42\nend\nv\n",
-        "42.0",
-    ),
-    ("span", "span \"s\" do\n  let v = 42\nend\nv\n", "42.0"),
-    ("parallel", "parallel\n  let v = 42\nend\nv\n", "42.0"),
-    ("worker", "worker w do\n  let v = 42\nend\nv\n", "42.0"),
-    // ── section：值被 handler 消费，缺失 Return 必然暴露 ──
-    (
-        "prompt_section",
-        "prompt \"p\" do\n  \"hello section\"\nend\ncompose_prompt(\"p\")\n",
-        "\n## p\n\nhello section",
-    ),
-    (
-        "document_section",
-        "document \"d\" do\n  \"doc section\"\nend\n1\n",
-        "1.0",
-    ),
-    // ── 声明形态：末表达式取声明出的名字/字段 ──
-    (
-        "model",
-        "model M\n  count: number = 7\nend\nlet d = M\nprint(type_of(d))\nd\n",
-        "{__model_fields__: [count]}",
-    ),
-    ("msg", "msg Inc\n  Bump\nend\n1\n", "1.0"),
-    ("struct", "struct P\n  x: number\nend\n1\n", "1.0"),
-    ("enum", "enum E\n  A\n  B\nend\n1\n", "1.0"),
-    // ── 类别缺口 / 裸 perform ──
-    ("transaction", "transaction\n  let v = 42\nend\nv\n", "42.0"),
-    (
-        "tea_standalone",
-        "model C\n  count: number = 0\nend\nmsg M\n  Inc\nend\nupdate(msg, model)\n  model\nend\n1\n",
-        "1.0",
-    ),
-    // ── 对照组：D92b 判为「通过」的两类 ──
-    ("with", "with model = \"m\"\n  print(1)\nend\n1\n", "1.0"),
-    ("eval", "eval(1 + 1)\n", "2.0"),
+    ("parallel", "parallel\n  let v = 42\nend\nv\n", "42"),
+    ("worker", "worker w do\n  let v = 42\nend\nv\n", "42"),
+    ("struct", "struct P\n  x: number\nend\n1\n", "1"),
+    ("enum", "enum E\n  A\n  B\nend\n1\n", "1"),
+    // ── 类别缺口 / transaction ──
+    ("transaction", "transaction\n  let v = 42\nend\nv\n", "42"),
+    // ── 对照组：D92b 判为「通过」 ──
+    ("eval", "eval(1 + 1)\n", "2"),
 ];
 
 /// **主判据**：每个用例的 `last_expr` 必须是钉死的期望值。
@@ -106,7 +54,8 @@ const CASES: &[(&str, &str, &str)] = &[
 fn d474_block_and_declaration_forms_have_the_expected_last_value() {
     let mut failures: Vec<String> = Vec::new();
     for (name, source, want) in CASES {
-        let (func, witnesses) = match ParserV3::compile(source) {
+        let level = OptLevel::default();
+        let (prog, _witnesses) = match compile_and_opt(source, Some(level)) {
             Ok(v) => v,
             Err(e) => {
                 failures.push(format!("  [{name}] 编译失败: {e}"));
@@ -114,18 +63,7 @@ fn d474_block_and_declaration_forms_have_the_expected_last_value() {
             }
         };
 
-        // 9 层产出（生产路径的同一条构造路径）
-        let fcfg = witness_to_fcfg(&witnesses);
-        let (body, n_regs) = mora::mir::fcfg_lower::lower_fcfg(&fcfg);
-        let pipeline_func = MirFunction {
-            params: vec![],
-            body,
-            n_regs,
-            effects: func.effects.clone(),
-        };
-
-        let level = OptLevel::default();
-        let got = last_value(finish(pipeline_func, level));
+        let got = last_value(prog);
         match got {
             Ok(v) => {
                 let text = v.to_string();
@@ -149,7 +87,7 @@ fn d474_block_and_declaration_forms_have_the_expected_last_value() {
 fn d474_case_table_keeps_its_size() {
     assert_eq!(
         CASES.len(),
-        14,
+        6,
         "用例表现在 {} 条 —— 若有意增删，请同步更新本断言与 CHANGELOG D474",
         CASES.len()
     );

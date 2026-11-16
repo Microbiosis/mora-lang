@@ -44,7 +44,8 @@ fn hist(bins: Value) -> Result<Value, String> {
         Value::Float(3.0),
         Value::Float(4.0),
     ]));
-    mora::interpreter::builtins::stats::call_stats_method("histogram", &[xs, bins])
+    mora::runtime::builtins::stats::call_stats_method("histogram", &[xs, bins])
+        .map_err(|e| e.to_string())
 }
 
 /// **主断言**：`Value::Int(-1)`（`json.parse("-1")` 的产物）必须被拒绝。

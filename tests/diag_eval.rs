@@ -3,26 +3,19 @@ use mora::value::Value;
 use std::sync::Arc;
 
 fn run_mora(source: &str) -> Result<Value, String> {
-    let mut interp = mora::interpreter::Interpreter::new();
-    let mut env = interp.take_env();
-    let (func, _witnesses) =
+    let mut core = mora::runtime::CoreRuntime::default();
+    let (prog, _witnesses) =
         ParserV3::compile(source).map_err(|e| format!("compile error: {}", e))?;
-    let func_arc = Arc::new(func);
-    mora::mir::vm::execute(
-        &func_arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    )
-    .map_err(|e| format!("execute error: {}", e))?;
-    mora::mir::vm::run_main_task(
-        &func_arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    )
-    .map_err(|e| format!("run_main_task error: {}", e))?;
-    env.get("__result")
+    let prog_arc = Arc::new(prog);
+    let (_, globals) = mora::runtime::vm::execute_program(Arc::clone(&prog_arc), &mut core)
+        .map_err(|e| format!("execute error: {}", e))?;
+    mora::runtime::vm::run_main_task(Arc::clone(&prog_arc), globals.clone(), &mut core)
+        .map_err(|e| format!("run_main_task error: {}", e))?;
+    prog_arc
+        .globals
+        .iter()
+        .position(|g| g.name == "__result")
+        .map(|i| globals[i].lock().0.clone())
         .ok_or_else(|| "result variable '__result' not found".to_string())
 }
 
@@ -46,7 +39,7 @@ fn diag_eval_fn_and_call() {
 let __result = f(21)"#;
     let result = run_mora(src).expect("eval+call should succeed");
     println!("diag2: eval('fn(x) x + 1')(21) = {:?}", result);
-    assert_eq!(result.to_string(), "22.0");
+    assert_eq!(result.to_string(), "22");
 }
 
 #[test]
@@ -56,5 +49,5 @@ fn diag_eval_fn_inner_call() {
 let __result = f(fn(x) x * 2)"#;
     let result = run_mora(src).expect("eval inner call should succeed");
     println!("diag3: eval('fn(f) f(21)')(fn(x) x * 2) = {:?}", result);
-    assert_eq!(result.to_string(), "42.0");
+    assert_eq!(result.to_string(), "42");
 }

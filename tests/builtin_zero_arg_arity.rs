@@ -59,7 +59,7 @@ impl WorkDir {
     fn run(&self, src: &str) -> (i32, String) {
         let f = self.0.join("t.mora");
         std::fs::write(&f, src).expect("写脚本");
-        let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+        let exe = env!("CARGO_BIN_EXE_mora");
         let out = Command::new(exe)
             .current_dir(&self.0)
             .arg(&f)
@@ -77,24 +77,41 @@ impl Drop for WorkDir {
     }
 }
 
-/// **缺参必须报错，且报错要指名是哪个内建**。
+fn run_runtime(src: &str) -> String {
+    let (prog, _) = mora::parser_v3::ParserV3::compile(src).expect("compile");
+    let mut core = mora::runtime::CoreRuntime::default();
+    match mora::runtime::vm::execute_program(std::sync::Arc::new(prog), &mut core) {
+        Ok((v, _)) => format!("{v}"),
+        Err(e) => format!("{e}"),
+    }
+}
+
+/// **缺参必须报错（静态 typeck + 运行期双层保障）**。
 #[test]
 fn d327_zero_arg_unary_builtins_are_rejected() {
     let wd = WorkDir::new("zero");
     for name in UNARY {
-        let (code, out) = wd.run(&format!("print({name}())\n"));
+        let src = format!("print({name}())\n");
+        let (code, out) = wd.run(&src);
         assert_ne!(
             code, 0,
             "`{name}()` 缺参必须非零退出（修前静默当成 nil 继续算）; out={out}"
         );
+        // Stage 3A-2：静态 typeck 在 CLI 期即拦截 arity 错误
         assert!(
-            out.contains(&format!("{name}() requires 1 argument")),
-            "`{name}()` 的报错必须说清「缺 1 个参数」; out={out}"
+            out.contains("Expected 1 arguments, got 0")
+                || out.contains(&format!("{name}() requires 1 argument")),
+            "`{name}()` 的报错必须说清缺参数; out={out}"
         );
         assert!(
             !out.contains("does not accept nil"),
-            "`{name}()` 的报错不得说「不接受 nil」—— 真实原因是**没给参数**，\
-             那个说法会把排查方向带到「你的 nil 哪来的」上; out={out}"
+            "`{name}()` 的报错不得说「不接受 nil」; out={out}"
+        );
+        // 运行期直接路径亦保持精确消息
+        let rt_err = run_runtime(&src);
+        assert!(
+            rt_err.contains(&format!("{name}() requires 1 argument")),
+            "`{name}()` 运行期同样应报 `{name}() requires 1 argument`; rt_err={rt_err}"
         );
     }
 }
@@ -119,21 +136,26 @@ fn d327_unary_builtins_with_one_arg_still_work() {
     }
 }
 
-/// **显式传 nil 仍报「不接受 nil」** —— 与「缺参」是**两个不同的诊断**，
-/// 不该被合并。
+/// **显式传 nil 保持诊断语义** —— CLI 静态期拒 `nil`、运行期报 `does not accept nil`。
 #[test]
 fn d327_explicit_nil_keeps_its_own_diagnostic() {
     let wd = WorkDir::new("nil");
     for name in ["int", "float"] {
-        let (code, out) = wd.run(&format!("print({name}(nil))\n"));
+        let src = format!("print({name}(nil))\n");
+        let (code, out) = wd.run(&src);
         assert_ne!(code, 0, "`{name}(nil)` 应报错; out={out}");
         assert!(
-            out.contains(&format!("{name}() does not accept nil")),
-            "`{name}(nil)` 是**给了个不能用的值**，不是缺参数; out={out}"
+            out.contains("nil"),
+            "`{name}(nil)` CLI 诊断应点名 `nil`; out={out}"
         );
         assert!(
             !out.contains("requires 1 argument"),
             "`{name}(nil)` 不该被报成缺参数; out={out}"
+        );
+        let rt_err = run_runtime(&src);
+        assert!(
+            rt_err.contains(&format!("{name}() does not accept nil")),
+            "`{name}(nil)` 运行期应报 `does not accept nil`; rt_err={rt_err}"
         );
     }
 }
@@ -180,9 +202,9 @@ fn d327_extra_args_still_rejected_by_typeck_not_by_this_change() {
 fn d327_unary_entrypoints_use_require_1() {
     let src = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/src/interpreter/builtin_impls.rs"
+        "/src/runtime/builtins/impls.rs"
     ))
-    .expect("读 builtin_impls.rs");
+    .expect("读 runtime/builtins/impls.rs");
 
     for name in UNARY {
         let sig = format!("fn call_builtin_{name}(");

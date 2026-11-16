@@ -23,24 +23,18 @@
 use std::sync::Arc;
 
 fn run(src: &str) -> String {
-    let (func, _w) = ParserV3::compile(src).unwrap_or_else(|e| panic!("compile: {e}"));
-    let arc = Arc::new(func);
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    match execute(
-        &arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    ) {
-        Ok(v) => format!("{v}"),
+    let (prog, _w) = ParserV3::compile(src).unwrap_or_else(|e| panic!("compile: {e}"));
+    let arc = Arc::new(prog);
+    let mut core = CoreRuntime::default();
+    match execute_program(arc, &mut core) {
+        Ok((v, _)) => format!("{v}"),
         Err(e) => format!("ERR: {e}"),
     }
 }
 
-use mora::interpreter::Interpreter;
-use mora::mir::vm::execute;
 use mora::parser_v3::ParserV3;
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::execute_program;
 
 /// `(用例名, 源码, 期望)` —— 期望值为迁移完成后实测所得。
 fn cases() -> Vec<(&'static str, &'static str, &'static str)> {
@@ -49,16 +43,16 @@ fn cases() -> Vec<(&'static str, &'static str, &'static str)> {
         (
             "push_keeps_receiver",
             "let a = [1, 2]\nlet b = a.push(3)\n[a, b]\n",
-            "[[1.0, 2.0], [1.0, 2.0, 3.0]]",
+            "[[1, 2], [1, 2, 3]]",
         ),
         (
             "pop_keeps_receiver",
             "let xs = [1, 2, 3]\nlet x = xs.pop()\n[xs, x]\n",
-            "[[1.0, 2.0, 3.0], 3.0]",
+            "[[1, 2, 3], 3]",
         ),
         ("pop_on_empty", "let xs = []\nxs.pop()\n", "nil"),
         // ── 索引读 ──
-        ("index_read", "let xs = [10, 20, 30]\nxs[1]\n", "20.0"),
+        ("index_read", "let xs = [10, 20, 30]\nxs[1]\n", "20"),
         (
             "index_out_of_bounds",
             "let xs = [10, 20]\nxs[5]\n",
@@ -68,12 +62,12 @@ fn cases() -> Vec<(&'static str, &'static str, &'static str)> {
         (
             "eq_same_content",
             "let a = [1, 2, 3]\nlet b = [1, 2, 3]\nif a == b then 1 else 0 end\n",
-            "1.0",
+            "1",
         ),
         (
             "eq_diff_content",
             "let a = [1, 2, 3]\nlet b = [1, 2, 4]\nif a == b then 1 else 0 end\n",
-            "0.0",
+            "0",
         ),
         // ── 长度 / 链式 push ────────────────────────────────────────
         (
@@ -84,63 +78,63 @@ fn cases() -> Vec<(&'static str, &'static str, &'static str)> {
         (
             "push_chain",
             "let xs = [].push(1).push(2).push(3)\n[xs, len(xs)]\n",
-            "[[1.0, 2.0, 3.0], 3]",
+            "[[1, 2, 3], 3]",
         ),
         // ── 其余 list 方法（迁移时改过实现）──────────────────────────
         (
             "map",
             "let xs = [1, 2, 3]\nxs.map(fn(x) x * 2 end)\n",
-            "[2.0, 4.0, 6.0]",
+            "[2, 4, 6]",
         ),
         (
             "filter",
             "let xs = [1, 2, 3, 4]\nxs.filter(fn(x) x % 2 == 0 end)\n",
-            "[2.0, 4.0]",
+            "[2, 4]",
         ),
         (
             "window",
             "let xs = [1, 2, 3, 4, 5]\nxs.window(2)\n",
-            "[[1.0, 2.0], [2.0, 3.0], [3.0, 4.0], [4.0, 5.0]]",
+            "[[1, 2], [2, 3], [3, 4], [4, 5]]",
         ),
         (
             "batch",
             "let xs = [1, 2, 3, 4, 5]\nxs.batch(2)\n",
-            "[[1.0, 2.0], [3.0, 4.0], [5.0]]",
+            "[[1, 2], [3, 4], [5]]",
         ),
-        ("sort", "let xs = [3, 1, 2]\nxs.sort()\n", "[1.0, 2.0, 3.0]"),
+        ("sort", "let xs = [3, 1, 2]\nxs.sort()\n", "[1, 2, 3]"),
         (
             "shape",
             "let xs = [[1, 2, 3], [4, 5, 6]]\nxs.shape()\n",
-            "[2.0, 3.0]",
+            "[2, 3]",
         ),
         (
             "flatten",
             "let xs = [[1, 2], [3, 4]]\nxs.flatten()\n",
-            "[1.0, 2.0, 3.0, 4.0]",
+            "[1, 2, 3, 4]",
         ),
         (
             "reshape",
             "let xs = [1, 2, 3, 4]\nxs.reshape(2, 2)\n",
-            "[[1.0, 2.0], [3.0, 4.0]]",
+            "[[1, 2], [3, 4]]",
         ),
         (
             "transpose",
             "let xs = [[1, 2, 3], [4, 5, 6]]\nxs.transpose()\n",
-            "[[1.0, 4.0], [2.0, 5.0], [3.0, 6.0]]",
+            "[[1, 4], [2, 5], [3, 6]]",
         ),
-        ("get", "let xs = [1, 2, 3]\nxs.get(1)\n", "2.0"),
-        ("take", "let xs = [1, 2, 3, 4]\nxs.take(2)\n", "[1.0, 2.0]"),
-        ("drop", "let xs = [1, 2, 3, 4]\nxs.drop(2)\n", "[3.0, 4.0]"),
+        ("get", "let xs = [1, 2, 3]\nxs.get(1)\n", "2"),
+        ("take", "let xs = [1, 2, 3, 4]\nxs.take(2)\n", "[1, 2]"),
+        ("drop", "let xs = [1, 2, 3, 4]\nxs.drop(2)\n", "[3, 4]"),
         (
             "reduce",
             "let xs = [1, 2, 3]\nxs.reduce(fn(a, b) a + b end, 0)\n",
-            "6.0",
+            "6",
         ),
         // ── 与 dict 互嵌 ─────────────────────────────────────────────
         (
             "list_of_dict",
             "let xs = [{a: 1}, {a: 2}]\nxs[1].get(\"a\")\n",
-            "2.0",
+            "2",
         ),
         (
             "dict_with_list_value",
@@ -151,18 +145,18 @@ fn cases() -> Vec<(&'static str, &'static str, &'static str)> {
         (
             "dict_set_is_pure",
             "let d = {a: 1}\nlet e = d.set(\"a\", 7)\n[d.get(\"a\"), e.get(\"a\")]\n",
-            "[1.0, 7.0]",
+            "[1, 7]",
         ),
         // ── 循环累积（本次迁移的靶心）───────────────────────────────
         (
             "accumulate_in_while",
             "let xs = []\nlet i = 0\nwhile i < 4\n  let xs = xs.push(i * 10)\n  let i = i + 1\nend\nxs\n",
-            "[0.0, 10.0, 20.0, 30.0]",
+            "[0, 10, 20, 30]",
         ),
         (
             "accumulate_preserves_prefix",
             "let a = [1, 2, 3]\nlet b = [].push(1).push(2).push(3)\nif a == b then 1 else 0 end\n",
-            "1.0",
+            "1",
         ),
     ]
 }

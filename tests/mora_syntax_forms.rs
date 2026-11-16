@@ -136,29 +136,7 @@ const FORMS: &[(&str, &str, Form, &str)] = &[
         Form::Ok,
         "连续调用的可用等价写法",
     ),
-    // ── TEA / 效果 / 声明（§11）—— D140 实测 ──────────────────────
-    // ⚠ 三条标 `Rejected` 的是 **spec EBNF 承诺、实现却不接受**的形态
-    //    （与「实现不支持且 spec 未承诺」性质不同，后者才该补实现）。
-    (
-        "TEA app（仅 body）",
-        "app Counter\n  print(1)\nend\n",
-        Form::Rejected,
-        "spec §11 `app_stmt = \"app\" IDENTIFIER { statement } \"end\"` 允许，\
-         实现却要求 `model:`/`msg:`/`init:`/`update:`/`view:` 五个字段（D140）",
-    ),
-    (
-        "TEA app（五字段）",
-        "app Counter\n  model: Counter\n  msg: CounterMsg\n  init: 0\n  \
-         update: fn(msg, model) => model\n  view: fn(model) => model\nend\n",
-        Form::Ok,
-        "真实形态（见 `tests/fixtures/e2e/tea_app.mora`）",
-    ),
-    (
-        "顶层 update(m)",
-        "update(m)\n  m.x = 1\nend\n",
-        Form::Rejected,
-        "spec §11 `update_stmt` 承诺顶层形态，实现只把它当 `app` 的**字段**（D140）",
-    ),
+    // ── 效果 / 声明（§11）—— D140 实测 ──────────────────────
     (
         "handle（on … -> 形态）",
         "handle ask\n  on prompt -> return 1\nend\n",
@@ -172,13 +150,6 @@ const FORMS: &[(&str, &str, Form, &str)] = &[
         "D140",
     ),
     (
-        "model 声明",
-        "model Point\n  x: number\n  y: number\nend\n",
-        Form::Ok,
-        "§11",
-    ),
-    ("msg 声明", "msg Move\n  x\n  y\nend\n", Form::Ok, "§11"),
-    (
         "macro 定义与调用",
         "macro m(x)\n  return x + 1\nend\nprint(m(1))\n",
         Form::Ok,
@@ -191,12 +162,6 @@ const FORMS: &[(&str, &str, Form, &str)] = &[
         "§11 `transaction_stmt` 的补偿子句",
     ),
     ("worker 块", "worker w\n  print(1)\nend\n", Form::Ok, "§11"),
-    (
-        "with 块",
-        "with model = \"m\"\n  print(1)\nend\n",
-        Form::Ok,
-        "§11",
-    ),
     (
         "assign 语句",
         "let a = 1\nassign a = 5\nprint(a)\n",
@@ -301,7 +266,7 @@ fn d139_table_is_not_vacuous() {
     let rejected = FORMS.iter().filter(|f| f.2 == Form::Rejected).count();
     let ok = FORMS.iter().filter(|f| f.2 == Form::Ok).count();
     assert!(
-        rejected >= 9 && ok >= 20,
+        rejected >= 7 && ok >= 16,
         "速查表应有足量的两类样本（实测 rejected={rejected}, ok={ok}）"
     );
 }
@@ -313,14 +278,14 @@ fn d139_table_is_not_vacuous() {
 /// 否则日后有人只跑 `compile` 就以为异质字面量可用。
 #[test]
 fn d139_heterogeneous_literals_are_rejected_by_typeck() {
-    use mora::typeck::check_mir::check_program_witnesses_bidirectional;
+    use mora::typeck::check_mir::check_program_witnesses;
 
     for (name, src, needle) in [
         ("list", "let xs = [1, \"x\"]\nprint(xs)\n", "同质"),
         ("dict", "let d = {a: 1, b: \"x\"}\nprint(d)\n", "同质"),
     ] {
         let (_f, wits) = ParserV3::compile(src).expect("解析层应通过");
-        let errs = check_program_witnesses_bidirectional(&wits);
+        let errs = check_program_witnesses(&wits);
         assert!(
             !errs.is_empty(),
             "[{name}] 异质字面量必须被 typeck 拒绝（D124/D125）"

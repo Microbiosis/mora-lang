@@ -6,11 +6,11 @@
 
 use mora::parser_v3::ParserV3;
 use mora::typeck::TypeError;
-use mora::typeck::check_mir::check_program_witnesses_bidirectional;
+use mora::typeck::check_mir::check_program_witnesses;
 
 fn typecheck(src: &str) -> Vec<TypeError> {
     let (_func, witnesses) = ParserV3::compile(src).expect("compile should succeed");
-    check_program_witnesses_bidirectional(&witnesses)
+    check_program_witnesses(&witnesses)
 }
 
 fn first_err(errs: &[TypeError]) -> &TypeError {
@@ -126,8 +126,8 @@ fn list_get_exposes_element_type_error() {
     );
     assert!(
         errs.iter()
-            .any(|e| e.message.contains("String") && e.message.contains("Float")),
-        "冲突应指向 String 元素与 Float 运算数: {errs:?}"
+            .any(|e| e.message.contains("string") && e.message.contains("int")),
+        "冲突应指向 string 元素与 int 运算数: {errs:?}"
     );
 }
 
@@ -181,7 +181,7 @@ fn list_map_keeps_int_elements_clean() {
 ///
 /// 原因：本文件原先用 `check_program_witnesses`（**弱**检查器），而**生产
 /// 路径**（`main.rs:447,500` 的 `run_file` / REPL）用的是
-/// `check_program_witnesses_bidirectional`（**强**检查器）。弱检查器放行了
+/// `check_program_witnesses`（**强**检查器）。弱检查器放行了
 /// 强检查器会拒的程序，于是测试「通过」了 —— 但真实 CLI 早就 exit 2：
 ///
 /// ```text
@@ -195,21 +195,22 @@ fn list_map_keeps_int_elements_clean() {
 ///
 /// 现改为断言**真实行为**：第二个不同类型的实参被拒。同文件
 /// `let_identity_polymorphic` 此前也有同样问题，一并更正。
+/// Stage 3A-2：纯 syntactic value（`fn(x) x end`）启用真 let-polymorphism；
+/// 非 value（调用返回值 `make_id()`）遵守 ML Value Restriction，保持单态化。
 #[test]
 fn let_binding_is_monomorphised_not_polymorphic() {
-    // 单态化本身应当正常（首个实参决定 id 的类型）
+    // 1. 纯值 `let id = fn(x) x end` 支持 let 多态
     assert!(
-        typecheck("let id = fn(x) x end\nlet a = id([1, 2])").is_empty(),
-        "首个实参的单态化应当通过"
+        typecheck("let id = fn(x) x end\nlet a = id([1, 2])\nlet b = id(\"hi\")").is_empty(),
+        "Stage 3A-2 下纯语法值 let 绑定应支持真 let-polymorphism"
     );
-    // 换个实参类型就必须被拒 —— 这才是本语言的实际行为
-    let errs = typecheck("let id = fn(x) x end\nlet a = id([1, 2])\nlet b = id(\"hi\")");
+    // 2. 非值表达式遵守 ML Value Restriction：首个调用单态化，后续异型调用被拒
+    let errs = typecheck(
+        "task make_id()\n  return fn(x) x end\nend\nlet id = make_id()\nlet a = id([1, 2])\nlet b = id(\"hi\")",
+    );
     assert!(
         !errs.is_empty(),
-        "本语言**没有** let-polymorphism：`id` 被首个实参单态化成 list<float>，\
-         再用 string 调它必须报类型错。修前本测试断言「两次调用都通过」——\
-         那是弱检查器（check_program_witnesses）造成的假阳性，生产路径用的是\
-         check_program_witnesses_bidirectional，真实 CLI 实测 exit 2。"
+        "非 value 表达式 let 绑定受 Value Restriction 约束不得泛化，异型第二次调用必须报错"
     );
 }
 
@@ -316,7 +317,7 @@ fn imported_effect_signature_enforces_arg_type() {
     );
 }
 
-/// v0.104.6 D56：改用**生产同款**检查器（`check_program_witnesses_bidirectional`）
+/// v0.104.6 D56：改用**生产同款**检查器（`check_program_witnesses`）
 /// 后，本测试的「恰好 1 条错误」不再成立 —— 强的检查器给出 **2 条**，且两条
 /// 是**同一个**不匹配被报了两次：
 ///
@@ -325,7 +326,7 @@ fn imported_effect_signature_enforces_arg_type() {
 /// Type mismatch: expected Int, got String at line 3, column 3
 /// ```
 ///
-/// 列号不同（19 vs 3）导致 `check_program_witnesses_bidirectional` 里
+/// 列号不同（19 vs 3）导致 `check_program_witnesses` 里
 /// 按 line+column 去重的过滤漏掉其中一条 —— 这是**诊断质量**问题
 /// （同一处冲突报两遍、且位置不一致），不是两个独立缺陷，故本测试不断言
 /// 条数。
@@ -346,8 +347,8 @@ fn imported_effect_signature_result_typed() {
     );
     assert!(
         errs.iter()
-            .any(|e| e.message.contains("Int") && e.message.contains("String")),
-        "冲突应指向标注类型（Int）与签名结果（String）: {:?}",
+            .any(|e| e.message.contains("int") && e.message.contains("string")),
+        "冲突应指向标注类型（int）与签名结果（string）: {:?}",
         errs
     );
 }

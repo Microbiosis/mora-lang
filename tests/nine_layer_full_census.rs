@@ -69,9 +69,9 @@ const SYNTHETIC: &[(&str, &str, Expect)] = &[
     (
         "pipe",
         "let x = 1 |> print\n",
-        // `|>` 把值**灌进**被调函数的首参；`print` 的签名是 `print(v)`，
-        // 灌进去后参数个数不匹配 ⇒ 运行期错误。
-        Expect::RuntimeErr,
+        // `|>` 把左值传给右值函数调用；v0.110 W2.3 使 `Value::Builtin` 成为
+        // 一等可调用值（`resolve_value_call`），`1 |> print` 等价 `print(1)`。
+        Expect::Ok,
     ),
     (
         "perform_bare",
@@ -91,38 +91,6 @@ const SYNTHETIC: &[(&str, &str, Expect)] = &[
         Expect::Ok,
     ),
     ("parallel", "parallel\n  print(1)\nend\n", Expect::Ok),
-    (
-        "observe",
-        "observe trace \"t\" do\n  print(1)\nend\n",
-        Expect::Ok,
-    ),
-    ("span", "span \"s\" do\n  print(1)\nend\n", Expect::Ok),
-    (
-        "prompt_section",
-        "prompt \"p\" do\n  print(1)\nend\n",
-        Expect::Ok,
-    ),
-    (
-        "document_section",
-        "document \"d\" do\n  print(1)\nend\n",
-        Expect::Ok,
-    ),
-    ("with", "with model = \"m\"\n  print(1)\nend\n", Expect::Ok),
-    (
-        "model",
-        "model Counter\n  count: number = 0\nend\nprint(1)\n",
-        Expect::Ok,
-    ),
-    (
-        "model_default",
-        "model Counter\n  count: number = 7\nend\nprint(1)\n",
-        Expect::Ok,
-    ),
-    (
-        "msg",
-        "msg CounterMsg\n  Increment\n  Decrement\nend\nprint(1)\n",
-        Expect::Ok,
-    ),
     (
         "struct",
         "struct P\n  x: number\nend\nprint(1)\n",
@@ -145,8 +113,11 @@ const SYNTHETIC: &[(&str, &str, Expect)] = &[
         Expect::Ok,
     ),
     ("type_alias", "type MyNum = number\nprint(1)\n", Expect::Ok),
-    ("template", "let n = 1\nprint(p\"v={n}\")\n", Expect::Ok),
-    ("bigint", "let n = 123n\nprint(n)\n", Expect::Ok),
+    (
+        "quasiquote_unquote",
+        "let n = 1\nlet q = `v=,n\nprint(q)\n",
+        Expect::Ok,
+    ),
     ("closure", "let f = fn(x) x + 1\nprint(f(1))\n", Expect::Ok),
     (
         "task",
@@ -164,32 +135,12 @@ const SYNTHETIC: &[(&str, &str, Expect)] = &[
         Expect::Ok,
     ),
     ("for", "for x in [1, 2, 3]\n  print(x)\nend\n", Expect::Ok),
-    (
-        "update",
-        "update(msg, model)\n  model\nend\nprint(1)\n",
-        Expect::Ok,
-    ),
-    (
-        "tea_standalone",
-        "model C\n  count: number = 0\nend\nmsg M\n  Inc\nend\nupdate(msg, model)\n  model\nend\nprint(1)\n",
-        Expect::Ok,
-    ),
     ("quasiquote", "let q = `(10+20)\nprint(q)\n", Expect::Ok),
     ("export", "export task t()\n  print(1)\nend\n", Expect::Ok),
     ("dyn_coerce", "let d = 1 as dyn T\nprint(d)\n", Expect::Ok),
     (
         "or_and",
         "let x = true or false\nlet y = true and false\nprint(x)\nprint(y)\n",
-        Expect::Ok,
-    ),
-    (
-        "rel",
-        "rel edge(\"a\", \"b\")\nsolve { edge(\"x\", \"y\") }\n",
-        Expect::Ok,
-    ),
-    (
-        "orchestrate",
-        "orchestrate graph input -> result\n  agent a => \"A\"\n  agent b => \"B\"\n  @start -> a\n  a -> b\nend\n",
         Expect::Ok,
     ),
     // ── 嵌套组合（最易触发降级链的错位）──
@@ -343,7 +294,7 @@ fn d474_full_census_every_program_compiles_and_runs() {
 fn d474_synthetic_table_keeps_its_size() {
     assert_eq!(
         SYNTHETIC.len(),
-        50,
+        37,
         "合成构造表现在 {} 条 —— 若有意增删，请同步更新本断言与 CHANGELOG D474",
         SYNTHETIC.len()
     );

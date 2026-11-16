@@ -2,7 +2,59 @@
 
 All notable changes to Mora will be documented in this file.
 
-## [Unreleased] — `Int` 语义统一为精确 i64（数值塔模块化）+ SSA 门最终删除 + 执行器重构 + 文档订正
+## [0.110.0] — Wave 1 架构解耦与编译器瘦身
+
+重新校准 Mora 核心定位：**AI-native 静态类型语言，面向大模型底层、计算图与算子、大模型推理/训练与资源动态调控，同时具备云原生属性并对 HTTP 与 MCP 服务提供语言原语级友好支持**。
+
+### Breaking 变更（Wave 1 移除硬编码耦合特性）
+
+- **移除硬编码上层应用原语与语法**：
+  - 移除 `with ... end` 运行时配置块（保留 `with` 仅作为 `match ... with ... end` 分支关键字）
+  - 移除 `observe` / `span` / `prompt` / `document` 语句与内建
+  - 移除 `TEA` (`model` / `msg` / `update` / `app` 及 `tea.*` 模块) 与 `transducer` 内建模块
+  - 移除 `rel` / `solve` 与 `orchestrate` 语句
+  - 移除 `ai` / `agent` / `web` / `xform` 内建模块与 `Router` / `McpServer` 硬编码运行时构造
+  - 移除 CLI `record` / `replay` / `diff` / `snapshot` / `audit` 录制回放子命令
+- **核心数值塔收敛与外部化**：
+  - 核心运行时数值类型聚焦精确 `Int` (`i64`) 与 `Float` (`f64`)
+  - 任意精度整数 `BigInt`（及 `999n` 核心字面量耦合）移出核心语言运行时，独立拆分至 workspace crate `mora-std-bigint`（对应标准库规划 `std/math/bigint`）
+- **保留的核心与内建模块集合**：
+  - 保留核心 FP 与元编程原语：`CoreClosure`、`CoreMacro`、`match ... with ... end`、`p"..."` 模板字符串、`tail` 尾递归、`merge_with` / `parallel` / `worker` / `transaction`、`Cons`/`car`/`cdr`、`atom`/`deref`/`swap`、`quote`/`read`/`eval`/`macroexpand`/`apply`/`into`/`curry`/`compose`/`partial`/`uncurry`
+  - 保留 Hindley-Milner 类型推导与代数效果（`effect` / `perform` / `handle`）
+  - `value::MODULE_OBJECTS` 收敛为 7 个核心内建模块：`json`、`file`、`exec`、`math`、`stats`、`linalg`、`random`
+- **文档与测试套件同步**：
+  - 更新 `docs/mora-spec.md` 至 `v0.110.0` 架构边界
+  - 同步收敛全工作区单元测试、EBNF/builtin/method/code-block `spec_*` 测试与 9 层管线一致性校验
+
+### Wave 2 核心运行时增强（W2.3 & W2.4）
+
+- **W2.3 迭代化编译执行、`O(1)` 尾调用优化与多段定界续延（`tests/w2_3_continuations_and_tco.rs`）**：
+  - Pratt 与一元表达式编译迭代化（`emit_pratt_w` / `emit_unary_w`）以及深层控制流/witness/HM 迭代化处理，消除默认 OS 线程栈上的深递归爆栈
+  - VM 尾调用帧复用（`O(1)` 栈空间支持 100,000+ 次尾递归调用）
+  - 一等定界续延捕获与多发回溯重放（`handle` / `perform` / 显式多发 `resume` 及静态 HM 类型检查、闭包捕获、`list.map` 等高阶调用穿透）
+- **W2.4 领域类型化错误体系、`tokio` 多线程调度器与异步 I/O Reactor（`tests/w2_4_scheduler_and_reactor.rs`）**：
+  - 扩展领域枚举 `MoraError`（`Parse`、`Typeck`、`Runtime`、`Task`、`Channel`、`Cancelled`、`Timeout`、`Io`、`Serialization`、`Other`）与 `MoraResult<T>`（含 `kind_name`、`message`、`with_prefix`、`is_cancellation_or_timeout` 及 `std::io::Error` / `tokio::task::JoinError` 转换），全量直迁 `src/runtime/`、`src/interpreter/` 与 `src/cli/mod.rs`
+  - 新增基于 `tokio` 多线程运行时的 `TaskScheduler`（`src/runtime/scheduler.rs`）：结构化并发 `TaskGroup`（析构自动 abort 清理、panic 传播为 `MoraError::Task`）、`TaskHandle`、分层取消与截止期传播 `TaskContext`（`child` / `with_timeout` / `cancel` / `status` / `cancelled`）、有界与无界通道（`ChannelSender` / `ChannelReceiver` 背压、关闭、上下文取消）、公平轮询 `select_channels` 与 `select2`、`spawn_mora_task` 及 `run_indexed_batch`
+  - 新增 `AsyncIoReactor`、`AsyncTcpListener` 与 `AsyncTcpStream`（`src/runtime/reactor.rs`）：支持可取消 `sleep`、`timeout`、并发连接服务 `serve_connections` 与 `request_response`
+  - `CoreRuntime` 与 `VmEngine` 深度集成：VM 循环协作式取消检查（取消/超时传播与 `transaction` 回滚保真），`parallel` worker 批执行迁移至 `TaskScheduler::run_indexed_batch`
+- **Wave 2 架构遗留收口（`tests/w2_closure_concurrency_and_lsp.rs`）**：
+  - 废除 HAMT `src/value/persistent.rs` 及 `Environment` 上的 `VectorClock`/`Conflict` 耦合，`Environment` 重构为扁平 `HashMap<String, Value>` + `Arc<Environment>` 父链，并从 `CoreRuntime` 拆出进程级共享服务 `EngineShared { scheduler, reactor }`（`src/runtime/core.rs`）
+  - 彻底解散 `src/interpreter/` 目录与 `Interpreter` 门面：域函数与纯方法分派收敛至 `src/runtime/builtins/`，交互式 REPL 独立至 `src/cli/repl.rs`，同步迁移全仓 11 个集成测试文件
+  - 端到端实现 Go 式并发原语：`Value::{Channel, TaskHandle, Context}`、`MoraChannel`（无缓冲 rendezvous 与有界 FIFO，`select_arms` 全局 ID 保序加锁公平多路选择）、`channel` / `context` / `sleep` 内建、上下文式 `spawn` / `select` (`case` / `timeout` / `default`) 语法及 `ControlInst::{Spawn, Select}`、`Type::{Channel, TaskHandle, Context}`（`Channel<T>` 严格不变、`TaskHandle<T>` 协变）与 HM 类型检查
+  - 将 `src/lsp/providers/{hover,completion}.rs` 接入统一 HM 引擎 `typeck::check_mir::infer_program_types`，补齐 `RUNTIME_BUILTIN_NAMES`、`MODULE_OBJECTS` 与完整关键字清单，同步更新 `tests/lsp_hover_annotations.rs` 并保持显式类型标注与未解决回落 `<inferred>` 的诚实语义
+
+### Wave 3 Stage 3A 数值字面量精度、运算符完备性与统一 HM 约束求解器
+
+- **Track 3A-1（词法精度、运算符与 `Int` 返回语义统一）**：
+  - 无后缀整数字面量（如 `1`、`42`）严格解析为精确 `Value::Int`；带小数点、科学计数法或浮点后缀（`1.0`、`1e5`、`1f32`）解析为 `Value::Float`
+  - 支持数字下划线分隔（`1_000_000`、`1_000.5`）与严格位宽后缀白名单校验（`f`/`f16`/`f32`/`f64`/`bf16`/`fp8` 与 `i`/`i4`..`i64`/`u`/`u8`..`u64`），显式拒绝非法后缀（如 `1i7`、`1.5f7`）与超界溢出字面量
+  - 完善右结合幂运算 `**`、矩阵乘 `@`（1D 点积 / 2D 矩阵乘 / 矩阵向量乘）、以及一元逻辑非 `!` / `not`
+  - `range(...)`、`random.rand_int(...)` 与 `list.shape()` 统一返回精确 `Int` / `List<Int>`，与静态类型签名严格对齐
+- **Track 3A-2（统一 `Span` 追踪 HM 约束求解器与类型代数完善）**：
+  - 收敛为唯一类型检查入口 `check_program_witnesses`，引入 `TypeVarId::{Meta, Rigid}`、`Type::Error` 毒化哨兵、fail-closed `Type::Unknown`、`Type::BuiltinModule`、协变 `Result_` 与效果行包含（`EffectRow` subsumption）
+  - 支持多字符泛型参数（如 `<TT, Tx>`）与刚性参数约束检查、限定 `let` 多态与 ML Value Restriction、预注册全部 `FnDef` / `MacroDef` 支持互递归、强制 `return_targets` 检查并封堵未定义自由函数/内建模块/大写关联调用逃逸；同步打通用户 `type` / `enum` / `struct` 类型标注解析与别名递归展开，清理残余 `123n`/`bidirectional` 陈旧文档与 `.mimosa` 缓存目录（新增 `tests/stage3a_precision_and_hm.rs` 覆盖）
+
+## [Unreleased] — 历史提交记录（`Int` 语义统一 + D468–D491）
 
 自 `v0.104.5`（最后一个真正的发布，tag `v0.104.5`）起累计：
 7 个提交 + 工作区在制品 + D468 数值塔重构。

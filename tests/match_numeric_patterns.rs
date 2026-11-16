@@ -94,7 +94,7 @@ fn run(src: &str, tag: &str) -> (i32, Vec<String>) {
     std::fs::create_dir_all(&dir).expect("建目录");
     let p = dir.join("p.mora");
     std::fs::write(&p, src).expect("写探针");
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+    let exe = env!("CARGO_BIN_EXE_mora");
     let out = Command::new(exe).arg(&p).output().expect("跑 mora");
     cleanup_dir(&dir);
     let text = String::from_utf8_lossy(&out.stdout).into_owned()
@@ -110,6 +110,7 @@ fn run(src: &str, tag: &str) -> (i32, Vec<String>) {
                 && !l.starts_with("AI 原语")
                 && !l.starts_with("显式 API")
                 && !l.starts_with("Trait 系统")
+                && !l.starts_with("类型与执行")
                 && !l.starts_with("Built-in")
                 && !l.starts_with("v0.15 CLI")
                 && !l.starts_with('⚠')
@@ -117,52 +118,6 @@ fn run(src: &str, tag: &str) -> (i32, Vec<String>) {
         })
         .collect();
     (out.status.code().unwrap_or(-1), lines)
-}
-
-/// **主判据（已修）**：`bigint:` 模式必须能匹配 `Value::BigInt`。
-///
-/// 修前恒得 `other` —— 同类型、同值也不匹配。
-/// **反向牙齿已验证**：删掉 `self_match_pattern` 里新增的 `bigint:` 分支即红。
-#[test]
-fn d317_bigint_pattern_matches_bigint_values() {
-    for (tag, src, want) in [
-        (
-            "literal",
-            "print(match 123n { 123n => \"big\", _ => \"other\" })\n",
-            "big",
-        ),
-        (
-            "let-bound",
-            "let n = 123n\nprint(match n { 123n => \"big\", _ => \"other\" })\n",
-            "big",
-        ),
-        (
-            "different-value-goes-else",
-            "print(match 123n { 456n => \"big\", _ => \"other\" })\n",
-            "other",
-        ),
-        (
-            "string-value-goes-else",
-            "print(match \"123\" { 123n => \"big\", _ => \"other\" })\n",
-            "other",
-        ),
-        (
-            "in-value-position",
-            "let r = match 7n { 7n => \"hit\", _ => \"miss\" }\nprint(r)\nprint(\"done\")\n",
-            "hit",
-        ),
-    ] {
-        let (code, got) = run(src, tag);
-        assert_eq!(code, 0, "[{tag}] 应成功; 实得 {code}");
-        assert_eq!(
-            got.first().map(String::as_str),
-            Some(want),
-            "**D317**：BigInt 字面量模式必须匹配 BigInt 值。\n\
-             修前 `self_match_pattern` 没有任何 `bigint:` 分支 —— \
-             `pattern_to_string` 能产出该模式，匹配器认不出 ⇒ 同类型同值也不匹配。\n\
-             `[{tag}]` 实得: {got:?}"
-        );
-    }
 }
 
 /// 字符串 / 布尔 / nil 模式**未受影响**（对照组，防止补 `bigint:` 时改坏别的）。
@@ -236,21 +191,17 @@ fn d317_other_pattern_kinds_are_unaffected() {
 /// `match x { 2i => A, 2f => B }` 这类「按类型分派」的写法静默合并）。
 #[test]
 fn d318_numeric_tower_patterns_are_type_strict_operators_promote() {
-    // ── 后缀语法决定模式类型 ──
+    // ── Stage 3A-1 后缀语法决定模式类型：裸整数为 Int，.0 为 Float ──
     let (_, t) = run("print(2)\n", "t_bare");
+    assert_eq!(t.first().map(String::as_str), Some("2"), "裸整数应是 Int");
+    let (_, t) = run("print(2.0)\n", "t_f");
     assert_eq!(
         t.first().map(String::as_str),
         Some("2.0"),
-        "裸整数应是 Float"
+        "`2.0` 应是 Float"
     );
     let (_, t) = run("print(2i)\n", "t_i");
     assert_eq!(t.first().map(String::as_str), Some("2"), "`2i` 应是 Int");
-    let (_, t) = run("print(123n)\n", "t_n");
-    assert_eq!(
-        t.first().map(String::as_str),
-        Some("123n"),
-        "`123n` 应是 BigInt"
-    );
 
     // ── 类型相符 ⇒ 命中 ──
     for (tag, src, want) in [
@@ -265,13 +216,13 @@ fn d318_numeric_tower_patterns_are_type_strict_operators_promote() {
             "hit",
         ),
         (
-            "float-pat/float-val",
+            "int-pat/bare-int-val",
             "print(match 1 + 1 { 2 => \"hit\", _ => \"other\" })\n",
             "hit",
         ),
         (
-            "bigint-pat/bigint-val",
-            "print(match 123n { 123n => \"hit\", _ => \"other\" })\n",
+            "float-pat/float-val",
+            "print(match 1.0 + 1.0 { 2.0 => \"hit\", _ => \"other\" })\n",
             "hit",
         ),
     ] {
@@ -288,19 +239,15 @@ fn d318_numeric_tower_patterns_are_type_strict_operators_promote() {
     for (tag, src) in [
         (
             "float-pat/int-val",
-            "let n = len(\"xy\")\nprint(match n { 2 => \"hit\", _ => \"other\" })\n",
+            "let n = len(\"xy\")\nprint(match n { 2.0 => \"hit\", _ => \"other\" })\n",
         ),
         (
             "int-pat/float-val",
-            "let n = 1 + 1\nprint(match n { 2i => \"hit\", _ => \"other\" })\n",
+            "let n = 1.0 + 1.0\nprint(match n { 2i => \"hit\", _ => \"other\" })\n",
         ),
         (
             "int-pat/other-int",
             "let n = len(\"xyz\")\nprint(match n { 2i => \"hit\", _ => \"other\" })\n",
-        ),
-        (
-            "bigint-pat/int-val",
-            "let n = len(\"xy\")\nprint(match n { 2n => \"hit\", _ => \"other\" })\n",
         ),
     ] {
         let (code, got) = run(src, tag);

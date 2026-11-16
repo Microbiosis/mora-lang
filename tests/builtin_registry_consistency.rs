@@ -46,7 +46,7 @@
 //! `let s: string = atom(1)` 报错）。此处已改为行为探针，不再依赖可能算错的
 //! 表枚举。
 
-use mora::interpreter::RUNTIME_BUILTIN_NAMES;
+use mora::runtime::builtins::RUNTIME_BUILTIN_NAMES;
 use std::collections::BTreeSet;
 
 /// 运行期有实现、但**在类型域里如实无法声明**的内建。
@@ -54,7 +54,6 @@ use std::collections::BTreeSet;
 /// 这些不是「漏补签名」—— 给它们编一个窄签名会**拒绝合法程序**。故显式
 /// 登记为刻意宽松，保持可见可回归。见文件头的逐条理由表。
 const KNOWN_UNTYPABLE: &[(&str, &str)] = &[
-    ("conde", "both 的别名，自身无需单列签名"),
     ("deref", "Type::Atom 是单元变体、无载荷，放不下元素类型"),
     ("eval", "返回值是被求值表达式的类型，需递归推断"),
     ("quote", "返回 Value::Code，Type 无 Code 变体"),
@@ -81,15 +80,14 @@ fn probe_source(name: &str) -> Option<&'static str> {
         "len" => "let v: string = len([1])\n",
         "range" => "let v: string = range(0, 2)\n",
         "print" => "let v: string = print(1)\n",
-        "batch_chat" => "let v: bool = batch_chat([\"a\"])\n",
+        "channel" => "let v: string = channel(1)\n",
+        "context" => "let v: string = context()\n",
+        "sleep" => "let v: string = sleep(0)\n",
         // 返回类型随回调/元素变化 ⇒ 无法用固定探针判「被拒」，见 LOOSE。
         "car" | "cdr" | "cons" | "uncurry" | "apply" | "into" | "swap" | "compose" | "partial"
-        | "both" | "either" | "fail" | "succeed" | "project" | "unify" | "merge_with"
-        | "compose_prompt" | "compress" | "crush_json" | "tail" | "macroexpand" | "curry" => {
-            "let v = NAME_PLACEHOLDER\n"
-        }
+        | "merge_with" | "tail" | "macroexpand" | "curry" => "let v = NAME_PLACEHOLDER\n",
         // 已知刻意宽松 —— 探针必然「通过」，登记在 KNOWN_UNTYPABLE。
-        "deref" | "quote" | "read" | "eval" | "conde" => "let v: bool = NAME_PLACEHOLDER\n",
+        "deref" | "quote" | "read" | "eval" => "let v: bool = NAME_PLACEHOLDER\n",
         _ => return None,
     })
 }
@@ -109,7 +107,9 @@ const CONCRETE_RETURN: &[&str] = &[
     "len",
     "range",
     "print",
-    "batch_chat",
+    "channel",
+    "context",
+    "sleep",
 ];
 
 /// 把探针里的占位符换成真实调用。
@@ -125,7 +125,6 @@ fn call_expr(name: &str) -> String {
         "quote" => "quote(\"x\")".to_string(),
         "read" => "read(\"x\")".to_string(),
         "eval" => "eval(\"x\")".to_string(),
-        "conde" => "conde(fn(x) x)".to_string(),
         "car" | "cdr" => format!("{name}([1, 2, 3])"),
         "cons" => "cons(1, [2])".to_string(),
         "uncurry" => "uncurry(fn(x) x)".to_string(),
@@ -135,15 +134,7 @@ fn call_expr(name: &str) -> String {
         "curry" => "curry(fn(x) x, 1)".to_string(),
         "compose" => "compose(fn(x) x, fn(y) y)".to_string(),
         "partial" => "partial(fn(x) x, 1)".to_string(),
-        "both" | "either" => format!("{name}(fn(x) x)"),
-        "fail" => "fail()".to_string(),
-        "succeed" => "succeed(fn(x) x)".to_string(),
-        "project" => "project(fn(x) x, 1, 2)".to_string(),
-        "unify" => "unify(1, 2)".to_string(),
         "merge_with" => "merge_with(\"k\", \"s\")".to_string(),
-        "compose_prompt" => "compose_prompt(\"a\", \"b\")".to_string(),
-        "compress" => "compress(\"x\", \"s\")".to_string(),
-        "crush_json" => "crush_json(\"{}\", 1)".to_string(),
         "tail" => "tail(\"p\", 1)".to_string(),
         "macroexpand" => "macroexpand(\"m\")".to_string(),
         other => other.to_string(),
@@ -156,7 +147,7 @@ fn typecheck_rejects(src: &str) -> bool {
         Ok(v) => v,
         Err(e) => panic!("探针源码应能解析（{src:?}）：{e}"),
     };
-    !mora::typeck::check_mir::check_program_witnesses_bidirectional(&witnesses).is_empty()
+    !mora::typeck::check_mir::check_program_witnesses(&witnesses).is_empty()
 }
 
 /// **主判据**：每个**具体返回类型**的运行期内建都必须**有签名** ——

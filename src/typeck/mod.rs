@@ -22,20 +22,13 @@
 //! - 控制流敏感的类型缩窄
 
 // v0.55: typeck V2 模块 (mod check, mod pregel_check) 已删除。
-// 类型检查入口: `check_program_witnesses` / `check_program_witnesses_bidirectional` (mod check_mir)。
+// 类型检查入口: `check_program_witnesses` (mod check_mir)。
 
-pub mod annotate; // v0.89: TypeAnnotator (FCFG + TypeTable → EHIR)
-pub mod bidirectional; // v0.75.86: 双向类型检查骨架入口（Phase A）
 pub mod check_mir;
 pub mod dispatch;
-pub mod export; // v0.89: shadow type table export (Phase 0 EHIR)
 pub mod hm;
 /// v0.75.18: 跨模块 import 符号表（typeck 阶段预扫描合并）
 pub mod imports;
-
-// ── 9 层 IR 架构 re-exports ──
-pub use annotate::annotate;
-pub use export::{TypeTable, export_type_table, verify_type_table};
 
 use std::collections::HashMap;
 
@@ -46,6 +39,24 @@ use crate::common::Span;
 // 公共类型
 // ===================================================================
 
+/// Type variable identity: inference meta-variable vs explicit rigid generic parameter.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TypeVarId {
+    /// HM inference meta-variable allocated during inference.
+    Meta(u32),
+    /// User-declared generic type parameter (`task f<T>`, `fn<T>`).
+    Rigid(String),
+}
+
+impl std::fmt::Display for TypeVarId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TypeVarId::Meta(id) => write!(f, "t{id}"),
+            TypeVarId::Rigid(name) => write!(f, "{name}"),
+        }
+    }
+}
+
 /// Mora 类型系统：基础类型 + Any（推断不出时退路）
 #[derive(Debug, Clone, PartialEq)]
 pub enum Type {
@@ -55,67 +66,31 @@ pub enum Type {
     // v0.38: numeric tower — Int(i64) and Float(f64) as distinct types.
     Int,
     Float,
-    /// v0.91: arbitrary-precision 整数。
-    /// 算术 promotion 规则：含 BigInt 时结果 BigInt。
-    /// 不参与 Int <: Float 提升（避免隐式精度损失）。
-    BigInt,
     Bool,
     Nil,
     /// 任意类型（推断不出时的退路，或显式 `any` 标注）
     Any,
-    /// v0.75.91: 未知类型逃逸标签 — HM 推断 / parser / import 解析失败时的
-    /// 兜底；与 `Any` 区别：`Any` 是 strict top type（仅在 subtype_of /
-    /// unify 路径与所有类型兼容），`Unknown` 在所有路径都是「不可判定」标
-    /// 记。详见 `docs/decisions/any-vs-unknown.md`（v0.75.91）。
+    /// Unknown type escape marker — fails closed in compatibility and subtyping.
     Unknown,
+    /// Poison sentinel emitted after recording a type error to stop cascading errors.
+    Error,
+    /// Built-in stdlib module namespace (`json`, `file`, `exec`, `math`, `stats`, `linalg`).
+    BuiltinModule(String),
     /// v0.x: 列表类型携带元素类型（`list<T>`）
     List(Box<Type>),
     /// v0.x: 字典类型携带键值类型（`dict<K, V>`）
     Dict(Box<Type>, Box<Type>),
     Task,
     Closure,
-    Conversation,
-    Stream,
     Builtin,
-    /// v0.06: AI 配置类型（ai.chat 的接收者 / AiConfig::new() 构造）
-    ///
-    /// ⚠ v0.104.6：`Value::AiConfig` **全仓从未被构造**，本类型是只存在于
-    /// typeck 的幽灵类型。详见 `dispatch.rs::method_signature_builtin` 里
-    /// `(Type::AiConfig, …)` 处的完整标注。
-    AiConfig,
-    /// v0.06: AI 调用结果类型（ai.chat 的成功返回）
-    ///
-    /// ⚠ v0.104.6：`ai.chat` 的返回类型**已改为 `Type::String`**，本类型自
-    /// 此**无人引用**。原因：`Value` 里没有任何 `AiResult` 变体，而
-    /// `do_ai_chat` 的每一条路径都返回 `Value::String` —— 声明成它等于宣布
-    /// 「`ai.chat` 的返回值任何东西都消费不了」，实测使 `ai.chat` 在源语言里
-    /// 完全不可用（连 `let r = ai.chat("hi")` 再 `print(r)` 都过不了检查）。
-    ///
-    /// 保留变体本身（它仍可由字符串 `"ai_result"` 解析，见下方名字映射），
-    /// 以免把一个语言设计决定（未来 `ai.chat` 是否该返结构化结果）偷偷
-    /// 变成一次机械清理。**要真让 `ai.chat` 返结构化结果，得先给 `Value`
-    /// 加对应变体。**
-    AiResult,
-    /// v0.06: AI 调用错误类型（ai.chat 的失败返回，v0.06.2 起被 Result<T,E> 包裹）
-    AiError,
-    /// v0.06: AI 模块类型（`ai` 内建变量的接收者类型）
-    AiModule,
     /// v0.99: random 模块类型（`random` 内建变量的接收者类型）。
     /// 模块方法调用 = ambient effect perform —— 每操作一个标签
     /// （`crate::mir::effect::ambient`）+ 预置签名，效果行随调用传播。
     RandomModule,
     /// v0.06.2: 类型化错误处理 Result<T, E>
     Result_(Box<Type>, Box<Type>),
-    /// v0.83: 元组类型 — `(Model, Cmd)` 等。strong tuple typeck 支持 update 返回。
+    /// v0.83: 元组类型
     Tuple(Vec<Box<Type>>),
-    /// v0.06.3: HTTP 路由构建器
-    Router,
-    /// v0.06.3: HTTP 请求对象
-    HttpRequest,
-    /// v0.06.3: HTTP 响应对象（handler 返回值）
-    HttpResponse,
-    /// v0.06.6: MCP 服务器构建器
-    McpServer,
     /// v0.08: dyn trait 类型（名称）
     /// v0.09: 携带泛型参数列表（如 `dyn Container<number>`）
     Trait {
@@ -133,11 +108,6 @@ pub enum Type {
     ///   用于 builtin 多类型签名（print 等）
     ///   兼容规则: A 兼容 B 当 A 是 B 的成员, 或 B 是 A 的成员, 或递归嵌套
     Union(Vec<Type>),
-    // v0.36 (Permanent #3): 8 new Type variants for v0.17–v0.27 Value kinds.
-    // The v0.34 audit's claim that "16 Value variants lack Type variants" was
-    // solvable in one commit; the previous deferral to v1.0 was a cop-out.
-    /// v0.03: Agent (name + tool_names + model_route + max_steps + system)
-    Agent,
     /// v0.08.5: Trait object carrier (for_type + trait_name + generics + data)
     /// v0.75.86: 扩展 trait_name + generics 字段——subtype_of 升级为
     /// trait_name + generics 同构判断（之前 unit variant 返 false 是 stub）。
@@ -154,53 +124,49 @@ pub enum Type {
     Atom,
     /// v0.20: Macro definition (name + params shape)
     Macro,
-    /// v0.26: Prompt section (named system-prompt segment)
-    PromptSection,
-    /// v0.27: Document unified IR (`Arc<dyn DocumentBackend>`)
-    Document,
-    /// v0.55: HM type variable (char key, fresh in inference, unified during solve)
-    TypeVar(char),
-    /// v0.75.17: 泛型量化 ∀α₁...αₙ. τ — let-generalization 的产物。
-    /// 命中 env 时由 instantiate 替换为 fresh TypeVar（标准 HM 规则）。
-    ForAll(Vec<char>, Box<Type>),
+    /// HM type variable (meta-variable or rigid generic parameter).
+    TypeVar(TypeVarId),
+    /// Generic quantification ∀α₁...αₙ. τ — product of let-generalization / explicit generics.
+    ForAll(Vec<TypeVarId>, Box<Type>),
     /// v0.80: 函数类型带 effect row（Stage 2/4 algebraic effects 的类型基础）。
     /// `fn(a) -> b ! {Ai, Fs}` — input type → output type with effect row。
     /// Koka 风格：`Arrow(input, output, EffectRow)`。
     /// 与 ForAll 的区别：ForAll 跨函数泛型量化；Arrow 标记具体函数类型的 effect。
     /// 老 `Closure` / `Task` 类型视为 `Arrow(_, _, Empty)`。
     Arrow(Box<Type>, Box<Type>, crate::mir::effect::EffectRow),
-    // ── v0.83: TEA (The Elm Architecture) 类型注解 ──
-    /// Model 类型 — 状态结构（与 Concrete 类似但语义是 Model）
-    TeaModel {
-        name: String,
-        fields: Vec<(String, Box<Type>)>,
-    },
-    /// Msg 类型 — tagged union
-    TeaMsg {
-        name: String,
-        variants: Vec<(String, Option<Box<Type>>)>,
-    },
-    /// App 类型 — 完整 TEA app
-    TeaApp {
-        name: String,
-        model: Box<Type>,
-        msg: Box<Type>,
-        update: Box<Type>,
-        view: Box<Type>,
-    },
-    // ── v0.102: 声明式范式（逻辑式/关系式）类型 ──
-    /// 关系类型 — 位置参数签名（由子句头/体推断，precompute_rel_sigs
-    /// 不动点预计算）。关系调用点实参逐一与签名统一，表达式类型是 Goal。
-    Relation(Vec<Type>),
-    /// 目标类型 — 目标一等值（unify/both/either/关系调用/项目投影的产物，
-    /// solve 的消费对象）。
-    Goal,
-    /// v0.102: cons 单元类型（逻辑式项构造 `cons(h, t)` 的产物，appendo
-    /// 等递归列表关系的载体）。
+    /// cons 单元类型（`cons(h, t)` / `car` / `cdr`）
     Cons(Box<Type>, Box<Type>),
+    /// Wave 2: Typed concurrent message channel (`channel<T>`).
+    Channel(Box<Type>),
+    /// Wave 2: Asynchronous task join handle (`task_handle<T>`).
+    TaskHandle(Box<Type>),
+    /// Wave 2: Cooperative cancellation & deadline context (`context`).
+    Context,
 } // ← close pub enum Type
 
 impl Type {
+    /// Build a curried `Arrow` type for a parameter slice, using empty `Tuple([])`
+    /// as the unit domain when `param_types` is empty so 0-arg callables remain
+    /// `Type::Arrow` values rather than bare return types.
+    pub(crate) fn curried_arrow(
+        param_types: &[Type],
+        ret: Type,
+        row: &crate::mir::effect::EffectRow,
+    ) -> Type {
+        if param_types.is_empty() {
+            return Type::Arrow(
+                Box::new(Type::Tuple(Vec::new())),
+                Box::new(ret),
+                row.clone(),
+            );
+        }
+        let mut ty = ret;
+        for param_ty in param_types.iter().rev() {
+            ty = Type::Arrow(Box::new(param_ty.clone()), Box::new(ty), row.clone());
+        }
+        ty
+    }
+
     /// 返回类型的字符串表示。v0.x 起支持泛型：`list<number>` / `dict<string, any>` / `result<T, E>`
     pub fn name(&self) -> String {
         match self {
@@ -209,22 +175,17 @@ impl Type {
             // v0.38: Int and Float distinct.
             Type::Int => "int".to_string(),
             Type::Float => "float".to_string(),
-            Type::BigInt => "bigint".to_string(),
             Type::Bool => "bool".to_string(),
             Type::Nil => "nil".to_string(),
             Type::Any => "any".to_string(),
             Type::Unknown => "unknown".to_string(),
+            Type::Error => "<error>".to_string(),
+            Type::BuiltinModule(name) => format!("module<{name}>"),
             Type::List(elem) => format!("list<{}>", elem.name()),
             Type::Dict(k, v) => format!("dict<{}, {}>", k.name(), v.name()),
             Type::Task => "task".to_string(),
             Type::Closure => "closure".to_string(),
-            Type::Conversation => "conversation".to_string(),
-            Type::Stream => "stream".to_string(),
             Type::Builtin => "builtin".to_string(),
-            Type::AiConfig => "ai_config".to_string(),
-            Type::AiResult => "ai_result".to_string(),
-            Type::AiError => "ai_error".to_string(),
-            Type::AiModule => "ai".to_string(),
             Type::RandomModule => "random".to_string(),
             Type::Result_(ok, err) => format!("result<{}, {}>", ok.name(), err.name()),
             // v0.83: Tuple 类型
@@ -232,14 +193,8 @@ impl Type {
                 let parts: Vec<String> = types.iter().map(|t| t.name()).collect();
                 format!("({})", parts.join(", "))
             }
-            Type::Router => "router".to_string(),
-            Type::HttpRequest => "http_request".to_string(),
-            Type::HttpResponse => "http_response".to_string(),
-            Type::McpServer => "mcp_server".to_string(),
             Type::Trait { .. } => "trait".to_string(),
             Type::Concrete { .. } => "concrete".to_string(),
-            // v0.36: 8 new variants
-            Type::Agent => "agent".to_string(),
             Type::TraitObject {
                 trait_name,
                 generics,
@@ -262,9 +217,7 @@ impl Type {
             Type::Partial => "partial".to_string(),
             Type::Atom => "atom".to_string(),
             Type::Macro => "macro".to_string(),
-            Type::PromptSection => "prompt_section".to_string(),
-            Type::Document => "document".to_string(),
-            Type::TypeVar(c) => format!("'{}", c),
+            Type::TypeVar(id) => format!("'{}", id),
             // v0.75.17: 泛型量化显示为 "forall<'a, 'b>. τ"（let-generalization 产物）
             Type::ForAll(vars, inner) => {
                 let names: Vec<String> = vars.iter().map(|v| format!("'{}", v)).collect();
@@ -273,15 +226,15 @@ impl Type {
             // v0.80: 函数类型带 effect row —— `fn (T) -> U ! {Ai, Fs}` 形式。
             Type::Arrow(input, output, row) => {
                 let row_str = row.to_string();
-                if row_str == "pure" {
-                    format!("fn ({}) -> {}", input.name(), output.name())
+                let arg_str = if matches!(&**input, Type::Tuple(elems) if elems.is_empty()) {
+                    String::new()
                 } else {
-                    format!(
-                        "fn ({}) -> {} ! {{ {} }}",
-                        input.name(),
-                        output.name(),
-                        row_str
-                    )
+                    input.name()
+                };
+                if row_str == "pure" {
+                    format!("fn ({arg_str}) -> {}", output.name())
+                } else {
+                    format!("fn ({arg_str}) -> {} ! {{ {} }}", output.name(), row_str)
                 }
             }
             // v0.13: Union 类型显示为 "T1 | T2 | T3"
@@ -292,32 +245,10 @@ impl Type {
                 let parts: Vec<String> = members.iter().map(|m| m.name()).collect();
                 parts.join(" | ")
             }
-            // v0.83: TEA type annotations
-            Type::TeaModel { name, fields } => {
-                let parts: Vec<String> = fields
-                    .iter()
-                    .map(|(n, t)| format!("{}: {}", n, t.name()))
-                    .collect();
-                format!("model {} {{ {} }}", name, parts.join(", "))
-            }
-            Type::TeaMsg { name, variants } => {
-                let parts: Vec<String> = variants
-                    .iter()
-                    .map(|(n, payload)| match payload {
-                        Some(t) => format!("{}({})", n, t.name()),
-                        None => n.clone(),
-                    })
-                    .collect();
-                format!("msg {} = {}", name, parts.join(" | "))
-            }
-            Type::TeaApp { name, model, .. } => format!("app<{}: {}>", name, model.name()),
-            // v0.102: 声明式范式
-            Type::Relation(params) => {
-                let parts: Vec<String> = params.iter().map(|t| t.name()).collect();
-                format!("rel({})", parts.join(", "))
-            }
-            Type::Goal => "goal".to_string(),
             Type::Cons(h, t) => format!("cons<{}, {}>", h.name(), t.name()),
+            Type::Channel(t) => format!("channel<{}>", t.name()),
+            Type::TaskHandle(t) => format!("task_handle<{}>", t.name()),
+            Type::Context => "context".to_string(),
         }
     }
 
@@ -326,35 +257,32 @@ impl Type {
         match hint {
             "string" => Type::String,
             "char" => Type::Char,
-            // v0.104.6 D62: `number` 与 `parser_v3/syntax.rs` 的标注映射
-            // 对齐为数值塔 `Int | Float`（此前这里是 `Type::Float`、那边
-            // 是 `Type::Int`，两处互相矛盾且与 spec §13.1 :110 相悖）。
-            // ⚠ 本函数目前**全仓零调用点**（只有自递归），实际生效的映射
-            // 是 parser 那条；此处同步只为消除同一概念的两份真相。
-            "float" => Type::Float,
+            "int" | "i4" | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => Type::Int,
+            "float" | "f16" | "bf16" | "fp8" | "f32" | "f64" => Type::Float,
             "number" => Type::Union(vec![Type::Int, Type::Float]),
-            "bigint" => Type::BigInt,
             "bool" => Type::Bool,
             "nil" => Type::Nil,
             // v0.50: "any" 应解析为 Union(vec![])（兼容任何类型）
             "any" => Type::Union(vec![]),
             "list" => Type::List(Box::new(Type::Union(vec![]))),
             "dict" => Type::Dict(Box::new(Type::Union(vec![])), Box::new(Type::Union(vec![]))),
+            "channel" => Type::Channel(Box::new(Type::Union(vec![]))),
+            "task_handle" | "taskhandle" => Type::TaskHandle(Box::new(Type::Union(vec![]))),
+            "context" => Type::Context,
             "task" => Type::Task,
             "closure" => Type::Closure,
-            "conversation" => Type::Conversation,
-            "stream" => Type::Stream,
-            "ai_config" => Type::AiConfig,
-            "ai_result" => Type::AiResult,
-            "ai_error" => Type::AiError,
-            "router" => Type::Router,
-            "http_request" => Type::HttpRequest,
-            "http_response" => Type::HttpResponse,
-            "mcp_server" => Type::McpServer,
             // v0.x: list<T> 泛型语法
             s if s.starts_with("list<") && s.ends_with('>') => {
                 let inner = &s[5..s.len() - 1];
                 Type::List(Box::new(Type::from_hint(inner.trim())))
+            }
+            s if s.starts_with("channel<") && s.ends_with('>') => {
+                let inner = &s[8..s.len() - 1];
+                Type::Channel(Box::new(Type::from_hint(inner.trim())))
+            }
+            s if s.starts_with("task_handle<") && s.ends_with('>') => {
+                let inner = &s[12..s.len() - 1];
+                Type::TaskHandle(Box::new(Type::from_hint(inner.trim())))
             }
             // v0.x: dict<K, V> 泛型语法（顶层 split，保留嵌套）
             s if s.starts_with("dict<") && s.ends_with('>') => {
@@ -413,11 +341,6 @@ impl Type {
                     Type::Union(vec![])
                 }
             }
-            // v0.102: 声明式范式类型注解
-            "goal" => Type::Goal,
-            // v0.12: 未知类型名 fallback → 改用 Type::Trait 占位
-            //   这样调用方可以查 trait_registry 判断是否合法
-            //   （之前是 Any, 丢失了 hint 信息）
             _ => Type::Trait {
                 name: hint.to_string(),
                 generics: vec![],
@@ -431,75 +354,84 @@ impl Type {
             name,
             "string"
                 | "char"
+                | "int"
+                | "i4"
+                | "i8"
+                | "i16"
+                | "i32"
+                | "i64"
+                | "u8"
+                | "u16"
+                | "u32"
+                | "u64"
                 | "float"
-                | "bigint"
+                | "f16"
+                | "bf16"
+                | "fp8"
+                | "f32"
+                | "f64"
+                | "number"
                 | "bool"
                 | "nil"
                 | "list"
                 | "dict"
+                | "channel"
+                | "task_handle"
+                | "taskhandle"
+                | "context"
                 | "task"
                 | "closure"
-                | "conversation"
-                | "stream"
-                | "ai_config"
-                | "ai_result"
-                | "ai_error"
-                | "ai_module"
-                | "router"
-                | "http_request"
-                | "http_response"
-                | "mcp_server"
                 | "any"
         )
     }
 
-    /// 类型兼容：Any 总兼容；Result<T,E> 与 Ok/Err 兼容
-    /// v0.13: Union 类型支持 —— A ∈ union(expected) 或 expected ∈ union(self)
+    /// Type compatibility predicate (symmetric across compatible types; numeric coercion allowed).
     pub fn compatible_with(&self, expected: &Type) -> bool {
-        // v0.84: Unknown 是「无法判定」标记，但作为 top type 与任何类型兼容——
-        // 让 HM 推断能在一侧为 Unknown 时继续推进（类似 Any，但语义不同：
-        // Any = 类型明确的万能类型，Unknown = 推断器无法判定的占位）。
-        // 与 v0.75.92 的 fail-fast 不同：当时 Unknown 被误当作"无效"，
-        // 但实际它是"尚待推断"，应允许 unification 继续约束。
-        if matches!(self, Type::Unknown) || matches!(expected, Type::Unknown) {
+        if matches!(self, Type::Error) || matches!(expected, Type::Error) {
             return true;
         }
-        // v0.80: Any 是 top type — 与任何类型兼容（包括 TypeVar 推断路径）。
-        // 此前 Any 仅通过 Union(vec![]) 间接兼容，Type::Any 变体本身无 arm。
+        // Fail-closed sentinel: Unknown must never silently pass type compatibility.
+        if matches!(self, Type::Unknown) || matches!(expected, Type::Unknown) {
+            return false;
+        }
         if matches!(self, Type::Any) || matches!(expected, Type::Any) {
             return true;
         }
-        // v0.84: TypeVar 可被约束合一指向任何类型 — 与 Unknown 不同（Unknown =
-        // "无法判定"，语义上仍拒绝；TypeVar = "待推断"，语义上接受）。
-        // `infer_binop` 的 Add 分支中，`greeting + ", "` 的返回是 fresh TypeVar，
-        // `+ name`（String）需要 compatible_with(TypeVar) 为 true。
-        if matches!(self, Type::TypeVar(_)) || matches!(expected, Type::TypeVar(_)) {
+        if matches!(self, Type::TypeVar(TypeVarId::Meta(_)))
+            || matches!(expected, Type::TypeVar(TypeVarId::Meta(_)))
+        {
             return true;
         }
-        // v0.13: Union 兼容 —— self 是 union, expected 是 union 任一成员
+        // Empty Union represents top element placeholder (`any`).
         if let Type::Union(members) = expected {
-            // 空 Union = "any element type" (兼容任何)
             if members.is_empty() {
                 return true;
             }
             return members.iter().any(|m| self.compatible_with(m));
         }
         if let Type::Union(members) = self {
-            // 空 Union = "any element type" (兼容任何)
             if members.is_empty() {
                 return true;
             }
             return members.iter().any(|m| m.compatible_with(expected));
         }
-        // v0.75.17: ForAll 类型 — 与内层类型同兼容性判断（命中 env 时已实例化，
-        // 此处仅作防御：泛型值兼容任意实例）。
         if let Type::ForAll(_, inner) = self {
             return inner.compatible_with(expected);
         }
         if let Type::ForAll(_, inner) = expected {
             return self.compatible_with(inner);
         }
-        // v0.13: Result<T1, E1> 兼容 Result<T2, E2> 当 T1==T2 且 E1==E2 (真正同构)
+        if let (Type::TypeVar(TypeVarId::Rigid(a)), Type::TypeVar(TypeVarId::Rigid(b))) =
+            (self, expected)
+        {
+            return a == b;
+        }
+        if matches!(self, Type::TypeVar(TypeVarId::Rigid(_)))
+            || matches!(expected, Type::TypeVar(TypeVarId::Rigid(_)))
+        {
+            return false;
+        }
+        // v0.13: Result<T1, E1> 兼容 Result<T2, E2> 当 T1 兼容 T2 且 E1 兼容 E2
         if let (Type::Result_(t1, e1), Type::Result_(t2, e2)) = (self, expected) {
             return t1.compatible_with(t2) && e1.compatible_with(e2);
         }
@@ -519,30 +451,22 @@ impl Type {
         if let (Type::List(a), Type::List(b)) = (self, expected) {
             return a.compatible_with(b);
         }
+        if let (Type::Channel(a), Type::Channel(b)) = (self, expected) {
+            return a.compatible_with(b);
+        }
+        if let (Type::TaskHandle(a), Type::TaskHandle(b)) = (self, expected) {
+            return a.compatible_with(b);
+        }
         // v0.x: Dict<K1, V1> 兼容 Dict<K2, V2> 当 K 兼容且 V 兼容
         if let (Type::Dict(k1, v1), Type::Dict(k2, v2)) = (self, expected) {
             return k1.compatible_with(k2) && v1.compatible_with(v2);
         }
-        // v0.83: Dict literal 可赋给 TeaModel/TeaMsg（强类型 typeck）
-        // Dict literal 必须有 tag 字段（TeaMsg）或匹配字段名（TeaModel）
-        // —— 真正的 field-by-field 检查在 infer_let_typed 的 path 里做（用 value.entries）
-        // 这里只做「Dict literal 是 compatible_with TeaModel/TeaMsg」的基础检查
-        if let (Type::Dict(_, _), Type::TeaModel { .. }) | (Type::Dict(_, _), Type::TeaMsg { .. }) =
-            (self, expected)
-        {
-            return true; // 详细检查在 infer_let_typed path
-        }
-        // v0.08.1: Nil 兼容所有 trait（用于 dyn Trait = nil 占位）
-        // v0.12: 后门 2 关闭 —— Nil 仅兼容 Nil, 不再豁免 trait 赋值
-        //   若需要 dyn Trait = nil, 显式使用 Option<T> 或 T? 语法
         if matches!(self, Type::Nil) && matches!(expected, Type::Nil) {
             return true;
         }
         if matches!(self, Type::Nil) || matches!(expected, Type::Nil) {
             return false;
         }
-        // v0.08.5: Trait 兼容
-        // v0.09: 含泛型比较（name 一致 + generics 个数一致 + 元素兼容）
         if let (
             Type::Trait {
                 name: a,
@@ -564,158 +488,74 @@ impl Type {
             }
             return true;
         }
-        // v0.80: Arrow 兼容 — input/output 递归兼容，effect row 严格相等。
-        // （effect row 的 subsumption 暂用 == 近似；严格 row subsumption 留给
-        // 后续版本。）
         if let (Type::Arrow(i1, o1, r1), Type::Arrow(i2, o2, r2)) = (self, expected) {
-            return i1.compatible_with(i2) && o1.compatible_with(o2) && r1 == r2;
+            return i1.compatible_with(i2)
+                && o1.compatible_with(o2)
+                && (effect_row_subsumes(r1, r2) || effect_row_subsumes(r2, r1));
         }
-        // v0.90.5: 数值类型兼容 — Int 与 Float 在非算术上下文也兼容
-        // （如 let x: float = 42、fn(x: float) f(42)、42 == 3.14）
-        // v0.91: BigInt 故意不参与此规则 — 隐式 BigInt → Float 会丢精度，
-        // 编译器拒绝（用户需显式调用 `.to_float()`）。
         if (matches!(self, Type::Int) && matches!(expected, Type::Float))
             || (matches!(self, Type::Float) && matches!(expected, Type::Int))
         {
             return true;
         }
-        // v0.91: BigInt 自反兼容（同类型 BigInt 等于 BigInt）
-        if matches!(self, Type::BigInt) && matches!(expected, Type::BigInt) {
-            return true;
-        }
-        // v0.102: 声明式范式 — Goal 自反；cons 逐位兼容；关系按位置签名兼容
-        if matches!(self, Type::Goal) && matches!(expected, Type::Goal) {
-            return true;
-        }
         if let (Type::Cons(h1, t1), Type::Cons(h2, t2)) = (self, expected) {
             return h1.compatible_with(h2) && t1.compatible_with(t2);
         }
-        if let (Type::Relation(p1), Type::Relation(p2)) = (self, expected) {
-            return p1.len() == p2.len()
-                && p1.iter().zip(p2.iter()).all(|(a, b)| a.compatible_with(b));
-        }
-        // v0.104.6 D77：`Type::TeaApp` 的 `name` 是**显示标签**（`name()` 渲染成
-        // `app<{name}: {model}>`），**不是名义类型的一部分** —— 源语言里没有任何
-        // 语法能写出一个指定名字的 TEA app（`tea` 模块没有类型标注语法）。
-        //
-        // 但下面的兜底 `self == expected` 是**结构相等**，会把 `name` 一起比掉，
-        // 于是两条签名各自构造的 TeaApp（`name` 一个 `"tea"` 一个 `""`）被判为
-        // 不兼容：
-        //     print(tea.init())
-        //     → expected … | app<: any> | … , got app<tea: any>
-        // 运行期 `value/display.rs:155` 明明有
-        // `Value::TeaApp(_) => write!(f, "<tea_app>")` —— 打不出来纯粹是这个
-        // 字段比较带来的。故按四个**类型**字段逐一比较、忽略 `name`，
-        // 与 `Cons` / `Relation` 的结构化处理同款。
-        //
-        // ⚠ 承重的是**这一处**（`compatible_with`）：反向验证把它退回结构相等后，
-        // `tests/print_display_arms.rs` 的 2 条测试立即失败。`subtype_of` 里的
-        // 同名 arm **未被该测试触及**（退回后测试仍绿），它是为「同一概念两处
-        // 保持一致」而一并改的 —— 属推理，不是测试证据。
-        if let (
-            Type::TeaApp {
-                model: m1,
-                msg: g1,
-                update: u1,
-                view: v1,
-                ..
-            },
-            Type::TeaApp {
-                model: m2,
-                msg: g2,
-                update: u2,
-                view: v2,
-                ..
-            },
-        ) = (self, expected)
-        {
-            return m1.compatible_with(m2)
-                && g1.compatible_with(g2)
-                && u1.compatible_with(u2)
-                && v1.compatible_with(v2);
-        }
-        // v0.104.6 D82：`Type::TraitObject` 同理 —— `trait_name` 在 `print`
-        // 的 Union 成员里只能是**通配**（用户写 `let x: dyn Foo = 1`，
-        // trait 名由用户任意指定，签名表无从枚举）。按结构相等比较的话，
-        // 成员渲染成 `dyn` 而实际是 `dyn Foo`，`print(x)` 会被误拒 ——
-        // 这正是 D77 修 `TeaApp` 时**漏掉的同型问题**。
-        // 代价：不同 trait 名的 `TraitObject` 互相兼容（放弃名义性）。
-        // 鉴于 `impl` 前端尚不存在、用户代码无法构造任何 impl，
-        // 该代价目前**无实际影响**；待 impl 前端落地时须重新审视。
         if let (Type::TraitObject { .. }, Type::TraitObject { .. }) = (self, expected) {
             return true;
         }
-        // v0.08.5: Type::Struct 已删除，统一为 Type::Trait 注册
         self == expected
     }
 
-    /// v0.75.86: 非对称 subtype 关系 `self <: super`。
-    ///
-    /// 与 [`compatible_with`](Self::compatible_with) 的关键区别：
-    /// `compatible_with` 是**对称**关系（任一边匹配即 true），
-    /// `subtype_of` 是**单向**子类型——`A <: B` 不蕴含 `B <: A`。
-    ///
-    /// 实现策略：
-    ///   1. 所有 `compatible_with` 的现有 arm 复用（`Any` top type、
-    ///      `ForAll` 内层、容器递归、Trait 同构、Union 任一成员、`Result`
-    ///      同构、`Nil` 自反）
-    ///   2. 新增 `Concrete <: Trait` ——`Concrete { traits, .. }` 的 traits
-    ///      列表中任一与 super 同构即 subtype（实现 trait 即 subtype）
-    ///   3. 新增 `TraitObject <: Trait` ——dyn trait object 视为 trait 的
-    ///      运行时载体（`TraitObject { trait_name, generics, .. }` 与 super
-    ///      name 一致 + generics 兼容即 subtype）
-    ///   4. 末尾 `self == expected` 兜底（同构严格相等是 subtype）
-    ///
-    /// 应用：双向定型 check 模式核心 — `actual <: expected ?`。
-    /// `compatible_with` 保留对称语义给 HM 合一（双向算法需要任一
-    /// 方向兼容即可 unify），`subtype_of` 给定向检查用。
+    /// Asymmetric subtyping `self <: super_ty` (strict: `Int <: Float`, not `Float <: Int`).
     pub fn subtype_of(&self, super_ty: &Type) -> bool {
-        // === 复用 compatible_with 全部 arm ===
-        // Any 是 top type —— 与任何类型兼容（自然 subtype 任何）
-        if matches!(self, Type::Any) || matches!(super_ty, Type::Any) {
+        if matches!(self, Type::Error) || matches!(super_ty, Type::Error) {
             return true;
         }
-        // v0.75.92: Unknown fail-fast — 不参与任何 subtype 判断
-        // （与 Any 区分：Any top type 任意 subtype；Unknown 未知 type 拒绝）
+        // Fail-closed sentinel: Unknown never participates in subtyping.
         if matches!(self, Type::Unknown) || matches!(super_ty, Type::Unknown) {
             return false;
         }
-        // v0.84: TypeVar 可被约束合一只指向任何类型 — 不等 solve_constraints 兜底。
-        // `infer_if` / `infer_match` 的 arm/branch 比较中，两侧都是 fresh TypeVar
-        // （如 `print(1i)` 返回的 fresh ret var），它们尚未被合一，此时 subtype_of
-        // 应返回 true（"可能合一"），而非 false（"不兼容"）。严格子类型判断由
-        // constraint solver 在合一阶段完成。
-        if matches!(self, Type::TypeVar(_)) || matches!(super_ty, Type::TypeVar(_)) {
+        if matches!(self, Type::Any) || matches!(super_ty, Type::Any) {
             return true;
         }
-        // v0.75.17: ForAll 类型——泛型值命中 env 时已实例化，此处防御
+        if matches!(self, Type::TypeVar(TypeVarId::Meta(_)))
+            || matches!(super_ty, Type::TypeVar(TypeVarId::Meta(_)))
+        {
+            return true;
+        }
         if let Type::ForAll(_, inner) = self {
             return inner.subtype_of(super_ty);
         }
         if let Type::ForAll(_, inner) = super_ty {
             return self.subtype_of(inner);
         }
-        // v0.13: Union subtype——任一成员 subtype super_ty 即可（保守）
         if let Type::Union(members) = self {
             if members.is_empty() {
-                // 空 Union = "any element type" 占位，subtype 任何
                 return true;
             }
             return members.iter().any(|m| m.subtype_of(super_ty));
         }
-        // super 是 Union 时，self 必须 subtype 任一成员（与
-        // compatible_with 一致——但保守方向）
         if let Type::Union(members) = super_ty {
             if members.is_empty() {
                 return true;
             }
             return members.iter().any(|m| self.subtype_of(m));
         }
-        // Result<T1, E1> subtype Result<T2, E2> 当 T1<:T2 && E1<:E2
-        if let (Type::Result_(t1, e1), Type::Result_(t2, e2)) = (self, super_ty) {
-            return t1.subtype_of(t2) && e2.subtype_of(e1);
+        if let (Type::TypeVar(TypeVarId::Rigid(a)), Type::TypeVar(TypeVarId::Rigid(b))) =
+            (self, super_ty)
+        {
+            return a == b;
         }
-        // v0.83: Tuple 元素逐一 subtype
+        if matches!(self, Type::TypeVar(TypeVarId::Rigid(_)))
+            || matches!(super_ty, Type::TypeVar(TypeVarId::Rigid(_)))
+        {
+            return false;
+        }
+        // Result<T, E> is covariant in both ok (T) and err (E) variants.
+        if let (Type::Result_(t1, e1), Type::Result_(t2, e2)) = (self, super_ty) {
+            return t1.subtype_of(t2) && e1.subtype_of(e2);
+        }
         if let (Type::Tuple(a), Type::Tuple(b)) = (self, super_ty) {
             if a.len() != b.len() {
                 return false;
@@ -727,107 +567,28 @@ impl Type {
             }
             return true;
         }
-        // List<T1> subtype List<T2> 当 T1<:T2
         if let (Type::List(a), Type::List(b)) = (self, super_ty) {
             return a.subtype_of(b);
         }
-        // Dict<K1, V1> subtype Dict<K2, V2>
+        // Channel<T> is INVARIANT in T because channels both receive and send values.
+        if let (Type::Channel(a), Type::Channel(b)) = (self, super_ty) {
+            return a.subtype_of(b) && b.subtype_of(a);
+        }
+        // TaskHandle<T> is COVARIANT in T because join() only reads the produced result.
+        if let (Type::TaskHandle(a), Type::TaskHandle(b)) = (self, super_ty) {
+            return a.subtype_of(b);
+        }
         if let (Type::Dict(k1, v1), Type::Dict(k2, v2)) = (self, super_ty) {
             return k1.subtype_of(k2) && v1.subtype_of(v2);
         }
-        // v0.83: Dict literal subtype TeaModel/TeaMsg（强类型 typeck 基础规则）
-        if let (Type::Dict(_, _), Type::TeaModel { .. }) | (Type::Dict(_, _), Type::TeaMsg { .. }) =
-            (self, super_ty)
-        {
-            return true; // 详细检查在 infer_let_typed
-        }
-        // v0.83: TeaModel subtype TeaModel（同 name + 字段兼容）
-        if let (
-            Type::TeaModel {
-                name: n1,
-                fields: f1,
-            },
-            Type::TeaModel {
-                name: n2,
-                fields: f2,
-            },
-        ) = (self, super_ty)
-        {
-            if n1 != n2 {
-                return false;
-            }
-            // source 可少字段，extra 字段允许；但 target 字段必须 source 也有
-            for (target_name, target_ty) in f2 {
-                let source_match = f1.iter().find(|(n, _)| n == target_name);
-                match source_match {
-                    None => return false,
-                    Some((_, source_ty)) => {
-                        if !source_ty.subtype_of(target_ty) {
-                            return false;
-                        }
-                    }
-                }
-            }
-            return true;
-        }
-        // v0.83: TeaMsg subtype TeaMsg（同 name + variants 兼容）
-        if let (
-            Type::TeaMsg {
-                name: n1,
-                variants: v1,
-            },
-            Type::TeaMsg {
-                name: n2,
-                variants: v2,
-            },
-        ) = (self, super_ty)
-        {
-            if n1 != n2 {
-                return false;
-            }
-            // source 可少 variants；但 target variant 必 source 也有
-            for (target_name, target_payload) in v2 {
-                let source_match = v1.iter().find(|(n, _)| n == target_name);
-                match source_match {
-                    None => return false,
-                    Some((_, source_payload)) => {
-                        // source payload 必须 subtype target payload
-                        match (source_payload, target_payload) {
-                            (Some(s), Some(t)) => {
-                                if !s.subtype_of(t) {
-                                    return false;
-                                }
-                            }
-                            (None, None) => {}
-                            // source has no payload but target does —— 不兼容
-                            (None, Some(_)) => return false,
-                            (Some(_), None) => return false,
-                        }
-                    }
-                }
-            }
-            return true;
-        }
-        // Nil 仅 subtype Nil（v0.12 后门 2 关闭）
         match (self, super_ty) {
             (Type::Nil, Type::Nil) => return true,
             (Type::Nil, _) | (_, Type::Nil) => return false,
             _ => {}
         }
-        // === subtype 新增 arm ===
-        // Concrete subtype Trait：实现 trait 即 subtype trait
         if let (Type::Concrete { traits, .. }, Type::Trait { .. }) = (self, super_ty) {
             return traits.iter().any(|t| t.subtype_of(super_ty));
         }
-        // TraitObject subtype Trait：dyn object 视为 trait 的运行时载体
-        //
-        // 当前 TraitObject 是 unit variant（无 trait_name/generics 字段——
-        // trait 信息存在 `Value::TraitObject` 运行时值里，类型系统层面
-        // 不可达）。真正的 dyn: 语法未实现（parser_v3/mod.rs 无 dyn: 解析），
-        // 此处兜底：TraitObject 不 subtype 任何具体 Trait。后续若解析器
-        // 加 dyn: 语法、扩展 `Type::TraitObject { trait_name, generics }`，
-        // TraitObject subtype Trait：v0.75.86 升级为 trait_name + generics
-        // 同构判断（之前 unit variant 返 false 是 stub）。
         if let (
             Type::TraitObject {
                 trait_name: tn1,
@@ -844,7 +605,6 @@ impl Type {
             }
             return g1.iter().zip(g2.iter()).all(|(a, b)| a.subtype_of(b));
         }
-        // === 现有 compatible_with 的 Trait 同构 arm ===
         if let (
             Type::Trait {
                 name: a,
@@ -859,69 +619,49 @@ impl Type {
             if a != b || ga.len() != gb.len() {
                 return false;
             }
-            // 严格 subtype：ga 必须逐元素 <: gb（保守方向）
             return ga.iter().zip(gb.iter()).all(|(x, y)| x.subtype_of(y));
         }
-        // v0.80: Arrow subtype — 参数逆变，返回协变，effect row 严格相等。
-        // （函数子类型标准规则：contravariant in input, covariant in output。）
+        // Function subtyping: contravariant parameter, covariant return, subsumed effect row.
         if let (Type::Arrow(i1, o1, r1), Type::Arrow(i2, o2, r2)) = (self, super_ty) {
-            return i2.subtype_of(i1) && o1.subtype_of(o2) && r1 == r2;
+            return i2.subtype_of(i1) && o1.subtype_of(o2) && effect_row_subsumes(r1, r2);
         }
-        // v0.90.5: 数值子类型 — Int <: Float（标准数值提升规则）
-        // `let x: float = 42` / `fn(x: float) f(42)` 等场景
+        // Int widens cleanly to Float; Float does not narrow to Int.
         if matches!(self, Type::Int) && matches!(super_ty, Type::Float) {
-            return true;
-        }
-        // v0.91: BigInt 自反 — BigInt <: BigInt
-        if matches!(self, Type::BigInt) && matches!(super_ty, Type::BigInt) {
-            return true;
-        }
-        // v0.102: 声明式范式 — Goal 自反；cons 逐位 subtype；关系按位置签名
-        if matches!(self, Type::Goal) && matches!(super_ty, Type::Goal) {
             return true;
         }
         if let (Type::Cons(h1, t1), Type::Cons(h2, t2)) = (self, super_ty) {
             return h1.subtype_of(h2) && t1.subtype_of(t2);
         }
-        if let (Type::Relation(p1), Type::Relation(p2)) = (self, super_ty) {
-            return p1.len() == p2.len() && p1.iter().zip(p2.iter()).all(|(a, b)| a.subtype_of(b));
-        }
-        // v0.104.6 D77：同 `compatible_with` 里的处理 —— `Type::TeaApp` 的
-        // `name` 是显示标签而非名义类型的一部分，逐字段比较时忽略它。
-        // `print` 的形参检查走 `check_against` → 本函数，其 Union 分支调用的
-        // 也是 `subtype_of`，故这一处**必须**与 `compatible_with` 同步改，
-        // 否则 `print(tea.init())` 仍会被拒。
-        if let (
-            Type::TeaApp {
-                model: m1,
-                msg: g1,
-                update: u1,
-                view: v1,
-                ..
-            },
-            Type::TeaApp {
-                model: m2,
-                msg: g2,
-                update: u2,
-                view: v2,
-                ..
-            },
-        ) = (self, super_ty)
-        {
-            // ⚠ 诚实标注：**本 arm 未被 `tests/print_display_arms.rs` 触及** ——
-            // 反向验证表明，把上面 `compatible_with` 的同名 arm 退回结构相等后
-            // 那 2 条测试仍失败（即 `print` 这条路径**只**走 `compatible_with`）。
-            // 此处仍按同一推理修改，是为「同一概念两处保持一致」：否则下一次
-            // 有代码走 `subtype_of` 判 TeaApp 兼容性时会重新踩坑。
-            // **理由是推理，不是测试证据** —— 别把它当成「测过了」。
-            return m1.subtype_of(m2)
-                && g1.subtype_of(g2)
-                && u1.subtype_of(u2)
-                && v1.subtype_of(v2);
-        }
-        // 兜底：同构严格相等
         self == super_ty
     }
+}
+
+fn effect_row_tail(row: &crate::mir::effect::EffectRow) -> Option<&str> {
+    let mut cur = row;
+    loop {
+        match cur {
+            crate::mir::effect::EffectRow::Empty => return None,
+            crate::mir::effect::EffectRow::Var(v) => return Some(v.as_str()),
+            crate::mir::effect::EffectRow::Cons(_, rest) => cur = rest,
+        }
+    }
+}
+
+/// True iff every effect possibly performed by `sub` is permitted by `sup`.
+pub fn effect_row_subsumes(
+    sub: &crate::mir::effect::EffectRow,
+    sup: &crate::mir::effect::EffectRow,
+) -> bool {
+    let sup_tail = effect_row_tail(sup);
+    if let Some(sub_var) = effect_row_tail(sub)
+        && sup_tail != Some(sub_var)
+    {
+        return false;
+    }
+    let sup_labels = sup.labels();
+    sub.labels()
+        .iter()
+        .all(|lbl| sup_labels.contains(lbl) || sup_tail.is_some())
 }
 
 /// v0.13: 判断类型是否是空 Union (即原 Any 占位)
@@ -969,31 +709,35 @@ pub fn is_known_type(name: &str) -> bool {
         lower.as_str(),
         "string"
             | "char"
+            | "int"
+            | "i4"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
             | "float"
+            | "f16"
+            | "bf16"
+            | "fp8"
+            | "f32"
+            | "f64"
+            | "number"
             | "bool"
             | "nil"
             | "list"
             | "dict"
             | "task"
             | "closure"
-            | "conversation"
-            | "stream"
-            | "ai_config"
-            | "ai_result"
-            | "ai_error"
-            | "ai_module"
-            | "router"
-            | "http_request"
-            | "http_response"
-            | "mcp_server"
             | "result"
             | "atom"
             | "compose"
             | "partial"
             | "macro"
             | "any"
-            // v0.102: 声明式范式
-            | "goal"
     ) || lower.starts_with("list<")
         || lower.starts_with("dict<")
         || lower.starts_with("result<")
@@ -1173,4 +917,4 @@ impl SymbolTable {
 
 // v0.90.5: check_program_mir / check_program_mir_with_types 已删除
 // （兼容桥违反 AGENTS.md §6）。类型检查入口统一为
-// check_program_witnesses / check_program_witnesses_bidirectional。
+// check_program_witnesses。

@@ -39,7 +39,7 @@ use mora::test_support::TempDir;
 fn typeck(src: &str) -> Result<(), String> {
     let (_func, witnesses) =
         mora::cli::compile_and_opt(src, None).map_err(|e| format!("COMPILE: {e}"))?;
-    let errs = mora::typeck::check_mir::check_program_witnesses_bidirectional(&witnesses);
+    let errs = mora::typeck::check_mir::check_program_witnesses(&witnesses);
     if errs.is_empty() {
         Ok(())
     } else {

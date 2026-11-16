@@ -17,8 +17,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use crate::mir::witness::{MirWitness, WitnessKind};
-use crate::typeck::Type;
-use crate::typeck::TypeError;
+use crate::typeck::{Type, TypeError, TypeVarId};
 
 /// v0.98: import 收集结果 —— env 绑定与 effect 签名双通道。
 #[derive(Debug, Default)]
@@ -48,25 +47,25 @@ impl ImportedModuleSymbols {
 /// 桥接 from_exprs 后进入本函数，单一实现）。
 fn extract_module_symbols(
     witnesses: &[MirWitness],
-    pre: &[(String, Type)],
+    nested: &ImportedModuleSymbols,
+    module_path: &str,
+    errors: &mut Vec<TypeError>,
 ) -> ImportedModuleSymbols {
     let mut syms: Vec<(String, Type)> = Vec::new();
 
-    // 1) 逐条顶层声明求**精确类型**。
-    //
-    // v0.103 修复：此前只把 `let` 绑定从模块 HM env 取出，而 `task`(FnDef)
-    // 一律硬编码为裸 `Type::Closure` —— 但调用点需要精确的 Arrow 才能完成
-    // `greet("x")` 的合一，于是「导入的 task 被调用」必然报
-    // "expected closure, got fn (string) -> …"（无任何测试覆盖该路径，
-    // 缺陷长期潜伏）。现在对每条顶层声明单独 `infer_expr` 取其真实类型：
-    // FnDef → curried Arrow，let → 绑定类型，struct/enum → Unknown，
-    // type alias → 目标类型。
+    // 1) 逐条顶层声明求**精确类型**，并将模块内部静态类型错误冒泡到导入方检查结果。
     let mut hm = crate::typeck::hm::HMInference::new();
-    for (name, ty) in pre {
+    for (name, ty) in &nested.env_bindings {
         hm.env.add(name.clone(), ty.clone());
     }
-    let _ = hm.infer_program(witnesses); // 模块内部错误不在此冒泡（与运行时
-    // mir_import 的 `let _type_errs` 一致）
+    for (label, sig) in &nested.effect_signatures {
+        hm.effect_signatures.insert(label.clone(), sig.clone());
+    }
+    for hm_err in hm.infer_program(witnesses) {
+        let mut ext = crate::typeck::check_mir::hm_to_external(hm_err);
+        ext.message = format!("in imported module '{}': {}", module_path, ext.message);
+        errors.push(ext);
+    }
     // let 绑定（已在 env 中，含 generalization）
     for (name, ty) in hm.env.all_bindings() {
         syms.push((name, sanitize(&ty)));
@@ -149,21 +148,78 @@ fn extract_module_symbols(
     }
 }
 
-/// 合并前的安全化：闭包身份 TypeVar / 未解析 TypeVar 不能直接进目标 env
-/// （不同模块的 fresh 变量命名空间相同，直接合会与目标模块的 closure_sigs
-/// 侧表键冲突）。`forall<'a>.'a` 纯闭包身份 → `Closure`；结构型泛型值
-/// （如 `list<'a>`）保留结构，内部 TypeVar 退化为 `Any`。
+/// Sanitize exported types across module boundaries: rigid type parameters
+/// and `ForAll` wrappers stay polymorphic, while unresolved meta variables
+/// degrade safely to `Any` (or `Closure` for naked closure identities).
 fn sanitize(ty: &Type) -> Type {
     match ty {
-        Type::TypeVar(_) => Type::Unknown,
+        Type::TypeVar(TypeVarId::Rigid(_)) => ty.clone(),
+        Type::TypeVar(TypeVarId::Meta(_)) => Type::Any,
         Type::ForAll(vars, inner) => match inner.as_ref() {
             Type::TypeVar(_) => Type::Closure,
-            _ => Type::ForAll(vars.clone(), Box::new(sanitize(inner))),
+            _ => {
+                let kept_vars: Vec<TypeVarId> = vars
+                    .iter()
+                    .filter(|v| matches!(v, TypeVarId::Rigid(_)))
+                    .cloned()
+                    .collect();
+                let clean_inner = sanitize_keeping(inner, &kept_vars);
+                if kept_vars.is_empty() {
+                    clean_inner
+                } else {
+                    Type::ForAll(kept_vars, Box::new(clean_inner))
+                }
+            }
         },
         Type::List(e) => Type::List(Box::new(sanitize(e))),
+        Type::Channel(e) => Type::Channel(Box::new(sanitize(e))),
+        Type::TaskHandle(e) => Type::TaskHandle(Box::new(sanitize(e))),
         Type::Dict(k, v) => Type::Dict(Box::new(sanitize(k)), Box::new(sanitize(v))),
         Type::Result_(ok, err) => Type::Result_(Box::new(sanitize(ok)), Box::new(sanitize(err))),
+        Type::Tuple(elems) => Type::Tuple(elems.iter().map(|e| Box::new(sanitize(e))).collect()),
+        Type::Cons(h, t) => Type::Cons(Box::new(sanitize(h)), Box::new(sanitize(t))),
+        Type::Arrow(i, o, row) => {
+            Type::Arrow(Box::new(sanitize(i)), Box::new(sanitize(o)), row.clone())
+        }
         Type::Union(members) => Type::Union(members.iter().map(sanitize).collect()),
+        _ => ty.clone(),
+    }
+}
+
+fn sanitize_keeping(ty: &Type, kept: &[TypeVarId]) -> Type {
+    match ty {
+        Type::TypeVar(id) if kept.contains(id) => ty.clone(),
+        Type::TypeVar(TypeVarId::Rigid(_)) => ty.clone(),
+        Type::TypeVar(TypeVarId::Meta(_)) => Type::Any,
+        Type::List(e) => Type::List(Box::new(sanitize_keeping(e, kept))),
+        Type::Channel(e) => Type::Channel(Box::new(sanitize_keeping(e, kept))),
+        Type::TaskHandle(e) => Type::TaskHandle(Box::new(sanitize_keeping(e, kept))),
+        Type::Dict(k, v) => Type::Dict(
+            Box::new(sanitize_keeping(k, kept)),
+            Box::new(sanitize_keeping(v, kept)),
+        ),
+        Type::Result_(ok, err) => Type::Result_(
+            Box::new(sanitize_keeping(ok, kept)),
+            Box::new(sanitize_keeping(err, kept)),
+        ),
+        Type::Tuple(elems) => Type::Tuple(
+            elems
+                .iter()
+                .map(|e| Box::new(sanitize_keeping(e, kept)))
+                .collect(),
+        ),
+        Type::Cons(h, t) => Type::Cons(
+            Box::new(sanitize_keeping(h, kept)),
+            Box::new(sanitize_keeping(t, kept)),
+        ),
+        Type::Arrow(i, o, row) => Type::Arrow(
+            Box::new(sanitize_keeping(i, kept)),
+            Box::new(sanitize_keeping(o, kept)),
+            row.clone(),
+        ),
+        Type::Union(members) => {
+            Type::Union(members.iter().map(|m| sanitize_keeping(m, kept)).collect())
+        }
         _ => ty.clone(),
     }
 }
@@ -196,7 +252,7 @@ pub fn collect_imported_symbols(
                             let nested =
                                 collect_imported_symbols(&module_witnesses, visited, errors);
                             let own =
-                                extract_module_symbols(&module_witnesses, &nested.env_bindings);
+                                extract_module_symbols(&module_witnesses, &nested, &path, errors);
                             out.extend(own);
                             out.extend(nested);
                         }

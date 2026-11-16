@@ -39,7 +39,7 @@ fn run(src: &str) -> String {
     //
     // 加这道关的代价很低（本文件用例都是刻意写成能过 typeck 的），收益是
     // 「两种写法**都被编译器接受**且**运行期一致**」这一更强的不变量。
-    let type_errs = check_program_witnesses_bidirectional(&witnesses);
+    let type_errs = check_program_witnesses(&witnesses);
     if !type_errs.is_empty() {
         return format!(
             "TYPECK-ERR: {:?}",
@@ -50,23 +50,17 @@ fn run(src: &str) -> String {
         );
     }
     let arc = Arc::new(func);
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    match execute(
-        &arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    ) {
-        Ok(v) => format!("{v}"),
+    let mut core = CoreRuntime::default();
+    match execute_program(arc, &mut core) {
+        Ok((v, _)) => format!("{v}"),
         Err(e) => format!("ERR: {e}"),
     }
 }
 
-use mora::interpreter::Interpreter;
-use mora::mir::vm::execute;
 use mora::parser_v3::ParserV3;
-use mora::typeck::check_mir::check_program_witnesses_bidirectional;
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::execute_program;
+use mora::typeck::check_mir::check_program_witnesses;
 
 /// `(配对名, 源码, 期望结果)` —— 源码内部对两种写法做相等性比较。
 ///
@@ -77,47 +71,39 @@ fn pairs() -> Vec<(&'static str, String, &'static str)> {
     vec![
         // ── 取元素：下标 vs `.get`（memo 缺陷的原发现处）────────────────
         ("list_index_vs_get",
-         "let xs = [10, 20, 30]\nif xs[1] == xs.get(1) then 1 else 0 end\n".into(), "1.0"),
+         "let xs = [10, 20, 30]\nif xs[1] == xs.get(1) then 1 else 0 end\n".into(), "1"),
         ("dict_index_vs_get",
-         "let d = {a: 7}\nif d[\"a\"] == d.get(\"a\") then 1 else 0 end\n".into(), "1.0"),
+         "let d = {a: 7}\nif d[\"a\"] == d.get(\"a\") then 1 else 0 end\n".into(), "1"),
         ("nested_index_paths_agree",
-         "let m = [[1, 2], [3, 4]]\nif m[1][0] == m.get(1).get(0) then 1 else 0 end\n".into(), "1.0"),
+         "let m = [[1, 2], [3, 4]]\nif m[1][0] == m.get(1).get(0) then 1 else 0 end\n".into(), "1"),
         // ── 长度：builtin vs 方法（Call vs 方法）───────────────────────
         ("len_builtin_vs_method_list",
-         "let xs = [1, 2, 3]\nif len(xs) == xs.len() then 1 else 0 end\n".into(), "1.0"),
-        // v0.104.6 D54：原先写 `if len(d) == d.len() then 1 else 0 end`，而
-        // **Dict 接收者**的这一形态被 typeck 拒（`expected int, got float`），
-        // 且把比较结果绑给变量（`let eq = …`）同样被拒 —— 两者都属 D54。
-        // 本配对要检验的只是「builtin `len` vs 方法 `.len()`」**是否等价**，
-        // 与结果被不被消费无关，故用尾表达式形态（实测通过，值是 `true` 而非
-        // `1.0` —— 故本对的期望值也随之为 `"true"`）。
-        // D54 本身由下面 `dict_len_comparison_inside_if_is_a_known_typeck_gap`
-        // 单独记录。
+         "let xs = [1, 2, 3]\nif len(xs) == xs.len() then 1 else 0 end\n".into(), "1"),
         ("len_builtin_vs_method_dict",
-         "let d = {a: 1, b: 2}\nif len(d) == d.len() then 1 else 0 end\n".into(), "1.0"),
+         "let d = {a: 1, b: 2}\nif len(d) == d.len() then 1 else 0 end\n".into(), "1"),
         ("len_builtin_vs_method_str",
-         "let s = \"hello\"\nif len(s) == s.len() then 1 else 0 end\n".into(), "1.0"),
+         "let s = \"hello\"\nif len(s) == s.len() then 1 else 0 end\n".into(), "1"),
         // ── 容器方法 vs 手工等价写法 ─────────────────────────────────────
         ("take_equals_manual",
-         "let xs = [1, 2, 3, 4, 5]\nlet t = xs.take(3)\nlet m = [].push(1).push(2).push(3)\nif t == m then 1 else 0 end\n".into(), "1.0"),
+         "let xs = [1, 2, 3, 4, 5]\nlet t = xs.take(3)\nlet m = [].push(1).push(2).push(3)\nif t == m then 1 else 0 end\n".into(), "1"),
         ("filter_equals_manual",
-         "let xs = [1, 2, 3, 4]\nlet a = xs.filter(fn(x) x % 2 == 0 end)\nlet b = [2, 4]\nif a == b then 1 else 0 end\n".into(), "1.0"),
+         "let xs = [1, 2, 3, 4]\nlet a = xs.filter(fn(x) x % 2 == 0 end)\nlet b = [2, 4]\nif a == b then 1 else 0 end\n".into(), "1"),
         ("flatten_equals_manual",
-         "let xs = [[1, 2], [3, 4]]\nlet a = xs.flatten()\nlet b = [1, 2, 3, 4]\nif a == b then 1 else 0 end\n".into(), "1.0"),
+         "let xs = [[1, 2], [3, 4]]\nlet a = xs.flatten()\nlet b = [1, 2, 3, 4]\nif a == b then 1 else 0 end\n".into(), "1"),
         ("map_equals_manual",
-         "let xs = [1, 2, 3]\nlet a = xs.map(fn(x) x * 2 end)\nlet b = [2, 4, 6]\nif a == b then 1 else 0 end\n".into(), "1.0"),
+         "let xs = [1, 2, 3]\nlet a = xs.map(fn(x) x * 2 end)\nlet b = [2, 4, 6]\nif a == b then 1 else 0 end\n".into(), "1"),
         ("sum_equals_manual_index",
-         "let xs = [1, 2, 3]\nlet a = xs.sum()\nlet b = 0\nlet i = 0\nwhile i < 3\n  let b = b + xs[i]\n  let i = i + 1\nend\nif a == b then 1 else 0 end\n".into(), "1.0"),
+         "let xs = [1, 2, 3]\nlet a = xs.sum()\nlet b = 0\nlet i = 0\nwhile i < 3\n  let b = b + xs[i]\n  let i = i + 1\nend\nif a == b then 1 else 0 end\n".into(), "1"),
         ("push_chain_equals_literal",
-         "let a = [].push(1).push(2).push(3)\nlet b = [1, 2, 3]\nif a == b then 1 else 0 end\n".into(), "1.0"),
+         "let a = [].push(1).push(2).push(3)\nlet b = [1, 2, 3]\nif a == b then 1 else 0 end\n".into(), "1"),
         // ── `sort` 返回新列表、**不改**接收者（值语义契约）─────────────
         // 注意：sort 从来不是原地排序（迁移前后实现一致，都是「构建 sorted 再返回」）。
         ("sort_leaves_receiver_unchanged",
-         "let a = [3, 1, 2]\nlet b = a.sort()\nif b == [1, 2, 3] and a == [3, 1, 2] then 1 else 0 end\n".into(), "1.0"),
+         "let a = [3, 1, 2]\nlet b = a.sort()\nif b == [1, 2, 3] and a == [3, 1, 2] then 1 else 0 end\n".into(), "1"),
         // ── `keys` / `values` 必须按下标对齐 ───────────────────────────
         // `keys()` 与 `values()` 曾各自独立排序（一个对、一个错就会错配）。
         ("keys_values_aligned_by_index",
-         "let d = {a: 1, b: 2, c: 3}\nlet ks = d.keys()\nlet vs = d.values()\nlet ok = 1\nlet i = 0\nwhile i < 3\n  if vs[i] != d.get(ks[i]) then\n    let ok = 0\n  end\n  let i = i + 1\nend\nok\n".into(), "1.0"),
+         "let d = {a: 1, b: 2, c: 3}\nlet ks = d.keys()\nlet vs = d.values()\nlet ok = 1\nlet i = 0\nwhile i < 3\n  if vs[i] != d.get(ks[i]) then\n    let ok = 0\n  end\n  let i = i + 1\nend\nok\n".into(), "1"),
     ]
 }
 

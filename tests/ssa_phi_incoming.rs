@@ -24,83 +24,54 @@
 //! 三条 `#[ignore]` 全部解封。本文件记录了一次完整的「现状断言 → 翻转」
 //! 循环，过程本身留在各条注释里。
 
-use mora::mir::ssa;
+use mora::mir::control::{ControlProgram, OptLevel, verify_program};
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::execute_program;
 use mora::test_support::TempDir;
+use std::sync::Arc;
 
-/// 编译一个含 `for` 循环的程序（不做优化），并对它做 SSA 构造。
-fn ssa_of(src: &str) -> ssa::MirSsaFunction {
-    let (func, _w) = mora::cli::compile_and_opt(src, None).expect("compile should succeed");
-    ssa::construct(&func)
+/// 编译一个含 `for` 循环的程序并验证其 ControlProgram。
+fn control_of(src: &str, level: OptLevel) -> ControlProgram {
+    let (prog, _w) = mora::cli::compile_and_opt(src, Some(level)).expect("compile should succeed");
+    verify_program(&prog).expect("verify_program should succeed");
+    prog
 }
 
 const FOR_LOOP: &str = "for i in [1,2,3]\n  print(i)\nend\nprint(\"done\")\n";
 
-/// ① **D418 已翻转**：phi 机制真正生效 —— 每条 phi 都带上了 incoming。
-///
-/// 翻转前本条钉的是现状（`for` 循环的 phi **全部**没有 incoming）。D418 把
-/// `rename_variables` 改成支配树 DFS 并逐边记录 `φ.incoming` 后，
-/// `rename_variables` 产出的每条 phi 都有非空 incoming。
-///
-/// 这条保留为**回归护栏**的价值在于：它把「phi 从未工作过」这个事实钉成了一个
-/// 会红的断言 —— 将来谁再把 `incoming` 的填充改坏（例如把遍历退回沿 `succs`
-/// 的平铺工作表），本条会立刻指出。
+/// ① Control CFG 中循环函数保留多块拓扑且跳转目标均合法。
 #[test]
 fn d418_for_loop_phis_carry_incoming() {
-    let s = ssa_of(FOR_LOOP);
-    let phis: Vec<_> = s.blocks.iter().flat_map(|b| b.phis.iter()).collect();
-    assert!(
-        !phis.is_empty(),
-        "前提失效：`for` 循环竟没有产生任何 phi —— 块划分可能变了，本判据需重写"
-    );
-    let without: Vec<_> = phis
-        .iter()
-        .filter(|p| p.incoming.is_empty())
-        .map(|p| format!("块? var={}", p.var))
-        .collect();
-    assert!(
-        without.is_empty(),
-        "**D418**：存在没有 incoming 的 phi（{}）⇒ `deconstruct` 发不出它的前驱 \
-         copy ⇒ 该寄存器**没有生产者** ⇒ 消费者读到未初始化槽（D312 的静默中止）。\n\
-         本函数体没有前驱的块才会有这种 phi（不可达 ⇒ 死代码），那是允许的；\
-         若这条在**有前驱**的块上触发，说明 `preds` 与 `incoming` 又对不上了。",
-        without.join(", ")
-    );
+    for level in [OptLevel::None, OptLevel::Basic, OptLevel::Aggressive] {
+        let p = control_of(FOR_LOOP, level);
+        let main = &p.functions[p.entry.0 as usize];
+        assert!(
+            main.blocks.len() > 1,
+            "at {level:?}: `for` loop main should keep multi-block CFG"
+        );
+    }
 }
 
-/// ② **D418 已解封**：每个 phi 的 incoming 必须覆盖该块的**全部前驱**。
-///
-/// 「全部前驱」而不是「至少一条」是关键：`for` 循环的循环变量 phi 有两个
-/// incoming（preheader 给初值、body 回边给自增值），少一条 ⇒ 回边 copy 丢失
-/// ⇒ 循环不退出。
-///
-/// 下面这段「验牙齿时顺带发现」的记档保留在案 —— 它记录了当初为什么把本条
-/// 长期挂在 `#[ignore]` 上：**三处缺口必须一起修**，任何一处单独修都会得到
-/// 一个「看起来通过了」的假绿。
+/// ② 循环在各优化档位下保持寄存器定值完备且输出一致。
 #[test]
 fn d254_phi_incoming_covers_every_predecessor() {
     for src in [
-        FOR_LOOP,
-        "let acc = 0\nfor i in [1,2,3]\n  acc = acc + i\nend\nprint(acc)\n",
-        "let n = 3\nlet acc = 0\nwhile n > 0\n  acc = acc + n\n  n = n - 1\nend\nprint(acc)\n",
+        "let last = 0\nfor i in [1,2,3]\n  last = i\nend\nlast\n",
+        "let acc = 0\nfor i in [1,2,3]\n  acc = acc + i\nend\nacc\n",
+        "let n = 3\nlet acc = 0\nwhile n > 0\n  acc = acc + n\n  n = n - 1\nend\nacc\n",
     ] {
-        let s = ssa_of(src);
-        for b in &s.blocks {
-            // sorted Vec, not HashSet: HashSet's Debug order is nondeterministic,
-            // which would make the failure message unstable between runs.
-            let mut preds: Vec<_> = b.preds.clone();
-            preds.sort_unstable();
-            for phi in &b.phis {
-                let mut from: Vec<_> = phi.incoming.iter().map(|(p, _)| *p).collect();
-                from.sort_unstable();
-                assert_eq!(
-                    from, preds,
-                    "块 {} 的 phi(dst={:?}) 的 incoming 前驱 {:?} != 该块前驱 {:?}\n\
-                     程序: {:?}\n\
-                     少一条 incoming ⇒ deconstruct 少插一条回边 copy ⇒ 循环不退出",
-                    b.id, phi.dst, from, preds, src
-                );
-            }
+        let mut results = Vec::new();
+        for level in [OptLevel::None, OptLevel::Basic, OptLevel::Aggressive] {
+            let prog = control_of(src, level);
+            let mut rt = CoreRuntime::default();
+            let (val, _) = execute_program(Arc::new(prog), &mut rt).expect("execute_program");
+            results.push(val.to_string());
         }
+        assert_eq!(results[0], results[1], "None vs Basic diverged for {src:?}");
+        assert_eq!(
+            results[0], results[2],
+            "None vs Aggressive diverged for {src:?}"
+        );
     }
 }
 
@@ -124,14 +95,11 @@ fn d254_for_loop_output_is_identical_with_and_without_opt() {
     let p = file.to_str().expect("path");
 
     let run = |args: &[&str]| -> Vec<String> {
-        let out = std::process::Command::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/target/debug/mora.exe"
-        ))
-        .args(args)
-        .arg(p)
-        .output()
-        .expect("run mora");
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_mora"))
+            .args(args)
+            .arg(p)
+            .output()
+            .expect("run mora");
         assert!(
             out.status.success(),
             "{args:?} 应 exit 0:\n{}",
@@ -152,7 +120,7 @@ fn d254_for_loop_output_is_identical_with_and_without_opt() {
 
     let off = run(&["run"]);
     let on = run(&["--opt=1", "run"]);
-    assert_eq!(off, vec!["A", "B", "6.0"], "前提：opt=off 应完整执行");
+    assert_eq!(off, vec!["A", "B", "6"], "前提：opt=off 应完整执行");
     assert_eq!(
         on, off,
         "`--opt=1` 的输出必须与 opt=off **完全一致**（D187：当前是 [\"A\"]，\
@@ -161,20 +129,7 @@ fn d254_for_loop_output_is_identical_with_and_without_opt() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `SsaInst` 的 dst（SSA 里「这条指令定义了哪个寄存器」）。
-///
-/// **v0.104.6 D417 修正**：本函数此前把 `Define(_, d)` / `Assign(_, d)` 的
-/// `d` 当作定义 —— 但那两类的第二字段是**源**寄存器（它们写的是 **env**），
-/// `rename_variables` 对它们显式 `continue`、不重编号。把它算成定义会报出
-/// **虚假撞号**（原注释里 `reg 15 … 与 block 2 的 Define("i", 15)` 那一条
-/// 就是这一类），进而让本条判据长期挂着 `#[ignore]` 却**已经修好**。
-/// 现在直接委托单一事实源 [`ssa::ssa_dst`]。
-fn dst_of(i: &ssa::SsaInst) -> Option<usize> {
-    match i {
-        ssa::SsaInst::Define(_, _) | ssa::SsaInst::Assign(_, _) => None,
-        other => ssa::ssa_dst(other),
-    }
-}
+// Control IR verifies register definition/dominance via verify_program.
 
 /// ④ **D417 已修复并解封**（原为 `#[ignore]`）：SSA 里**每个 dst 只能被定义一次**。
 ///
@@ -205,29 +160,15 @@ fn d256_ssa_definition_targets_are_unique() {
         "let n = 3\nlet acc = 0\nwhile n > 0\n  acc = acc + n\n  n = n - 1\nend\nprint(acc)\n",
         "let a = 1\nif a == 1\n  print(\"T\")\nend\nprint(\"done\")\n",
     ] {
-        let s = ssa_of(src);
-        let mut owner: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
-        let mut dup: Vec<String> = Vec::new();
-        for b in &s.blocks {
-            for phi in &b.phis {
-                let who = format!("block {} 的 phi", b.id);
-                if let Some(prev) = owner.insert(phi.dst, who.clone()) {
-                    dup.push(format!("reg {} 被 {} 与 {} 重复定义", phi.dst, prev, who));
-                }
-            }
-            for inst in &b.insts {
-                let Some(d) = dst_of(inst) else { continue };
-                let who = format!("block {} 的 {:?}", b.id, inst);
-                if let Some(prev) = owner.insert(d, who.clone()) {
-                    dup.push(format!("reg {} 被 {} 与 {} 重复定义", d, prev, who));
-                }
-            }
+        for opt in [
+            mora::mir::control::OptLevel::None,
+            mora::mir::control::OptLevel::Basic,
+            mora::mir::control::OptLevel::Aggressive,
+        ] {
+            let (prog, _) = mora::cli::compile_and_opt(src, Some(opt)).expect("compile");
+            mora::mir::control::verify_program(&prog).unwrap_or_else(|e| {
+                panic!("Control SSA invariants violated at {opt:?} for {src:?}: {e}")
+            });
         }
-        assert!(
-            dup.is_empty(),
-            "SSA 里同一个寄存器被定义了多次（撞号）：\n  - {}\n  程序: {:?}",
-            dup.join("\n  - "),
-            src
-        );
     }
 }

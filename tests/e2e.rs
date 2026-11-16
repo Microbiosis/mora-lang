@@ -92,7 +92,7 @@ fn e2e_assign_statement_recognized() {
     let r = mora::cli::compile_and_opt("assign zzz = 1i\n", None);
     assert!(r.is_ok(), "语法上应可编译（语义由 typeck 拒）");
     let ws = r.expect("compile ok").1;
-    let errs = mora::typeck::check_mir::check_program_witnesses_bidirectional(&ws);
+    let errs = mora::typeck::check_mir::check_program_witnesses(&ws);
     assert!(!errs.is_empty(), "assign 到未绑定名字必须报错");
 }
 
@@ -109,7 +109,7 @@ fn e2e_loop_bodies_are_typechecked() {
     use e2e_helpers::assert_source_ok;
     let errs_of = |src: &str| -> Vec<String> {
         let (_, ws) = mora::cli::compile_and_opt(src, None).expect("compile");
-        mora::typeck::check_mir::check_program_witnesses_bidirectional(&ws)
+        mora::typeck::check_mir::check_program_witnesses(&ws)
             .iter()
             .map(mora::typeck::format_error)
             .collect()
@@ -336,7 +336,7 @@ fn e2e_match_arm_body_need_not_match_scrutinee() {
     // 反向契约：arm 之间**不兼容**时仍必须报错
     let (_, ws) = mora::cli::compile_and_opt("match 1i {\n  1i => \"str\"\n  _ => 42i\n}\n", None)
         .expect("compile");
-    let errs = mora::typeck::check_mir::check_program_witnesses_bidirectional(&ws);
+    let errs = mora::typeck::check_mir::check_program_witnesses(&ws);
     assert!(
         !errs.is_empty(),
         "异质 arm body（String vs Int）必须被拒，实际无错误"
@@ -456,7 +456,7 @@ x
     let res = (|| -> Result<(), String> {
         let (_, witnesses) =
             mora::parser_v3::ParserV3::compile(bogus).map_err(|e| format!("parse: {}", e))?;
-        let type_errs = mora::typeck::check_mir::check_program_witnesses_bidirectional(&witnesses);
+        let type_errs = mora::typeck::check_mir::check_program_witnesses(&witnesses);
         if !type_errs.is_empty() {
             return Err(format!("{} type error(s)", type_errs.len()));
         }
@@ -495,8 +495,11 @@ fn e2e_compile_and_opt_returns_err_on_parse_error() {
         res.is_err(),
         "语法错误必须以 Err 返回（此前 panic），实际 Ok"
     );
-    let msg = res.expect_err("asserted is_err above");
-    assert!(!msg.is_empty(), "解析错误消息不得为空（需可读定位）");
+    let err = res.expect_err("asserted is_err above");
+    assert!(
+        !err.message().is_empty(),
+        "解析错误消息不得为空（需可读定位）"
+    );
 }
 
 // ===================================================================
@@ -569,7 +572,6 @@ fn e2e_all_fixtures_run() {
         "linalg_basic.mora",
         "random_basic.mora",
         "random_handle.mora",
-        "bigint_basic.mora",
         // v0.103: 循环 fixture（此前三个因二参 print 被类型检查拒绝而未纳入，
         // loop_basic 另有 `{` 配 `end` 的语法错误）
         "loop_basic.mora",
@@ -597,190 +599,6 @@ fn e2e_handle_perform_returns_handler_result() {
         "mocked:hello",
         "handle/perform 端到端语义失败：handler 末尾表达式值未传回 perform"
     );
-}
-
-// ===================================================================
-// v0.83: TEA (The Elm Architecture) — Runtime 层验证
-// ===================================================================
-// 注：完整 TEA 循环（Model/Msg/Update/Cmd + Replay）的 Runtime 基础设施
-// 已通过 unit tests 验证（src/tea/{mod,replay}.rs 中 10+ tests）。
-// E2E fixtures 需要 model/msg/update/app 新语法支持（Stage 4 路线图），
-// 本阶段仅做 Runtime API 集成测试：
-
-#[test]
-fn e2e_tea_runtime_compiles() {
-    // 验证 TeaApp/TeaCmd/TeaMsg 类型在 VM 中可构造和操作
-    // （Runtime 通过 builtin tea.* 暴露，E2E 暂用 unit tests 覆盖）
-    use mora::tea::{Cmd, Msg, TeaApp};
-    // v0.94: TeaApp 是纯值 —— with_model/dispatch 返回新 app，run_loop 返回新 app。
-    let app = TeaApp::new(
-        mora::value::Value::Nil,
-        mora::value::Value::Nil,
-        mora::value::Value::Nil,
-    )
-    .with_model(mora::value::Value::Int(42))
-    .dispatch(Msg::new("Test", mora::value::Value::Nil));
-    assert_eq!(app.model(), mora::value::Value::Int(42));
-    // v0.83: run_loop 需要 MirHost context —— 用 Interpreter::new() 注入
-    let mut interp = mora::interpreter::Interpreter::new();
-    assert_eq!(
-        app.run_loop(10, &mut interp).model(),
-        mora::value::Value::Int(42)
-    );
-    let cmd = Cmd::None;
-    let _ = cmd.to_value();
-}
-
-/// tea_app.mora：完整 model/msg/update/app 语法糖 — 验证 parser 端到端解析
-#[test]
-fn e2e_tea_app_runs() {
-    assert_ok("tea_app.mora");
-}
-
-/// tea_standalone.mora：TEA 独立声明 `model Name ... end` / `msg Name ... end`
-/// （spec §9.6 工作示例 + §14.2 EBNF）。锁定「IR/handler/typeck 齐备但
-/// parser 零产出」的缺陷。
-#[test]
-fn e2e_tea_standalone_runs() {
-    // run_e2e 不捕获 stdout 且 last_expr 取自顶层（app 声明为 Nil），
-    // 故走子进程捕获 print 输出做精确断言。
-    use std::process::Command;
-    let out = Command::new(env!("CARGO_BIN_EXE_mora"))
-        .arg("tests/fixtures/e2e/tea_standalone.mora")
-        .output()
-        .expect("run fixture");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("dict"),
-        "model 声明应注册为 dict，实际 stdout:
-{}",
-        stdout
-    );
-    assert!(
-        stdout.contains("list"),
-        "msg 声明应注册为 list，实际 stdout:
-{}",
-        stdout
-    );
-    // v0.103: 独立 `update(params) ... end` 声明（spec §9.6）——
-    // 运行时 h_update_def 注册为**可调用的 closure**（此前存的是 Dict +
-    // 一个 `"<MirFunction:N>"` 描述字符串，声明出的 update 永不可调用）；
-    // 更早则连 parser 产出点都没有，`type_of(update)` 报 Unbound variable。
-    assert!(
-        stdout.contains("closure"),
-        "update 声明应注册为可调用 closure，实际 stdout:
-{}",
-        stdout
-    );
-    assert!(
-        stdout.contains("tea_app"),
-        "app 应构造 TeaApp，实际 stdout:
-{}",
-        stdout
-    );
-}
-
-/// tea_counter.mora：TEA 完整运行时链路 —— 声明式 app 名可引用 +
-/// tea.init 三参构造 + tea.dispatch/run/update 驱动。
-/// 锁定的既有缺陷：typeck 不注册 app 名（Unbound variable）、emit 端伪造
-/// update/view witness、tea.init 硬编码 update/view = Nil（tea.run 崩）。
-#[test]
-fn e2e_tea_counter_runs() {
-    assert_ok("tea_counter.mora");
-}
-
-/// v0.104: TEA update 全链路 —— spec §9.6 工作示例必须逐字可跑。
-///
-/// 缺陷链（本条锁定的整条）：
-///   ① `update(msg, model) ... end` 独立声明 parser 无产出点（Unbound variable）；
-///   ② `h_update_def` 存 `Dict{__update_body__: "<MirFunction:2>"}` 描述字符串，
-///      声明出的 update 不可调用；
-///   ③ AppDef 把 update/view 的 **Closure witness** 当表达式 lower →
-///      产出「构造闭包」的指令，update 每次调用返回新闭包、模型变 `<closure>`；
-///   ④ `h_app_def` 硬编码闭包形参名 `["model","msg"]`，用户形参名 unbound；
-///   ⑤ 名字引用 `update: update` 的转发闭包缺 `Var` 取参 + 缺 `MirFunction.params`；
-///   ⑥ 运行时 `apply_update` 传 `(model, msg)`，与 spec §9.6 的
-///      `update(msg, model)`（Elm 序）相反 → 示例体 `model.count` 报
-///      "Dict has no method: count"；
-///   ⑦ match 的 output_reg 用 arm 局部寄存器 → 越界 panic。
-///
-/// 断言：2 次 Increment、1 次 Decrement 后模型 count == 3（n = 0 + 2 - 1）。
-#[test]
-fn e2e_tea_standalone_update_full_cycle() {
-    use e2e_helpers::assert_source_ok;
-    use mora::value::Value;
-    let src = "\
-model Counter
-  count: number = 0
-end
-msg CounterMsg
-  Increment
-  Decrement
-end
-update(msg, model)
-  match msg {
-    Increment => {count: model.count + 1i}
-    Decrement => {count: model.count - 1i}
-  }
-end
-app CounterApp
-  model: Counter
-  msg: CounterMsg
-  init: {count: 0}
-  update: update
-  view: fn(m) => m
-end
-let a = tea.dispatch(CounterApp, {tag: \"Increment\"})
-let a = tea.dispatch(a, {tag: \"Increment\"})
-let a = tea.dispatch(a, {tag: \"Decrement\"})
-let b = tea.run(a, 5)
-tea.model(b)
-";
-    let v = assert_source_ok(src);
-    let count = match &v {
-        Value::Dict(m) => m.get("count").cloned(),
-        other => panic!("期望模型 dict，得到 {:?}", other),
-    };
-    let n = match count {
-        Some(Value::Int(i)) => i as f64,
-        Some(Value::Float(f)) => f,
-        other => panic!("期望 count 为数值，得到 {:?}", other),
-    };
-    assert_eq!(
-        n, 3.0,
-        "+1 +1 -1 后 count 应为 3（update(msg, model) 按 spec §9.6 序被真正调用）"
-    );
-}
-
-/// ai_critic.mora：`ai.critic(answer, ctx?)`（spec §12.5 `string, string? -> value`）。
-/// 此前无任何实现（全仓无该 builtin），方法调用落 Unknown method。
-#[test]
-fn e2e_ai_critic_runs() {
-    use mora::value::Value;
-    let (last_expr, _) = assert_ok("ai_critic.mora");
-    // fixture 返回 [b(2参), a(1参)] —— 两者都必须是结构化裁决 dict
-    let items = match last_expr {
-        Value::List(items) => items,
-        other => panic!("期望 [b, a] 列表，得到 {:?}", other),
-    };
-    assert_eq!(items.len(), 2, "1 参与 2 参调用都必须可用（可选尾参）");
-    for (i, v) in items.iter().enumerate() {
-        let d = match v {
-            Value::Dict(d) => d,
-            other => panic!("第 {} 个结果应为 dict，得到 {:?}", i, other),
-        };
-        let verdict = d.get("verdict").and_then(|v| match v {
-            Value::String(s) => Some(s.as_str()),
-            _ => None,
-        });
-        assert!(
-            matches!(verdict, Some("pass") | Some("fail")),
-            "verdict 必须是 pass/fail，得到 {:?}",
-            d.get("verdict")
-        );
-        assert!(d.contains_key("score"), "结果须含 score 字段");
-        assert!(d.contains_key("critique"), "结果须含 critique 字段");
-    }
 }
 
 /// export_visibility.mora：模块可见性（spec §10.2）端到端。
@@ -815,105 +633,11 @@ fn e2e_export_visibility_runs() {
 fn e2e_export_private_symbol_not_visible() {
     let src = "import \"tests/fixtures/mod_export.mora\"\nlet x = hidden";
     let witnesses = mora::parser_v3::ParserV3::compile(src).expect("parse").1;
-    let errs = mora::typeck::check_mir::check_program_witnesses_bidirectional(&witnesses);
+    let errs = mora::typeck::check_mir::check_program_witnesses(&witnesses);
     assert!(
         !errs.is_empty(),
         "未 export 的 hidden 必须在 typeck 阶段被拒，实际无错"
     );
-}
-
-/// explicit_api.mora：`Type::new()` 关联构造 + Router/McpServer 方法链 +
-/// dict 关键字键。锁定 `::` 不被 parser 消费、构造器无分派、typeck 方法
-/// 签名漏用户参数、dict 键拒绝关键字四处缺陷。
-#[test]
-fn e2e_explicit_api_runs() {
-    use mora::value::Value;
-    let (last_expr, _) = assert_ok("explicit_api.mora");
-    let d = match last_expr {
-        Value::Dict(d) => d,
-        other => panic!("期望 dict 结果，得到 {:?}", other),
-    };
-    assert_eq!(d.get("router"), Some(&Value::String("router".into())));
-    assert_eq!(d.get("server"), Some(&Value::String("mcp_server".into())));
-    assert!(
-        matches!(d.get("schema"), Some(Value::Dict(_))),
-        "schema 应为 dict（含关键字键 type），得到 {:?}",
-        d.get("schema")
-    );
-}
-
-/// v0.104.4: **具体类型的自反合一** —— `unify(τ, τ)` 对任何 τ 成立。
-///
-/// 缺陷：`unify` 只列了 Int/Float/BigInt/String/Bool/Nil/Any 七个具体类型的
-/// 自反 arm，其余所有具体类型（Router、McpServer、Conversation…）落到末尾
-/// `_ => Err` —— 同一类型与自己合一都失败。触发面是「把方法返回值赋回同一
-/// 变量」的链式累加：`mcp = mcp.tool(…)` 报 "expected mcp_server, got
-/// mcp_server"；而 `let y = x.tool(…)`（新绑定走 generalize、不推 `Eq`）
-/// 正常，于是呈现为「赋回自己失败、换个名字就好」的怪象。
-/// 这正是 CI 里 `examples/mcp_server_demo.mora` 的报错。
-#[test]
-fn e2e_concrete_type_self_reassign_unifies() {
-    use e2e_helpers::run_source;
-    use mora::value::Value;
-    // ① McpServer 链式累加（CI 示例的形状）
-    let src = "let mcp = McpServer::new()\nmcp = mcp.tool(\"t\", {}, fn(a) return 1i end)\nmcp";
-    match run_source(src) {
-        e2e_helpers::E2eResult::Ok { last_expr, .. } => assert!(
-            matches!(last_expr, Value::McpServer { .. }),
-            "McpServer 自反赋值后应仍是 mcp_server，得到 {:?}",
-            last_expr
-        ),
-        e2e_helpers::E2eResult::CompileError(e) => {
-            panic!("McpServer 自反赋值不应是编译错误: {e}")
-        }
-        e2e_helpers::E2eResult::TypeErrors(errs) => panic!(
-            "McpServer 自反赋值不应报类型错误: {:?}",
-            errs.iter()
-                .map(mora::typeck::format_error)
-                .collect::<Vec<_>>()
-        ),
-    }
-    // ② Router 同理
-    let src = "let r = Router::new()\nr = r.route(\"GET\", \"/x\", fn(q) return 1i end)\nr";
-    match run_source(src) {
-        e2e_helpers::E2eResult::Ok { last_expr, .. } => assert!(
-            matches!(last_expr, Value::Router { .. }),
-            "Router 自反赋值后应仍是 router，得到 {:?}",
-            last_expr
-        ),
-        _ => panic!("Router 自反赋值必须通过类型检查"),
-    }
-    // ③ 反向：真正不同的具体类型仍必须被拒（契约未放松）
-    let (_f, w) = mora::parser_v3::ParserV3::compile(
-        "let mcp = McpServer::new()\nlet r = Router::new()\nmcp = r\n",
-    )
-    .expect("compile");
-    let errs = mora::typeck::check_mir::check_program_witnesses_bidirectional(&w);
-    assert!(
-        !errs.is_empty(),
-        "McpServer 赋值为 Router 必须被拒，实际无错误"
-    );
-}
-
-/// prompt_section.mora：`prompt "name" do ... end` 声明 + compose_prompt 拼接。
-/// 锁定：prompt 关键字不被 parser 消费、handler 吞错不构建值、
-/// compose_prompt 读错环境（core.environment vs 执行 env）三处缺陷。
-#[test]
-fn e2e_prompt_section_runs() {
-    use mora::value::Value;
-    let (last_expr, _) = assert_ok("prompt_section.mora");
-    let out = match last_expr {
-        Value::String(s) => s,
-        other => panic!("compose_prompt 应返回字符串，得到 {:?}", other),
-    };
-    assert!(out.contains("system"), "拼接结果应含 system 节: {}", out);
-    assert!(
-        out.contains("You are a helpful assistant."),
-        "应含 system 正文: {}",
-        out
-    );
-    assert!(out.contains("user"), "拼接结果应含 user 节: {}", out);
-    assert!(out.contains("What is Mora?"), "应含 user 正文: {}", out);
 }
 
 /// 全局模块对象在类型检查阶段可用 —— globals 注册表与 typeck 名单同源。
@@ -930,7 +654,7 @@ fn builtin_module_objects_pass_typeck() {
         );
         let (_f, w) = mora::parser_v3::ParserV3::compile(&src)
             .unwrap_or_else(|e| panic!("{} 编译失败: {}", name, e));
-        let errs = mora::typeck::check_mir::check_program_witnesses_bidirectional(&w);
+        let errs = mora::typeck::check_mir::check_program_witnesses(&w);
         assert!(
             errs.is_empty(),
             "模块对象 {} 不应在 typeck 报错: {:?}",
@@ -945,184 +669,15 @@ fn builtin_module_objects_pass_typeck() {
 /// 模块对象名单与 globals 注册同源（防再次漂移）。
 #[test]
 fn module_objects_are_registered_in_globals() {
-    use mora::mir::host::MirHost;
     use mora::value::MODULE_OBJECTS;
-    let interp = mora::interpreter::Interpreter::new();
-    let env = MirHost::environment(&interp);
+    let core = mora::runtime::CoreRuntime::default();
+    let env = core.environment();
     for (name, _) in MODULE_OBJECTS {
         assert!(
             env.get(name).is_some(),
             "MODULE_OBJECTS 列出的 {} 必须在 globals 中注册",
             name
         );
-    }
-}
-
-// ===================================================================
-// v0.102: 声明式范式（逻辑式/关系式）
-// ===================================================================
-
-/// rel_basic.mora：事实 + 规则 + 双查询变量 → 传递闭包全部有序对。
-#[test]
-fn e2e_rel_basic_runs() {
-    use mora::value::Value;
-    let (last_expr, _) = assert_ok("rel_basic.mora");
-    let pairs = match last_expr {
-        Value::List(items) => items,
-        other => panic!("expected list of (from, to) pairs, got {:?}", other),
-    };
-    // a→b, b→c, c→d 的传递闭包共 6 条有向路径
-    assert_eq!(pairs.len(), 6, "3 节点链的传递闭包应有 6 条路径");
-    let mut seen: Vec<(String, String)> = Vec::new();
-    for p in &pairs {
-        match p {
-            Value::List(t) if t.len() == 2 => {
-                let from = match &t[0] {
-                    Value::String(s) => s.clone(),
-                    o => panic!("from 应为字符串，得到 {:?}", o),
-                };
-                let to = match &t[1] {
-                    Value::String(s) => s.clone(),
-                    o => panic!("to 应为字符串，得到 {:?}", o),
-                };
-                seen.push((from, to));
-            }
-            o => panic!("解应为二元列表（元组），得到 {:?}", o),
-        }
-    }
-    seen.sort();
-    assert_eq!(
-        seen,
-        vec![
-            ("a".to_string(), "b".to_string()),
-            ("a".to_string(), "c".to_string()),
-            ("a".to_string(), "d".to_string()),
-            ("b".to_string(), "c".to_string()),
-            ("b".to_string(), "d".to_string()),
-            ("c".to_string(), "d".to_string()),
-        ],
-        "传递闭包应精确覆盖所有可达对"
-    );
-}
-
-/// rel_single_var.mora：单查询变量 → 解是标量值本身（非元组）。
-#[test]
-fn e2e_rel_single_var_runs() {
-    use mora::value::Value;
-    let (last_expr, _) = assert_ok("rel_single_var.mora");
-    let mut reach: Vec<String> = match last_expr {
-        Value::List(items) => items
-            .iter()
-            .map(|v| match v {
-                Value::String(s) => s.clone(),
-                o => panic!("单变量解应为字符串，得到 {:?}", o),
-            })
-            .collect(),
-        other => panic!("expected list of strings, got {:?}", other),
-    };
-    reach.sort();
-    assert_eq!(reach, vec!["b", "c", "d"], "从 a 可达 b/c/d");
-}
-
-/// rel_zero_var.mora：零查询变量 → 每个解是 nil 成功标记。
-#[test]
-fn e2e_rel_zero_var_runs() {
-    use mora::value::Value;
-    let (last_expr, _) = assert_ok("rel_zero_var.mora");
-    match last_expr {
-        Value::List(items) => {
-            assert_eq!(items.len(), 1, "edge(\"a\",\"b\") 恰有一个解");
-            assert_eq!(items[0], Value::Nil, "零查询变量的解是 nil 成功标记");
-        }
-        other => panic!("expected list, got {:?}", other),
-    }
-}
-
-/// rel_empty.mora：不可满足的目标 → 空解列表（失败剪枝）。
-#[test]
-fn e2e_rel_empty_runs() {
-    use mora::value::Value;
-    let (last_expr, _) = assert_ok("rel_empty.mora");
-    match last_expr {
-        Value::List(items) => assert!(items.is_empty(), "不存在的边应无解"),
-        other => panic!("expected list, got {:?}", other),
-    }
-}
-
-/// rel_run_limit.mora：run N 形式 → 恰好 N 个解（无后缀数字是 Float 的坑）。
-#[test]
-fn e2e_rel_run_limit_runs() {
-    use mora::value::Value;
-    let (last_expr, _) = assert_ok("rel_run_limit.mora");
-    match last_expr {
-        Value::List(items) => assert_eq!(items.len(), 2, "solve 2 应产出恰好 2 个解"),
-        other => panic!("expected list, got {:?}", other),
-    }
-}
-
-/// rel_project.mora：宿主投影（project）—— 关系体内的确定性宿主计算。
-/// 覆盖 Project 节点 + 顶层 task 的词法可见性：
-/// num 绑定 x → project(square, x, y) 调用外层 task 计算 x*x 并与 y 合一。
-#[test]
-fn e2e_rel_project_runs() {
-    use mora::value::Value;
-    let (last_expr, _) = assert_ok("rel_project.mora");
-    let items = match last_expr {
-        Value::List(items) => items,
-        other => panic!("expected list of (x, y) pairs, got {:?}", other),
-    };
-    assert_eq!(items.len(), 3, "num 有 3 条事实，squared 应产出 3 个解");
-    let mut pairs: Vec<(f64, f64)> = Vec::new();
-    for p in &items {
-        match p {
-            Value::List(t) if t.len() == 2 => {
-                let num = |v: &Value| match v {
-                    Value::Int(n) => *n as f64,
-                    Value::Float(n) => *n,
-                    o => panic!("应为数值，得到 {:?}", o),
-                };
-                pairs.push((num(&t[0]), num(&t[1])));
-            }
-            o => panic!("解应为二元列表，得到 {:?}", o),
-        }
-    }
-    pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-    assert_eq!(
-        pairs,
-        vec![(1.0, 1.0), (2.0, 4.0), (3.0, 9.0)],
-        "project(square, x, y) 应把 x*x 绑定到 y"
-    );
-}
-
-/// rel_cons.mora：cons 项构造 + 递归列表关系（appendo）→ 结构化解。
-#[test]
-fn e2e_rel_cons_runs() {
-    use mora::value::Value;
-    let (last_expr, _) = assert_ok("rel_cons.mora");
-    match last_expr {
-        Value::List(items) => {
-            assert_eq!(items.len(), 1, "appendo 的确定性拼接应恰有一个解");
-            // 结果应是 Cons 链 [1, 2, 3]
-            let mut cur = &items[0];
-            // 注意：无后缀数字字面量在 Mora 词法层是 Float（语言约定），
-            // 故 cons(1, ...) 的头是 Float(1.0)。
-            let mut got: Vec<f64> = Vec::new();
-            loop {
-                match cur {
-                    Value::Cons { car, cdr } => {
-                        match &**car {
-                            Value::Float(n) => got.push(*n),
-                            o => panic!("cons 头应为 Float，得到 {:?}", o),
-                        }
-                        cur = cdr;
-                    }
-                    Value::Nil => break,
-                    o => panic!("列表尾部应为 Cons 或 Nil，得到 {:?}", o),
-                }
-            }
-            assert_eq!(got, vec![1.0, 2.0, 3.0], "appendo([1,2], [3]) = [1,2,3]");
-        }
-        other => panic!("expected list of solutions, got {:?}", other),
     }
 }
 
@@ -1218,24 +773,18 @@ fn e2e_if_then_block_and_single_stmt_forms() {
     // then + break（语句而非表达式）
     ok("for i in [1i, 2i, 3i]\n  if i == 2i then break end\n  print(i)\nend\n1i");
     // 三种拼写在 execute 直调下都返回尾值 7（精确值验证）
-    use mora::mir::vm::execute;
+    use mora::runtime::CoreRuntime;
+    use mora::runtime::vm::execute_program;
     use std::sync::Arc;
     for src in [
         "if true { print(\"p\") }\n7i\n",
         "if true then\n  print(\"p\")\nend\n7i\n",
         "if false then\n  print(\"t\")\nelse\n  print(\"e\")\nend\n7i\n",
     ] {
-        let (func, _w) = mora::cli::compile_and_opt(src, None).expect("compile");
-        let mut interp = mora::interpreter::Interpreter::new();
-        let mut env = interp.take_env();
-        let arc = Arc::new(func);
-        let v = execute(
-            &arc,
-            &mut interp,
-            &mut env,
-            &mut mora::mir::effect::Effects::new(),
-        )
-        .expect("execute");
+        let (prog, _w) = mora::cli::compile_and_opt(src, None).expect("compile");
+        let mut core = CoreRuntime::default();
+        let arc = Arc::new(prog);
+        let (v, _) = execute_program(arc, &mut core).expect("execute");
         assert!(
             matches!(v, Value::Int(7) | Value::Float(_)),
             "if 语句之后的尾随表达式必须被执行到（得到 {:?}）:\n{src}",
@@ -1322,10 +871,11 @@ fn e2e_string_method_arities_match_runtime() {
 /// 同样返回哨兵 0。改用真实分配的寄存器。
 #[test]
 fn e2e_empty_blocks_do_not_panic() {
-    use mora::mir::vm::execute;
+    use mora::runtime::CoreRuntime;
+    use mora::runtime::vm::execute_program;
     use mora::value::Value;
     use std::sync::Arc;
-    // 直调 `execute` 断言尾值 —— 与本文件其他条目的 helper 取法无关，
+    // 直调 `execute_program` 断言尾值 —— 与本文件其他条目的 helper 取法无关，
     // 直接验证「空块之后程序继续执行、返回尾值」。
     for (label, src, expect) in [
         ("空 transaction 体", "transaction\nend\n5i\n", 5.0),
@@ -1345,17 +895,10 @@ fn e2e_empty_blocks_do_not_panic() {
             8.0,
         ),
     ] {
-        let (func, _w) = mora::cli::compile_and_opt(src, None).expect("compile");
-        let mut interp = mora::interpreter::Interpreter::new();
-        let mut env = interp.take_env();
-        let arc = Arc::new(func);
-        let v = execute(
-            &arc,
-            &mut interp,
-            &mut env,
-            &mut mora::mir::effect::Effects::new(),
-        )
-        .expect("execute 不得 panic");
+        let (prog, _w) = mora::cli::compile_and_opt(src, None).expect("compile");
+        let mut core = CoreRuntime::default();
+        let arc = Arc::new(prog);
+        let (v, _) = execute_program(arc, &mut core).expect("execute 不得 panic");
         let n = match v {
             Value::Int(n) => n as f64,
             Value::Float(n) => n,
@@ -1465,37 +1008,39 @@ fn e2e_task_lexical_visibility_runs() {
 /// 另锁定 register-level 语义：`return <expr>` emit 的寄存器即表达式结果。
 #[test]
 fn return_emits_result_register() {
-    use mora::mir::MirInst;
-    let (func, _w) = mora::parser_v3::ParserV3::compile(
+    use mora::mir::control::{ControlInst, ControlTerminator, FunctionKind};
+    let (prog, _w) = mora::parser_v3::ParserV3::compile(
         "task f(n)
   return n + 100i
 end",
     )
     .expect("compile task");
-    // 找到 TaskDef 的 body：末尾 Return 的寄存器必须是 BinaryOp 的 dst
-    let body = func
-        .body
+    let func = prog
+        .functions
         .iter()
-        .find_map(|i| match i {
-            MirInst::TaskDef { name, body, .. } if name == "f" => Some(body.as_ref()),
-            _ => None,
+        .find(|f| {
+            f.kind == FunctionKind::Task && f.name.map(|s| prog.symbols.resolve(s)) == Some("f")
         })
         .expect("TaskDef f");
-    let binary_dst = body.body.iter().find_map(|i| match i {
-        MirInst::BinaryOp(dst, _, _, _) => Some(*dst),
-        _ => None,
-    });
-    let ret_reg = body.body.iter().find_map(|i| match i {
-        MirInst::Return(Some(r)) => Some(*r),
-        _ => None,
-    });
+    let mut binary_dst = None;
+    let mut ret_reg = None;
+    for block in &func.blocks {
+        for inst in &block.insts {
+            if let ControlInst::Binary(dst, _, _, _) = inst {
+                binary_dst = Some(*dst);
+            }
+        }
+        if let ControlTerminator::Return(Some(r)) = block.terminator {
+            ret_reg = Some(r);
+        }
+    }
     assert_eq!(
         ret_reg, binary_dst,
-        "Return 必须指向 BinaryOp 的结果寄存器，而非硬编码 0"
+        "Return 必须指向 Binary 的结果寄存器，而非硬编码 0"
     );
     assert_ne!(
         binary_dst,
-        Some(0),
-        "该表达式结果不在 reg 0，能检出硬编码回归"
+        Some(mora::mir::control::VReg(0)),
+        "该表达式结果不应硬编码为 reg 0"
     );
 }

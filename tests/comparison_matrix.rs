@@ -42,7 +42,7 @@ fn run(src: &str, tag: &str) -> (i32, String) {
     let dir = TempDir::new(tag);
     let p = dir.join("p.mora");
     std::fs::write(&p, src).expect("写探针");
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+    let exe = env!("CARGO_BIN_EXE_mora");
     let out = Command::new(exe).arg(&p).output().expect("跑 mora");
     let _ = std::fs::remove_dir_all(&dir);
     let text = String::from_utf8_lossy(&out.stdout).into_owned()
@@ -58,6 +58,7 @@ fn run(src: &str, tag: &str) -> (i32, String) {
                 && !l.starts_with("AI 原语")
                 && !l.starts_with("显式 API")
                 && !l.starts_with("Trait 系统")
+                && !l.starts_with("类型与执行")
                 && !l.starts_with("Built-in")
                 && !l.starts_with("v0.15 CLI")
                 && !l.starts_with('⚠')
@@ -90,8 +91,6 @@ fn d323_cross_type_equality_is_rejected_never_silently_true() {
         "true == 1.0",
         "'a' == \"a\"",
         "\"1\" == 1",
-        "1n == 1i",
-        "1n == 1",
     ] {
         let (code, got) = cmp_of(e);
         assert_eq!(
@@ -104,11 +103,7 @@ fn d323_cross_type_equality_is_rejected_never_silently_true() {
         );
     }
     // 对照：数值塔内的 Int↔Float 提升是**既定**行为（D318 钉住）。
-    for (e, want) in [
-        ("1 == 1.0", "true"),
-        ("1i == 1.0", "true"),
-        ("1n == 1n", "true"),
-    ] {
+    for (e, want) in [("1 == 1.0", "true"), ("1i == 1.0", "true")] {
         let (code, got) = cmp_of(e);
         assert_eq!(code, 0, "`{e}` 应成功; 实得 {got}");
         assert_eq!(got, want, "`print({e})` 应得 {want}; 实得 {got}");

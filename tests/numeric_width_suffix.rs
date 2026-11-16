@@ -67,7 +67,7 @@ fn ev(body: &str) -> (i32, String) {
     std::fs::write(&p, body).expect("写探针");
     let home = dir.join("home");
     std::fs::create_dir_all(&home).expect("建 home");
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+    let exe = env!("CARGO_BIN_EXE_mora");
     let out = Command::new(exe)
         .arg(&p)
         .env("HOME", &home)
@@ -89,6 +89,7 @@ fn ev(body: &str) -> (i32, String) {
                 && !l.starts_with("AI 原语")
                 && !l.starts_with("显式 API")
                 && !l.starts_with("Trait 系统")
+                && !l.starts_with("类型与执行")
                 && !l.starts_with("Built-in")
                 && !l.starts_with("v0.15 CLI")
                 && !l.starts_with('⚠')
@@ -120,7 +121,7 @@ fn d356_harness_can_actually_collect_print_output() {
     assert_eq!(code, 0, "探针应正常退出; 实得 exit={code} out=[{got}]");
     assert_eq!(
         got.trim(),
-        "42.0",
+        "42",
         "采集器失效：`print(42)` 的 stdout 没被采到（本文件的断言全部依赖它）"
     );
 }
@@ -149,37 +150,40 @@ fn d356_width_suffix_is_not_appended_to_the_value() {
         ("1f32", "1.0"),
         ("1.5f64", "1.5"),
         ("2.5f16", "2.5"),
-        // 非 8/16/32/64 的位宽：位宽不建模 ⇒ 照常消费，值不变
-        ("1.5f7", "1.5"),
+        ("1.5bf16", "1.5"),
+        ("1.5fp8", "1.5"),
     ];
     for (lit, expected) in cases {
         let (code, got) = ev(&lit_probe(lit));
         assert_eq!(code, 0, "`{lit}` 应正常求值; 实得 exit={code} out={got}");
-        // 精确匹配而不是 contains —— "1.5" 是 "1.532" 的前缀，
-        // 用 contains 会让这条判据**恒绿**（第一次就犯过）。
         assert_eq!(
             got.trim(),
             expected,
             "`{lit}` 的位宽不得被拼进数值（修前 1.5f32 → 1.532）"
         );
     }
+    // Stage 3A-1：非法后缀 `1.5f7` 应明确报错、不得静默忽略
+    let (code, got) = ev(&lit_probe("1.5f7"));
+    assert_eq!(code, 2, "`1.5f7` 非法位宽后缀应报错; 实得 {got}");
+    assert!(
+        got.contains("Unknown numeric suffix"),
+        "`1.5f7` 应报 Unknown numeric suffix; 实得: {got}"
+    );
 }
 
-/// **整数位宽**：修前 `1i32` → 132，靠 `take_while` **侥幸**没坏。
-///
-/// 单独钉住是为了防止将来有人把 `take_while` 去掉（那正是
-/// 「巧合当设计」的典型改法 —— 有人会想「既然位宽已单独收集，
-/// 这个截断是多余的」）。
 #[test]
 fn d356_integer_width_suffix_yields_the_bare_value() {
     for (lit, expected) in [
-        ("1i7", "1"),
+        ("1i4", "1"),
         ("1i8", "1"),
         ("1i16", "1"),
         ("1i32", "1"),
         ("1i64", "1"),
         ("42i32", "42"),
+        ("1u8", "1"),
+        ("1u16", "1"),
         ("1u32", "1"),
+        ("1u64", "1"),
     ] {
         let (code, got) = ev(&lit_probe(lit));
         assert_eq!(code, 0, "`{lit}` 应正常求值; 实得 exit={code} out={got}");
@@ -189,30 +193,26 @@ fn d356_integer_width_suffix_yields_the_bare_value() {
             "`{lit}` 的位宽不得被拼进数值（修前 1i32 → 132）"
         );
     }
+    // Stage 3A-1：非法整数位宽 `1i7` 应明确报错
+    let (code, got) = ev(&lit_probe("1i7"));
+    assert_eq!(code, 2, "`1i7` 非法位宽后缀应报错; 实得 {got}");
+    assert!(
+        got.contains("Unknown numeric suffix"),
+        "`1i7` 应报 Unknown numeric suffix; 实得: {got}"
+    );
 }
 
-/// **BigInt 位宽**：`1n32` 修前也是 132（同一根因的第三条路径）。
-#[test]
-fn d356_bigint_width_suffix_yields_the_bare_value() {
-    for (lit, expected) in [("1n32", "1n"), ("7n8", "7n"), ("1N64", "1n")] {
-        let (code, got) = ev(&lit_probe(lit));
-        assert_eq!(code, 0, "`{lit}` 应正常求值; 实得 exit={code} out={got}");
-        assert_eq!(got.trim(), expected, "`{lit}` 的位宽不得被拼进数值");
-    }
-}
-
-/// **无位宽的字面量必须完全不受影响** —— 修复不能动到主路径。
+/// **无位宽字面量** —— 无后缀整数字面量在 Stage 3A-1 为 Int，浮点为 Float。
 #[test]
 fn d356_literals_without_width_are_unchanged() {
     for (lit, expected) in [
-        ("1", "1.0"),
+        ("1", "1"),
         ("1.5", "1.5"),
         ("1i", "1"),
         ("1u", "1"),
         ("1f", "1.0"),
-        ("1n", "1n"),
         ("0.125", "0.125"),
-        ("1000000", "1000000.0"),
+        ("1000000", "1000000"),
     ] {
         let (code, got) = ev(&lit_probe(lit));
         assert_eq!(code, 0, "`{lit}` 应正常求值; 实得 exit={code} out={got}");
@@ -259,7 +259,7 @@ fn d356_negative_literals_with_width_are_correct() {
         ("-1.5f32", "-1.5"),
         ("-1i32", "-1"),
         ("-42.25", "-42.25"),
-        ("-1.5f7", "-1.5"),
+        ("-1.5f64", "-1.5"),
     ] {
         let (code, got) = ev(&lit_probe(lit));
         assert_eq!(code, 0, "`{lit}` 应正常求值; 实得 exit={code} out={got}");

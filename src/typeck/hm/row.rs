@@ -56,6 +56,16 @@ pub fn unify_row(
     b: &EffectRow,
     subst: &mut super::unify::Substitution,
 ) -> Result<(), TypeError> {
+    unify_row_at(a, b, subst, None)
+}
+
+/// Unify two effect rows while propagating caller `Span` to any `EffectRowMismatch`.
+pub fn unify_row_at(
+    a: &EffectRow,
+    b: &EffectRow,
+    subst: &mut super::unify::Substitution,
+    span: Option<crate::common::Span>,
+) -> Result<(), TypeError> {
     use EffectRow::*;
     match (a, b) {
         (Empty, Empty) => Ok(()),
@@ -66,11 +76,11 @@ pub fn unify_row(
             } else if let Some(prev) = subst.lookup_row(v) {
                 // v 已绑定：用 bound 值递归
                 let prev = prev.clone();
-                unify_row(&prev, b, subst)
+                unify_row_at(&prev, b, subst, span)
             } else if let Some(prev) = subst.lookup_row(w) {
                 // w 已绑定：用 bound 值递归
                 let prev = prev.clone();
-                unify_row(a, &prev, subst)
+                unify_row_at(a, &prev, subst, span)
             } else {
                 // 都未绑定：单向绑定 v → Var(w)（禁止双向写入导致循环）
                 subst.bind_row(v.clone(), EffectRow::Var(w.clone()));
@@ -85,12 +95,12 @@ pub fn unify_row(
                 return Err(TypeError::EffectRowMismatch {
                     expected: format!("row var `{}`", v),
                     got: "self-referential row (occurs check)".to_string(),
-                    span: None,
+                    span,
                 });
             }
             if let Some(prev) = subst.lookup_row(v) {
                 let prev = prev.clone();
-                unify_row(&prev, other, subst)
+                unify_row_at(&prev, other, subst, span)
             } else {
                 subst.bind_row(v.clone(), other.clone());
                 Ok(())
@@ -99,19 +109,19 @@ pub fn unify_row(
         (Empty, Cons(h, _)) | (Cons(h, _), Empty) => Err(TypeError::EffectRowMismatch {
             expected: "pure".to_string(),
             got: format!("{{ {} }}", h),
-            span: None,
+            span,
         }),
         (Cons(h1, t1), Cons(h2, t2)) => {
             if h1 != h2 {
                 Err(TypeError::EffectRowMismatch {
                     expected: h1.clone(),
                     got: h2.clone(),
-                    span: None,
+                    span,
                 })
             } else {
                 let t1_owned = t1.as_ref().clone();
                 let t2_owned = t2.as_ref().clone();
-                unify_row(&t1_owned, &t2_owned, subst)
+                unify_row_at(&t1_owned, &t2_owned, subst, span)
             }
         }
     }

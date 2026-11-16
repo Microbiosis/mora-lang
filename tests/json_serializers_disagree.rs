@@ -83,16 +83,3 @@ fn d292_the_two_serializers_disagree_on_integral_float() {
          统一之后本条会红"
     );
 }
-
-/// `BigInt` 的线格式同样两路不同（D291 记录）。
-#[test]
-fn d292_the_two_serializers_disagree_on_bigint() {
-    let bi: num_bigint::BigInt = "123456789012345678901234567890".parse().unwrap();
-    let flow_side = value_to_json(&Value::BigInt(bi.clone()));
-    let lsp_side = mora::lsp::json::to_string(&mora::lsp::json::Value::String_(bi.to_string()));
-    assert_eq!(flow_side, "123456789012345678901234567890", "flow：裸数字");
-    assert_eq!(
-        lsp_side, "\"123456789012345678901234567890\"",
-        "lsp 侧：带引号字符串"
-    );
-}

@@ -63,30 +63,30 @@
 
 use std::sync::Arc;
 
-use mora::interpreter::Interpreter;
-use mora::mir::effect::Effects;
-use mora::mir::vm::execute;
+use mora::mir::control::ControlProgram;
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::execute_program;
 use mora::value::Value;
 
-fn compile(src: &str) -> Result<mora::mir::MirFunction, String> {
-    let (func, witnesses) =
+fn compile(src: &str) -> Result<ControlProgram, String> {
+    let (prog, witnesses) =
         mora::cli::compile_and_opt(src, None).map_err(|e| format!("COMPILE: {e}"))?;
-    let errs = mora::typeck::check_mir::check_program_witnesses_bidirectional(&witnesses);
+    let errs = mora::typeck::check_mir::check_program_witnesses(&witnesses);
     if !errs.is_empty() {
         return Err(format!(
             "TYPECK: {:?}",
             errs.iter().map(|e| e.message.clone()).collect::<Vec<_>>()
         ));
     }
-    Ok(func)
+    Ok(prog)
 }
 
 fn run(src: &str) -> Result<Value, String> {
-    let func = compile(src)?;
-    let arc = Arc::new(func);
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    execute(&arc, &mut interp, &mut env, &mut Effects::new())
+    let prog = compile(src)?;
+    let mut core = CoreRuntime::default();
+    execute_program(Arc::new(prog), &mut core)
+        .map(|(v, _)| v)
+        .map_err(|e| e.to_string())
 }
 
 // ===================================================================
@@ -138,41 +138,40 @@ fn return_at_program_top_is_rejected() {
 /// 跑到了」的证据，而不是只看编译通过。
 #[test]
 fn return_inside_functions_still_works() {
-    let cases: &[(&str, &str, f64)] = &[
+    let cases: &[(&str, &str, i64)] = &[
         // (名称, 源码, 期望返回值)
-        ("task 体", "task w()\n  return 7\nend\nw()\n", 7.0),
+        ("task 体", "task w()\n  return 7\nend\nw()\n", 7),
         (
             "task 内 if 体内",
             "task w()\n  if true then\n    return 7\n  end\n  9\nend\nw()\n",
-            7.0,
+            7,
         ),
         (
             "task 内 for 体内",
             "task w()\n  for i in [0]\n    return 7\n  end\n  9\nend\nw()\n",
-            7.0,
+            7,
         ),
         (
             "task 内 while 体内",
             "task w()\n  let i = 0\n  while i < 3\n    assign i = i + 1\n    return 7\n  end\n  9\nend\nw()\n",
-            7.0,
+            7,
         ),
-        ("闭包体", "let f = fn(x) return 7 end\nf(0)\n", 7.0),
+        ("闭包体", "let f = fn(x) return 7 end\nf(0)\n", 7),
         (
             "task 内 if 体后续语句被跳过",
             "task w()\n  if true then\n    return 7\n  end\n  9\nend\nw()\n",
-            7.0,
+            7,
         ),
     ];
     let mut failures = Vec::new();
     for (name, src, want) in cases {
         match run(src) {
-            // 按数值比较 —— `Value::Float(7.0)` 的 Debug 是 `7`，不是 `7.0`
-            Ok(Value::Float(got)) => {
+            Ok(Value::Int(got)) => {
                 if got != *want {
                     failures.push(format!("  [{name}] 期望 {want}，实得 {got}"));
                 }
             }
-            Ok(other) => failures.push(format!("  [{name}] 期望 Float({want})，实得 {other:?}")),
+            Ok(other) => failures.push(format!("  [{name}] 期望 Int({want})，实得 {other:?}")),
             Err(e) => failures.push(format!("  [{name}] 运行失败: {e}")),
         }
     }
@@ -183,7 +182,7 @@ fn return_inside_functions_still_works() {
     );
 }
 
-/// 其它函数体形态（macro / worker / transaction / observe）也必须不受影响。
+/// 其它函数体形态（macro / worker / transaction）也必须不受影响。
 ///
 /// 这些体的 `return` 修前就是正确的 —— 这里钉住的是「D42 的守卫没有把
 /// 它们误判成程序顶层」。
@@ -197,8 +196,6 @@ fn return_in_other_function_bodies_is_not_rejected() {
             "transaction compensation 段",
             "transaction\n  1\n  compensation\n    return 7\nend\n1\n",
         ),
-        ("observe 体", "observe tr do\n  return 7\nend\n1\n"),
-        ("with 体", "with model = \"gpt-4o\"\n  return 7\nend\n1\n"),
     ];
     let mut failures = Vec::new();
     for (name, src) in cases {

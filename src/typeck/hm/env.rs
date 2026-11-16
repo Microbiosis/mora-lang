@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use crate::typeck::Type;
+use crate::typeck::{Type, TypeVarId};
 
 ///  Type environment: maps variable names to their types (including polymorphic types)
 #[derive(Debug, Clone)]
@@ -49,14 +49,11 @@ impl TypeEnv {
     }
 
     /// Return free variables in the current environment
-    pub fn free_variables(&self) -> Vec<char> {
-        // Collect all type variable identifiers from all types
+    pub fn free_variables(&self) -> Vec<TypeVarId> {
         let mut free_vars = Vec::new();
-
         for ty in self.bindings.values() {
             free_vars.extend(collect_type_vars(ty));
         }
-
         free_vars.sort();
         free_vars.dedup();
         free_vars
@@ -81,25 +78,49 @@ impl Default for TypeEnv {
     }
 }
 
-///  Recursively collect all type variable identifiers from a type
-fn collect_type_vars(ty: &Type) -> Vec<char> {
+/// Recursively collect all free type variable identifiers from a type.
+pub(crate) fn collect_type_vars(ty: &Type) -> Vec<TypeVarId> {
     match ty {
-        Type::TypeVar(c) => vec![*c],
-        Type::List(elem_ty) => collect_type_vars(elem_ty),
+        Type::TypeVar(id) => vec![id.clone()],
+        Type::List(elem_ty) | Type::Channel(elem_ty) | Type::TaskHandle(elem_ty) => {
+            collect_type_vars(elem_ty)
+        }
         Type::Dict(key_ty, value_ty) => {
             let mut vars = collect_type_vars(key_ty);
             vars.extend(collect_type_vars(value_ty));
             vars
         }
         Type::Result_(ok_ty, err_ty) => {
-            let mut vars = Vec::new();
-            vars.extend(collect_type_vars(ok_ty));
+            let mut vars = collect_type_vars(ok_ty);
             vars.extend(collect_type_vars(err_ty));
             vars
         }
-        // v0.75.17: ForAll 内层仍是自由变量的来源（量化的变量自身是绑定，
-        // 但内层嵌套的自由变量要计入 FV(Γ) 用于外层 let-generalization）。
-        Type::ForAll(_, inner_ty) => collect_type_vars(inner_ty),
+        Type::Tuple(elems) => elems.iter().flat_map(|e| collect_type_vars(e)).collect(),
+        Type::Union(members) => members.iter().flat_map(collect_type_vars).collect(),
+        Type::Cons(h, t) => {
+            let mut vars = collect_type_vars(h);
+            vars.extend(collect_type_vars(t));
+            vars
+        }
+        Type::Arrow(input, output, _) => {
+            let mut vars = collect_type_vars(input);
+            vars.extend(collect_type_vars(output));
+            vars
+        }
+        Type::Trait { generics, .. } | Type::TraitObject { generics, .. } => {
+            generics.iter().flat_map(collect_type_vars).collect()
+        }
+        Type::Concrete {
+            generics, traits, ..
+        } => {
+            let mut vars: Vec<TypeVarId> = generics.iter().flat_map(collect_type_vars).collect();
+            vars.extend(traits.iter().flat_map(collect_type_vars));
+            vars
+        }
+        Type::ForAll(bound, inner_ty) => collect_type_vars(inner_ty)
+            .into_iter()
+            .filter(|v| !bound.contains(v))
+            .collect(),
         _ => Vec::new(),
     }
 }

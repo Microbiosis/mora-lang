@@ -29,7 +29,7 @@ pub enum TypeError {
 
     /// occurs check failure
     OccursCheck {
-        var: char, // type variable identifier
+        var: crate::typeck::TypeVarId,
         with_ty: String,
         span: Option<Span>,
     },
@@ -83,6 +83,21 @@ pub enum TypeError {
         got: String,
         span: Option<Span>,
     },
+
+    /// Contextual hint attached by a constraint origin.
+    WithHint {
+        inner: Box<TypeError>,
+        hint: String,
+    },
+}
+
+impl TypeError {
+    pub fn with_hint(self, hint: impl Into<String>) -> Self {
+        Self::WithHint {
+            inner: Box::new(self),
+            hint: hint.into(),
+        }
+    }
 }
 
 impl std::fmt::Display for TypeError {
@@ -191,6 +206,7 @@ impl std::fmt::Display for TypeError {
                     Ok(())
                 }
             }
+            TypeError::WithHint { inner, hint: _ } => std::fmt::Display::fmt(inner, f),
         }
     }
 }

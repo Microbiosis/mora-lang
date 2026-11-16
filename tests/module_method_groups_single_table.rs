@@ -33,10 +33,7 @@ use mora::typeck::dispatch::{module_method_names, module_method_signature};
 
 /// 走模块分组表的 20 个模块（`ai` / `agent` / `random` 三个**不走**，
 /// 见 `module_level_signature_is_absent_for_the_three_typed_modules`）。
-const GROUPED: &[&str] = &[
-    "math", "json", "file", "exec", "stats", "linalg", "document", "mora", "bus", "mock", "ccr",
-    "plan", "tea", "tool", "skill", "xform", "schedule", "memory", "sandbox", "web",
-];
+const GROUPED: &[&str] = &["math", "json", "file", "exec", "stats", "linalg"];
 
 /// ① `module_method_names` 列出的**每个**名字都必须解析出签名。
 ///
@@ -124,7 +121,7 @@ fn unlisted_names_have_no_signature() {
 /// 也会红。两侧都有护栏。
 #[test]
 fn module_level_signature_is_absent_for_the_three_typed_modules() {
-    for m in ["ai", "agent", "random"] {
+    for m in ["random"] {
         let names = module_method_names(m);
         assert!(!names.is_empty(), "[{m}] 仍应列出方法名（D175）");
         for meth in &names {
@@ -147,7 +144,7 @@ fn every_registered_module_has_a_group_table_or_is_documented_as_exempt() {
     for (name, _kind) in mora::value::MODULE_OBJECTS {
         let in_table = GROUPED.contains(name);
         assert!(
-            in_table || matches!(*name, "ai" | "agent" | "random"),
+            in_table || matches!(*name, "random"),
             "模块 `{name}` 既没有分组表，也不在三个豁免模块里 —— \
              它的方法会静默地既无签名也无自省。建表，或把它加进豁免名单并写明理由。"
         );
@@ -169,20 +166,8 @@ fn ret_shapes_materialize_correctly() {
         ), // Union
         ("math", "is_nan", 2, &Type::Bool), // Bool
         ("math", "PI", 1, &Type::Float),   // 零参
-        ("ccr", "len", 1, &Type::Int),     // Int
         ("file", "list", 2, &Type::List(Box::new(Type::String))), // List
         ("json", "parse", 2, &Type::Any),  // Any
-        ("document", "parse", 2, &Type::Document), // Document
-        ("bus", "emit", 2, &Type::Nil),    // Nil
-        (
-            "tool",
-            "info",
-            2,
-            &Type::Union(vec![
-                Type::Dict(Box::new(Type::String), Box::new(Type::Any)),
-                Type::Nil,
-            ]),
-        ), // Dict + Union
         (
             "stats",
             "histogram",
@@ -219,23 +204,5 @@ fn ret_shapes_materialize_correctly() {
             sig.raw_params.iter().all(|r| r.is_none()),
             "[{m}.{meth}] 模块方法不登记 raw hint"
         );
-    }
-}
-
-/// `bus` 那一组在 D293 被**拆成两组**（`emit`/`off` 返 `Nil`，
-/// `publish`/`subscribe` 返 `Float`）—— 它是 D171 结构下「同组不同签名」
-/// 的唯一破口，拆分是本次重构唯一的数据变更，故单独钉住。
-#[test]
-fn bus_group_split_preserves_every_return_type() {
-    for (meth, want_arity, want) in [
-        ("emit", 2, Type::Nil),
-        ("off", 2, Type::Nil),
-        ("publish", 2, Type::Float),
-        ("subscribe", 2, Type::Float),
-        ("count", 1, Type::Float), // 零参（含 self 共 1 个形参）
-    ] {
-        let sig = module_method_signature("bus", meth).expect("bus 方法必须有签名");
-        assert_eq!(sig.return_type, want, "[bus.{meth}] 返回类型变了");
-        assert_eq!(sig.params.len(), want_arity, "[bus.{meth}] 最小元数变了");
     }
 }

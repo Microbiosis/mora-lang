@@ -44,43 +44,18 @@
 //! 且 D58 修的是 `Block::result`（FCFG 内部，`dst` 是否被写），
 //! 与这里的末值选取是**两件事**，故不构成 D58 回归。仅记录。
 
-use mora::interpreter::Interpreter;
-use mora::mir::MirFunction;
-use mora::mir::ssa::OptLevel;
-use mora::mir::vm::{execute, run_main_task};
-use mora::mir::witness_to_fcfg::witness_to_fcfg;
-use mora::parser_v3::ParserV3;
+use mora::mir::control::{ControlProgram, OptLevel};
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::{execute_program, run_main_task};
 use mora::value::Value;
 use std::sync::Arc;
 
-fn finish(mut f: MirFunction, level: OptLevel) -> MirFunction {
-    mora::mir::optimize::apply_rules(&mut f);
-    if level.enabled() {
-        mora::mir::opt::optimize(&mut f, level);
-    }
-    f
-}
-
 /// 跑整个程序：顶层 body（取末值）+ `main` task。
-///
-/// 与库入口 [`mora::mir::vm::execute`] 同名会撞，故本地 helper 用
-/// `run_program` —— 两者职责差一层（多跑 `main` task）。
-fn run_program(func: MirFunction) -> Result<Value, String> {
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    let func_arc = Arc::new(func);
-    let last = execute(
-        &func_arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    )?;
-    run_main_task(
-        &func_arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    )?;
+fn run_program(prog: ControlProgram) -> mora::error::MoraResult<Value> {
+    let mut core = CoreRuntime::default();
+    let prog_arc = Arc::new(prog);
+    let (last, globals) = execute_program(prog_arc.clone(), &mut core)?;
+    run_main_task(prog_arc, globals, &mut core)?;
     Ok(last)
 }
 
@@ -129,55 +104,45 @@ fn d96_missing_result_reg_arm_is_latent_not_live() {
     let mut divergent = Vec::new();
 
     for (name, source) in CASES {
-        let (func, witnesses) = match ParserV3::compile(source) {
+        let (p_none, _) = match mora::cli::compile_and_opt(source, Some(OptLevel::None)) {
             Ok(v) => v,
             Err(e) => {
                 report.push(format!("{name}: COMPILE_ERR {e}"));
                 continue;
             }
         };
-        let fcfg = witness_to_fcfg(&witnesses);
-        let (body, n_regs) = mora::mir::fcfg_lower::lower_fcfg(&fcfg);
-        let pipeline_func = MirFunction {
-            params: vec![],
-            body,
-            n_regs,
-            effects: func.effects.clone(),
+        let (p_basic, _) = mora::cli::compile_and_opt(source, Some(OptLevel::Basic))
+            .expect("OptLevel::Basic compile");
+        let (p_aggr, _) = mora::cli::compile_and_opt(source, Some(OptLevel::Aggressive))
+            .expect("OptLevel::Aggressive compile");
+
+        let r_none = run_program(p_none);
+        let r_basic = run_program(p_basic);
+        let r_aggr = run_program(p_aggr);
+        let show = |r: &mora::error::MoraResult<Value>| match r {
+            Ok(v) => v.to_string(),
+            Err(e) => format!("Err({e})"),
         };
-        let level = OptLevel::default();
-        let a = run_program(finish(func.clone(), level));
-        let b = run_program(finish(pipeline_func.clone(), level));
-        let same = match (&a, &b) {
-            (Ok(x), Ok(y)) => format!("{x}") == format!("{y}"),
-            (Err(_), Err(_)) => true,
-            _ => false,
-        };
-        if !same {
+        let same = show(&r_none) == show(&r_basic) && show(&r_none) == show(&r_aggr);
+        if !same || r_none.is_err() {
             divergent.push(*name);
         }
-        report.push({
-            let show = |r: &Result<Value, String>| match r {
-                Ok(v) => v.to_string(),
-                Err(e) => format!("Err({})", e),
-            };
-            format!(
-                "{}: {}  original={:?} pipeline={:?}\n      orig_mir={:?}",
-                name,
-                if same { "一致" } else { "**不一致**" },
-                show(&a),
-                show(&b),
-                func.body
-                    .iter()
-                    .map(|i| format!("{:?}", i)
-                        .split(['(', ' '])
-                        .next()
-                        .unwrap_or("?")
-                        .to_string())
-                    .collect::<Vec<_>>()
-            )
-        });
+        if *name == "literal_tail" {
+            assert_eq!(show(&r_none), "7", "literal_tail should yield 7");
+        }
+        report.push(format!(
+            "{}: {}  none={} basic={} aggr={}",
+            name,
+            if same { "一致" } else { "**不一致**" },
+            show(&r_none),
+            show(&r_basic),
+            show(&r_aggr)
+        ));
     }
-    eprintln!("D96 结果寄存器消费对拍：\n  {}", report.join("\n  "));
+    eprintln!(
+        "D96 结果寄存器消费优化一致检查：\n  {}",
+        report.join("\n  ")
+    );
 
     assert_eq!(
         report.len(),
@@ -187,8 +152,7 @@ fn d96_missing_result_reg_arm_is_latent_not_live() {
     );
     assert!(
         divergent.is_empty(),
-        "管线在 {} 个构造上与原路径**不一致** —— `node_result_reg` 缺 arm 已经是**活缺陷**，\
-         不再是潜在隐患。\n  {}",
+        "优化等级之间在 {} 个构造上不一致或失败：\n  {}",
         divergent.len(),
         report.join("\n  ")
     );

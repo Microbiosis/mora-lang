@@ -47,23 +47,23 @@
 
 use std::sync::Arc;
 
-use mora::interpreter::Interpreter;
-use mora::mir::effect::Effects;
-use mora::mir::vm::execute;
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::execute_program;
 use mora::value::Value;
 
 fn run(src: &str) -> Result<Value, String> {
-    let (func, witnesses) =
+    let (prog, witnesses) =
         mora::cli::compile_and_opt(src, None).map_err(|e| format!("COMPILE: {e}"))?;
-    let errs = mora::typeck::check_mir::check_program_witnesses_bidirectional(&witnesses);
+    let errs = mora::typeck::check_mir::check_program_witnesses(&witnesses);
     if !errs.is_empty() {
         let msgs: Vec<String> = errs.iter().map(|e| e.message.clone()).collect();
         return Err(format!("TYPECK: {msgs:?}"));
     }
-    let arc = Arc::new(func);
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    execute(&arc, &mut interp, &mut env, &mut Effects::new())
+    let arc = Arc::new(prog);
+    let mut core = CoreRuntime::default();
+    execute_program(arc, &mut core)
+        .map(|(v, _)| v)
+        .map_err(|e| e.to_string())
 }
 
 fn num_of(v: &Value) -> f64 {
@@ -173,18 +173,18 @@ fn int_and_float_annotations_unchanged() {
         run("let x: int = \"hi\"\nx\n").is_err(),
         "`int` 不该接住 String"
     );
-    // Float 标注：收 Float、拒 Int 与 BigInt
+    // Float 标注：收 Float 与 Int widening（Int <: Float），拒 BigInt / String
     assert!(
         run("let x: float = 1.5\nx\n").is_ok(),
         "`float` 必须接住 `1.5`"
     );
     assert!(
         run("let x: float = 1\nx\n").is_ok(),
-        "`float` 必须接住无后缀 `1`"
+        "`float` 必须接住 `1`（Int <: Float 子类型拓宽）"
     );
     assert!(
-        run("let x: float = 1i\nx\n").is_err(),
-        "`float` 不该接住 `1i`"
+        run("let x: float = 1i\nx\n").is_ok(),
+        "`float` 必须接住 `1i`（Int <: Float 子类型拓宽）"
     );
     assert!(
         run("let x: float = 999n\nx\n").is_err(),

@@ -46,27 +46,27 @@
 use std::sync::Arc;
 
 use mora::cli::compile_and_opt;
-use mora::interpreter::Interpreter;
-use mora::mir::effect::Effects;
-use mora::mir::vm::execute;
 use mora::parser_v3::ParserV3;
-use mora::typeck::check_mir::check_program_witnesses_bidirectional;
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::execute_program;
+use mora::typeck::check_mir::check_program_witnesses;
 
-/// 走**生产路径**（`cli::compile_and_opt` = 9 层管线 + 优化）执行并收集
-/// `print` 的输出行。默认 banner 由 `execute` 不产生。
+/// 走**生产路径**（`cli::compile_and_opt` = Control SSA + 优化）执行并收集
+/// `print` 的输出行。默认 banner 由 `execute_program` 不产生。
 fn run_production(src: &str) -> Result<String, String> {
-    let (func, witnesses) = compile_and_opt(src, None).map_err(|e| format!("COMPILE: {e}"))?;
-    let errs = check_program_witnesses_bidirectional(&witnesses);
+    let (prog, witnesses) = compile_and_opt(src, None).map_err(|e| format!("COMPILE: {e}"))?;
+    let errs = check_program_witnesses(&witnesses);
     if !errs.is_empty() {
         return Err(format!(
             "TYPECK: {:?}",
             errs.iter().map(|e| e.message.clone()).collect::<Vec<_>>()
         ));
     }
-    let arc = Arc::new(func);
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    execute(&arc, &mut interp, &mut env, &mut Effects::new()).map(|v| format!("{v:?}"))
+    let arc = Arc::new(prog);
+    let mut core = CoreRuntime::default();
+    execute_program(arc, &mut core)
+        .map(|(v, _)| format!("{v:?}"))
+        .map_err(|e| e.to_string())
 }
 
 // ===================================================================
@@ -83,7 +83,7 @@ fn run_production(src: &str) -> Result<String, String> {
 fn d35_handle_bound_to_a_let_does_not_starve_later_statements() {
     let r = run_production("let r = handle a { 5 } { 7 }\n999\n").unwrap();
     assert_eq!(
-        r, "Float(999.0)",
+        r, "Int(999)",
         "`let r = handle …` 之后必须仍有语句执行（末表达式若被饿死会是 Nil）"
     );
 }
@@ -95,7 +95,7 @@ fn d35_handle_value_is_readable_from_the_binding() {
     // 绑定的值经 `Define` 落到 env，读它需要一个独立程序；这里用
     // 编译期不报错 + 后续语句可执行作为间接断言，真正的取值断言见
     // `handle_value_flows_into_following_computation`。
-    let errs = check_program_witnesses_bidirectional(&witnesses);
+    let errs = check_program_witnesses(&witnesses);
     assert!(errs.is_empty(), "typeck 应放行: {errs:?}");
 }
 
@@ -105,15 +105,14 @@ fn d35_handle_value_is_readable_from_the_binding() {
 fn handle_value_flows_into_following_computation() {
     // run_production 只回末表达式值；这里用 `--check` 之外的真实执行：
     // 把结果乘 2 后作为末表达式，若 `r` 是 Nil 则 `nil * 2` 不会是 10。
-    let (func, witnesses) =
+    let (prog, witnesses) =
         ParserV3::compile("let r = handle a { 5 } { 7 }\nlet z = r * 2\nz").expect("编译");
-    let errs = check_program_witnesses_bidirectional(&witnesses);
+    let errs = check_program_witnesses(&witnesses);
     assert!(errs.is_empty(), "typeck: {errs:?}");
-    let arc = Arc::new(func);
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    let v = execute(&arc, &mut interp, &mut env, &mut Effects::new()).expect("执行");
-    assert_eq!(format!("{v:?}"), "Float(10.0)", "handle 的值应流进后续计算");
+    let arc = Arc::new(prog);
+    let mut core = CoreRuntime::default();
+    let (v, _) = execute_program(arc, &mut core).expect("执行");
+    assert_eq!(format!("{v:?}"), "Int(10)", "handle 的值应流进后续计算");
 }
 
 /// 嵌套 handle：内层结果 + 后续语句。
@@ -125,28 +124,22 @@ fn handle_value_flows_into_following_computation() {
 fn d35_nested_handle_does_not_starve_either() {
     let r = run_production("let r = handle a { handle b { 6 } { 8 } } { 7 }\nlet z = r + 1\nz")
         .expect("生产路径执行");
-    assert_eq!(r, "Float(7.0)", "嵌套 handle 的值应可用");
+    assert_eq!(r, "Int(7)", "嵌套 handle 的值应可用");
 }
 
 /// handle 出现在 task 体内同样不能饿死该 task 内的后续语句。
 #[test]
 fn d35_handle_inside_task_body_does_not_starve() {
-    let (func, witnesses) = ParserV3::compile(
+    let (prog, witnesses) = ParserV3::compile(
         "task t()\n  let r = handle a { 5 } { 7 }\n  let z = r + 1\n  z\nend\nt()",
     )
     .expect("编译");
-    let errs = check_program_witnesses_bidirectional(&witnesses);
+    let errs = check_program_witnesses(&witnesses);
     assert!(errs.is_empty(), "typeck: {errs:?}");
-    let arc = Arc::new(func);
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    execute(&arc, &mut interp, &mut env, &mut Effects::new()).expect("顶层执行");
-    let v = execute(&arc, &mut interp, &mut env, &mut Effects::new()).expect("task 执行");
-    assert_eq!(
-        format!("{v:?}"),
-        "Float(6.0)",
-        "task 内的 handle 绑定应可用"
-    );
+    let arc = Arc::new(prog);
+    let mut core = CoreRuntime::default();
+    let (v, _) = execute_program(arc, &mut core).expect("顶层执行");
+    assert_eq!(format!("{v:?}"), "Int(6)", "task 内的 handle 绑定应可用");
 }
 
 // ===================================================================
@@ -157,25 +150,24 @@ fn d35_handle_inside_task_body_does_not_starve() {
 #[test]
 fn handle_as_a_statement_still_works() {
     let r = run_production("handle a { 5 } { 7 }\n999\n").unwrap();
-    assert_eq!(r, "Float(999.0)");
+    assert_eq!(r, "Int(999)");
 }
 
 /// D14 固件形态：handle body 里用 `assign` 改外层绑定。
 #[test]
 fn handle_body_assign_to_outer_binding_still_works() {
-    let (func, witnesses) = ParserV3::compile(
+    let (prog, witnesses) = ParserV3::compile(
         "let x = 0.0\nlet t = [10, 20, 30]\nhandle random_random { x = t[1] } { 0.5 }\nx",
     )
     .expect("编译");
-    let errs = check_program_witnesses_bidirectional(&witnesses);
+    let errs = check_program_witnesses(&witnesses);
     assert!(errs.is_empty(), "typeck: {errs:?}");
-    let arc = Arc::new(func);
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    let v = execute(&arc, &mut interp, &mut env, &mut Effects::new()).expect("执行");
+    let arc = Arc::new(prog);
+    let mut core = CoreRuntime::default();
+    let (v, _) = execute_program(arc, &mut core).expect("执行");
     assert_eq!(
         format!("{v:?}"),
-        "Float(20.0)",
+        "Int(20)",
         "handle body 的 assign 仍应回流外层"
     );
 }
@@ -184,7 +176,7 @@ fn handle_body_assign_to_outer_binding_still_works() {
 #[test]
 fn plain_let_binding_unaffected() {
     let r = run_production("let r = 42\n999\n").unwrap();
-    assert_eq!(r, "Float(999.0)");
+    assert_eq!(r, "Int(999)");
 }
 
 // ===================================================================
@@ -210,27 +202,31 @@ fn handle_result_binding_is_self_consistent() {
 
     let (pipelined, pwit) = compile_and_opt(src, None).expect("编译");
     assert!(
-        check_program_witnesses_bidirectional(&pwit).is_empty(),
+        check_program_witnesses(&pwit).is_empty(),
         "typeck 应无错: {:?}",
-        check_program_witnesses_bidirectional(&pwit)
+        check_program_witnesses(&pwit)
     );
 
     // ① Handle 指令的 k_dst 必须在**该路径内**被某条指令真正写出
-    let handle_dst = pipelined
-        .body
+    let main_fn = pipelined.func(pipelined.entry);
+    let handle_dst = main_fn
+        .blocks
         .iter()
+        .flat_map(|b| b.insts.iter())
         .find_map(|i| match i {
-            mora::mir::MirInst::Handle { k_dst, .. } => Some(*k_dst),
+            mora::mir::control::ControlInst::Handle { dst, .. } => Some(*dst),
             _ => None,
         })
         .expect("应产出 Handle 指令");
-    let written_by_define = pipelined.body.iter().any(|i| {
-        matches!(i, mora::mir::MirInst::Define(_, r) if *r == handle_dst)
-            || matches!(i, mora::mir::MirInst::Var(r, _) if *r == handle_dst)
+    let written_by_define = main_fn.blocks.iter().flat_map(|b| b.insts.iter()).any(|i| {
+        matches!(i, mora::mir::control::ControlInst::StoreGlobal(_, r) if *r == handle_dst)
+            || matches!(i, mora::mir::control::ControlInst::DefineDyn(_, r, _) if *r == handle_dst)
+            || matches!(i, mora::mir::control::ControlInst::StoreLocal(_, r) if *r == handle_dst)
+            || matches!(i, mora::mir::control::ControlInst::Binary(_, l, _, _) if *l == handle_dst)
     });
     assert!(
         written_by_define,
-        "引用 handle 结果的指令（k_dst={handle_dst}）必须与 Handle 的写入端一致"
+        "引用 handle 结果的指令（k_dst={handle_dst:?}）必须与 Handle 的写入端一致"
     );
 
     // ② **绝对值**：程序必须算出正确的值。
@@ -238,7 +234,7 @@ fn handle_result_binding_is_self_consistent() {
     //    故 `r = 5`、`z = r * 2 = 10`。
     assert_eq!(
         run_production("let r = handle a { 5 } { 7 }\nlet z = r * 2\nz").unwrap(),
-        "Float(10.0)",
+        "Int(10)",
         "handle 体的值必须真的被绑定到 r 并参与运算"
     );
 }
@@ -255,11 +251,11 @@ fn unhandled_perform_is_rejected_at_compile_time() {
         Ok(v) => v,
         // parse 阶段就拒绝也算数（更强的保证）
         Err(e) => {
-            assert!(!e.is_empty());
+            assert!(!e.to_string().is_empty());
             return;
         }
     };
-    let errs = check_program_witnesses_bidirectional(&witnesses);
+    let errs = check_program_witnesses(&witnesses);
     assert!(
         !errs.is_empty(),
         "未被 handle 的 perform 应在 typeck 期报错（spec :508）"
@@ -270,6 +266,6 @@ fn unhandled_perform_is_rejected_at_compile_time() {
 #[test]
 fn handled_perform_is_accepted() {
     let (_, witnesses) = ParserV3::compile("handle a { perform a 1 } { 7 }").expect("编译");
-    let errs = check_program_witnesses_bidirectional(&witnesses);
+    let errs = check_program_witnesses(&witnesses);
     assert!(errs.is_empty(), "有 handle 包裹的 perform 应放行: {errs:?}");
 }

@@ -39,218 +39,31 @@
 //! `Every kind needs interval_s > 0` 报错 —— 属**另一类**问题，按
 //! 「收紧一类错误，别顺手改另一类」记档待决。
 
-use mora::interpreter::Interpreter;
-use mora::mir::vm::execute;
 use mora::parser_v3::ParserV3;
-use mora::test_support::TempDir;
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::execute_program;
 use std::sync::Arc;
 
 fn run(src: &str) -> Result<String, String> {
-    let (func, _w) = ParserV3::compile(src).map_err(|e| format!("COMPILE: {e}"))?;
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    let arc = Arc::new(func);
-    execute(
-        &arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    )
-    .map(|v| format!("{v}"))
+    let (prog, _w) = ParserV3::compile(src).map_err(|e| format!("COMPILE: {e}"))?;
+    let mut core = CoreRuntime::default();
+    let arc = Arc::new(prog);
+    execute_program(arc, &mut core)
+        .map(|(v, _)| format!("{v}"))
+        .map_err(|e| e.to_string())
 }
 
-/// D150 主判据 ①：`schedule.add` 的两个**数值**实参必须认 `Int`。
-///
-/// 修复前：用户**明明传了合法值**，却被报成
-/// `Every kind needs interval_s > 0`（因为值被静默丢弃成了 0）。
-#[test]
-fn d150_schedule_add_accepts_int_valued_interval() {
-    let out = run("let n = len([1, 2, 3])\n\
-         let id = schedule.add(\"j\", \"every\", \"tick\", n)\n\
-         let jobs = schedule.list()\n\
-         id\n")
-    .unwrap_or_else(|e| panic!("合法的 Int 间隔不应报错: {e}"));
-    // `schedule.list()` 把 interval_s 回显出来 —— 直接读盘确认落盘值
-    let listed = run("let n = len([1, 2, 3])\n\
-         schedule.add(\"j\", \"every\", \"tick\", n)\n\
-         let jobs = schedule.list()\n\
-         jobs[0]\n")
-    .unwrap_or_else(|e| panic!("列出任务不应报错: {e}"));
-    assert!(
-        listed.contains("interval_s: 3"),
-        "interval_s 应为 3（修复前静默变 0 → 撞出 `Every kind needs interval_s > 0`）; 实得: {listed}"
-    );
-    assert!(!out.is_empty());
-}
-
-/// D150 主判据 ②：`ccr.marker` 的 size 必须认 `Int`（修复前静默变 0）。
-#[test]
-fn d150_ccr_marker_accepts_int_valued_size() {
-    let out = run("ccr.marker(\"abcdef\", len([1, 2, 3, 4, 5, 6, 7, 8]))\n")
-        .unwrap_or_else(|e| panic!("合法的 Int size 不应报错: {e}"));
-    assert!(
-        out.contains("8"),
-        "size 应为 8（修复前静默变 0）; 实得: {out}"
-    );
-}
-
-/// D150 主判据 ③：`mora.refine` 的 count 决定**返回类型**（D150 里后果最重的一处）。
-///
-/// 修复前传 `Int` → count 退回 1 → 返回单个 `Dict` 而非 `List[Dict]`。
-#[test]
-fn d150_refine_count_accepts_int_and_keeps_list_return_type() {
-    // 需要一个真实脚本文件作为第 1 参（它是**路径**不是脚本文本）
-    let dir = TempDir::new("mora_d150_refine");
-    let script = dir.join("s.mora");
-    std::fs::write(&script, "task main()\n  print(\"hi\")\nend\n").expect("写脚本");
-
-    let src = format!(
-        "let a = mora.refine(\"{p}\", \"add a comment\", len([1, 1]))\n\
-         type_of(a)\n",
-        p = script.display().to_string().replace('\\', "\\\\")
-    );
-    let out = run(&src).unwrap_or_else(|e| panic!("合法的 Int count 不应报错: {e}"));
-    assert!(
-        out.contains("list"),
-        "count=2 时返回类型必须是 list（修复前 Int → count 退回 1 → 静默变成 dict）; 实得: {out}"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// D150 主判据 ④：`mora.refine_info` 的 iteration 必须认 `Int`。
-///
-/// 修复前传 `Int` → `iter` 变 `None` → 走 `latest_step()`，
-/// 即「查第 1 轮」静默返回**最新一轮**。
-#[test]
-fn d150_refine_info_accepts_int_valued_iteration() {
-    let dir = TempDir::new("mora_d150_info");
-    let script = dir.join("s.mora");
-    std::fs::write(&script, "task main()\n  print(\"hi\")\nend\n").expect("写脚本");
-    let p = script.display().to_string().replace('\\', "\\\\");
-
-    // 两轮 refine，然后查第 1 轮：Float 与 Int 两条路必须给出**同一个** iteration
-    let src = format!(
-        "mora.refine(\"{p}\", \"first pass\", 1.0)\n\
-         mora.refine(\"{p}\", \"second pass\", 1.0)\n\
-         let byFloat = mora.refine_info(\"{p}\", 1.0)\n\
-         let byInt = mora.refine_info(\"{p}\", len([1]))\n\
-         byFloat\n"
-    );
-    let by_float = run(&src).unwrap_or_else(|e| panic!("Float 路径不应报错: {e}"));
-    let src_int = format!(
-        "mora.refine(\"{p}\", \"first pass\", 1.0)\n\
-         mora.refine(\"{p}\", \"second pass\", 1.0)\n\
-         let byInt = mora.refine_info(\"{p}\", len([1]))\n\
-         byInt\n"
-    );
-    let by_int = run(&src_int).unwrap_or_else(|e| panic!("Int 路径不应报错: {e}"));
-    assert_eq!(
-        by_int, by_float,
-        "查 iteration 1 时 Int 与 Float 必须等价（修复前 Int 静默走 latest_step → 返回第 2 轮）"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// D150 主判据 ⑤：`tea.run` 的上限必须认 **Float 字面量**（反向极性那处）。
-///
-/// 队列经 `Cmd::Dispatch` 每轮回流、永不空，故 `count` == 实际轮数。
-#[test]
-fn d150_tea_run_honours_float_literal_step_limit() {
-    let src = r#"
-model Counter
-  count: number = 0
-  step: number = 1
-end
-
-msg CounterMsg
-  Increment
-end
-
-update(msg, model)
-  match msg {
-    Increment => [{count: model.count + 1i, step: model.step}, json.parse("{\"kind\": \"Dispatch\", \"msg\": {\"tag\": \"Increment\"}}")]
-  }
-end
-
-app Application
-  model: Counter
-  msg: CounterMsg
-  init: {count: 0, step: 1}
-  update: update
-  view: fn(model) => model
-end
-
-let a = tea.dispatch(Application, {tag: "Increment"})
-tea.model(tea.run(a, 3))
-"#;
-    let out = run(src).unwrap_or_else(|e| panic!("tea.run 不应报错: {e}"));
-    assert!(
-        out.contains("count: 3"),
-        "`tea.run(a, 3)` 必须只跑 3 轮（修复前只认 Int → 用默认 1000 轮）; 实得: {out}"
-    );
-}
-
-/// 对照组 ①：各 builtin 的**默认**与 Float 路径不得改变。
-#[test]
-fn d150_defaults_and_float_paths_unchanged() {
-    // 省略上限 → 仍用默认 1000
-    let src = r#"
-model C
-  count: number = 0
-  step: number = 1
-end
-
-msg M
-  Increment
-end
-
-update(msg, model)
-  match msg {
-    Increment => [{count: model.count + 1i, step: model.step}, json.parse("{\"kind\": \"Dispatch\", \"msg\": {\"tag\": \"Increment\"}}")]
-  }
-end
-
-app A
-  model: C
-  msg: M
-  init: {count: 0, step: 1}
-  update: update
-  view: fn(model) => model
-end
-
-let a = tea.dispatch(A, {tag: "Increment"})
-let m = tea.model(tea.run(a, 10))
-m
-"#;
-    let out = run(src).unwrap_or_else(|e| panic!("Float 上限不应报错: {e}"));
-    assert!(
-        out.contains("count: 10"),
-        "Float 上限必须照常生效; 实得: {out}"
-    );
-
-    // ccr.marker 的 Float 路径（D149 之前就正常）
-    let lit = run("ccr.marker(\"abcdef\", 8)\n").unwrap();
-    assert!(lit.contains('8'), "Float size 路径不得回退; 实得: {lit}");
-}
-
-/// 对照组 ②：**类型错**必须报错（不再静默用默认值）。
+/// 对照组 ②：非数字实参对 `exec.parallel` 的数值上限/超时参数必须报错。
 #[test]
 fn d150_non_numeric_argument_is_rejected() {
-    for (call, field) in [
-        ("ccr.marker(\"h\", \"big\")", "size"),
-        (
-            "tea.run(tea.init(fn() => 1, fn(m, x) => m, fn(m) => m), \"x\")",
-            "max_steps",
-        ),
+    for call in [
+        "exec.parallel([\"echo hi\"], \"bad\", 1000)",
+        "exec.parallel([\"echo hi\"], 1, \"bad\")",
     ] {
         let res = run(&format!("{call}\n"));
         assert!(
             res.is_err(),
-            "[{call}] 非数字实参必须**报错**（修复前静默用默认值）; 实际: {res:?}"
-        );
-        assert!(
-            res.unwrap_err().contains(field),
-            "[{call}] 错误信息应点名 `{field}`"
+            "[{call}] 非数字实参必须**报错**; 实际: {res:?}"
         );
     }
 }
@@ -276,29 +89,4 @@ fn d150_required_numeric_args_still_accept_int() {
     );
 }
 
-/// 源码判据：`ai.rs` 的 `backoff_ms` **也**是 Int/Float 都认的那一处正确写法。
-///
-/// ⚠ 它**没有 Mora 语法入口** —— D59（`tests/ai_namespace_reachability.rs`）已实测
-/// `ai.retry(...)` 永远被 parser 解析成「裸名 `ai` + 方法 `retry`」，
-/// 产不出单名 `"ai.retry"`。故本条**只能**写成源码判据，不臆造运行时用例（D148 教训）。
-///
-/// v0.104.6 D246：断言从「字面含 `Value::Float(n)` **且** `Value::Int(i)`」改为
-/// 「走 `flow::value_as_usize`」。原断言钉的是**实现形态**而非行为，于是
-/// **正确的收敛也会让它红**（把两个 match 臂收进唯一收口，正是 D235–D246
-/// 反复证明该做的事）—— 这是「判据钉在错误的代码上」的又一例。
-///
-/// 意图「不退回单侧」由两处共同保证，强度不降：
-/// - **本条**：此处确实走收口，而不是各写各的；
-/// - **`tests/value_extraction_saturation.rs::d246_both_int_and_float_are_accepted`**：
-///   收口本身 `Int` / `Float` 都认（该条同时有运行时判据，无需源码断言）。
-#[test]
-fn d150_ai_retry_backoff_accepts_both_number_kinds_in_source() {
-    let src = std::fs::read_to_string("src/interpreter/builtins/ai.rs").expect("读 ai.rs");
-    let start = src.find("let backoff_ms").expect("找到 backoff_ms 取值");
-    let snippet: String = src[start..].chars().take(400).collect();
-    assert!(
-        snippet.contains("value_as_usize"),
-        "`ai.retry` 的 backoff_ms 必须走 `flow::value_as_usize`（Int/Float 都认，\
-         不得手写只认一侧的 match）; 实得: {snippet}"
-    );
-}
+// `ai` 模块已在 v0.110.0 移除，对应的 `ai.retry` 源码判据同步移除。

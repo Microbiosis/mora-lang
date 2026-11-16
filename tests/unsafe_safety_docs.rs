@@ -7,10 +7,9 @@
 //!
 //! | 文件 | unsafe | 参与编译 | 真实执行 |
 //! |---|---|---|---|
-//! | `mir/jit.rs` | 10 | ✅ | **仅测试**：`LegacyJitBackend::try_compile` 是恒定 `CompileReject` 的占位实现（生产回落解释器），真正执行的是 `tests/jit_compile.rs` 的 19 个差分测试 |
+//! | ~~`mir/jit.rs`~~ | ~~10~~ | — | **Wave 2 W2.1 已删除**（x86-64 子集 toy JIT 退休） |
 //! | ~~`mir/lmir_to_mir.rs`~~ | ~~1~~ | — | **v0.104.6 已删除**（见下） |
-//! | `sandbox/container.rs` / `interpreter/builtins/exec.rs` | 3 | ✅ | **`#[cfg(unix)]`，Windows 上不编译** |
-//! | `document/backend/image.rs` | 3 | ✅ | 仅测试（`EnvGuard` 已有 SAFETY） |
+//! | `sandbox/container.rs` / `interpreter/builtins/exec.rs` | 2 | ✅ | **`#[cfg(unix)]`，Windows 上不编译** |
 //!
 //! ⇒ 高危 unsafe 集中在 JIT，而 JIT 的**生产路径是关闭的**。
 //!
@@ -116,7 +115,7 @@ fn d252_every_unsafe_block_has_safety_justification() {
         missing.join("\n  - ")
     );
     assert!(
-        blocks >= 8,
+        blocks >= 1,
         "判据自身可能失效：只扫到 {blocks} 个 unsafe 块，扫描范围变了"
     );
 }

@@ -33,17 +33,11 @@
 use std::sync::Arc;
 
 fn run(src: &str) -> String {
-    let (func, _w) = mora::parser_v3::ParserV3::compile(src).unwrap_or_else(|e| panic!("{e}"));
-    let arc = Arc::new(func);
-    let mut interp = mora::interpreter::Interpreter::new();
-    let mut env = interp.take_env();
-    match mora::mir::vm::execute(
-        &arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    ) {
-        Ok(v) => format!("{v}"),
+    let (prog, _w) = mora::parser_v3::ParserV3::compile(src).unwrap_or_else(|e| panic!("{e}"));
+    let arc = Arc::new(prog);
+    let mut core = mora::runtime::CoreRuntime::default();
+    match mora::runtime::vm::execute_program(arc, &mut core) {
+        Ok((v, _)) => format!("{v}"),
         Err(e) => panic!("run failed: {e}"),
     }
 }
@@ -178,7 +172,7 @@ fn dict_values_aligns_with_keys_by_index() {
     // 注意本文件的 `run()` 返回的是 **Display**（非 Debug），故 Int 打印为 `0.0`
     // （Mora 的整数字面量在浮点上下文中是 Float）。
     assert_eq!(
-        misaligned, "0.0",
+        misaligned, "0",
         "values()[i] 与 keys()[i] 指向了不同的键（{KEYS:?}）"
     );
 }
@@ -187,10 +181,10 @@ fn dict_values_aligns_with_keys_by_index() {
 #[test]
 fn dict_values_is_in_sorted_key_order() {
     // {zeta: 26, alpha: 1, mid: 13} → 按 key 排 → alpha, mid, zeta
-    //                              → 对应值   1.0, 13.0, 26.0
+    //                              → 对应值   1, 13, 26
     let rendered = run("let d = {zeta: 26, alpha: 1, mid: 13}\nd.values()\n");
     assert_eq!(
-        rendered, "[1.0, 13.0, 26.0]",
+        rendered, "[1, 13, 26]",
         "values() 必须按 key 排序（alpha=1, mid=13, zeta=26）"
     );
 }

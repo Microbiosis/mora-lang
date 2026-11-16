@@ -173,8 +173,19 @@ pub mod ambient {
 // 确定顺序 `merge` 折叠。`merge` 满足结合律（Vec 拼接），因此并发执行的结果
 // 与串行执行逐字节一致 —— 并发成为数据的自然属性，而非需要加锁防御的状态。
 
-use crate::checkpoint::SendTask;
-use crate::mir::orchestrate::AggregatorContribution;
+/// 目标节点的待投递消息（原在 `checkpoint` 模块）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SendTask {
+    pub target_node: String,
+    pub input: crate::value::Value,
+}
+
+/// Aggregator 贡献记录（原在 `mir::orchestrate` 模块）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct AggregatorContribution {
+    pub name: String,
+    pub value: crate::value::Value,
+}
 
 /// 一次执行产生的单个效应。与 `EffectRow` 的具名标签一一对应：
 /// `Send` ↔ BSP 消息，`Contribute` ↔ per-super-step 聚合器贡献。

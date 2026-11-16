@@ -33,11 +33,11 @@
 //! （并放开其可见性到 `pub(crate)`）。守卫 `g` 同样在绑定就位下递归 ——
 //! `x when x > 0` 引用绑定。
 
-use mora::typeck::check_mir::check_program_witnesses_bidirectional;
+use mora::typeck::check_mir::check_program_witnesses;
 
 fn typeck(src: &str) -> Result<Vec<String>, String> {
     let (_f, w) = mora::cli::compile_and_opt(src, None).map_err(|e| format!("COMPILE: {e}"))?;
-    let errs = check_program_witnesses_bidirectional(&w);
+    let errs = check_program_witnesses(&w);
     if errs.is_empty() {
         Ok(vec![])
     } else {
@@ -46,17 +46,12 @@ fn typeck(src: &str) -> Result<Vec<String>, String> {
 }
 
 fn run(src: &str) -> Result<String, String> {
-    let (f, _w) = mora::parser_v3::ParserV3::compile(src).map_err(|e| format!("COMPILE: {e}"))?;
-    let mut interp = mora::interpreter::Interpreter::new();
-    let mut env = interp.take_env();
-    let arc = std::sync::Arc::new(f);
-    mora::mir::vm::execute(
-        &arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    )
-    .map(|v| format!("{v}"))
+    let (p, _w) = mora::parser_v3::ParserV3::compile(src).map_err(|e| format!("COMPILE: {e}"))?;
+    let mut core = mora::runtime::CoreRuntime::default();
+    let arc = std::sync::Arc::new(p);
+    mora::runtime::vm::execute_program(arc, &mut core)
+        .map(|(v, _)| format!("{v}"))
+        .map_err(|e| e.to_string())
 }
 
 /// D165 主判据 ①：arm 体里**引用绑定**必须能过 typeck（dict 与 list 两种形态）。
@@ -100,17 +95,17 @@ fn d165_match_arm_bindings_have_correct_runtime_values() {
         (
             "plain var",
             "let r = match 7 with\n  k -> k\n  _ -> 0\nend\nr\n",
-            "7.0",
+            "7",
         ),
         (
             "list binding",
             "let r = match [1, 2] with\n  [a, b] -> a + b\n  _ -> 0\nend\nr\n",
-            "3.0",
+            "3",
         ),
         (
             "dict binding",
             "let r = match {a: 9} with\n  {a: k} -> k\n  _ -> 0\nend\nr\n",
-            "9.0",
+            "9",
         ),
     ] {
         let got = run(src).unwrap_or_else(|e| panic!("[{label}] 运行期不应报错: {e}"));
@@ -167,8 +162,8 @@ fn d165_type_ascription_pattern_is_a_known_gap() {
     // (2) 运行期：arm 永不匹配，静默落到默认分支（这是最严重的一面）
     assert_eq!(
         run("let r = match 5 with\n  n: number -> n\n  _ -> 0\nend\nr\n").as_deref(),
-        Ok("0.0"),
-        "已知缺口：`n: number -> n` 永不匹配，静默取 `_` 分支（应为 5.0）"
+        Ok("0"),
+        "已知缺口：`n: number -> n` 永不匹配，静默取 `_` 分支（应为 5）"
     );
     // ⚠ `Value::String` 的 Display **不带引号**（`no` 而非 `"no"`）
     assert_eq!(

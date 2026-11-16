@@ -53,18 +53,7 @@ use std::process::{Command, Stdio};
 // ===================================================================
 
 fn json_string(s: &str) -> String {
-    let mut out = String::from("\"");
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            _ => out.push(c),
-        }
-    }
-    out.push('"');
-    out
+    format!("\"{}\"", mora::flow::escape_json_string(s))
 }
 
 fn frame(json: &str) -> String {
@@ -311,7 +300,7 @@ fn run_program(dir: &WorkDir, src: &str, name: &str) -> String {
 }
 
 fn run_file(p: &Path) -> String {
-    let mora = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+    let mora = env!("CARGO_BIN_EXE_mora");
     let out = Command::new(mora)
         .current_dir(p.parent().unwrap_or(Path::new(".")))
         .arg(p)
@@ -330,6 +319,7 @@ fn run_file(p: &Path) -> String {
                 && !t.starts_with("AI 原语")
                 && !t.starts_with("显式 API")
                 && !t.starts_with("Trait 系统")
+                && !t.starts_with("类型与执行")
                 && !t.starts_with("Built-in")
                 && !t.starts_with("v0.15 CLI")
                 && !t.starts_with('⚠')

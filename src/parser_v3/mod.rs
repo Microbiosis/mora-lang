@@ -4,22 +4,15 @@
 //! This is the final parser implementation that completely replaces Parser v2.
 
 use crate::common::{BinaryOp, Literal, Span};
-use crate::lexer::{Lexer, Token, TokenType};
-use crate::mir::orchestrate::{MirOrchestrateAgent, MirOrchestrateEdge, MirOrchestrateKind, Param};
+use crate::error::{MoraError, MoraResult};
+use crate::lexer::{Token, TokenType};
+use crate::mir::Param;
 use crate::mir::witness::{MirWitness, WitnessKind, WitnessParam};
-use std::collections::HashMap;
 
 mod emit;
 mod emit_definitions; // v0.92 P1.3: definition emit methods split from emit.rs
-mod rel;
-mod syntax; // v0.92 P1.4: pattern/orchestrate/type-annotation parsers (from parse.rs)
-mod tokens; // v0.92 P1.4: token-stream navigation primitives (from parse.rs) // v0.102: 声明式范式（rel/solve）语法 emit
-
-/// v0.103: TEA 独立 `update(params) ... end` 声明的注册名。
-///
-/// spec §9.6 的声明形式不带名字，同节的 `app` 块以 `update: update` 按名
-/// 引用它 —— 两处绑定到同一常量，避免字符串字面量漂移。
-pub(crate) const UPDATE_NAME: &str = "update";
+mod syntax; // v0.92 P1.4: pattern/type-annotation parsers (from parse.rs)
+mod tokens; // v0.92 P1.4: token-stream navigation primitives (from parse.rs)
 
 /// v0.104.6 D25：源码嵌套深度上限（同时用于词法括号深度与 witness 树深度）。
 ///
@@ -134,7 +127,7 @@ fn witness_depth(roots: &[MirWitness]) -> (usize, Span) {
             max_depth = depth;
             at = node.span;
         }
-        if depth >= MAX_NESTING_DEPTH {
+        if depth > MAX_NESTING_DEPTH {
             // 已越界，不再深入（继续遍历只会更慢）
             continue;
         }
@@ -145,29 +138,22 @@ fn witness_depth(roots: &[MirWitness]) -> (usize, Span) {
     (max_depth, at)
 }
 
+/// Parse-time scope flags tracked across nested function-like boundaries
+/// (`task` / `closure` / `macro` / `worker` / `transaction` / `match` arm guard & body /
+/// `parallel` / `with`). Isolated bodies reset `is_program_top` to `false` and
+/// `parse_loop_depth` to `0`, restored unconditionally on exit.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct ParserScope {
+    pub(super) is_program_top: bool,
+    pub(super) parse_loop_depth: usize,
+}
+
 ///  ParserV3 - Clean-room MIR parser with no AST legacy baggage
 pub struct ParserV3 {
     tokens: Vec<Token>,
     current: usize,
-    /// v0.75.40: 单遍编译 emit 上下文（阶段 3 完整融合）。
-    ///
-    /// v0.104.6 **D474**：parser **不再发射 MirInst** —— 它只产 witness，
-    /// MIR 全部由 9 层管线产出。故本字段现在**只承载解析期的作用域语义**，
-    /// 不再承载指令：
-    ///
-    /// - `is_program_top`：当前是否在**程序顶层**（不在任何函数体作用域内）。
-    ///   判「`return` 只在函数体里有意义」——程序顶层的 `return` 会静默终止
-    ///   整个程序（D42）。
-    /// - `parse_loop_depth`：当前作用域内的循环嵌套层数。判「循环外
-    ///   `break`/`continue` 是错误」——判的是**源码位置**，不是 IR 跳转标签。
-    ///
-    /// 两者的作用域边界完全一致：**函数体级**（task / closure / macro /
-    /// worker / transaction / observe / parallel / with / section / match arm /
-    /// do / app / update / orchestrate …）。换入全新 `EmitContext` 时两个计数
-    /// 天然归零，退出时随 `self.emit = parent` 一并还原。
-    ///
-    /// ⇒ 换入机制本身必须保留：它是这两条解析语义的**唯一**作用域来源。
-    emit: crate::mir::lower::EmitContext,
+    /// Parse-time lexical scope (`is_program_top`, `parse_loop_depth`).
+    scope: ParserScope,
     /// v0.75.40: 单遍编译并行产出的 witness 树（typeck/LSP 消费面）。
     /// compile() 返回此列表。
     witnesses: Vec<MirWitness>,
@@ -192,6 +178,8 @@ pub struct ParserV3 {
     /// 若函数体解析后未清，后续无关标注会把同名当类型变量（由
     /// `tests/generic_functions.rs` 的「泛型名不泄漏」一条兜住）。
     generic_params: Vec<String>,
+    /// User-declared nominal or alias type names (`type`, `enum`, `struct`) visible in annotations.
+    declared_type_names: std::collections::HashSet<String>,
 }
 
 impl ParserV3 {
@@ -201,20 +189,30 @@ impl ParserV3 {
             current: 0,
             diag: None,
             generic_params: Vec::new(),
-            emit: {
-                let mut ec = crate::mir::lower::EmitContext::new();
-                // v0.104.6 D42：程序顶层是**唯一**不属于任何函数体的寄存器
-                // 空间（task / closure / macro / worker / transaction / observe
-                // 等体都是另开 `EmitContext::new()`，它们才是「函数体」）。
-                // `return` 在这里没有可返回的函数 —— 此前它会 emit 一条
-                // `MirInst::Return` 到顶层函数体，从而**静默终止整个程序**、
-                // 吞掉其后所有语句且退出码 0（与 D35 同族）。
-                ec.is_program_top = true;
-                ec
+            declared_type_names: std::collections::HashSet::new(),
+            scope: ParserScope {
+                is_program_top: true,
+                parse_loop_depth: 0,
             },
             witnesses: Vec::new(),
             source: source.to_string(),
         }
+    }
+
+    /// Enter a nested function-like body scope (`is_program_top = false`,
+    /// `parse_loop_depth = 0`) and unconditionally restore the outer scope on
+    /// exit (including early `None` returns).
+    pub(super) fn in_nested_scope<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        let saved = std::mem::replace(
+            &mut self.scope,
+            ParserScope {
+                is_program_top: false,
+                parse_loop_depth: 0,
+            },
+        );
+        let result = f(self);
+        self.scope = saved;
+        result
     }
 
     /// v0.75.40: 单遍编译入口（阶段 3 完整融合）。
@@ -222,78 +220,76 @@ impl ParserV3 {
     /// parse 函数直接 emit MirInst 到内部 EmitContext，并行产出
     /// MirWitness 树，MirExpr 中间层消失（执行路径零 MirExpr）。
     /// 差分测试（tests/compile_differential.rs）锁定与 parse→lower 等价。
-    pub fn compile(
-        source: &str,
-    ) -> Result<
-        (
-            crate::mir::MirFunction,
-            Vec<crate::mir::witness::MirWitness>,
-        ),
-        String,
-    > {
+    /// W2.3: 仅运行词法 + 深度闸 + 语法分析产出 `MirWitness` 列表（不执行 lowering）。
+    /// LSP / `mora --check` / REPL / `eval` 动态绑定降维使用此入口避免无谓重降或误报。
+    pub fn parse_witnesses(source: &str) -> MoraResult<Vec<crate::mir::witness::MirWitness>> {
         use crate::lexer::Lexer;
         // 空输入或仅含注释的输入 → 显式 Err（与 proptest 期望对齐：
         // 成功编译必须产生非空 body，否则 prop_assert 失败）。
         let trimmed = source.trim();
         if trimmed.is_empty() || trimmed.chars().all(|c| c == '-' || c.is_whitespace()) {
-            return Err("empty program: source contains no executable statements".to_string());
+            return Err(MoraError::Parse(
+                "empty program: source contains no executable statements".to_string(),
+            ));
         }
         let tokens = Lexer::new(source).scan_tokens();
         // v0.104.6 D25：括号深度闸 — 在递归下降**之前**拦住字面嵌套，
         // 否则解析器会在有机会报错之前就爆栈（见 MAX_NESTING_DEPTH 文档）。
         let (bracket_depth, at) = token_bracket_depth(&tokens);
         if bracket_depth > MAX_NESTING_DEPTH {
-            return Err(format!(
+            return Err(MoraError::Parse(format!(
                 "source nesting too deep: bracket depth {} exceeds limit {} \
                  (first reached at line {}, column {}). \
                  Extract the deeply nested part into a task or a variable.",
                 bracket_depth, MAX_NESTING_DEPTH, at.0, at.1
-            ));
+            )));
         }
         // v0.104.6 D25：单语句 token 数闸 — 拦 `1+1+1+…` / `s[0][0]…` 这类
         // 括号深度恒为 1、却在 emit 循环里长成左深 n 层 witness 的形态。
         if let Some((n_tokens, line)) = max_statement_tokens(&tokens) {
-            return Err(format!(
+            return Err(MoraError::Parse(format!(
                 "statement too long: {} tokens on one line exceeds limit {} \
                  (near line {}). \
                  Split the expression across lines or bind the inner part to a variable.",
                 n_tokens, MAX_STATEMENT_TOKENS, line
-            ));
+            )));
         }
         let mut parser = ParserV3::new(tokens, source);
         let emitted = parser.emit_program();
         // v0.104.6 D413：语义诊断**优先于**泛化的解析失败。
-        // ⚠ 必须先捕获 `emit_program()` 的结果再查 `diag` ——
-        //   直接写 `parser.emit_program()?` 会在 `?` 处提前返回，
-        //   下面的诊断检查**永远执行不到**（第一版就是这么写错的）。
         if let Some(d) = parser.diag.clone() {
-            return Err(d);
+            return Err(MoraError::Parse(d));
         }
         emitted?;
         let witnesses = parser.witnesses;
         if witnesses.is_empty() {
-            return Err("empty program: parser produced no executable statements".to_string());
+            return Err(MoraError::Parse(
+                "empty program: parser produced no executable statements".to_string(),
+            ));
         }
-        // v0.104.6 D25：witness 深度闸 — 括号扫不到的形态（`1+1+1+…` 这类
-        // 左结合二元链在 emit 里是循环、括号深度恒为 0，但 witness 仍是
-        // 左深 n 层）由此兜住。
+        // v0.104.6 D25：witness 深度闸
         let (wd, wspan) = witness_depth(&witnesses);
         if wd > MAX_NESTING_DEPTH {
-            return Err(format!(
+            return Err(MoraError::Parse(format!(
                 "expression nesting too deep: witness depth {} exceeds limit {} \
                  (deepest at line {}, column {}). \
                  Split the expression or bind the inner part to a variable.",
                 wd, MAX_NESTING_DEPTH, wspan.line, wspan.column
-            ));
+            )));
         }
-        // v0.104.6 D474：**MIR 由 9 层管线从 witness 产出** —— parser 不再
-        // 发射任何 MirInst（`emit.rs` 里的 123 条发射语句已删）。
-        // 保留 `(MirFunction, Vec<MirWitness>)` 的返回形态是为了让**调用方**
-        // （CLI / import / runtime eval / REPL / LSP / typeck）不必各自决定
-        // 走哪条编译路径 —— 路径在这里**唯一**。
-        let raw = crate::mir::MirFunction::default();
-        let func = crate::mir::pipeline::compile(&raw, &witnesses);
-        Ok((func, witnesses))
+        Ok(witnesses)
+    }
+
+    pub fn compile(
+        source: &str,
+    ) -> MoraResult<(
+        crate::mir::control::ControlProgram,
+        Vec<crate::mir::witness::MirWitness>,
+    )> {
+        let witnesses = Self::parse_witnesses(source)?;
+        // W2.3: 单一路径直出 ControlProgram（retired 9-layer FCFG/SSA/VM）。
+        let prog = crate::mir::control::lower_program(&witnesses)?;
+        Ok((prog, witnesses))
     }
 
     /// v0.86: 将 line+column（token 坐标，1-based）转换为 source 中的字节偏移量。
@@ -365,82 +361,13 @@ fn token_to_identifier_name(tt: &TokenType) -> Option<&'static str> {
         TokenType::Struct => Some("struct"),
         TokenType::Macro => Some("macro"),
         TokenType::Loop => Some("loop"),
-        TokenType::Orchestrate => Some("orchestrate"),
-        TokenType::Prompt => Some("prompt"),
-        TokenType::Document => Some("document"),
         TokenType::Dyn => Some("dyn"),
         TokenType::As => Some("as"),
         TokenType::Do => Some("do"),
-        TokenType::MaxRounds => Some("max_rounds"),
         // v0.86: quote — Lisp homoiconicity 语法关键字
         TokenType::Quote => Some("quote"),
         _ => None,
     }
-}
-
-/// Parse prompt string content into MirWitness parts (standalone, no &self borrow).
-/// `p"hello {name}"` → [Literal("hello "), Variable("name")]
-///
-/// v0.92: 返回 MirWitness（canonical 类型）而非 MirExpr。
-/// 内嵌表达式经子 ParserV3 的 `emit_expr_w()` 解析（witness-native）。
-fn parse_prompt_parts(content: &str, span: Span) -> Vec<crate::mir::witness::MirWitness> {
-    use crate::mir::witness::{MirWitness, WitnessKind};
-
-    let mut parts = Vec::new();
-    let mut current_text = String::new();
-    let mut chars = content.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        if c == '{' {
-            // Flush accumulated text as a literal part
-            if !current_text.is_empty() {
-                parts.push(MirWitness {
-                    kind: WitnessKind::Literal(Literal::String(current_text.clone(), span)),
-                    span,
-                });
-                current_text.clear();
-            }
-            // Collect expression text until matching '}'
-            let mut expr_text = String::new();
-            let mut depth = 1;
-            while let Some(&ec) = chars.peek() {
-                chars.next();
-                if ec == '{' {
-                    depth += 1;
-                    expr_text.push(ec);
-                } else if ec == '}' {
-                    depth -= 1;
-                    if depth == 0 {
-                        break;
-                    }
-                    expr_text.push(ec);
-                } else {
-                    expr_text.push(ec);
-                }
-            }
-            // Parse the expression text via sub-lexer + witness parser
-            if !expr_text.is_empty() {
-                let mut lexer = Lexer::new(&expr_text);
-                let tokens = lexer.scan_tokens();
-                let mut parser = ParserV3::new(tokens, &expr_text);
-                if let Some(w) = parser.emit_expr_w() {
-                    parts.push(w);
-                }
-            }
-        } else {
-            current_text.push(c);
-        }
-    }
-
-    // Flush remaining text
-    if !current_text.is_empty() || parts.is_empty() {
-        parts.push(MirWitness {
-            kind: WitnessKind::Literal(Literal::String(current_text, span)),
-            span,
-        });
-    }
-
-    parts
 }
 
 #[cfg(test)]
@@ -470,7 +397,9 @@ mod tests {
     #[test]
     fn d25_bracket_depth_gate_fires_before_recursive_descent() {
         let src = format!("print({})", "(".repeat(MAX_NESTING_DEPTH + 50));
-        let err = ParserV3::compile(&src).expect_err("超深括号必须被闸拦下");
+        let err = ParserV3::compile(&src)
+            .expect_err("超深括号必须被闸拦下")
+            .to_string();
         assert!(
             err.contains("nesting too deep"),
             "应报括号深度超限，实得：{err}"
@@ -485,7 +414,9 @@ mod tests {
     #[test]
     fn d25_statement_token_gate_catches_deep_left_chains() {
         let src = format!("print({})", vec!["1"; MAX_STATEMENT_TOKENS].join(" + "));
-        let err = ParserV3::compile(&src).expect_err("超长单语句必须被闸拦下");
+        let err = ParserV3::compile(&src)
+            .expect_err("超长单语句必须被闸拦下")
+            .to_string();
         assert!(
             err.contains("statement too long"),
             "应报单语句过长，实得：{err}"

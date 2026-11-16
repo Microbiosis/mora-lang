@@ -43,68 +43,55 @@
 use std::sync::Arc;
 
 fn run(src: &str) -> String {
-    let (func, _w) = ParserV3::compile(src).unwrap_or_else(|e| panic!("compile: {e}"));
-    let arc = Arc::new(func);
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    match execute(
-        &arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    ) {
-        Ok(v) => format!("{v}"),
+    let (prog, _w) = ParserV3::compile(src).unwrap_or_else(|e| panic!("compile: {e}"));
+    let arc = Arc::new(prog);
+    let mut core = CoreRuntime::default();
+    match execute_program(arc, &mut core) {
+        Ok((v, _)) => format!("{v}"),
         Err(e) => format!("ERR: {e}"),
     }
 }
 
-use mora::interpreter::Interpreter;
-use mora::mir::vm::execute;
 use mora::parser_v3::ParserV3;
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::execute_program;
 
 fn cases() -> Vec<(&'static str, &'static str, &'static str)> {
     vec![
-        // ── 缺陷本体：长度恒为 1，内容逐轮变 ──
         (
             "index_dict_len_const_1",
             "let n = 0\nlet s = 0\nwhile n < 4\n  let d = {a: n}\n  let s = s + d[\"a\"]\n  let n = n + 1\nend\ns\n",
-            "6.0", // 0+1+2+3；缺陷下为 0.0
+            "6",
         ),
-        // ── 长度恒为 2，同样应逐轮变 ──
         (
             "index_dict_len_const_2",
             "let n = 0\nlet out = 0\nwhile n < 3\n  let d = {a: n, b: 9}\n  let out = d[\"a\"]\n  let n = n + 1\nend\nout\n",
-            "2.0", // 末轮 n=2；缺陷下为 0.0
+            "2",
         ),
-        // ── 累积式：长度恒定但内容整体累加，最易暴露 ──
         (
             "index_dict_accumulate",
             "let n = 0\nlet s = 0\nwhile n < 4\n  let d = {a: n}\n  let s = s + d[\"a\"]\n  let n = n + 1\nend\ns + 0.0\n",
             "6.0",
         ),
-        // ── 两种写法必须给出一致的**路径无关**结果（同值即同结果）──────
         (
             "index_bracket_vs_get_same_length",
             "let n = 0\nlet b = 0\nlet g = 0\nwhile n < 4\n  let d = {a: n}\n  let b = b + d[\"a\"]\n  let g = g + d.get(\"a\")\n  let n = n + 1\nend\nif b == g then 1 else 0 end\n",
-            "1.0", // 下标与 .get 必须同值
+            "1",
         ),
-        // ── 对照：list 下标（指纹为 Heap(identity)，本就正确）──────────
         (
             "index_list_control",
             "let n = 0\nlet s = 0\nwhile n < 4\n  let xs = [n]\n  let s = s + xs[0]\n  let n = n + 1\nend\ns\n",
-            "6.0",
+            "6",
         ),
-        // ── 对照：非容器纯节点 ──────────────────────────────────────────
         (
             "pure_binop_control",
             "let n = 0\nlet s = 0\nwhile n < 4\n  let s = s + n\n  let n = n + 1\nend\ns\n",
-            "6.0",
+            "6",
         ),
-        // ── dict 长度**也**逐轮变（原实现碰巧正确，改动不得破坏它）────
         (
             "index_dict_len_varies",
             "let n = 0\nlet s = 0\nwhile n < 3\n  let d = {a: n, b: n, c: n}\n  let s = s + d[\"a\"]\n  let n = n + 1\nend\ns\n",
-            "3.0", // 0+1+2
+            "3",
         ),
     ]
 }

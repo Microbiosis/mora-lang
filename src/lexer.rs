@@ -21,46 +21,27 @@ pub enum TokenType {
     Break,
     Continue,
     // v0.06.7: 移除 v0.04 云服务原生关键字 Serve/Http/Mcp/Repl/Stdio/On
-    // 云服务走显式 API: Router::new() / McpServer::new()
-    // v0.75.19: 语法面收敛 — 移除无前端可达的死关键字（lexer 有 token、
-    // ParserV3 不解析、MirInst 由手工构造驱动；运行时原语集不变）。
+    // v0.75.19: 语法面收敛 — 移除无前端可达的死关键字。
     // v0.20: 宏关键字
     Macro,
     // v0.86: Lisp homoiconicity — quote 冻结表达式为数据，完成 eval-apply-quote 三元组。
     Quote,
-    // v0.25: Multi-Agent 协调关键字
-    Orchestrate,
     Loop,
-    MaxRounds,
-    // v0.26: prompt section 块 — 用于声明一段 system prompt 分段
-    // 注意：与 p"..." 模板字符串(prompt_string)互不干扰,后者必须在 'p"' 双字符触发
-    Prompt,
-    // v0.27: Document 块（与 prompt 块语义类似）
-    Document,
-    // v0.85: with 块（配置桥接）— with mock_llm = [...] end
-    // 与 handle/perform 同模式但显式 TokenType，支持 §1.1 "语言一等公民"。
+    // v0.85 / match pattern: with 关键字
     With,
-    // v0.88: TEA app 块关键字 — app Counter ... end
-    App,
-    // v0.102: 声明式范式（逻辑式/关系式）关键字
-    Rel,
-    Solve,
     // 注意: HTTP 方法 (GET/POST/PUT/DELETE/PATCH) 不作关键字
-    // —— 保持 Identifier,显式 API Router.route() 按字符串匹配
+    // —— 保持 Identifier
     Identifier(String),
     String(String),
     /// v0.x: 单字符字面量（`'a'`）
     Char(char),
-    PromptString(String), // v0.04.0: p"..."
     // v0.38: numeric tower — Int and Float tokens.
     Int(i64),
     Float(f64),
-    // v0.91: BigInt 字面量 — `<digits>n` 后缀
-    // 持有 num_bigint::BigInt 直接解析（避免 i64 范围限制）
-    BigInt(num_bigint::BigInt),
     Plus,
     Minus,
     Star,
+    StarStar,
     Slash,
     Percent,
     Assign,
@@ -74,7 +55,7 @@ pub enum TokenType {
     // v0.85: standalone `|` — used for union type annotations (`string | number`).
     // `|` alone = Or; `|>` = Pipe. Distinct tokens to avoid ambiguity.
     Or,
-    // v0.30: `!` 前缀 (逻辑非) 和 `@` 装饰符 (如 @start, @exit graph 节点)
+    // `!` 前缀逻辑非，以及矩阵乘法运算符 `@`
     Bang,
     At,
     // v0.31: 词法错误时 emit (不 panic), 携带错误信息
@@ -83,7 +64,7 @@ pub enum TokenType {
     FatArrow, // v0.55: `=>` 用于 match arm
     // v0.06.2: ? 操作符（expr? 传播 Result 错误）
     Question,
-    // v0.07.1: :: 操作符（Namespace qualification like Router::new）
+    // 关联路径操作符 `::`（如 Enum::Variant / Trait::new）
     ColonColon,
     // v0.08: dyn / Self
     Dyn,
@@ -176,7 +157,7 @@ fn literal_range_error(text: &str, parsed: f64) -> Option<String> {
         };
         return Some(format!(
             "Float literal out of range: {} exceeds f64 max (~1.797e308). \
-             Use a BigInt literal (append `n`) for exact large integers.",
+             Use `std/math/bigint` for exact arbitrary-precision integers.",
             shown
         ));
     }
@@ -270,21 +251,6 @@ impl Lexer {
         }
     }
 
-    /// v0.27: 跳过空格/制表/换行,判断下一个非空白字符是否是 `"`。
-    /// 用于:把 `document "x" do ... end` 与 `document.parse(...)` 区分开。
-    fn peek_non_newline_is_string(&self) -> bool {
-        let mut i = self.current;
-        while i < self.source.len() {
-            let c = self.source[i];
-            if c == ' ' || c == '\t' || c == '\r' || c == '\n' {
-                i += 1;
-            } else {
-                break;
-            }
-        }
-        i < self.source.len() && self.source[i] == '"'
-    }
-
     fn match_char(&mut self, expected: char) -> bool {
         if self.is_at_end() || self.source[self.current] != expected {
             return false;
@@ -353,7 +319,13 @@ impl Lexer {
                     Self::simple_token(TokenType::Minus, start_line, start_col)
                 }
             }
-            '*' => Self::simple_token(TokenType::Star, start_line, start_col),
+            '*' => {
+                if self.match_char('*') {
+                    Self::simple_token(TokenType::StarStar, start_line, start_col)
+                } else {
+                    Self::simple_token(TokenType::Star, start_line, start_col)
+                }
+            }
             '/' => Self::simple_token(TokenType::Slash, start_line, start_col),
             '%' => Self::simple_token(TokenType::Percent, start_line, start_col),
             '(' => Self::simple_token(TokenType::LParen, start_line, start_col),
@@ -488,11 +460,6 @@ impl Lexer {
                 if c.is_ascii_digit() {
                     Some(self.number_from(start_line, start_col))
                 } else if c.is_ascii_alphabetic() || c == '_' {
-                    // v0.04.0: 检测 p"..." 前缀
-                    if c == 'p' && self.peek() == '"' {
-                        self.advance(); // 消费 "
-                        return Some(self.prompt_string_from(start_line, start_col));
-                    }
                     Some(self.identifier_from(start_line, start_col))
                 } else if c == '@' {
                     // v0.30: `@` 装饰符 (e.g. @start, @exit 用于 graph node label)
@@ -621,70 +588,6 @@ impl Lexer {
         }
     }
 
-    /// v0.04.0: 解析 p"..." prompt 字符串
-    /// 复用 string_from 的转义规则，但 token 类型是 PromptString
-    fn prompt_string_from(&mut self, start_line: usize, start_col: usize) -> Token {
-        let mut value = String::new();
-        while self.peek() != '"' && !self.is_at_end() {
-            if self.peek() == '\n' {
-                self.line += 1;
-                self.column = 0;
-            }
-            if self.peek() == '\\' {
-                self.advance();
-                if self.is_at_end() {
-                    break;
-                }
-                match self.advance() {
-                    '"' => {
-                        value.push('"');
-                    }
-                    '\\' => {
-                        value.push('\\');
-                    }
-                    'n' => {
-                        value.push('\n');
-                    }
-                    't' => {
-                        value.push('\t');
-                    }
-                    'r' => {
-                        value.push('\r');
-                    }
-                    '0' => {
-                        value.push('\0');
-                    }
-                    other => {
-                        value.push('\\');
-                        value.push(other);
-                    }
-                }
-            } else {
-                let c = self.advance();
-                // v0.35 (P0-B4): same control-char rejection as string_from.
-                let code = c as u32;
-                let is_legit = matches!(c, '\t' | '\n' | '\r');
-                if !is_legit && (code < 0x20 || c == '\x7f') {
-                    return self.error_token(
-                        start_line,
-                        start_col,
-                        "control character in prompt string",
-                    );
-                }
-                value.push(c);
-            }
-        }
-        if self.is_at_end() {
-            return self.error_token(start_line, start_col, "Unterminated prompt string");
-        }
-        self.advance(); // closing "
-        Token {
-            token_type: TokenType::PromptString(value),
-            line: start_line,
-            column: start_col,
-        }
-    }
-
     /// 还原用户写下的**完整**字面量文本（数值 + 类型后缀 + 位宽）。
     ///
     /// v0.104.6 D475：诊断此前只报**数值部分**（`9223372036854775808`），
@@ -694,155 +597,164 @@ impl Lexer {
     /// `tests/numeric_width_suffix.rs` 一直在断言「诊断应点名这个字面量」，
     /// 但它此前是**假通过** —— 旧实现把源码片段 slug 进了临时目录名，
     /// 目录名恰好含有那个字面量，断言其实是被**路径**满足的。
-    fn literal_text(value: &str, suffix: Option<char>, width: &str) -> String {
-        let mut s = String::from(value);
-        if let Some(c) = suffix {
-            s.push(c);
-        }
-        s.push_str(width);
-        s
-    }
-
     fn number_from(&mut self, start_line: usize, start_col: usize) -> Token {
         let start = self.current - 1;
-        while self.peek().is_ascii_digit() {
+        while self.peek().is_ascii_digit()
+            || (self.peek() == '_' && self.peek_next().is_ascii_digit())
+        {
             self.advance();
         }
+        let mut has_dot = false;
         if self.peek() == '.' && self.peek_next().is_ascii_digit() {
+            has_dot = true;
             self.advance();
-            while self.peek().is_ascii_digit() {
+            while self.peek().is_ascii_digit()
+                || (self.peek() == '_' && self.peek_next().is_ascii_digit())
+            {
                 self.advance();
             }
         }
-        // v0.38: detect `i` / `u` / `f` / `I` suffix for Int/Number/Float.
-        // v0.91: 加 `n` / `N` 后缀 → BigInt 字面量
-        let value: String = self.source[start..self.current].iter().collect();
-        let mut suffix: Option<char> = None;
-        // v0.104.6 D475：位宽文本**留一份** —— 诊断要报用户写下的**完整**
-        // token（数值 + 类型后缀 + 位宽），否则用户看到的诊断没点名自己写的东西。
-        let mut width = String::new();
-        // v0.104.6 D356：宽度数字**只被消费、不混进 `value`**。
-        //
-        // 修前 `value.push(self.advance())` 把宽度直接追加到数值串上，
-        // 而 `'f'` 分支是 `value.parse()`（**不做** take_while 截断）⇒
-        // 宽度被当成**数值**拼进去：
-        //
-        // ```text
-        // 1.5f32  → 1.532      ← 1.5 + "32" 被解析
-        // 1f32    → 132.0
-        // ```
-        //
-        // `i` / `u` / `n` 分支靠 `take_while(is_ascii_digit)` **侥幸**没受影响
-        // —— 那是巧合（依赖宽度首字符是 ASCII 数字），不是设计。
-        // Mora 不建模位宽（见 `'u'` 分支注释），宽度只需被消费。
-        if matches!(self.peek(), 'i' | 'I' | 'u' | 'U' | 'f' | 'F' | 'n' | 'N') {
-            suffix = Some(self.advance());
-            // Optional width: 8/16/32/64（其它数字也照常消费，不报错 —— 见下）。
-            while self.peek().is_ascii_digit() {
-                width.push(self.advance());
+        let mut has_exp = false;
+        if matches!(self.peek(), 'e' | 'E') {
+            has_exp = true;
+            self.advance();
+            if matches!(self.peek(), '+' | '-') {
+                self.advance();
+            }
+            if !self.peek().is_ascii_digit() {
+                // Consume trailing identifier chars so diagnostic names the malformed token cleanly
+                while self.peek().is_ascii_alphanumeric() || self.peek() == '_' {
+                    self.advance();
+                }
+                let raw: String = self.source[start..self.current].iter().collect();
+                return self.error_token(
+                    start_line,
+                    start_col,
+                    &format!("Invalid exponent in float literal: {}", raw),
+                );
+            }
+            while self.peek().is_ascii_digit()
+                || (self.peek() == '_' && self.peek_next().is_ascii_digit())
+            {
+                self.advance();
             }
         }
-        let tt = if let Some(s) = suffix {
-            match s {
-                'i' | 'I' => {
-                    // 宽度已由上面单独收集（D356），`value` 本身就是纯数字。
-                    let digits: String = value
-                        .chars()
-                        .take_while(|c| c.is_ascii_digit() || *c == '-')
-                        .collect();
-                    match digits.parse::<i64>() {
-                        Ok(n) => TokenType::Int(n),
-                        Err(_) => {
-                            return self.error_token(
-                                start_line,
-                                start_col,
-                                &format!(
-                                    "Invalid integer literal: {}",
-                                    Self::literal_text(&value, Some(s), &width)
-                                ),
-                            );
-                        }
+
+        let raw_num: String = self.source[start..self.current].iter().collect();
+        let clean_num: String = raw_num.chars().filter(|&c| c != '_').collect();
+
+        // Collect full alphanumeric suffix (`f`, `f16`, `bf16`, `fp8`, `i4`, `i8`, ..., `u64`).
+        let mut suffix_raw = String::new();
+        if self.peek().is_ascii_alphabetic() {
+            while self.peek().is_ascii_alphanumeric() || self.peek() == '_' {
+                suffix_raw.push(self.advance());
+            }
+        }
+        let full_text = format!("{raw_num}{suffix_raw}");
+
+        let tt = if suffix_raw.is_empty() {
+            if has_dot || has_exp {
+                let num: f64 = match clean_num.parse() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        return self.error_token(
+                            start_line,
+                            start_col,
+                            &format!("Invalid float literal: {}", full_text),
+                        );
+                    }
+                };
+                if let Some(msg) = literal_range_error(&clean_num, num) {
+                    return self.error_token(start_line, start_col, &msg);
+                }
+                TokenType::Float(num)
+            } else {
+                match clean_num.parse::<i64>() {
+                    Ok(n) => TokenType::Int(n),
+                    Err(_) => {
+                        let shown = if clean_num.len() > 24 {
+                            format!("{}… ({} 位)", &clean_num[..24], clean_num.len())
+                        } else {
+                            clean_num
+                        };
+                        return self.error_token(
+                            start_line,
+                            start_col,
+                            &format!(
+                                "Integer literal out of range: {} exceeds i64 max (9223372036854775807). \
+                                 Use a float literal (e.g. `.0` or `1e...`) or `std/math/bigint`.",
+                                shown
+                            ),
+                        );
                     }
                 }
-                'u' | 'U' => {
-                    // Same as int but cast via i64 (mora doesn't model unsigned).
-                    let digits: String = value
-                        .chars()
-                        .take_while(|c| c.is_ascii_digit() || *c == '-')
-                        .collect();
-                    match digits.parse::<i64>() {
-                        Ok(n) => TokenType::Int(n),
-                        Err(_) => {
-                            return self.error_token(
-                                start_line,
-                                start_col,
-                                &format!(
-                                    "Invalid integer literal: {}",
-                                    Self::literal_text(&value, Some(s), &width)
-                                ),
-                            );
-                        }
-                    }
-                }
-                'f' | 'F' => {
-                    // v0.104.6 D356：宽度已单独收集，此处 `value` 是**纯数值串**，
-                    // 可直接 parse（修前宽度混在串里 ⇒ `1.5f32` → 1.532）。
-                    let num: f64 = match value.parse() {
+            }
+        } else {
+            let suf = suffix_raw.to_ascii_lowercase();
+            match suf.as_str() {
+                "f" | "f16" | "f32" | "f64" | "bf16" | "fp8" => {
+                    let num: f64 = match clean_num.parse() {
                         Ok(n) => n,
                         Err(_) => {
                             return self.error_token(
                                 start_line,
                                 start_col,
-                                &format!(
-                                    "Invalid float literal: {}",
-                                    Self::literal_text(&value, Some(s), &width)
-                                ),
+                                &format!("Invalid float literal: {}", full_text),
                             );
                         }
                     };
-                    if let Some(msg) = literal_range_error(&value, num) {
+                    if let Some(msg) = literal_range_error(&clean_num, num) {
                         return self.error_token(start_line, start_col, &msg);
                     }
                     TokenType::Float(num)
                 }
-                // v0.91: BigInt 字面量 `<digits>n` — 任意精度
-                'n' | 'N' => {
-                    let digits: String = value
-                        .chars()
-                        .take_while(|c| c.is_ascii_digit() || *c == '-')
-                        .collect();
-                    match digits.parse::<num_bigint::BigInt>() {
-                        Ok(n) => TokenType::BigInt(n),
+                "i" | "i4" | "i8" | "i16" | "i32" | "i64" | "u" | "u8" | "u16" | "u32" | "u64" => {
+                    if has_dot || has_exp {
+                        return self.error_token(
+                            start_line,
+                            start_col,
+                            &format!("Float literal cannot have integer suffix: {}", full_text),
+                        );
+                    }
+                    match clean_num.parse::<i64>() {
+                        Ok(n) => {
+                            let width_ok = match suf.as_str() {
+                                "u8" => n <= u8::MAX as i64,
+                                "u16" => n <= u16::MAX as i64,
+                                "u32" => n <= u32::MAX as i64,
+                                _ => true,
+                            };
+                            if !width_ok {
+                                return self.error_token(
+                                    start_line,
+                                    start_col,
+                                    &format!("Invalid integer literal: {}", full_text),
+                                );
+                            }
+                            TokenType::Int(n)
+                        }
                         Err(_) => {
                             return self.error_token(
                                 start_line,
                                 start_col,
-                                &format!(
-                                    "Invalid bigint literal: {}",
-                                    Self::literal_text(&value, Some(s), &width)
-                                ),
+                                &format!("Invalid integer literal: {}", full_text),
                             );
                         }
                     }
                 }
-                _ => unreachable!(),
-            }
-        } else {
-            let num: f64 = match value.parse() {
-                Ok(n) => n,
-                Err(_) => {
+                _ => {
                     return self.error_token(
                         start_line,
                         start_col,
-                        &format!("Invalid number literal: {}", value),
+                        &format!(
+                            "Unknown numeric suffix '{}' in literal: {}",
+                            suffix_raw, full_text
+                        ),
                     );
                 }
-            };
-            if let Some(msg) = literal_range_error(&value, num) {
-                return self.error_token(start_line, start_col, &msg);
             }
-            TokenType::Float(num)
         };
+
         Token {
             token_type: tt,
             line: start_line,
@@ -893,30 +805,9 @@ impl Lexer {
             "type" => TokenType::Type,
             "enum" => TokenType::Enum,
             "struct" => TokenType::Struct,
-            // v0.25: Multi-Agent 协调
-            "orchestrate" => TokenType::Orchestrate,
             "loop" => TokenType::Loop,
-            "max_rounds" => TokenType::MaxRounds,
-            // v0.26: prompt 块语句（与 p"..." 模板字符串互不干扰）
-            "prompt" => TokenType::Prompt,
-            // v0.27: document 块语句（与 prompt "x" do end 同款）
-            // 但允许 `document.parse(...)` 形式:仅当下一个 token 是字符串字面量
-            // (块语句起始)时识别为 Document 关键字,否则退化为 Identifier,
-            // 使其可作为表达式上下文中的模块名。
-            "document" => {
-                if self.peek_non_newline_is_string() {
-                    TokenType::Document
-                } else {
-                    TokenType::Identifier(value)
-                }
-            }
-            // v0.85: with 块（配置桥接）— 与 handle/perform 同语义但显式关键字
+            // v0.85 / match pattern: with 关键字
             "with" => TokenType::With,
-            // v0.88: TEA app 块关键字
-            "app" => TokenType::App,
-            // v0.102: 声明式范式关键字
-            "rel" => TokenType::Rel,
-            "solve" => TokenType::Solve,
             _ => TokenType::Identifier(value),
         };
         Token {

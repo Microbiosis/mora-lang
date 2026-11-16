@@ -57,19 +57,16 @@ use std::process::{Command, Stdio};
 /// 返回 (stdout+stderr, 是否在时限内自行退出)。
 fn run_repl(lines: &[&str], timeout_ms: u64) -> (String, bool) {
     let dir = std::env::temp_dir();
-    let mut child = Command::new(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/target/debug/mora.exe"
-    ))
-    .current_dir(&dir)
-    .arg("--repl")
-    .env_remove("OPENAI_API_KEY")
-    .env_remove("MORA_AI_BASE_URL")
-    .stdin(Stdio::piped())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .spawn()
-    .expect("起 mora --repl");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mora"))
+        .current_dir(&dir)
+        .arg("--repl")
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("MORA_AI_BASE_URL")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("起 mora --repl");
 
     {
         let stdin = child.stdin.as_mut().expect("stdin");

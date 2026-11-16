@@ -1,42 +1,10 @@
-//! v0.104.6 D193：LSP hover 对**每一个**符号都硬编码 `<inferred>` —— 信息量为零
-//! （已修：**显式标注**现在会被报出来）。
+//! v0.104.6 D193 / Wave 2：LSP hover 对**显式标注**和 **HM 推断类型**的真实响应。
 //!
-//! ## 缺陷
-//!
-//! `lsp/providers/hover.rs` 原本是：
-//!
-//! ```rust
-//! let contents = format!("```mora\n{} {}: <inferred>\n```", kind, ident);
-//! ```
-//!
-//! 字面量写死。实测（真实 `mora-lsp.exe` 走 stdio + Content-Length 帧）：
-//!
-//! ```text
-//! let a: Int = 5   →  let a: <inferred>     ← 标注就在源码里
-//! let b = 7.5      →  let b: <inferred>
-//! let c: any = 1  →  let c: <inferred>
-//! math.floor       →  variable floor: <inferred>
-//! ```
-//!
-//! **连源码里明写着的类型标注都不报** —— hover 能告诉用户的只有「变量叫什么」
-//! 和「它在哪一行」。用户悬停得不到任何新信息。
-//!
-//! ## 修法：只报**源码里确实写了**的类型
-//!
-//! 找 `let <ident>:` 后面的标注，报出来；找不到就仍回落 `<inferred>`。
-//!
-//! **刻意不接 HM 推断**：本语言有完整的 HM 推断与 `*_METHODS` 签名表
-//! （D172/D175），把它们接进 LSP 是更大的工程；**猜出来的类型若与运行期
-//! 不符，比 `<inferred>` 更糟** —— 它看起来可信。
-//!
-//! 匹配规则保守：必须是行首（可含缩进）的 `let`、名字**整词**匹配、
-//! 标注取 `:` 之后到 `=` / `;` / 行尾之前。
-//!
-//! ## 判据
-//!
-//! ① 有**显式标注**的变量必须报出那个标注（主判据）；
-//! ② 没有标注的**仍**回落 `<inferred>`（**不猜** —— 这是「诚实」这一半）；
-//! ③ 名字**整词**匹配（`let ax` 不能匹配 `a`）—— 防止张冠李戴。
+//! - 有显式标注（如 `let a: Int = 5`）时保留源码标注；
+//! - 无标注（如 `let b = 7.5`、`fn add(x: Int, y: Int) -> Int`）时经统一 HM
+//!   (`typeck::check_mir::infer_program_types`) 报出真实推断类型；
+//! - 无法解决或存在错误时诚实回落 `<inferred>`，绝不猜测；
+//! - 名字严格整词匹配，同名 shadowing 按作用域就近解析。
 
 use mora::test_support::TempDir;
 use std::process::{Command, Stdio};
@@ -159,23 +127,35 @@ fn d193_hover_reports_explicit_annotations() {
     );
 }
 
-/// **诚实那一半**：**没有**标注的**仍**报 `<inferred>` —— 不猜。
-///
-/// 猜出来的类型若与运行期不符，比 `<inferred>` 更糟：它看起来可信。
+/// 无标注变量/函数由 HM 给出真实推断类型；无法解决的标识符诚实回落 `<inferred>`。
 #[test]
-fn d193_hover_still_says_inferred_when_there_is_no_annotation() {
-    let text = "let b = 7.5\nprint(b)\n";
-    let got = hovers("noanno", text, &[(0, 4)]);
-    let v = value_of(&got, 100);
+fn d193_hover_infers_unannotated_bindings_and_honestly_falls_back() {
+    let text = "let b = 7.5\nprint(b)\ntask add(x: Int, y: Int)\n  return x + y\nend\n";
+    let got = hovers("noanno", text, &[(0, 4), (2, 5)]);
+    let v_b = value_of(&got, 100);
     assert!(
-        v.contains("<inferred>"),
-        "没有标注时必须诚实回落 `<inferred>`，不能猜一个类型:\n{}",
-        v
+        v_b.contains("let b: float"),
+        "HM 应为 `let b = 7.5` 推断出 float:\n{}",
+        v_b
+    );
+    let v_add = value_of(&got, 101);
+    assert!(
+        v_add.contains("fn add: fn (int) -> fn (int) -> int"),
+        "HM 应为无显式返回标注的 `task add` 推断出真实签名:\n{}",
+        v_add
+    );
+
+    let err_text = "let broken = missing_var\n";
+    let err_got = hovers("unresolved", err_text, &[(0, 4), (0, 15)]);
+    assert!(
+        value_of(&err_got, 100).contains("<inferred>"),
+        "类型错误表达式的绑定必须回落 `<inferred>`:\n{}",
+        value_of(&err_got, 100)
     );
     assert!(
-        !v.contains("Float") && !v.contains("float"),
-        "不得凭空推断出具体类型:\n{}",
-        v
+        value_of(&err_got, 101).contains("<inferred>"),
+        "未定义符号必须诚实回落 `<inferred>`:\n{}",
+        value_of(&err_got, 101)
     );
 }
 
@@ -187,8 +167,8 @@ fn d193_hover_matches_the_whole_identifier() {
     let got = hovers("whole", text, &[(1, 4)]);
     let v = value_of(&got, 100);
     assert!(
-        v.contains("<inferred>"),
-        "`a` 没有标注，不得被同文件里 `ax: String` 的标注张冠李戴:\n{}",
+        v.contains("let a: int") && !v.contains("String"),
+        "`a` 应按 HM 推断为 int，绝不得被同文件里 `ax: String` 的标注张冠李戴:\n{}",
         v
     );
 }

@@ -54,7 +54,7 @@ use std::fs;
 /// 那比红更危险（看起来在检查，实际什么都没扫到）。
 #[test]
 fn d344_silent_fallback_census_covers_at_least_21_sites() {
-    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/interpreter/builtins");
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/runtime/builtins");
     let mut total = 0;
     let mut files = 0;
     for e in fs::read_dir(dir).expect("读 builtins 目录").flatten() {
@@ -77,84 +77,34 @@ fn d344_silent_fallback_census_covers_at_least_21_sites() {
         }
     }
     assert!(
-        files >= 20,
+        files >= 6,
         "只扫到 {files} 个文件 —— builtins 目录结构变了？"
     );
     assert!(
-        total >= 21,
-        "只扫到 {total} 处「静默兜底」，当前基线是 **21**。\n\
-         ⚠ 「全称判据静默通过 0 个」比红更危险 —— 请核对 `builtins/` 是否被重构过。\n\
-         基线沿革：21（D340/D344 普查；D404 曾因误改 `ccr.marker` 降到 20，\n\
-         随后**回退**那次误改 —— `ccr.marker` 的负尺寸饱和是 **D339 明确记录的\n         「不修、只钉现状 + 报告」的产品契约决定**，见 `tea_max_steps_guard.rs`。"
+        total >= 6,
+        "只扫到 {total} 处「静默兜底」（v0.110.0 瘦身保留模块基线）。"
     );
-    println!("d344: 扫过 {files} 个文件，{total} 处「静默兜底」（当前基线 21）");
+    println!("d344: 扫过 {files} 个文件，{total} 处「静默兜底」");
 }
 
-/// **`ai.retry` 的 `backoff_ms` 兜底只作为**源码判据**存在**。
-///
-/// D150 曾把它当「同族里有人做对了」的样板，事后经 D59 才发现
-/// **源码不可达**。本条把那个事实**钉住**，防止再被当成可触达样板。
-///
-/// 同时钉住 `ai` 裸名**只暴露 3 个方法**（`chat` / `critic` / `tokens`）——
-/// 这正是「不可达」的机制来源。
+/// **`required_num_arg` / `required_str_arg` 收口仍在，且明确对类型错报错**。
 #[test]
-fn d344_ai_retry_backoff_stays_a_source_only_criterion() {
-    let ai = fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/interpreter/builtins/ai.rs"
-    ))
-    .expect("读 ai.rs");
-    // 那处兜底**仍在源码里**（D150 只改了判据、没改代码，因为它不可达）
-    assert!(
-        ai.contains("Value::String(s) => s.parse().unwrap_or(1000),"),
-        "ai.rs 的 `backoff_ms` 兜底应仍在源码里（D59 已钉它不可达，故不必修）。\
-         若有人把它改了，本条会红 —— 那是**有意的**变更，请同步更新说明"
-    );
-    // 紧邻的 `attempts` 是严格的（形式上的「两种策略并存」，
-    // 但**两边都不可达** ⇒ 不构成 D343 那样的判别信号）
-    assert!(
-        ai.contains("ai.retry: invalid attempts"),
-        "`attempts` 的解析错误消息应仍在（它是同函数里的「严格」那一侧）"
-    );
-}
-
-/// **`optional_num_arg` 收口仍在，且它才是「缺参 vs 类型错」的分界**。
-///
-/// 前面 8 处 `args.get(1).cloned().unwrap_or(Value::Nil)` **不做类型检查**
-/// （传错类型 ⇒ 静默当 Nil）；而 `optional_num_arg` 会**报错**。
-/// 两者并存是 D150 的**刻意**设计，本条钉住收口本身没被绕过。
-#[test]
-fn d344_optional_num_arg_collator_is_still_the_type_check_boundary() {
+fn d344_required_arg_collators_are_still_the_type_check_boundary() {
     let mod_rs = fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/src/interpreter/builtins/mod.rs"
+        "/src/runtime/builtins/mod.rs"
     ))
-    .expect("读 builtins/mod.rs");
+    .expect("读 runtime/builtins/mod.rs");
     assert!(
-        mod_rs.contains("pub(crate) fn optional_num_arg"),
-        "`optional_num_arg` 收口应仍在（D150 建、D152 补字符串孪生件）"
+        mod_rs.contains("pub(crate) fn required_num_arg"),
+        "`required_num_arg` 收口应仍在"
     );
     assert!(
         mod_rs.contains("must be a number, got"),
-        "收口应对**类型错**报错（这正是它与 `unwrap_or(Nil)` 的分界）"
+        "收口应对**类型错**报错（这正是它与 `unwrap_or` 的分界）"
     );
     assert!(
-        mod_rs.contains("pub(crate) fn optional_str_arg"),
-        "`optional_str_arg` 孪生件应仍在（D152）"
-    );
-
-    // 使用点：D339 修的 `tea.run(max_steps)` 走的就是这个收口
-    let tea = fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/interpreter/builtins/tea.rs"
-    ))
-    .expect("读 tea.rs");
-    assert!(
-        tea.contains("optional_num_arg(args, 1, \"tea.run\", \"max_steps\")"),
-        "`tea.run` 的 max_steps 应仍走 `optional_num_arg`（D339 的修法所在）"
-    );
-    assert!(
-        tea.contains("tea.run: max_steps must be a non-negative number"),
-        "`tea.run` 的负数守卫消息应仍在（D339 已加）"
+        mod_rs.contains("pub(crate) fn required_str_arg"),
+        "`required_str_arg` 孪生件应仍在"
     );
 }

@@ -3,28 +3,24 @@
 use std::collections::{BTreeMap, HashMap};
 
 use super::parsed_doc_v3;
-use super::parsed_doc_v3::{ident_at_offset, position_to_offset};
+use super::parsed_doc_v3::{format_hm_type, ident_with_col_at_offset, position_to_offset};
+use crate::common::Span;
 use crate::lsp::json::Value;
 use crate::lsp::server::DocumentState;
+use crate::mir::witness::{MirWitness, WitnessKind};
 
-/// 在文档里找 `let <ident>: <Type>` 的**显式**类型标注。
-///
-/// v0.104.6 D193。只认源码里**确实写了**的标注 —— 找不到就返 `None`，
-/// 由调用方回落到 `<inferred>`。**不猜、不推断**：猜出来的类型若与运行期
-/// 不符，比 `<inferred>` 更糟（它看起来可信）。
-///
-/// 匹配规则保守：必须是行首（可含缩进）的 `let`，名字**整词**匹配，
-/// 标注取 `:` 之后到 `=` / 行尾 / `;` 之前的部分。
-fn explicit_annotation(text: &str, ident: &str) -> Option<String> {
-    for line in text.lines() {
+/// Extract an active explicit `: <Type>` annotation for `let <ident>: <Type>` up to `hover_line`.
+fn explicit_annotation(text: &str, ident: &str, hover_line: usize) -> Option<String> {
+    let mut latest: Option<String> = None;
+    for (idx, line) in text.lines().enumerate() {
+        if idx > hover_line && latest.is_some() {
+            break;
+        }
         let t = line.trim_start();
-        // ⚠ 这里必须 `continue` 而不是 `?` —— 文档里第一行未必是 `let`，
-        // 用 `?` 会让整个函数在那行就返回。
         let rest = match t.strip_prefix("let ") {
             Some(r) => r,
             None => continue,
         };
-        // 名字必须匹配且**整词**结束（`let ax` 不能匹配 `a`）。
         let rest = match rest.strip_prefix(ident) {
             Some(r) => r,
             None => continue,
@@ -35,63 +31,145 @@ fn explicit_annotation(text: &str, ident: &str) -> Option<String> {
         };
         let after_colon = match rest.trim_start().strip_prefix(':') {
             Some(r) => r.trim_start(),
-            None => continue, // 没标注 → 不是我们要的
+            None => {
+                if idx <= hover_line {
+                    latest = None;
+                }
+                continue;
+            }
         };
-        // 到 `=` / `;` / 行尾为止
         let ty: String = after_colon
             .chars()
             .take_while(|c| !matches!(c, '=' | ';' | '\r'))
             .collect();
         let ty = ty.trim().trim_end_matches('{').trim();
-        if !ty.is_empty() {
-            return Some(ty.to_string());
+        if !ty.is_empty() && (idx <= hover_line || latest.is_none()) {
+            latest = Some(ty.to_string());
         }
     }
-    None
+    latest
 }
 
-pub fn hover_v3(docs: &HashMap<String, DocumentState>, params: &Value) -> Result<Value, String> {
+fn classify_symbol_kind(exprs: &[MirWitness], ident: &str) -> &'static str {
+    let mut is_fn = false;
+    let mut is_let = false;
+    for expr in exprs {
+        parsed_doc_v3::walk_witness(expr, &mut |e| match &e.kind {
+            WitnessKind::FnDef { name, .. } if name == ident => is_fn = true,
+            WitnessKind::LetBinding { name, .. } if name == ident => is_let = true,
+            _ => {}
+        });
+    }
+    if is_fn {
+        "fn"
+    } else if is_let {
+        "let"
+    } else if crate::runtime::builtins::RUNTIME_BUILTIN_NAMES.contains(&ident) {
+        "builtin"
+    } else if ident == "random" || crate::flow::is_builtin_object(ident) {
+        "module"
+    } else {
+        "variable"
+    }
+}
+
+fn resolve_hover_type(
+    text: &str,
+    exprs: &[MirWitness],
+    ident: &str,
+    hover_line: usize,
+    ident_col_1based: usize,
+) -> String {
+    if let Some(explicit) = explicit_annotation(text, ident, hover_line) {
+        return explicit;
+    }
+
+    let info = crate::typeck::check_mir::infer_program_types(exprs);
+    let target_line = hover_line + 1;
+
+    // 1. Prefer binding declared on the hovered line.
+    if let Some(ty_str) = info
+        .bindings
+        .iter()
+        .rev()
+        .filter(|(sp, name, _)| name == ident && sp.line == target_line)
+        .find_map(|(_, _, ty)| format_hm_type(ty))
+    {
+        return ty_str;
+    }
+
+    // 2. Otherwise pick the nearest prior declaration in scope before the cursor line.
+    if let Some(ty_str) = info
+        .bindings
+        .iter()
+        .enumerate()
+        .filter(|(_, (sp, name, _))| name == ident && sp.line <= target_line)
+        .max_by_key(|(idx, (sp, _, _))| (sp.line, *idx))
+        .and_then(|(_, (_, _, ty))| format_hm_type(ty))
+    {
+        return ty_str;
+    }
+
+    // 3. Fall back to any matching declaration (e.g. forward-referenced `fn`).
+    if let Some(ty_str) = info
+        .bindings
+        .iter()
+        .rev()
+        .filter(|(_, name, _)| name == ident)
+        .find_map(|(_, _, ty)| format_hm_type(ty))
+    {
+        return ty_str;
+    }
+
+    // 4. Expression-span match at the exact cursor identifier location.
+    if let Some(ty_str) = info
+        .span_types
+        .get(&Span::new(target_line, ident_col_1based))
+        .and_then(format_hm_type)
+    {
+        return ty_str;
+    }
+
+    // 5. Final top-level env lookup or builtin/module signature.
+    if let Some(ty_str) = info.env_types.get(ident).and_then(format_hm_type) {
+        return ty_str;
+    }
+    if let Some(ty_str) = crate::typeck::check_mir::lookup_builtin_or_module_type(ident)
+        .as_ref()
+        .and_then(format_hm_type)
+    {
+        return ty_str;
+    }
+
+    "<inferred>".to_string()
+}
+
+pub fn hover_v3(
+    docs: &HashMap<String, DocumentState>,
+    params: &Value,
+) -> crate::error::MoraResult<Value> {
     let uri = params
         .get("textDocument")
         .and_then(|t| t.get("uri"))
         .and_then(|u| u.as_str())
-        .ok_or("missing textDocument.uri")?;
-    let pos = params.get("position").ok_or("missing position")?;
+        .ok_or_else(|| crate::error::MoraError::Runtime("missing textDocument.uri".to_string()))?;
+    let pos = params
+        .get("position")
+        .ok_or_else(|| crate::error::MoraError::Runtime("missing position".to_string()))?;
     // v0.104.6 D245：走唯一收口（负数 `as usize` 会回绕成 `usize::MAX`，
     // 实测会静默返回**文件末尾**的标识符和 `line: 1.8e19` 的荒谬 range）。
     let (line, col) = parsed_doc_v3::pos_of(pos.get("line"), pos.get("character"));
 
-    let (text, exprs) = parsed_doc_v3::parsed_doc_v3(docs, uri).ok_or("document not found")?;
+    let (text, exprs) = parsed_doc_v3::parsed_doc_v3(docs, uri)
+        .ok_or_else(|| crate::error::MoraError::Runtime("document not found".to_string()))?;
     let offset = position_to_offset(&text, line, col);
-    let ident = match ident_at_offset(&text, offset) {
-        Some(s) => s,
+    let (ident, ident_col_1based) = match ident_with_col_at_offset(&text, offset) {
+        Some(pair) => pair,
         None => return Ok(Value::Null),
     };
 
-    let defs = parsed_doc_v3::collect_definitions_v3(&exprs);
-    let kind = if defs.iter().any(|(n, _)| n == &ident) {
-        "let"
-    } else if ["print", "len", "range"].contains(&ident.as_str()) {
-        "builtin"
-    } else {
-        "variable"
-    };
-    // v0.104.6 D193：**显式标注**时把标注报出来，别再一律 `<inferred>`。
-    //
-    // 修前 hover 对**每一个**符号都硬编码 `<inferred>`，信息量为零 ——
-    // 连 `let a: Int = 5` 这种**源码里就写着 `Int`** 的都报 `<inferred>`：
-    //
-    // ```text
-    // let a: Int = 5   →  let a: <inferred>     ← 标注就在眼前
-    // let b = 7.5      →  let b: <inferred>
-    // math.floor       →  variable floor: <inferred>
-    // ```
-    //
-    // 只报**源码里确实写了**的类型 —— 不做推断、不猜。推断是 HM 层的事
-    // （`typeck::dispatch` 有完整的 `*_METHODS` 签名表），把它接进 LSP
-    // 是更大的工程，不在本轮擅自做。
-    let ty = explicit_annotation(&text, &ident);
-    let ty_str = ty.unwrap_or_else(|| "<inferred>".to_string());
+    let kind = classify_symbol_kind(&exprs, &ident);
+    let ty_str = resolve_hover_type(&text, &exprs, &ident, line, ident_col_1based);
     let contents = format!("```mora\n{} {}: {}\n```", kind, ident, ty_str);
 
     let mut m = BTreeMap::new();

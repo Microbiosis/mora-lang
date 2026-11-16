@@ -78,19 +78,38 @@ static SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// 临时目录的**根** —— 本仓所有测试临时产物的唯一落点。
 ///
-/// 优先仓库内 `target/test-scratch/`：
-/// - 落在**构建产物**里 ⇒ 不会被系统清理策略扫掉，也不会污染用户目录；
-/// - `target/` 已被 gitignore ⇒ 不会进版本库；
-/// - `cargo clean` 顺带清掉 ⇒ 即使某次异常退出留下残留，下次构建就带走。
-///
-/// 仓库不可写时（crate 作为**依赖**被别处测试时 `CARGO_MANIFEST_DIR`
-/// 指向只读的 registry 缓存）退回 `%TEMP%/mora_test_scratch/`。
+/// 优先级：
+/// 1. 若运行期显式设置 `CARGO_TARGET_DIR`，落到 `$CARGO_TARGET_DIR/test-scratch/`
+///    （相对路径按 `CARGO_MANIFEST_DIR` 解析），避免产物写回原仓库 `target/`；
+/// 2. 否则落在仓库内 `target/test-scratch/`（`target/` 已被 gitignore，`cargo clean`
+///    顺带清理，也不会污染系统 `%TEMP%`）；
+/// 3. 仓库不可写时（crate 作为**依赖**被别处测试时 `CARGO_MANIFEST_DIR`
+///    指向只读的 registry 缓存）退回 `%TEMP%/mora_test_scratch/`。
+fn target_dir_from_env(cargo_target_dir: Option<&std::ffi::OsStr>, manifest_dir: &Path) -> PathBuf {
+    if let Some(raw) = cargo_target_dir.filter(|v| !v.is_empty()) {
+        let base = PathBuf::from(raw);
+        let dir = if base.is_absolute() {
+            base
+        } else {
+            manifest_dir.join(base)
+        };
+        return dir.join("test-scratch");
+    }
+    manifest_dir.join("target").join("test-scratch")
+}
+
 fn scratch_root() -> PathBuf {
-    let repo_local = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join("test-scratch");
-    if std::fs::create_dir_all(&repo_local).is_ok() {
-        return repo_local;
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let env_target = std::env::var_os("CARGO_TARGET_DIR");
+    let primary = target_dir_from_env(env_target.as_deref(), manifest_dir);
+    if std::fs::create_dir_all(&primary).is_ok() {
+        return primary;
+    }
+    if env_target.as_deref().is_some_and(|v| !v.is_empty()) {
+        let fallback = manifest_dir.join("target").join("test-scratch");
+        if std::fs::create_dir_all(&fallback).is_ok() {
+            return fallback;
+        }
     }
     std::env::temp_dir().join("mora_test_scratch")
 }
@@ -251,5 +270,50 @@ impl Drop for TempFile {
         if let Some(parent) = self.path.parent() {
             let _ = std::fs::remove_dir_all(parent);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::target_dir_from_env;
+    use std::ffi::OsStr;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn target_dir_defaults_to_repo_target_when_unset_or_empty() {
+        let manifest = Path::new("repo");
+        assert_eq!(
+            target_dir_from_env(None, manifest),
+            PathBuf::from("repo").join("target").join("test-scratch")
+        );
+        assert_eq!(
+            target_dir_from_env(Some(OsStr::new("")), manifest),
+            PathBuf::from("repo").join("target").join("test-scratch")
+        );
+    }
+
+    #[test]
+    fn target_dir_joins_relative_path_to_manifest_dir() {
+        let manifest = Path::new("repo");
+        assert_eq!(
+            target_dir_from_env(Some(OsStr::new("custom-target")), manifest),
+            PathBuf::from("repo")
+                .join("custom-target")
+                .join("test-scratch")
+        );
+    }
+
+    #[test]
+    fn target_dir_preserves_absolute_path() {
+        let manifest = Path::new("repo");
+        #[cfg(windows)]
+        let abs = Path::new(r"E:\cargo-target\mora-lang");
+        #[cfg(not(windows))]
+        let abs = Path::new("/var/tmp/cargo-target/mora-lang");
+
+        assert_eq!(
+            target_dir_from_env(Some(abs.as_os_str()), manifest),
+            abs.join("test-scratch")
+        );
     }
 }

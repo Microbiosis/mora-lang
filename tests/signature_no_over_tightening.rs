@@ -23,7 +23,7 @@
 fn typeck(src: &str) -> Result<(), String> {
     let (_func, witnesses) =
         mora::cli::compile_and_opt(src, None).map_err(|e| format!("COMPILE: {e}"))?;
-    let errs = mora::typeck::check_mir::check_program_witnesses_bidirectional(&witnesses);
+    let errs = mora::typeck::check_mir::check_program_witnesses(&witnesses);
     if errs.is_empty() {
         Ok(())
     } else {
@@ -47,27 +47,12 @@ fn module_signatures_never_reject_extra_arguments() {
         ("exec.parallel([\"a\"], 2, 3, 4)", "exec"),
         ("stats.mean([1, 2], 3, 4)", "stats"),
         ("linalg.norm([1, 2], 3, 4, 5)", "linalg"),
-        ("document.parse(\"a\", 1, 2)", "document"),
-        ("mora.list_refines(1, 2, 3)", "mora"),
-        ("bus.emit(\"e\", 1, 2, 3)", "bus"),
-        ("mock.names(1, 2, 3)", "mock"),
-        ("ccr.put(\"d\", 1, 2)", "ccr"),
-        ("plan.list(1, 2, 3)", "plan"),
-        ("tea.init(1, 2, 3, 4)", "tea"),
-        ("tool.create(\"p\", 1, 2, 3)", "tool"),
-        ("skill.load(\"p\", 1, 2)", "skill"),
-        ("xform.map(1, 2, 3)", "xform"),
-        ("schedule.count(1, 2, 3)", "schedule"),
-        ("memory.size(1, 2, 3)", "memory"),
-        ("sandbox.mode(1, 2, 3)", "sandbox"),
-        // v0.104.6 D85：`web` 与 `file` / `math` 同款（落到 `Type::Unknown`）
-        ("web.fetch(\"http://x\", 1, 2)", "web"),
     ];
     assert_eq!(
         calls.len(),
-        20,
+        6,
         "已登记模块的抽样数被改动 —— 与 `module_table_keys_are_registered_names` \
-         的 REGISTERED（20 项）应对齐"
+         的 REGISTERED（6 项）应对齐"
     );
     for (call, module) in calls {
         let src = format!("print({call})\n");

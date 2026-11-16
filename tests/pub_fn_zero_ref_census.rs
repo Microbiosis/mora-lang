@@ -95,7 +95,7 @@ fn pub_fn_census() -> BTreeMap<String, (String, usize)> {
     out
 }
 
-/// **普查规模**：`pub fn` 总数落在 `[600, 1200]`。
+/// **普查规模**：`pub fn` 总数落在 `[250, 500]`（v0.110.0 瘦身后）。
 ///
 /// 低于下界说明抽样的源码树变了；高于上界说明**新增了大量 public API**，
 /// 应重新做一次「零引用」分类。
@@ -103,8 +103,8 @@ fn pub_fn_census() -> BTreeMap<String, (String, usize)> {
 fn d386_pub_fn_census_scale_is_stable() {
     let c = pub_fn_census();
     assert!(
-        (600..=1200).contains(&c.len()),
-        "`pub fn` 总数 {} 超出 [600, 1200] —— 源码树结构变了？",
+        (250..=500).contains(&c.len()),
+        "`pub fn` 总数 {} 超出 [250, 500] —— 源码树结构变了？",
         c.len()
     );
 }
@@ -136,7 +136,6 @@ fn d386_representative_zero_reference_functions() {
     let c = pub_fn_census();
     for name in [
         // D385 确认过的「底层齐全、上层无入口」
-        "is_exported",
         "is_moved",
         "is_borrowed_mut",
         "into_value",
@@ -147,11 +146,6 @@ fn d386_representative_zero_reference_functions() {
         "is_empty_union",
         "enter_scope",
         "exit_scope",
-        // mir / pregel / trace
-        "label_index",
-        "with_step_timeout",
-        "set_otel_endpoint",
-        "metrics_json",
     ] {
         let Some((rel, n)) = c.get(name) else {
             panic!("`pub fn {name}` 不在普查结果里 —— 源码树可能变了（被删或改名）");

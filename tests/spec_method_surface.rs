@@ -30,23 +30,23 @@
 
 use std::sync::Arc;
 
-use mora::interpreter::Interpreter;
-use mora::mir::effect::Effects;
-use mora::mir::vm::execute;
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::execute_program;
 use mora::value::Value;
 
 fn run(src: &str) -> Result<Value, String> {
-    let (func, witnesses) =
+    let (prog, witnesses) =
         mora::cli::compile_and_opt(src, None).map_err(|e| format!("COMPILE: {e}"))?;
-    let errs = mora::typeck::check_mir::check_program_witnesses_bidirectional(&witnesses);
+    let errs = mora::typeck::check_mir::check_program_witnesses(&witnesses);
     if !errs.is_empty() {
         let msgs: Vec<String> = errs.iter().map(|e| e.message.clone()).collect();
         return Err(format!("TYPECK: {msgs:?}"));
     }
-    let arc = Arc::new(func);
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    execute(&arc, &mut interp, &mut env, &mut Effects::new())
+    let arc = Arc::new(prog);
+    let mut core = CoreRuntime::default();
+    execute_program(arc, &mut core)
+        .map(|(v, _)| v)
+        .map_err(|e| e.to_string())
 }
 
 fn is_unresolved(err: &str) -> bool {
@@ -208,12 +208,12 @@ fn spec_method_table_is_fully_covered() {
     );
 }
 
-/// `methods_of` 在 spec 表之外**多列了 9 个 List 方法**（sum / min / max / mean /
-/// median / stddev / var / sort / crush_json）。这些未在 spec 逐字写，但**都在
-/// 运行期可用** —— 即「有能力但没文档」，属文档缺口而非缺陷。此处把数量钉住，
+/// `methods_of` 在 spec 表之外**多列了 8 个 List 方法**（sum / min / max / mean /
+/// median / stddev / var / sort；`crush_json` 已于 v0.110.0 移除）。这些未在 spec 逐字写，
+/// 但**都在运行期可用** —— 即「有能力但没文档」，属文档缺口而非缺陷。此处把数量钉住，
 /// 将来有人删掉其中之一会立刻发现。
 #[test]
-fn methods_of_lists_nine_undocumented_list_methods() {
+fn methods_of_lists_eight_undocumented_list_methods() {
     let listed = run("methods_of([1, 2])\n").expect("methods_of 应可用");
     let names: Vec<String> = match listed {
         Value::List(items) => items
@@ -226,15 +226,7 @@ fn methods_of_lists_nine_undocumented_list_methods() {
         other => panic!("应返回 List，实得 {other:?}"),
     };
     const UNDOCUMENTED: &[&str] = &[
-        "sum",
-        "min",
-        "max",
-        "mean",
-        "median",
-        "stddev",
-        "var",
-        "sort",
-        "crush_json",
+        "sum", "min", "max", "mean", "median", "stddev", "var", "sort",
     ];
     let missing: Vec<&str> = UNDOCUMENTED
         .iter()
@@ -243,6 +235,6 @@ fn methods_of_lists_nine_undocumented_list_methods() {
         .collect();
     assert!(
         missing.is_empty(),
-        "`methods_of` 上这 9 个 spec 未逐字写、但运行期可用的 List 方法消失了：{missing:?}"
+        "`methods_of` 上这 8 个 spec 未逐字写、但运行期可用的 List 方法消失了：{missing:?}"
     );
 }

@@ -19,22 +19,17 @@
 //! 不跳过分别放进两支），应当得到**完全相同**的结果；而把 `continue` 整个
 //! 删掉，则应当恰好多出被跳过的那些次。三者交叉即可独立判定对错。
 
-use mora::interpreter::Interpreter;
 use mora::parser_v3::ParserV3;
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::execute_program;
 use std::sync::Arc;
 
 fn run(src: &str) -> String {
-    let (func, _w) = ParserV3::compile(src).unwrap_or_else(|e| panic!("compile: {e}"));
-    let arc = Arc::new(func);
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    match mora::mir::vm::execute(
-        &arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    ) {
-        Ok(v) => format!("{v:?}"),
+    let (prog, _w) = ParserV3::compile(src).unwrap_or_else(|e| panic!("compile: {e}"));
+    let arc = Arc::new(prog);
+    let mut core = CoreRuntime::default();
+    match execute_program(arc, &mut core) {
+        Ok((v, _)) => format!("{v:?}"),
         Err(e) => format!("ERR: {e}"),
     }
 }
@@ -61,21 +56,21 @@ fn production_path_honours_continue() {
         "`continue` 与其 if/else 等价写法结果必须一致（实测 {with} vs {equivalent}）"
     );
     assert_eq!(
-        with, "Float(5.0)",
+        with, "Int(5)",
         "k 走到 2 时跳过一次 n 自增，6 轮里应自增 5 次"
     );
 }
 
-/// 删掉 `continue` 后应恰好多出被跳过的那些次 —— 反向确认上一步的 5.0
+/// 删掉 `continue` 后应恰好多出被跳过的那些次 —— 反向确认上一步的 5
 /// 是「跳过一次」而非「少跑了别的什么」。
 #[test]
 fn removing_continue_adds_exactly_the_skipped_iteration() {
     assert_eq!(
         run(WITHOUT_CONTINUE),
-        "Float(6.0)",
+        "Int(6)",
         "无 continue 时六轮全部自增"
     );
-    assert_eq!(run(WITH_CONTINUE), "Float(5.0)", "有 continue 时少一次");
+    assert_eq!(run(WITH_CONTINUE), "Int(5)", "有 continue 时少一次");
 }
 
 /// `break` 的同款对照：`x` 到 3 时跳出，`n` 应停在 2。
@@ -84,10 +79,7 @@ fn break_semantics() {
     let with_break = run(
         "let n = 0\nfor x in [1, 2, 3, 4, 5]\n  if x == 3 then\n    break\n  end\n  assign n = n + 1\nend\nn\n",
     );
-    assert_eq!(
-        with_break, "Float(2.0)",
-        "x=3 时跳出，此前只自增了 1、2 两次"
-    );
+    assert_eq!(with_break, "Int(2)", "x=3 时跳出，此前只自增了 1、2 两次");
     let without_break = run("let n = 0\nfor x in [1, 2, 3, 4, 5]\n  assign n = n + 1\nend\nn\n");
-    assert_eq!(without_break, "Float(5.0)", "无 break 时五轮全部自增");
+    assert_eq!(without_break, "Int(5)", "无 break 时五轮全部自增");
 }

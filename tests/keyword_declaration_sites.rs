@@ -51,32 +51,9 @@ use mora::test_support::TempDir;
 use std::process::Command;
 
 /// 25 个**真正**作关键字 token 的词面（`document` 除外，见文件头说明）。
-const KEYWORDS: [&str; 25] = [
-    "if",
-    "let",
-    "fn",
-    "end",
-    "then",
-    "match",
-    "return",
-    "for",
-    "break",
-    "continue",
-    "in",
-    "import",
-    "type",
-    "enum",
-    "struct",
-    "macro",
-    "loop",
-    "orchestrate",
-    "prompt",
-    "dyn",
-    "as",
-    "do",
-    "max_rounds",
-    "quote",
-    "task",
+const KEYWORDS: [&str; 22] = [
+    "if", "let", "fn", "end", "then", "match", "return", "for", "break", "continue", "in",
+    "import", "type", "enum", "struct", "macro", "loop", "dyn", "as", "do", "quote", "task",
 ];
 
 /// 独立进程 + 隔离 `HOME`；**stdout 与 stderr 都采**（D351 教训：
@@ -88,7 +65,7 @@ fn ev(body: &str) -> (i32, String) {
     std::fs::write(&p, body).expect("写探针");
     let home = dir.join("home");
     std::fs::create_dir_all(&home).expect("建 home");
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+    let exe = env!("CARGO_BIN_EXE_mora");
     let out = Command::new(exe)
         .arg(&p)
         .env("HOME", &home)
@@ -109,6 +86,7 @@ fn ev(body: &str) -> (i32, String) {
                 && !l.starts_with("AI 原语")
                 && !l.starts_with("显式 API")
                 && !l.starts_with("Trait 系统")
+                && !l.starts_with("类型与执行")
                 && !l.starts_with("Built-in")
                 && !l.starts_with("v0.15 CLI")
                 && !l.starts_with('⚠')
@@ -135,7 +113,7 @@ fn d353_let_declaration_rejects_every_keyword() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 25, "关键字表被清空 ⇒ 本条会假绿");
+    assert_eq!(checked, 22, "关键字表被清空 ⇒ 本条会假绿");
 }
 
 /// **D354**：`for` 循环变量位（修前的第二个泄漏点）。
@@ -154,7 +132,7 @@ fn d354_for_loop_variable_rejects_every_keyword() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 25, "关键字表被清空 ⇒ 本条会假绿");
+    assert_eq!(checked, 22, "关键字表被清空 ⇒ 本条会假绿");
 }
 
 /// **D354**：闭包参数位（第三个泄漏点）。
@@ -170,7 +148,7 @@ fn d354_closure_parameter_rejects_every_keyword() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 25, "关键字表被清空 ⇒ 本条会假绿");
+    assert_eq!(checked, 22, "关键字表被清空 ⇒ 本条会假绿");
 }
 
 /// **D354**：`macro` 参数位（第四个泄漏点）。
@@ -186,7 +164,7 @@ fn d354_macro_parameter_rejects_every_keyword() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 25, "关键字表被清空 ⇒ 本条会假绿");
+    assert_eq!(checked, 22, "关键字表被清空 ⇒ 本条会假绿");
 }
 
 /// **诊断必须指对行** —— 修前 `let if = 5` 的错误报在 line 1 是对的，
@@ -317,40 +295,36 @@ fn d354_all_real_fixtures_still_parse() {
     }
     // 计数下界：fixture 被搬走/改名时本条会立刻红，而不是静默通过 0 个。
     assert!(
-        files.len() >= 50,
+        files.len() >= 38,
         "真实 .mora 只找到 {} 个（基线 56），fixture 布局可能变了; files={files:?}",
         files.len()
     );
     let mut failed: Vec<String> = Vec::new();
     for f in &files {
-        let out = Command::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/target/debug/mora.exe"
-        ))
-        .arg(f)
-        .output()
-        .expect("跑 mora");
+        let out = Command::new(env!("CARGO_BIN_EXE_mora"))
+            .arg(f)
+            .output()
+            .expect("跑 mora");
         // 只看**解析/类型**阶段的失败（exit 2）；运行期错误（exit 1）
         // 与本判据无关 —— 有些 fixture 本来就需要外部输入。
         if out.status.code() == Some(2) {
             failed.push(f.display().to_string());
         }
     }
-    // 基线 2（见函数文档）—— 允许**恰好**这两个既有问题，不允许新增。
+    // 基线 1（`e2e/lisp.mora`）—— 允许**恰好**这个既有问题，不允许新增。
     assert_eq!(
         failed.len(),
-        2,
-        "解析失败的真实 .mora 数应停在基线 2；若变少，说明有人修好了既有错误，应同步更新基线；若变多，是本轮引入的回归:\n{}",
+        1,
+        "解析失败的真实 .mora 数应停在基线 1；若变少，说明有人修好了既有错误，应同步更新基线；若变多，是本轮引入的回归:\n{}",
         failed.join("\n")
     );
-    for expected in ["e2e/lisp.mora", "examples/integration_v0_34.mora"] {
-        assert!(
-            failed
-                .iter()
-                .any(|f| f.replace('\\', "/").ends_with(expected)),
-            "基线里的 `{expected}` 不该消失（那是别人修的，不是本轮）; 现存失败: {failed:?}"
-        );
-    }
+    let expected = "e2e/lisp.mora";
+    assert!(
+        failed
+            .iter()
+            .any(|f| f.replace('\\', "/").ends_with(expected)),
+        "基线里的 `{expected}` 不该消失（那是别人修的，不是本轮）; 现存失败: {failed:?}"
+    );
 }
 
 fn collect(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {

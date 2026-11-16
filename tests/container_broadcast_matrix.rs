@@ -58,7 +58,7 @@ fn run(src: &str, tag: &str) -> (i32, String) {
     let dir = TempDir::new(tag);
     let p = dir.join("p.mora");
     std::fs::write(&p, src).expect("写探针");
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+    let exe = env!("CARGO_BIN_EXE_mora");
     let out = Command::new(exe).arg(&p).output().expect("跑 mora");
     let _ = std::fs::remove_dir_all(&dir);
     let text = String::from_utf8_lossy(&out.stdout).into_owned()
@@ -74,6 +74,7 @@ fn run(src: &str, tag: &str) -> (i32, String) {
                 && !l.starts_with("AI 原语")
                 && !l.starts_with("显式 API")
                 && !l.starts_with("Trait 系统")
+                && !l.starts_with("类型与执行")
                 && !l.starts_with("Built-in")
                 && !l.starts_with("v0.15 CLI")
                 && !l.starts_with('⚠')
@@ -111,9 +112,9 @@ fn ev(e: &str) -> (i32, String) {
 fn d324_plus_overloads_on_length_others_always_require_equal_length() {
     // `+`：等长 → 逐元素
     for (e, want) in [
-        ("[1,2] + [3,4]", "[4.0, 6.0]"),
-        ("[1,2] + [1,1]", "[2.0, 3.0]"),
-        ("[1,2] * [3,4]", "[3.0, 8.0]"),
+        ("[1,2] + [3,4]", "[4, 6]"),
+        ("[1,2] + [1,1]", "[2, 3]"),
+        ("[1,2] * [3,4]", "[3, 8]"),
     ] {
         let (code, got) = ev(e);
         assert_eq!(code, 0, "`{e}` 应成功; 实得 exit={code} out={got}");
@@ -121,11 +122,11 @@ fn d324_plus_overloads_on_length_others_always_require_equal_length() {
     }
     // `+`：不等长 → **连接**（不是报错！）—— 追加惯用法
     for (e, want) in [
-        ("[1,2] + [10,20,30]", "[1.0, 2.0, 10.0, 20.0, 30.0]"),
-        ("[1,2] + [1]", "[1.0, 2.0, 1.0]"),
-        ("[1] + [2,3,4,5]", "[1.0, 2.0, 3.0, 4.0, 5.0]"),
-        ("[1,2] + []", "[1.0, 2.0]"),
-        ("[] + [1,2]", "[1.0, 2.0]"),
+        ("[1,2] + [10,20,30]", "[1, 2, 10, 20, 30]"),
+        ("[1,2] + [1]", "[1, 2, 1]"),
+        ("[1] + [2,3,4,5]", "[1, 2, 3, 4, 5]"),
+        ("[1,2] + []", "[1, 2]"),
+        ("[] + [1,2]", "[1, 2]"),
         ("[] + []", "[]"),
     ] {
         let (code, got) = ev(e);
@@ -139,10 +140,10 @@ fn d324_plus_overloads_on_length_others_always_require_equal_length() {
     }
     // 其余四个：等长逐元素
     for (e, want) in [
-        ("[1,2] - [3,4]", "[-2.0, -2.0]"),
-        ("[1,2] * [3,4]", "[3.0, 8.0]"),
-        ("[2,4] / [2,2]", "[1.0, 2.0]"),
-        ("[5,5] % [2,2]", "[1.0, 1.0]"),
+        ("[1,2] - [3,4]", "[-2, -2]"),
+        ("[1,2] * [3,4]", "[3, 8]"),
+        ("[2,4] / [2,2]", "[1, 2]"),
+        ("[5,5] % [2,2]", "[1, 1]"),
     ] {
         let (code, got) = ev(e);
         assert_eq!(code, 0, "`{e}` 应成功; 实得 exit={code} out={got}");
@@ -176,7 +177,7 @@ fn d324_plus_overloads_on_length_others_always_require_equal_length() {
 /// 属**能力缺口**，只报告不实施。
 #[test]
 fn d324_bigint_scalar_broadcast_is_rejected_while_int_and_float_work() {
-    for (e, want) in [("[1,2] + 1i", "[2.0, 3.0]"), ("[1,2] + 1.5", "[2.5, 3.5]")] {
+    for (e, want) in [("[1,2] + 1i", "[2, 3]"), ("[1,2] + 1.5", "[2.5, 3.5]")] {
         let (code, got) = ev(e);
         assert_eq!(code, 0, "`{e}` 应成功（Int / Float 可广播）; 实得 {got}");
         assert_eq!(got, want, "`print({e})` 应得 `{want}`; 实得 `{got}`");
@@ -217,13 +218,13 @@ fn d324_broadcast_requires_uniform_element_types() {
 #[test]
 fn d324_scalar_list_broadcast_is_order_sensitive() {
     for (e, want) in [
-        ("[1,2,3] - 1", "[0.0, 1.0, 2.0]"),
-        ("1 - [1,2,3]", "[0.0, -1.0, -2.0]"),
-        ("[1,2] * 2", "[2.0, 4.0]"),
-        ("2 * [1,2]", "[2.0, 4.0]"),
-        ("[1,2] / 2", "[0.5, 1.0]"),
-        ("2 / [1,2]", "[2.0, 1.0]"),
-        ("[1,2] + 1i", "[2.0, 3.0]"),
+        ("[1,2,3] - 1", "[0, 1, 2]"),
+        ("1 - [1,2,3]", "[0, -1, -2]"),
+        ("[1,2] * 2", "[2, 4]"),
+        ("2 * [1,2]", "[2, 4]"),
+        ("[1,2] / 2.0", "[0.5, 1.0]"),
+        ("2.0 / [1,2]", "[2.0, 1.0]"),
+        ("[1,2] + 1i", "[2, 3]"),
     ] {
         let (code, got) = ev(e);
         assert_eq!(code, 0, "`{e}` 应成功; 实得 exit={code} out={got}");

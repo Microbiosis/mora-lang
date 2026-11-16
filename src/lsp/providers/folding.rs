@@ -118,16 +118,9 @@ fn collect_folds(expr: &crate::mir::witness::MirWitness, out: &mut Vec<Value>) {
         // 不折叠等于编辑器里完全没法收起来。
         //
         // 本 arm 收的是**带 `MirWitness` body** 的那批（结束行可从 body 精确算出）。
-        // `ModelDef` / `MsgDef` / `StructDef` / `EnumDef` 的字段是纯字符串 /
+        // `StructDef` / `EnumDef` 的字段是纯字符串 /
         // `TypeHint`，**不带 span**，结束行无从算起 —— 属 parser 层缺口，记档。
-        WitnessKind::WithConfig { body, .. }
-        | WitnessKind::UpdateDef { body, .. }
-        | WitnessKind::MacroDef { body, .. }
-        | WitnessKind::PromptSection { body, .. }
-        | WitnessKind::DocumentSection { body, .. }
-        | WitnessKind::Observe { body, .. }
-        | WitnessKind::Span { body, .. }
-        | WitnessKind::Parallel { body, .. } => {
+        WitnessKind::MacroDef { body, .. } | WitnessKind::Parallel { body, .. } => {
             let end_line = body_end_line(body);
             if end_line > expr.span.line {
                 out.push(make_range(expr.span.line, end_line));
@@ -142,23 +135,6 @@ fn collect_folds(expr: &crate::mir::witness::MirWitness, out: &mut Vec<Value>) {
             }
             collect_folds(body, out);
             collect_folds(handler, out);
-        }
-        // TEA `app … end` —— 三个子 witness（init/update/view）取最大行
-        WitnessKind::AppDef {
-            init_w,
-            update_w,
-            view_w,
-            ..
-        } => {
-            let end_line = body_end_line(init_w)
-                .max(body_end_line(update_w))
-                .max(body_end_line(view_w));
-            if end_line > expr.span.line {
-                out.push(make_range(expr.span.line, end_line));
-            }
-            collect_folds(init_w, out);
-            collect_folds(update_w, out);
-            collect_folds(view_w, out);
         }
         _ => {}
     }

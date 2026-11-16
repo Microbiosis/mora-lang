@@ -10,137 +10,240 @@
 //! changing Type enum"，Type 枚举已加 ForAll 变体）。同时新增 `instantiate`
 //! 把 ForAll 展开为 fresh TypeVar（标准 HM 的 let-polymorphism 展开规则）。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use crate::typeck::Type;
+use super::env::collect_type_vars;
+use crate::typeck::{Type, TypeVarId};
 
-///  Generalize a type by quantifying over free variables not in env
-pub fn generalize(ty: &Type, free_in_env: &[char]) -> Type {
-    // Collect all free type variables in ty
-    let all_free_vars: HashSet<char> = collect_free_vars(ty).into_iter().collect();
-
-    // Those that are not bound in env should be generalized
-    let env_set: HashSet<char> = free_in_env.iter().cloned().collect();
-    let to_quantify: HashSet<char> = all_free_vars.difference(&env_set).cloned().collect();
+/// Generalize a type by quantifying free meta-variables not free in `free_in_env`.
+/// Explicit rigid generic variables remain untouched unless wrapped explicitly
+/// at `FnDef` / `Closure` boundaries.
+pub fn generalize(ty: &Type, free_in_env: &[TypeVarId]) -> Type {
+    let env_set: HashSet<&TypeVarId> = free_in_env.iter().collect();
+    let mut to_quantify: Vec<TypeVarId> = collect_free_vars(ty)
+        .into_iter()
+        .filter(|v| matches!(v, TypeVarId::Meta(_)) && !env_set.contains(v))
+        .collect();
+    to_quantify.sort();
+    to_quantify.dedup();
 
     if to_quantify.is_empty() {
-        ty.clone() // Nothing to generalize
+        ty.clone()
     } else {
-        // v0.75.17: 替换剩余自由变量为量化参数，产出 ForAll。
-        // 被量化的变量名记录在 ForAll(vars, _) 中，内层 τ 的 TypeVar
-        // 保留原名（实例化时按 vars 匹配展开）。
-        let quantified: Vec<char> = to_quantify.iter().cloned().collect();
-        Type::ForAll(quantified, Box::new(rebuild_inner(ty)))
+        Type::ForAll(to_quantify, Box::new(ty.clone()))
     }
 }
 
-/// v0.75.17: 实例化 — `∀α₁...αₙ.τ` 命中 env 时展开为 fresh TypeVar。
-/// 标准 HM：每次使用泛型绑定都得到一份新的、可被单形化的副本。
-pub fn instantiate(ty: &Type, fresh_id: &mut impl FnMut() -> char) -> Type {
+/// Instantiate `∀α₁...αₙ. τ` into fresh type variables (preserving identity per variable).
+pub fn instantiate(ty: &Type, fresh_id: &mut impl FnMut() -> TypeVarId) -> Type {
+    instantiate_with_mapping(ty, fresh_id).0
+}
+
+/// Instantiate `∀α₁...αₙ. τ` and return the substitution map used for bound variables.
+pub fn instantiate_with_mapping(
+    ty: &Type,
+    fresh_id: &mut impl FnMut() -> TypeVarId,
+) -> (Type, HashMap<TypeVarId, TypeVarId>) {
     match ty {
         Type::ForAll(vars, inner) => {
-            let quantified: HashSet<char> = vars.iter().cloned().collect();
-            instantiate_ty(inner, &quantified, fresh_id)
+            let mapping: HashMap<TypeVarId, TypeVarId> =
+                vars.iter().map(|v| (v.clone(), fresh_id())).collect();
+            let instantiated = instantiate_ty(inner, &mapping, fresh_id);
+            (instantiated, mapping)
         }
-        _ => ty.clone(),
+        _ => (ty.clone(), HashMap::new()),
     }
 }
 
-/// 把内层 τ 中被量化的 TypeVar 替换为 fresh TypeVar（未量化的保留）。
-fn instantiate_ty(
-    ty: &Type,
-    quantified: &HashSet<char>,
-    fresh_id: &mut impl FnMut() -> char,
-) -> Type {
+/// Apply an arbitrary `TypeVarId -> TypeVarId` substitution across a type tree.
+pub(crate) fn remap_type_vars(ty: &Type, mapping: &HashMap<TypeVarId, TypeVarId>) -> Type {
+    if mapping.is_empty() {
+        return ty.clone();
+    }
     match ty {
-        Type::TypeVar(c) => {
-            if quantified.contains(c) {
-                Type::TypeVar(fresh_id())
-            } else {
-                ty.clone()
-            }
-        }
-        Type::List(elem) => Type::List(Box::new(instantiate_ty(elem, quantified, fresh_id))),
+        Type::TypeVar(id) => mapping
+            .get(id)
+            .cloned()
+            .map(Type::TypeVar)
+            .unwrap_or_else(|| ty.clone()),
+        Type::List(elem) => Type::List(Box::new(remap_type_vars(elem, mapping))),
+        Type::Channel(elem) => Type::Channel(Box::new(remap_type_vars(elem, mapping))),
+        Type::TaskHandle(elem) => Type::TaskHandle(Box::new(remap_type_vars(elem, mapping))),
         Type::Dict(k, v) => Type::Dict(
-            Box::new(instantiate_ty(k, quantified, fresh_id)),
-            Box::new(instantiate_ty(v, quantified, fresh_id)),
+            Box::new(remap_type_vars(k, mapping)),
+            Box::new(remap_type_vars(v, mapping)),
         ),
         Type::Result_(ok, err) => Type::Result_(
-            Box::new(instantiate_ty(ok, quantified, fresh_id)),
-            Box::new(instantiate_ty(err, quantified, fresh_id)),
+            Box::new(remap_type_vars(ok, mapping)),
+            Box::new(remap_type_vars(err, mapping)),
+        ),
+        Type::Tuple(elems) => Type::Tuple(
+            elems
+                .iter()
+                .map(|e| Box::new(remap_type_vars(e, mapping)))
+                .collect(),
         ),
         Type::Union(members) => Type::Union(
             members
                 .iter()
-                .map(|m| instantiate_ty(m, quantified, fresh_id))
+                .map(|m| remap_type_vars(m, mapping))
                 .collect(),
         ),
-        // v0.75.17: 嵌套 ForAll（外层先被剥掉；防御性处理内层）
-        Type::ForAll(inner_vars, inner) => {
-            let inner_quantified: HashSet<char> = inner_vars.iter().cloned().collect();
-            Type::ForAll(
-                inner_vars.clone(),
-                Box::new(instantiate_ty(inner, &inner_quantified, fresh_id)),
-            )
-        }
-        _ => ty.clone(),
-    }
-}
-
-///  Recursively collect all free type variable identifiers from a type
-fn collect_free_vars(ty: &Type) -> Vec<char> {
-    match ty {
-        Type::TypeVar(c) => vec![*c],
-        Type::List(elem) => collect_free_vars(elem),
-        Type::Dict(key, value) => {
-            let mut vars = collect_free_vars(key);
-            vars.extend(collect_free_vars(value));
-            vars
-        }
-        Type::Result_(ok, err) => {
-            let mut vars = collect_free_vars(ok);
-            vars.extend(collect_free_vars(err));
-            vars
-        }
-        // v0.75.17: ForAll 内层仍是自由变量的来源（量化只消除命名变量自身，
-        // 内层嵌套的自由变量仍需收集）。
-        Type::ForAll(_, inner) => collect_free_vars(inner),
-        // v0.80: Arrow — 递归收集 input/output 的自由变量。EffectRow::Var
-        // 是 String 命名空间，不收集为 TypeVar(char)。
-        Type::Arrow(input, output, _row) => {
-            let mut vars = collect_free_vars(input);
-            vars.extend(collect_free_vars(output));
-            vars
-        }
-        _ => Vec::new(),
-    }
-}
-
-///  Rebuild the inner type tree so ForAll's body is a fresh structural copy.
-///  TypeVar leaves are kept verbatim (their names are the quantified
-///  parameters; `instantiate` expands them per use).
-fn rebuild_inner(ty: &Type) -> Type {
-    match ty {
-        Type::List(elem) => Type::List(Box::new(rebuild_inner(elem))),
-        Type::Dict(key, value) => {
-            Type::Dict(Box::new(rebuild_inner(key)), Box::new(rebuild_inner(value)))
-        }
-        Type::Result_(ok, err) => {
-            Type::Result_(Box::new(rebuild_inner(ok)), Box::new(rebuild_inner(err)))
-        }
-        // v0.80: Arrow — 递归重建 input/output，effect row 原样保留。
+        Type::Cons(h, t) => Type::Cons(
+            Box::new(remap_type_vars(h, mapping)),
+            Box::new(remap_type_vars(t, mapping)),
+        ),
         Type::Arrow(input, output, row) => Type::Arrow(
-            Box::new(rebuild_inner(input)),
-            Box::new(rebuild_inner(output)),
+            Box::new(remap_type_vars(input, mapping)),
+            Box::new(remap_type_vars(output, mapping)),
             row.clone(),
         ),
+        Type::Trait { name, generics } => Type::Trait {
+            name: name.clone(),
+            generics: generics
+                .iter()
+                .map(|g| remap_type_vars(g, mapping))
+                .collect(),
+        },
+        Type::Concrete {
+            name,
+            generics,
+            traits,
+        } => Type::Concrete {
+            name: name.clone(),
+            generics: generics
+                .iter()
+                .map(|g| remap_type_vars(g, mapping))
+                .collect(),
+            traits: traits.iter().map(|t| remap_type_vars(t, mapping)).collect(),
+        },
+        Type::TraitObject {
+            trait_name,
+            generics,
+        } => Type::TraitObject {
+            trait_name: trait_name.clone(),
+            generics: generics
+                .iter()
+                .map(|g| remap_type_vars(g, mapping))
+                .collect(),
+        },
+        Type::ForAll(bound, inner) => {
+            let shadowed: HashSet<&TypeVarId> = bound.iter().collect();
+            let filtered: HashMap<TypeVarId, TypeVarId> = mapping
+                .iter()
+                .filter(|(k, _)| !shadowed.contains(k))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            Type::ForAll(bound.clone(), Box::new(remap_type_vars(inner, &filtered)))
+        }
         _ => ty.clone(),
     }
+}
+
+fn instantiate_ty(
+    ty: &Type,
+    mapping: &HashMap<TypeVarId, TypeVarId>,
+    fresh_id: &mut impl FnMut() -> TypeVarId,
+) -> Type {
+    match ty {
+        Type::TypeVar(id) => mapping
+            .get(id)
+            .cloned()
+            .map(Type::TypeVar)
+            .unwrap_or_else(|| ty.clone()),
+        Type::List(elem) => Type::List(Box::new(instantiate_ty(elem, mapping, fresh_id))),
+        Type::Channel(elem) => Type::Channel(Box::new(instantiate_ty(elem, mapping, fresh_id))),
+        Type::TaskHandle(elem) => {
+            Type::TaskHandle(Box::new(instantiate_ty(elem, mapping, fresh_id)))
+        }
+        Type::Dict(k, v) => Type::Dict(
+            Box::new(instantiate_ty(k, mapping, fresh_id)),
+            Box::new(instantiate_ty(v, mapping, fresh_id)),
+        ),
+        Type::Result_(ok, err) => Type::Result_(
+            Box::new(instantiate_ty(ok, mapping, fresh_id)),
+            Box::new(instantiate_ty(err, mapping, fresh_id)),
+        ),
+        Type::Tuple(elems) => Type::Tuple(
+            elems
+                .iter()
+                .map(|e| Box::new(instantiate_ty(e, mapping, fresh_id)))
+                .collect(),
+        ),
+        Type::Union(members) => Type::Union(
+            members
+                .iter()
+                .map(|m| instantiate_ty(m, mapping, fresh_id))
+                .collect(),
+        ),
+        Type::Cons(h, t) => Type::Cons(
+            Box::new(instantiate_ty(h, mapping, fresh_id)),
+            Box::new(instantiate_ty(t, mapping, fresh_id)),
+        ),
+        Type::Arrow(input, output, row) => Type::Arrow(
+            Box::new(instantiate_ty(input, mapping, fresh_id)),
+            Box::new(instantiate_ty(output, mapping, fresh_id)),
+            row.clone(),
+        ),
+        Type::Trait { name, generics } => Type::Trait {
+            name: name.clone(),
+            generics: generics
+                .iter()
+                .map(|g| instantiate_ty(g, mapping, fresh_id))
+                .collect(),
+        },
+        Type::Concrete {
+            name,
+            generics,
+            traits,
+        } => Type::Concrete {
+            name: name.clone(),
+            generics: generics
+                .iter()
+                .map(|g| instantiate_ty(g, mapping, fresh_id))
+                .collect(),
+            traits: traits
+                .iter()
+                .map(|t| instantiate_ty(t, mapping, fresh_id))
+                .collect(),
+        },
+        Type::TraitObject {
+            trait_name,
+            generics,
+        } => Type::TraitObject {
+            trait_name: trait_name.clone(),
+            generics: generics
+                .iter()
+                .map(|g| instantiate_ty(g, mapping, fresh_id))
+                .collect(),
+        },
+        Type::ForAll(inner_vars, inner) => {
+            let mut next_mapping = mapping.clone();
+            for v in inner_vars {
+                next_mapping.insert(v.clone(), fresh_id());
+            }
+            instantiate_ty(inner, &next_mapping, fresh_id)
+        }
+        _ => ty.clone(),
+    }
+}
+
+/// Recursively collect all free type variable identifiers from a type.
+pub fn collect_free_vars(ty: &Type) -> Vec<TypeVarId> {
+    collect_type_vars(ty)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn meta(id: u32) -> TypeVarId {
+        TypeVarId::Meta(id)
+    }
+
+    fn rigid(name: &str) -> TypeVarId {
+        TypeVarId::Rigid(name.to_string())
+    }
 
     #[test]
     fn test_collect_free_var_int() {
@@ -149,77 +252,90 @@ mod tests {
 
     #[test]
     fn test_collect_free_var_typevar() {
-        let vars = collect_free_vars(&Type::TypeVar('a'));
-        assert_eq!(vars, vec!['a']);
+        let vars = collect_free_vars(&Type::TypeVar(meta(0)));
+        assert_eq!(vars, vec![meta(0)]);
     }
 
     #[test]
     fn test_collect_free_var_list() {
-        let ty = Type::List(Box::new(Type::TypeVar('a')));
+        let ty = Type::List(Box::new(Type::TypeVar(meta(0))));
         let vars = collect_free_vars(&ty);
-        assert_eq!(vars, vec!['a']);
+        assert_eq!(vars, vec![meta(0)]);
     }
 
     #[test]
     fn test_generalize_no_quantification_needed() {
-        let empty_env: Vec<char> = Vec::new();
+        let empty_env: Vec<TypeVarId> = Vec::new();
         let ty = Type::Int;
-
-        let r#gen = generalize(&ty, &empty_env);
-        assert_eq!(r#gen, ty); // Int has no type vars, so unchanged
+        assert_eq!(generalize(&ty, &empty_env), ty);
     }
 
     #[test]
     fn test_generalize_with_free_var() {
-        let empty_env: Vec<char> = Vec::new();
-        let ty = Type::TypeVar('a');
-
-        // v0.75.17: 'a' 不在 env 中 → 量化为 ForAll['a]. 'a
-        let r#gen = generalize(&ty, &empty_env);
-        assert_eq!(r#gen, Type::ForAll(vec!['a'], Box::new(Type::TypeVar('a'))));
+        let empty_env: Vec<TypeVarId> = Vec::new();
+        let ty = Type::TypeVar(meta(0));
+        let gen_ty = generalize(&ty, &empty_env);
+        assert_eq!(
+            gen_ty,
+            Type::ForAll(vec![meta(0)], Box::new(Type::TypeVar(meta(0))))
+        );
     }
 
     #[test]
-    fn test_generalize_skips_env_bound_vars() {
-        // env 中已有 'a'（即 'a' 是外层绑定的）→ 不量化
-        let ty = Type::TypeVar('a');
-        let r#gen = generalize(&ty, &['a']);
-        assert_eq!(r#gen, Type::TypeVar('a'));
+    fn test_generalize_skips_env_bound_and_rigid_vars() {
+        let ty = Type::Tuple(vec![
+            Box::new(Type::TypeVar(meta(0))),
+            Box::new(Type::TypeVar(rigid("T"))),
+        ]);
+        let gen_ty = generalize(&ty, &[meta(0)]);
+        assert_eq!(gen_ty, ty);
     }
 
     #[test]
     fn test_generalize_list() {
-        // list<'a> 在空 env 下 → forall<'a>. list<'a>
-        let ty = Type::List(Box::new(Type::TypeVar('a')));
-        let r#gen = generalize(&ty, &[]);
+        let ty = Type::List(Box::new(Type::TypeVar(meta(0))));
+        let gen_ty = generalize(&ty, &[]);
         assert_eq!(
-            r#gen,
+            gen_ty,
             Type::ForAll(
-                vec!['a'],
-                Box::new(Type::List(Box::new(Type::TypeVar('a'))))
+                vec![meta(0)],
+                Box::new(Type::List(Box::new(Type::TypeVar(meta(0)))))
             )
         );
     }
 
     #[test]
-    fn test_instantiate_forall() {
-        // ∀'a. 'a 实例化为 TypeVar(fresh)
-        let forall = Type::ForAll(vec!['a'], Box::new(Type::TypeVar('a')));
-        let mut counter = 0usize;
+    fn test_instantiate_forall_preserves_arrow_identity() {
+        let forall = Type::ForAll(
+            vec![meta(0)],
+            Box::new(Type::Arrow(
+                Box::new(Type::TypeVar(meta(0))),
+                Box::new(Type::TypeVar(meta(0))),
+                crate::mir::effect::EffectRow::Empty,
+            )),
+        );
+        let mut counter = 10u32;
         let mut fresh = || {
-            let id = std::char::from_u32(counter as u32).unwrap();
+            let id = meta(counter);
             counter += 1;
             id
         };
         let inst = instantiate(&forall, &mut fresh);
-        assert_eq!(inst, Type::TypeVar('\0'));
+        assert_eq!(
+            inst,
+            Type::Arrow(
+                Box::new(Type::TypeVar(meta(10))),
+                Box::new(Type::TypeVar(meta(10))),
+                crate::mir::effect::EffectRow::Empty,
+            )
+        );
     }
 
     #[test]
     fn test_instantiate_non_forall_passthrough() {
-        let mut counter = 0usize;
+        let mut counter = 0u32;
         let mut fresh = || {
-            let id = std::char::from_u32(counter as u32).unwrap();
+            let id = meta(counter);
             counter += 1;
             id
         };

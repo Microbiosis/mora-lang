@@ -50,17 +50,11 @@ const SAMPLES: &[(&str, &str)] = &[
     // `List([…])`（正确值是 `1, 2, 3`）。
     (
         "quasiquote.mora",
-        "30.0\n15.0\ncode:1, 2, 3\ncode:hello world\n30.0",
+        "30\n15\ncode:1, 2, 3\ncode:hello world\n30",
     ),
-    // D276 的主角：stdout 都是空，**退出码**才是判别器。
-    ("rel_basic.mora", ""),
-    ("rel_empty.mora", ""),
     // import / 模块边界
-    ("import_handle_index_main.mora", "20.0"),
+    ("import_handle_index_main.mora", "20"),
     ("export_visibility.mora", "hi\n1.0"),
-    // TEA
-    ("tea_standalone.mora", "dict\nlist\nclosure\ntea_app"),
-    ("tea_counter.mora", ""),
     // 基础控制流
     ("arithmetic.mora", "42"),
     ("for_loop.mora", "15"),

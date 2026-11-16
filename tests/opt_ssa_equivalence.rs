@@ -97,7 +97,7 @@ impl Drop for WorkDir {
 }
 
 fn mora_exe() -> String {
-    concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe").to_string()
+    env!("CARGO_BIN_EXE_mora").to_string()
 }
 
 /// 跑一段 Mora，把**程序自己的输出**（剥掉横幅）与退出码取出来。
@@ -130,6 +130,7 @@ fn run(dir: &Path, opt: Option<&str>, file: &str) -> (Vec<String>, i32) {
                 && !l.starts_with("AI 原语")
                 && !l.starts_with("显式 API")
                 && !l.starts_with("Trait 系统")
+                && !l.starts_with("类型与执行")
                 && !l.starts_with("Built-in")
                 && !l.starts_with("v0.15 CLI")
                 && !l.starts_with('⚠')
@@ -159,7 +160,7 @@ fn d187_opt1_runs_a_for_loop_equivalently() {
     let (base, base_code) = run(dir.path(), None, p);
     assert_eq!(
         base,
-        vec!["A".to_string(), "B".to_string(), "6.0".to_string()],
+        vec!["A".to_string(), "B".to_string(), "6".to_string()],
         "前提：不带 --opt 时程序应完整执行（opt=off exit={}）",
         base_code
     );
@@ -189,7 +190,7 @@ fn d187_opt1_executes_only_the_taken_branch_of_a_constant_if() {
     let p = file.to_str().unwrap();
 
     let (base, _) = run(dir.path(), None, p);
-    assert_eq!(base, vec!["7.0".to_string()], "前提：只应走 then 分支");
+    assert_eq!(base, vec!["7".to_string()], "前提：只应走 then 分支");
 
     let (got, code) = run(dir.path(), Some("1"), p);
     assert_eq!(code, 0, "`--opt=1` 应成功执行; 实得 exit={code}");
@@ -261,7 +262,7 @@ fn d187_opt1_map_closure_leaks_an_internal_invariant() {
     let (base, _) = run(dir.path(), None, p);
     assert_eq!(
         base,
-        vec!["[11.0, 12.0, 13.0]".to_string()],
+        vec!["[11, 12, 13]".to_string()],
         "前提：opt=off 应正常"
     );
 
@@ -285,7 +286,7 @@ fn d187_opt1_map_closure_leaks_an_internal_invariant() {
     );
     assert_eq!(
         got,
-        vec!["[11.0, 12.0, 13.0]".to_string()],
+        vec!["[11, 12, 13]".to_string()],
         "**D310**：`--opt=1` 下 map+闭包必须与 opt=off 等价。\
          修前是「静默无输出」。实得: {got:?}"
     );

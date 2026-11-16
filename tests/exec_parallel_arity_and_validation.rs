@@ -68,7 +68,7 @@ fn ev(body: &str) -> (i32, String) {
     std::fs::write(&p, body).expect("写探针");
     let home = dir.join("home");
     std::fs::create_dir_all(&home).expect("建 home");
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+    let exe = env!("CARGO_BIN_EXE_mora");
     let out = Command::new(exe)
         .arg(&p)
         .env("HOME", &home)
@@ -89,6 +89,7 @@ fn ev(body: &str) -> (i32, String) {
                 && !l.starts_with("AI 原语")
                 && !l.starts_with("显式 API")
                 && !l.starts_with("Trait 系统")
+                && !l.starts_with("类型与执行")
                 && !l.starts_with("Built-in")
                 && !l.starts_with("v0.15 CLI")
                 && !l.starts_with('⚠')

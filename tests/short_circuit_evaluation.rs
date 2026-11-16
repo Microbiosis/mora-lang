@@ -25,8 +25,7 @@
 //! ③ **跨路径一致**：生产路径与直连路径对同一程序，rhs 的指令都排在
 //!    分支指令**之后** —— 防止两条路径再次分叉（这次的缺陷就是这么来的）。
 
-use mora::mir::MirFunction;
-use mora::mir::MirInst;
+use mora::mir::control::{ControlInst, ControlProgram, ControlTerminator};
 use mora::test_support::TempDir;
 use std::process::Command;
 
@@ -109,52 +108,40 @@ fn short_circuit_keeps_the_value_semantics() {
     }
 }
 
-/// 生产路径编译（witness → FCFG → MIR）。
-fn compile_production(src: &str) -> MirFunction {
-    let (func, witnesses) = mora::parser_v3::ParserV3::compile(src).expect("解析");
-    mora::mir::pipeline::compile(&func, &witnesses)
+/// 生产路径编译（witness → Control SSA）。
+fn compile_production(src: &str) -> ControlProgram {
+    mora::parser_v3::ParserV3::compile(src).expect("解析").0
 }
 
-/// 直连路径编译（witness → MIR）。
-fn compile_direct(src: &str) -> MirFunction {
-    let (_func, witnesses) = mora::parser_v3::ParserV3::compile(src).expect("解析");
-    mora::mir::lower::lower_mir_witnesses(&witnesses).expect("直连 lowering")
-}
-
-/// 找第一个「分支指令」（`JumpIf` / `JumpIfNot`）的下标。
-fn branch_index(body: &[MirInst]) -> Option<usize> {
-    body.iter()
-        .position(|i| matches!(i, MirInst::JumpIf(_, _) | MirInst::JumpIfNot(_, _)))
-}
-
-/// 找第一个「调用指令」的下标 —— rhs 是 `task bump()`，它必然是一次调用。
-fn call_index(body: &[MirInst]) -> Option<usize> {
-    body.iter()
-        .position(|i| matches!(i, MirInst::Call(_, _, _) | MirInst::CallValue(_, _, _)))
-}
-
-/// 判据 ② + ③：两条路径里，rhs 的调用都排在分支指令**之后**。
-///
-/// 这正是「短路求值」的形状：分支先判，rhs 只在**不短路**的那条路上求值。
-/// 改动前生产路径把 rhs 排在 `Or` 节点之前 ⇒ 调用下标 < 分支下标 ⇒ 失败。
+/// 判据 ②：entry block 必须先经 `Branch` 短路决策，rhs 的 `Call(bump)` 必须在后续基本块发射（不得在 Branch 前急切求值）。
 #[test]
-fn rhs_call_is_emitted_after_the_branch_in_both_paths() {
+fn rhs_call_is_emitted_after_the_branch() {
     let src = format!("{BUMP_TASK}\nlet x = true or bump()\n");
-
-    for (path_name, body) in [
-        ("生产路径", compile_production(&src).body),
-        ("直连路径", compile_direct(&src).body),
-    ] {
-        let branch = branch_index(&body)
-            .unwrap_or_else(|| panic!("{path_name}：应有一条分支指令（JumpIf）"));
-        let call =
-            call_index(&body).unwrap_or_else(|| panic!("{path_name}：应有一次 rhs 调用（Call）"));
-        assert!(
-            call > branch,
-            "{path_name}：rhs 的调用下标 {call} 必须**大于**分支下标 {branch} —— \
-             rhs 只有在「不短路」那条路上才该求值。\n\
-             指令序列：{:#?}",
-            body
-        );
-    }
+    let prog = compile_production(&src);
+    let entry_fn = prog.func(prog.entry);
+    let entry_bb = &entry_fn.blocks[entry_fn.entry.0 as usize];
+    assert!(
+        matches!(entry_bb.terminator, ControlTerminator::Branch { .. }),
+        "entry 块应以 Branch 终结以实现短路，实际: {:?}",
+        entry_bb.terminator
+    );
+    let entry_has_call = entry_bb
+        .insts
+        .iter()
+        .any(|i| matches!(i, ControlInst::Call { .. }));
+    assert!(
+        !entry_has_call,
+        "entry 块在 Branch 之前不应出现 rhs Call(bump)：{:#?}",
+        entry_bb.insts
+    );
+    let later_has_call = entry_fn.blocks.iter().skip(1).any(|b| {
+        b.insts
+            .iter()
+            .any(|i| matches!(i, ControlInst::Call { .. }))
+    });
+    assert!(
+        later_has_call,
+        "rhs Call(bump) 应位于后续条件分支基本块内: {:#?}",
+        entry_fn.blocks
+    );
 }

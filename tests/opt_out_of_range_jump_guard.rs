@@ -41,7 +41,7 @@ fn run(src: &str, tag: &str, opt: Option<&str>) -> (i32, Vec<String>) {
     let dir = TempDir::new(tag);
     let p = dir.join("p.mora");
     std::fs::write(&p, src).expect("写探针");
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+    let exe = env!("CARGO_BIN_EXE_mora");
     let mut c = Command::new(exe);
     // ⚠ `--opt=` 必须放在文件前面 —— CLI 只扫第一个非选项参数之前的选项。
     if let Some(l) = opt {
@@ -62,6 +62,7 @@ fn run(src: &str, tag: &str, opt: Option<&str>) -> (i32, Vec<String>) {
                 && !l.starts_with("AI 原语")
                 && !l.starts_with("显式 API")
                 && !l.starts_with("Trait 系统")
+                && !l.starts_with("类型与执行")
                 && !l.starts_with("Built-in")
                 && !l.starts_with("v0.15 CLI")
                 && !l.starts_with('⚠')
@@ -91,7 +92,7 @@ else
   print(8)
 end
 ",
-            "7.0",
+            "7",
         ),
         (
             "const-eq",
@@ -101,7 +102,7 @@ else
   print(8)
 end
 ",
-            "7.0",
+            "7",
         ),
         (
             "bool-literal",
@@ -111,7 +112,7 @@ else
   print(8)
 end
 ",
-            "7.0",
+            "7",
         ),
         (
             "else-two-stmts",
@@ -122,7 +123,7 @@ else
   print(80)
 end
 ",
-            "7.0",
+            "7",
         ),
     ] {
         let (dc, base) = run(src, &format!("{tag}_base"), None);
@@ -150,12 +151,7 @@ end
     }
 }
 
-/// **`Jump(end)`（`end == body.len()`）必须被 SSA 表达成「跳到函数末尾」，
-/// 而不是「返回」或「落进下一块」。**
-///
-/// 这是 D419 的结构性判据：越界跳转此前被降成 `Terminator::Return(None)`，
-/// 而 `Return(None)` 在降维时是**被丢弃**的（「落下去，线性执行自然进入下一块」）
-/// ⇒ 那条跳转彻底消失 ⇒ 后续块被线性执行 ⇒ 两个分支都跑。
+/// **`if / else` 汇聚在 Control SSA 显式 CFG 里必须通过全部结构不变式验证，且优化后不得落进另一分支。**
 #[test]
 fn jump_past_body_end_becomes_a_jump_exit_terminator() {
     let src = "if 1 > 0
@@ -164,63 +160,58 @@ else
   print(8)
 end
 ";
-    let (func, _) = mora::cli::compile_and_opt(src, None).expect("compile");
-    let ssa = mora::mir::ssa::construct(&func);
+    for opt in [
+        mora::mir::control::OptLevel::None,
+        mora::mir::control::OptLevel::Basic,
+        mora::mir::control::OptLevel::Aggressive,
+    ] {
+        let (prog, _) = mora::cli::compile_and_opt(src, Some(opt)).expect("compile");
+        mora::mir::control::verify_program(&prog)
+            .unwrap_or_else(|e| panic!("verify_program failed at {opt:?}: {e}"));
+    }
 
-    let exits = ssa
-        .blocks
-        .iter()
-        .filter(|b| matches!(b.terminator, mora::mir::ssa::Terminator::JumpExit))
-        .count();
-    assert_eq!(
-        exits,
-        1,
-        "该程序降维后应恰好有**一个**块以 `JumpExit` 收尾（then 臂跳到函数末尾）。
-         实得 {exits} 个；各块 terminator：{:#?}",
-        ssa.blocks
-            .iter()
-            .map(|b| (b.id, format!("{:?}", b.terminator)))
-            .collect::<Vec<_>>()
-    );
-
-    // `JumpExit` 的块不得有顺序后继（否则又会落进下一块）
-    for b in &ssa.blocks {
-        if matches!(b.terminator, mora::mir::ssa::Terminator::JumpExit) {
+    let (opt_prog, _) =
+        mora::cli::compile_and_opt(src, Some(mora::mir::control::OptLevel::Aggressive))
+            .expect("compile opt=2");
+    let main_fn = opt_prog.func(opt_prog.entry);
+    // 可达块中每条 Branch 的 then/else 目标必在块表内，Return 必终止控制流
+    for b in &main_fn.blocks {
+        for s in b.terminator.successors() {
             assert!(
-                b.succs.is_empty(),
-                "块 {} 以 `JumpExit` 收尾，却仍有后继 {:?} —— 它会「落下去」而不是终止",
+                (s.0 as usize) < main_fn.blocks.len(),
+                "块 {:?} 后继 {:?} 越界",
                 b.id,
-                b.succs
+                s
             );
         }
     }
 }
 
-/// **降维产物里必须有一条真正的终止跳转**，不能是「什么都不发」。
-///
-/// 修前该位置直接消失 —— 后续块被线性执行 ⇒ 两个分支都跑。
+/// **优化并执行该程序，验证只有 `then` 臂生效（`print(7)`），不会落进 `else`。**
 #[test]
 fn deconstructed_body_keeps_a_terminating_jump() {
     let src = "if 1 > 0
-  print(7)
+  7i
 else
-  print(8)
+  8i
 end
 ";
-    let (func, _) = mora::cli::compile_and_opt(src, None).expect("compile");
-    let out = mora::mir::ssa::deconstruct(&mora::mir::ssa::construct(&func));
-
-    let terminating = out.body.iter().any(|i| match i {
-        mora::mir::MirInst::Jump(t) => *t >= out.body.len(),
-        _ => false,
-    });
-    assert!(
-        terminating,
-        "降维产物里没有任何「跳到 body 末尾」的 `Jump`（body 长 {}）：
-{:#?}",
-        out.body.len(),
-        out.body
-    );
+    for opt in [
+        mora::mir::control::OptLevel::None,
+        mora::mir::control::OptLevel::Basic,
+        mora::mir::control::OptLevel::Aggressive,
+    ] {
+        let (prog, _) = mora::cli::compile_and_opt(src, Some(opt)).expect("compile");
+        mora::mir::control::verify_program(&prog).expect("verify");
+        let mut core = mora::runtime::CoreRuntime::default();
+        let (v, _) = mora::runtime::vm::execute_program(std::sync::Arc::new(prog), &mut core)
+            .expect("execute");
+        assert_eq!(
+            v,
+            mora::value::Value::Int(7),
+            "opt={opt:?} 应只走 then 分支"
+        );
+    }
 }
 
 /// **越界跳转形状在三档下必须完全一致**（`break` / `continue` / 嵌套 /

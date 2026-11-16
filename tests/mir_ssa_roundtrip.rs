@@ -34,57 +34,37 @@
 //! 2. 第一版把 `return` 写在顶层当复现式，被 parser 正确拒绝。
 //!    **与 D102 同源：写判据/复现式之前先确认它在当前实现下成立。**
 
-use mora::interpreter::Interpreter;
-use mora::mir::ssa::OptLevel;
-use mora::mir::vm::{execute, run_main_task};
-use mora::parser_v3::ParserV3;
+use mora::mir::control::OptLevel;
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::{execute_program, run_main_task};
 
-/// 应用 SSA 优化（不 panic 即通过 — 管线正确性由等价性测试治理）。
+/// 应用 Control IR 优化（不 panic 且通过校验 — 管线正确性由等价性测试治理）。
 fn optimize_without_panic(source: &str, level: OptLevel) {
-    let (mut func, _witnesses) = ParserV3::compile(source).expect("compile should succeed");
-    mora::mir::opt::optimize(&mut func, level);
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    let func_arc = std::sync::Arc::new(func);
-    let _ = execute(
-        &func_arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    );
-    let _ = run_main_task(
-        &func_arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    );
+    let (prog, _witnesses) =
+        mora::cli::compile_and_opt(source, Some(level)).expect("compile should succeed");
+    mora::mir::control::verify_program(&prog).expect("verify_program should succeed");
+    let prog_arc = std::sync::Arc::new(prog);
+    let mut core = CoreRuntime::default();
+    if let Ok((_, globals)) = execute_program(prog_arc.clone(), &mut core) {
+        let _ = run_main_task(prog_arc, globals, &mut core);
+    }
 }
 
 /// 对 task 内显式 return 的程序，验证优化前后返回值一致。
 fn assert_task_equiv(source: &str) {
-    let run = |level: Option<OptLevel>| -> Result<mora::value::Value, String> {
-        let (mut func, _witnesses) = ParserV3::compile(source)?;
-        if let Some(l) = level {
-            mora::mir::opt::optimize(&mut func, l);
-        }
-        let mut interp = Interpreter::new();
-        let mut env = interp.take_env();
-        let func_arc = std::sync::Arc::new(func);
-        let v = execute(
-            &func_arc,
-            &mut interp,
-            &mut env,
-            &mut mora::mir::effect::Effects::new(),
-        )?;
-        run_main_task(
-            &func_arc,
-            &mut interp,
-            &mut env,
-            &mut mora::mir::effect::Effects::new(),
-        )?;
-        Ok(v)
-    };
-    let baseline = run(None);
+    let run =
+        |level: Option<OptLevel>| -> Result<(mora::value::Value, mora::value::Value), String> {
+            let (prog, _witnesses) =
+                mora::cli::compile_and_opt(source, level).map_err(|e| e.to_string())?;
+            mora::mir::control::verify_program(&prog).map_err(|e| e.to_string())?;
+            let prog_arc = std::sync::Arc::new(prog);
+            let mut core = CoreRuntime::default();
+            let (v, globals) =
+                execute_program(prog_arc.clone(), &mut core).map_err(|e| e.to_string())?;
+            let tv = run_main_task(prog_arc, globals, &mut core).map_err(|e| e.to_string())?;
+            Ok((v, tv))
+        };
+    let baseline = run(Some(OptLevel::None));
     let basic = run(Some(OptLevel::Basic));
     let aggressive = run(Some(OptLevel::Aggressive));
     assert_eq!(
@@ -135,20 +115,15 @@ fn task_arithmetic_equiv() {
 /// v0.75.7 修复后此场景必须等价。
 fn assert_top_level_equiv(source: &str) {
     let run = |level: Option<OptLevel>| -> Result<mora::value::Value, String> {
-        let (mut func, _witnesses) = ParserV3::compile(source)?;
-        if let Some(l) = level {
-            mora::mir::opt::optimize(&mut func, l);
-        }
-        let mut interp = Interpreter::new();
-        let mut env = interp.take_env();
-        execute(
-            &std::sync::Arc::new(func),
-            &mut interp,
-            &mut env,
-            &mut mora::mir::effect::Effects::new(),
-        )
+        let (prog, _witnesses) =
+            mora::cli::compile_and_opt(source, level).map_err(|e| e.to_string())?;
+        mora::mir::control::verify_program(&prog).map_err(|e| e.to_string())?;
+        let mut core = CoreRuntime::default();
+        let (v, _) =
+            execute_program(std::sync::Arc::new(prog), &mut core).map_err(|e| e.to_string())?;
+        Ok(v)
     };
-    let baseline = run(None);
+    let baseline = run(Some(OptLevel::None));
     let basic = run(Some(OptLevel::Basic));
     let aggressive = run(Some(OptLevel::Aggressive));
     assert_eq!(
@@ -189,53 +164,61 @@ fn task_loop_equiv() {
 
 #[test]
 fn dag_algebraic_placeholder_fix_regression() {
-    // v0.75.6 bug (a)：dag 优化 placeholder 0 与「节点 0 是合法 id」冲突。
-    // 含变量操作数的 BinaryOp（lhs/rhs 来自非 0 节点）在 Algebraic 重写
-    // 时曾触发 index out of bounds。核心回归点 = dag_optimize 不 panic；
-    // 变量折叠的具体结果由 dag_rule 单元测试治理，此处不作强断言。
-    let source = "let x = 10\nlet y = x + 0\nprint(y)\n";
-    let (func, _witnesses) = ParserV3::compile(source).unwrap();
-    let mut dag = mora::mir::dag::dag_analyze(&func);
-    mora::mir::optimize::dag_optimize(&mut dag); // 不得 panic（bug(a) 回归）
+    let source = "let x = 10\nlet y = x + 0\ny\n";
+    let (prog, _witnesses) =
+        mora::cli::compile_and_opt(source, Some(OptLevel::Aggressive)).unwrap();
+    mora::mir::control::verify_program(&prog).unwrap();
+    let mut core = CoreRuntime::default();
+    let (v, _) = execute_program(std::sync::Arc::new(prog), &mut core).unwrap();
+    assert_eq!(v.to_string(), "10");
 }
 
 #[test]
 fn deconstruct_skips_return_none() {
-    // v0.75.6 bug (c)：deconstruct 曾把顶层 Return(None) 发射为
-    // MirInst::Return(None)，在块首短路导致隐式返回载体不执行。
-    // 修复后优化产物不应包含 Return(None)。
-    let source = "let x = 42\nprint(x)\n";
-    let (mut func, _witnesses) = ParserV3::compile(source).unwrap();
-    mora::mir::opt::optimize(&mut func, OptLevel::Basic);
+    let source = "let x = 42\nx\n";
+    let (prog, _witnesses) = mora::cli::compile_and_opt(source, Some(OptLevel::Basic)).unwrap();
+    mora::mir::control::verify_program(&prog).unwrap();
     assert!(
-        !func
-            .body
+        !prog.functions[prog.entry.0 as usize]
+            .blocks
             .iter()
-            .any(|i| matches!(i, mora::mir::MirInst::Return(None))),
-        "deconstruct 不得发射 Return(None)（顶层隐式返回语义）"
+            .any(|b| matches!(
+                b.terminator,
+                mora::mir::control::ControlTerminator::Return(None)
+            )),
+        "优化后顶层隐式返回不应发射 Return(None)"
     );
+    let mut core = CoreRuntime::default();
+    let (v, _) = execute_program(std::sync::Arc::new(prog), &mut core).unwrap();
+    assert_eq!(v.to_string(), "42");
 }
 
-// ─── v0.75.30 回归：SSA 声明透传（--opt 显式化暴露的 bug）──────────────
+// ─── v0.75.30 回归：声明透传与主任务执行 ────────────────────────────────
 
 #[test]
 fn taskdef_survives_ssa_optimization() {
-    // SSA construct 曾丢弃声明型指令（TaskDef 等）→ `--opt` 下 task main
-    // 消失（MORA_OPT=1 默认关掩盖；CLI 显式化后暴露）。结构断言：
-    // 优化后 func.body 必须仍含 TaskDef。
-    let source = "task main()\n  print(1 + 2)\nend\n";
-    let (mut func, _witnesses) = ParserV3::compile(source).expect("compile");
+    let source = "task main()\n  return 1 + 2\nend\n";
+    let (mut prog, _witnesses) =
+        mora::cli::compile_and_opt(source, Some(OptLevel::None)).expect("compile");
+    let has_reg_task = |p: &mora::mir::control::ControlProgram| {
+        p.functions.iter().any(|f| {
+            f.blocks.iter().any(|b| {
+                b.insts
+                    .iter()
+                    .any(|i| matches!(i, mora::mir::control::ControlInst::RegisterTask { .. }))
+            })
+        })
+    };
+    assert!(has_reg_task(&prog), "baseline: 无优化时 RegisterTask 存在");
+    mora::mir::control::optimize_program(&mut prog, OptLevel::Aggressive);
+    mora::mir::control::verify_program(&prog).expect("verify");
     assert!(
-        func.body
-            .iter()
-            .any(|i| matches!(i, mora::mir::MirInst::TaskDef { .. })),
-        "baseline: 无优化时 TaskDef 存在"
+        has_reg_task(&prog),
+        "Aggressive 优化后 RegisterTask 必须保留"
     );
-    mora::mir::opt::optimize(&mut func, OptLevel::Aggressive);
-    assert!(
-        func.body
-            .iter()
-            .any(|i| matches!(i, mora::mir::MirInst::TaskDef { .. })),
-        "SSA 优化后 TaskDef 必须保留（声明透传）"
-    );
+    let prog_arc = std::sync::Arc::new(prog);
+    let mut core = CoreRuntime::default();
+    let (_, globals) = execute_program(prog_arc.clone(), &mut core).expect("exec");
+    let res = run_main_task(prog_arc, globals, &mut core).expect("run_main_task");
+    assert_eq!(res.to_string(), "3");
 }

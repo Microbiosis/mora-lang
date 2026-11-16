@@ -17,23 +17,18 @@
 //! **有意设计**（有注释声明），不是被错误前提掩盖的缺陷。
 //! 真正破例的只有 `cov` 一个。
 
-use mora::interpreter::Interpreter;
-use mora::mir::vm::execute;
 use mora::parser_v3::ParserV3;
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::execute_program;
 use std::sync::Arc;
 
 fn run(src: &str) -> Result<String, String> {
-    let (func, _w) = ParserV3::compile(src).map_err(|e| format!("COMPILE: {e}"))?;
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    let arc = Arc::new(func);
-    execute(
-        &arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    )
-    .map(|v| format!("{v}"))
+    let (prog, _w) = ParserV3::compile(src).map_err(|e| format!("COMPILE: {e}"))?;
+    let mut core = CoreRuntime::default();
+    let arc = Arc::new(prog);
+    execute_program(arc, &mut core)
+        .map(|(v, _)| format!("{v}"))
+        .map_err(|e| e.to_string())
 }
 
 /// D143 主判据：`cov` 的空输入必须与**同族其余函数**一致返回 `0.0`。

@@ -41,7 +41,7 @@ fn frame(body: &str) -> Vec<u8> {
 ///
 /// ⚠ **必须在字节层解帧**（见文件头）—— `Content-Length` 是字节数。
 fn run_lines(lines: &[&str]) -> Vec<String> {
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora-lsp.exe");
+    let exe = env!("CARGO_BIN_EXE_mora-lsp");
     let mut payload: Vec<u8> = Vec::new();
     for l in lines {
         payload.extend(frame(l));

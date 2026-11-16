@@ -23,34 +23,24 @@
 //! （`flatten` 的内层可以是异质，如 `[[1],["x"]]`）。
 
 use mora::cli::compile_and_opt;
-use mora::interpreter::Interpreter;
-use mora::mir::vm::execute;
-use mora::typeck::check_mir::check_program_witnesses_bidirectional;
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::execute_program;
+use mora::typeck::check_mir::check_program_witnesses;
 use std::sync::Arc;
 
 fn diagnostics(src: &str) -> Vec<String> {
     let (_f, wits) = compile_and_opt(src, None).expect("应能编译");
-    check_program_witnesses_bidirectional(&wits)
+    check_program_witnesses(&wits)
         .iter()
         .map(|e| e.message.clone())
         .collect()
 }
 
 fn run(src: &str) -> String {
-    let (func, _w) = compile_and_opt(src, None).expect("compile");
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    let arc = Arc::new(func);
-    format!(
-        "{}",
-        execute(
-            &arc,
-            &mut interp,
-            &mut env,
-            &mut mora::mir::effect::Effects::new()
-        )
-        .expect("run")
-    )
+    let (prog, _w) = compile_and_opt(src, None).expect("compile");
+    let mut core = CoreRuntime::default();
+    let arc = Arc::new(prog);
+    format!("{}", execute_program(arc, &mut core).expect("run").0)
 }
 
 /// ⚠ **主判据（假阴性）**：错误的类型标注**必须被拒**。
@@ -62,22 +52,22 @@ fn d130_wrong_annotations_on_list_methods_are_rejected() {
         (
             "take_as_string",
             "let xs = [1, 2, 3]\nlet bad: string = xs.take(2)\nprint(bad)\n",
-            "String",
+            "string",
         ),
         (
             "reduce_as_string",
             "let xs = [1, 2, 3]\nlet bad: string = xs.reduce(fn(a, b) a + b end, 0)\nprint(bad)\n",
-            "String",
+            "string",
         ),
         (
             "flatten_as_number",
             "let xs = [[1, 2], [3]]\nlet bad: number = xs.flatten()\nprint(bad)\n",
-            "Float",
+            "int",
         ),
         (
             "shape_as_string",
             "let xs = [[1, 2], [3]]\nlet bad: string = xs.shape()\nprint(bad)\n",
-            "String",
+            "string",
         ),
     ] {
         let errs = diagnostics(src);
@@ -134,26 +124,20 @@ fn d130_unannotated_calls_still_run_correctly() {
     // 全部实测过的运行期行为，作为「补签名只动 typeck、不动运行期」的证据
     assert_eq!(
         run("let xs = [1, 2, 3]\nxs.reduce(fn(a, b) a + b end, 0)\n"),
-        "6.0"
+        "6"
     );
-    assert_eq!(run("let xs = [1, 2, 3]\nxs.take(2)\n"), "[1.0, 2.0]");
-    assert_eq!(run("let xs = [1, 2, 3]\nxs.drop(1)\n"), "[2.0, 3.0]");
+    assert_eq!(run("let xs = [1, 2, 3]\nxs.take(2)\n"), "[1, 2]");
+    assert_eq!(run("let xs = [1, 2, 3]\nxs.drop(1)\n"), "[2, 3]");
     assert_eq!(
         run("let xs = [1, 2, 3]\nxs.window(2)\n"),
-        "[[1.0, 2.0], [2.0, 3.0]]"
+        "[[1, 2], [2, 3]]"
     );
-    assert_eq!(
-        run("let xs = [1, 2, 3]\nxs.batch(2)\n"),
-        "[[1.0, 2.0], [3.0]]"
-    );
-    assert_eq!(
-        run("let xs = [[1, 2], [3]]\nxs.flatten()\n"),
-        "[1.0, 2.0, 3.0]"
-    );
-    assert_eq!(run("let xs = [[1, 2], [3, 4]]\nxs.shape()\n"), "[2.0, 2.0]");
+    assert_eq!(run("let xs = [1, 2, 3]\nxs.batch(2)\n"), "[[1, 2], [3]]");
+    assert_eq!(run("let xs = [[1, 2], [3]]\nxs.flatten()\n"), "[1, 2, 3]");
+    assert_eq!(run("let xs = [[1, 2], [3, 4]]\nxs.shape()\n"), "[2, 2]");
     assert_eq!(
         run("let xs = [[1, 2], [3, 4]]\nxs.transpose()\n"),
-        "[[1.0, 3.0], [2.0, 4.0]]"
+        "[[1, 3], [2, 4]]"
     );
 }
 

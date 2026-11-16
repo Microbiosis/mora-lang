@@ -60,7 +60,7 @@ fn folding(src: &str) -> String {
     let ask = r#"{"jsonrpc":"2.0","id":2,"method":"textDocument/foldingRange","params":{"textDocument":{"uri":"file:///f.mora"}}}"#;
     let exit = r#"{"jsonrpc":"2.0","method":"exit","params":{}}"#;
     let payload = frame(init) + &frame(&open) + &frame(ask) + &frame(exit);
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora-lsp.exe");
+    let exe = env!("CARGO_BIN_EXE_mora-lsp");
     let mut child = Command::new(exe)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -104,65 +104,26 @@ fn ranges(raw: &str) -> Vec<(usize, usize)> {
     res
 }
 
-/// D159 主判据 ①：`with` 块必须可折叠（修复前**完全不可折叠**）。
+/// D159 主判据 ③：`parallel` 块必须可折叠。
 #[test]
-fn d159_with_block_is_foldable() {
-    let raw = folding("with model = \"m\"\n  print(1)\nend\n");
+fn d159_parallel_block_is_foldable() {
+    let raw = folding("parallel\n  let a = 1\n  let b = 2\nend\n");
     let rs = ranges(&raw);
-    assert_eq!(rs.len(), 1, "`with` 块应产生一个折叠区间; 实得: {raw}");
-    assert_eq!(
-        rs[0].0, 0,
-        "`with` 在源码第 1 行 → startLine 应是 0（0-based）; 实得: {raw}"
-    );
-}
-
-/// D159 主判据 ②：TEA `app` 块必须可折叠（修复前**完全不可折叠**）。
-#[test]
-fn d159_tea_app_block_is_foldable() {
-    let src = "app Counter\n  model: Point\n  msg: Move\n  init: 0\n  \
-               update: fn(msg, model) => model\n  view: fn(model) => model\nend\n";
-    let raw = folding(src);
-    let rs = ranges(&raw);
-    assert_eq!(rs.len(), 1, "`app` 块应产生一个折叠区间; 实得: {raw}");
-    assert_eq!(
-        rs[0].0, 0,
-        "`app` 在源码第 1 行 → startLine 应是 0; 实得: {raw}"
-    );
-    // 结束行应覆盖到 `view:` 那一行（源码第 6 行 → 0-based 5）
-    assert_eq!(
-        rs[0].1, 5,
-        "endLine 应取三个子 witness 的最大行（`view:` 在第 6 行）; 实得: {raw}"
-    );
-}
-
-/// D159 主判据 ③：命名 section 块（`prompt` / `document`）与 `parallel` 必须可折叠。
-#[test]
-fn d159_section_and_parallel_blocks_are_foldable() {
-    for (name, src) in [
-        (
-            "prompt",
-            "prompt \"system\" do\n  \"You are helpful.\"\nend\n",
-        ),
-        ("parallel", "parallel\n  let a = 1\n  let b = 2\nend\n"),
-    ] {
-        let raw = folding(src);
-        let rs = ranges(&raw);
-        assert_eq!(rs.len(), 1, "[{name}] 应可折叠; 实得: {raw}");
-        assert_eq!(rs[0].0, 0, "[{name}] startLine 应是 0; 实得: {raw}");
-    }
+    assert_eq!(rs.len(), 1, "[parallel] 应可折叠; 实得: {raw}");
+    assert_eq!(rs[0].0, 0, "[parallel] startLine 应是 0; 实得: {raw}");
 }
 
 /// D159 主判据 ④：混合文档里**每种**块各出一个区间，且互不错位。
 #[test]
 fn d159_each_block_kind_yields_its_own_range() {
-    let src = "model Point\n  x: number\n  y: number\nend\n\ntask work()\n  let a = 1\n  let b = 2\n  print(a + b)\nend\n\nwith model = \"m\"\n  print(1)\nend\n";
+    let src = "task work()\n  let a = 1\n  let b = 2\n  print(a + b)\nend\n\nparallel\n  let c = 3\n  print(c)\nend\n";
     let raw = folding(src);
     let rs = ranges(&raw);
     let starts: Vec<usize> = rs.iter().map(|r| r.0).collect();
     assert_eq!(
         starts,
-        vec![5, 11],
-        "应恰好两段：`task`（源码第 6 行 → 0-based 5）与 `with`（第 12 行 → 11）; 实得: {raw}"
+        vec![0, 6],
+        "应恰好两段：`task`（源码第 1 行 → 0-based 0）与 `parallel`（第 7 行 → 6）; 实得: {raw}"
     );
 }
 

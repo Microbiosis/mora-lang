@@ -3,22 +3,20 @@
 //! Implements the unification procedure to solve type constraints.
 //! Core of HM inference: finds most general unifier (MGU) for two types.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::error::TypeError;
+use crate::common::Span;
+use crate::typeck::{Type, TypeVarId};
 
-///  A substitution maps type variables to concrete types
-/// v0.80: 同时映射 row 变量（EffectRow::Var 的 String 名）到具体 row。
+/// Substitution mapping inference meta-variables and effect row variables.
 #[derive(Debug, Clone)]
 pub struct Substitution {
-    mapping: HashMap<char, crate::typeck::Type>,
-    /// v0.80: row 变量绑定（EffectRow 共享 typeck 命名空间，但用 String 名而非 char。
-    /// 原因：EffectRow::Var(String) 是公开类型，char 转换会引起兼容成本）。
+    mapping: HashMap<TypeVarId, Type>,
     row_mapping: HashMap<String, crate::mir::effect::EffectRow>,
 }
 
 impl Substitution {
-    /// Create a new empty substitution
     pub fn new() -> Self {
         Self {
             mapping: HashMap::new(),
@@ -26,58 +24,135 @@ impl Substitution {
         }
     }
 
-    /// v0.80: row var 查询（String 键，与 EffectRow::Var(String) 同空间）。
+    pub fn lookup(&self, id: &TypeVarId) -> Option<&Type> {
+        self.mapping.get(id)
+    }
+
     pub fn lookup_row(&self, name: &str) -> Option<&crate::mir::effect::EffectRow> {
         self.row_mapping.get(name)
     }
 
-    /// v0.80: row var 绑定（直接覆盖，不做 occur check — Phase 2 仅用于
-    /// builtin 累积（已被 lower 阶段解析），后期 row-poly HM 加 occur check）。
     pub fn bind_row(&mut self, name: String, row: crate::mir::effect::EffectRow) {
         self.row_mapping.insert(name, row);
     }
 
-    /// Apply substitution to a type (replace all type variables)
-    pub fn apply(&self, ty: &crate::typeck::Type) -> crate::typeck::Type {
+    /// Apply substitution transitively to a type, avoiding capture under `ForAll`.
+    pub fn apply(&self, ty: &Type) -> Type {
+        self.apply_with_bound(ty, &HashSet::new())
+    }
+
+    fn apply_with_bound(&self, ty: &Type, bound: &HashSet<TypeVarId>) -> Type {
         match ty {
-            crate::typeck::Type::TypeVar(c) => {
-                self.mapping.get(c).cloned().unwrap_or_else(|| ty.clone())
+            Type::TypeVar(id) => {
+                if !bound.contains(id)
+                    && let Some(resolved) = self.mapping.get(id)
+                {
+                    return self.apply_with_bound(resolved, bound);
+                }
+                ty.clone()
             }
-            crate::typeck::Type::List(elem) => {
-                crate::typeck::Type::List(Box::new(self.apply(elem)))
+            Type::List(elem) => Type::List(Box::new(self.apply_with_bound(elem, bound))),
+            Type::Channel(elem) => Type::Channel(Box::new(self.apply_with_bound(elem, bound))),
+            Type::TaskHandle(elem) => {
+                Type::TaskHandle(Box::new(self.apply_with_bound(elem, bound)))
             }
-            crate::typeck::Type::Dict(key, value) => {
-                crate::typeck::Type::Dict(Box::new(self.apply(key)), Box::new(self.apply(value)))
+            Type::Dict(key, value) => Type::Dict(
+                Box::new(self.apply_with_bound(key, bound)),
+                Box::new(self.apply_with_bound(value, bound)),
+            ),
+            Type::Result_(ok, err) => Type::Result_(
+                Box::new(self.apply_with_bound(ok, bound)),
+                Box::new(self.apply_with_bound(err, bound)),
+            ),
+            Type::Tuple(elems) => Type::Tuple(
+                elems
+                    .iter()
+                    .map(|e| Box::new(self.apply_with_bound(e, bound)))
+                    .collect(),
+            ),
+            Type::Cons(h, t) => Type::Cons(
+                Box::new(self.apply_with_bound(h, bound)),
+                Box::new(self.apply_with_bound(t, bound)),
+            ),
+            Type::Union(members) => Type::Union(
+                members
+                    .iter()
+                    .map(|m| self.apply_with_bound(m, bound))
+                    .collect(),
+            ),
+            Type::Trait { name, generics } => Type::Trait {
+                name: name.clone(),
+                generics: generics
+                    .iter()
+                    .map(|g| self.apply_with_bound(g, bound))
+                    .collect(),
+            },
+            Type::Concrete {
+                name,
+                generics,
+                traits,
+            } => Type::Concrete {
+                name: name.clone(),
+                generics: generics
+                    .iter()
+                    .map(|g| self.apply_with_bound(g, bound))
+                    .collect(),
+                traits: traits
+                    .iter()
+                    .map(|t| self.apply_with_bound(t, bound))
+                    .collect(),
+            },
+            Type::TraitObject {
+                trait_name,
+                generics,
+            } => Type::TraitObject {
+                trait_name: trait_name.clone(),
+                generics: generics
+                    .iter()
+                    .map(|g| self.apply_with_bound(g, bound))
+                    .collect(),
+            },
+            Type::ForAll(vars, inner) => {
+                let mut next_bound = bound.clone();
+                for v in vars {
+                    next_bound.insert(v.clone());
+                }
+                Type::ForAll(
+                    vars.clone(),
+                    Box::new(self.apply_with_bound(inner, &next_bound)),
+                )
             }
-            crate::typeck::Type::Result_(ok, err) => {
-                crate::typeck::Type::Result_(Box::new(self.apply(ok)), Box::new(self.apply(err)))
-            }
-            crate::typeck::Type::Union(members) => {
-                crate::typeck::Type::Union(members.iter().map(|m| self.apply(m)).collect())
-            }
-            // v0.75.17: ForAll 内层应用替换（量化变量自身不会被替换 — 它们
-            // 与活跃 TypeVar 命名空间隔离；替换只作用于内层 τ 中的自由变量）。
-            crate::typeck::Type::ForAll(vars, inner) => {
-                crate::typeck::Type::ForAll(vars.clone(), Box::new(self.apply(inner)))
-            }
-            // v0.80: Arrow — 递归替换 input/output，effect row 走 apply_row。
-            crate::typeck::Type::Arrow(input, output, row) => crate::typeck::Type::Arrow(
-                Box::new(self.apply(input)),
-                Box::new(self.apply(output)),
+            Type::Arrow(input, output, row) => Type::Arrow(
+                Box::new(self.apply_with_bound(input, bound)),
+                Box::new(self.apply_with_bound(output, bound)),
                 crate::typeck::hm::row::apply_row(row, self),
             ),
             _ => ty.clone(),
         }
     }
 
-    /// Extend substitution with new mapping
-    pub fn extend(&self, var: char, ty: crate::typeck::Type) -> Result<Self, TypeError> {
-        // Occurs check: ty cannot contain var
-        if contains_typevar(&ty, var) {
+    pub fn extend(&self, var: TypeVarId, ty: Type) -> Result<Self, TypeError> {
+        self.extend_at(var, ty, None)
+    }
+
+    pub fn extend_at(
+        &self,
+        var: TypeVarId,
+        ty: Type,
+        span: Option<Span>,
+    ) -> Result<Self, TypeError> {
+        if matches!(var, TypeVarId::Rigid(_)) {
+            return Err(TypeError::UnificationFailure {
+                expected: Type::TypeVar(var).name(),
+                got: ty.name(),
+                span,
+            });
+        }
+        if occurs_in_subst(self, &var, &ty) {
             return Err(TypeError::OccursCheck {
                 var,
-                with_ty: format!("{:?}", ty),
-                span: None,
+                with_ty: ty.name(),
+                span,
             });
         }
 
@@ -89,18 +164,19 @@ impl Substitution {
         })
     }
 
-    /// Compose this substitution with another
     pub fn compose(&self, other: &Self) -> Self {
         let mut new_mapping = self.mapping.clone();
-
         for (var, ty) in &other.mapping {
             let applied_ty = self.apply(ty);
-            new_mapping.insert(*var, applied_ty);
+            new_mapping.insert(var.clone(), applied_ty);
         }
-
+        let mut new_rows = self.row_mapping.clone();
+        for (k, v) in &other.row_mapping {
+            new_rows.insert(k.clone(), crate::typeck::hm::row::apply_row(v, self));
+        }
         Self {
             mapping: new_mapping,
-            row_mapping: self.row_mapping.clone(),
+            row_mapping: new_rows,
         }
     }
 }
@@ -111,35 +187,60 @@ impl Default for Substitution {
     }
 }
 
-///  Type constraint that needs to be solved
+/// Type constraint kind emitted during HM inference.
 #[derive(Debug, Clone)]
 pub enum Constraint {
-    /// Two types must be equal
-    Eq(Box<crate::typeck::Type>, Box<crate::typeck::Type>),
-
-    /// Both types must be numeric (Int or Float) - for arithmetic operations
+    /// Two types must unify strictly.
+    Eq(Box<Type>, Box<Type>),
+    /// Subtype constraint `sub <: sup` (allows `Int <: Float`, rejects `Float <: Int`).
+    Subtype { sub: Box<Type>, sup: Box<Type> },
+    /// Numeric (or overloaded `+`) binary constraint with optional result unification.
     Numeric(BinaryConstraint),
-
-    /// v0.80: Two effect rows must unify (row-polymorphic unification).
+    /// Row-polymorphic effect equation.
     RowEq(crate::mir::effect::EffectRow, crate::mir::effect::EffectRow),
 }
 
-///  Arithmetic binary operator constraint: both operands must be compatible numeric types
-/// v0.90.5: 增加 result 字段 — solver 在校验数值类型后将 result 与 promotion 类型合一。
+/// Constraint paired with originating source span and optional diagnostic hint.
+#[derive(Debug, Clone)]
+pub struct SpannedConstraint {
+    pub kind: Constraint,
+    pub span: Span,
+    pub hint: Option<String>,
+}
+
+impl SpannedConstraint {
+    pub fn new(kind: Constraint, span: Span) -> Self {
+        Self {
+            kind,
+            span,
+            hint: None,
+        }
+    }
+
+    pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BinaryConstraint {
-    pub left: Box<crate::typeck::Type>,
-    pub right: Box<crate::typeck::Type>,
-    pub result: Option<Box<crate::typeck::Type>>,
+    pub left: Box<Type>,
+    pub right: Box<Type>,
+    pub result: Option<Box<Type>>,
+    pub allow_string: bool,
 }
 
 impl std::fmt::Display for Constraint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Constraint::Eq(t1, t2) => write!(f, "({} == {})", format_type(t1), format_type(t2)),
+            Constraint::Subtype { sub, sup } => {
+                write!(f, "({} <: {})", format_type(sub), format_type(sup))
+            }
             Constraint::Numeric(bc) => write!(
                 f,
-                "(+ {:?}, {:?})",
+                "(+ {}, {})",
                 format_type(&bc.left),
                 format_type(&bc.right)
             ),
@@ -148,339 +249,581 @@ impl std::fmt::Display for Constraint {
     }
 }
 
-///  Format type with proper display
-fn format_type(ty: &crate::typeck::Type) -> String {
+fn format_type(ty: &Type) -> String {
     ty.name()
 }
 
-///  Solve a single constraint, returning updated substitution
-pub fn solve(constraint: &Constraint, subst: &Substitution) -> Result<Substitution, TypeError> {
-    match constraint {
-        Constraint::Eq(ty1, ty2) => unify(ty1, ty2, subst),
+pub(crate) fn remap_constraint(
+    sc: &SpannedConstraint,
+    mapping: &HashMap<TypeVarId, TypeVarId>,
+    span_override: Option<Span>,
+) -> SpannedConstraint {
+    use crate::typeck::hm::generalize::remap_type_vars;
+    let kind = match &sc.kind {
+        Constraint::Eq(a, b) => Constraint::Eq(
+            Box::new(remap_type_vars(a, mapping)),
+            Box::new(remap_type_vars(b, mapping)),
+        ),
+        Constraint::Subtype { sub, sup } => Constraint::Subtype {
+            sub: Box::new(remap_type_vars(sub, mapping)),
+            sup: Box::new(remap_type_vars(sup, mapping)),
+        },
+        Constraint::Numeric(bc) => Constraint::Numeric(BinaryConstraint {
+            left: Box::new(remap_type_vars(&bc.left, mapping)),
+            right: Box::new(remap_type_vars(&bc.right, mapping)),
+            result: bc
+                .result
+                .as_ref()
+                .map(|r| Box::new(remap_type_vars(r, mapping))),
+            allow_string: bc.allow_string,
+        }),
+        Constraint::RowEq(r1, r2) => Constraint::RowEq(r1.clone(), r2.clone()),
+    };
+    SpannedConstraint {
+        kind,
+        span: span_override.unwrap_or(sc.span),
+        hint: sc.hint.clone(),
+    }
+}
+
+pub(crate) fn constraint_mentions_any(c: &Constraint, vars: &HashSet<TypeVarId>) -> bool {
+    use crate::typeck::hm::generalize::collect_free_vars;
+    let has = |t: &Type| collect_free_vars(t).iter().any(|v| vars.contains(v));
+    match c {
+        Constraint::Eq(a, b) => has(a) || has(b),
+        Constraint::Subtype { sub, sup } => has(sub) || has(sup),
         Constraint::Numeric(bc) => {
-            // v0.90.5: Numeric type checking with Int/Float promotion.
-            // 1. Resolve TypeVars via substitution
-            // 2. Both must be numeric (Int or Float)
-            // 3. Mixed Int/Float → Float promotion
-            // 4. If result type provided, unify with promoted type
-            let left = subst.apply(&bc.left);
-            let right = subst.apply(&bc.right);
-            let promoted = match (&left, &right) {
-                (crate::typeck::Type::Int, crate::typeck::Type::Int) => crate::typeck::Type::Int,
-                (crate::typeck::Type::Float, crate::typeck::Type::Float) => {
-                    crate::typeck::Type::Float
-                }
-                (crate::typeck::Type::Int, crate::typeck::Type::Float)
-                | (crate::typeck::Type::Float, crate::typeck::Type::Int) => {
-                    crate::typeck::Type::Float
-                }
-                // v0.91: BigInt promotion — 任一含 BigInt 时结果 BigInt
-                (crate::typeck::Type::BigInt, crate::typeck::Type::BigInt) => {
-                    crate::typeck::Type::BigInt
-                }
-                (crate::typeck::Type::Int, crate::typeck::Type::BigInt)
-                | (crate::typeck::Type::BigInt, crate::typeck::Type::Int) => {
-                    crate::typeck::Type::BigInt
-                }
-                (crate::typeck::Type::Float, crate::typeck::Type::BigInt)
-                | (crate::typeck::Type::BigInt, crate::typeck::Type::Float) => {
-                    crate::typeck::Type::Float
-                }
-                // TypeVar + numeric → bind TypeVar to numeric type
-                (crate::typeck::Type::TypeVar(v), crate::typeck::Type::Int)
-                | (crate::typeck::Type::Int, crate::typeck::Type::TypeVar(v)) => {
-                    let s = subst.extend(*v, crate::typeck::Type::Int)?;
-                    if let Some(ref result) = bc.result {
-                        return unify(&crate::typeck::Type::Int, result, &s);
-                    }
-                    return Ok(s);
-                }
-                (crate::typeck::Type::TypeVar(v), crate::typeck::Type::Float)
-                | (crate::typeck::Type::Float, crate::typeck::Type::TypeVar(v)) => {
-                    let s = subst.extend(*v, crate::typeck::Type::Float)?;
-                    if let Some(ref result) = bc.result {
-                        return unify(&crate::typeck::Type::Float, result, &s);
-                    }
-                    return Ok(s);
-                }
-                // v0.91: BigInt + TypeVar → bind TypeVar to BigInt
-                (crate::typeck::Type::TypeVar(v), crate::typeck::Type::BigInt)
-                | (crate::typeck::Type::BigInt, crate::typeck::Type::TypeVar(v)) => {
-                    let s = subst.extend(*v, crate::typeck::Type::BigInt)?;
-                    if let Some(ref result) = bc.result {
-                        return unify(&crate::typeck::Type::BigInt, result, &s);
-                    }
-                    return Ok(s);
-                }
-                // TypeVar + 任何类型 — Numeric 约束要求两侧均为已解析数值，
-                // TypeVar 出现在此处说明推断有误（infer_binop guard 应阻止）。
-                (crate::typeck::Type::TypeVar(_), _) | (_, crate::typeck::Type::TypeVar(_)) => {
-                    return Err(crate::typeck::hm::error::TypeError::UnificationFailure {
-                        expected: "numeric type (int or float)".to_string(),
-                        got: format!("{} and {}", format_type(&left), format_type(&right)),
-                        span: None,
-                    });
-                }
-                // Both resolved, not numeric — error
-                _ => {
-                    return Err(crate::typeck::hm::error::TypeError::UnificationFailure {
-                        expected: "numeric type (int or float)".to_string(),
-                        got: format!("{} and {}", format_type(&left), format_type(&right)),
-                        span: None,
-                    });
-                }
-            };
-            // Concrete numeric types (Int/Int, Float/Float, or mixed) — unify result
-            if let Some(ref result) = bc.result {
-                unify(&promoted, result, subst)
-            } else {
-                Ok(subst.clone())
-            }
+            has(&bc.left) || has(&bc.right) || bc.result.as_ref().is_some_and(|r| has(r))
         }
+        Constraint::RowEq(_, _) => false,
+    }
+}
+
+pub(crate) fn numeric_has_unbound_meta(bc: &BinaryConstraint, subst: &Substitution) -> bool {
+    let l = subst.apply(&bc.left);
+    let r = subst.apply(&bc.right);
+    matches!(l, Type::TypeVar(TypeVarId::Meta(_))) || matches!(r, Type::TypeVar(TypeVarId::Meta(_)))
+}
+
+pub fn solve(constraint: &Constraint, subst: &Substitution) -> Result<Substitution, TypeError> {
+    solve_at(constraint, subst, None)
+}
+
+pub fn solve_spanned(
+    sc: &SpannedConstraint,
+    subst: &Substitution,
+) -> Result<Substitution, TypeError> {
+    match solve_at(&sc.kind, subst, Some(sc.span)) {
+        Ok(s) => Ok(s),
+        Err(e) => Err(match &sc.hint {
+            Some(hint) => e.with_hint(hint.clone()),
+            None => e,
+        }),
+    }
+}
+
+fn solve_at(
+    constraint: &Constraint,
+    subst: &Substitution,
+    span: Option<Span>,
+) -> Result<Substitution, TypeError> {
+    match constraint {
+        Constraint::Eq(ty1, ty2) => unify_at(ty1, ty2, subst, span),
+        Constraint::Subtype { sub, sup } => unify_subtype_at(sub, sup, subst, span),
+        Constraint::Numeric(bc) => solve_numeric(bc, subst, span),
         Constraint::RowEq(r1, r2) => {
             let mut new_subst = subst.clone();
-            crate::typeck::hm::row::unify_row(r1, r2, &mut new_subst)?;
+            crate::typeck::hm::row::unify_row_at(r1, r2, &mut new_subst, span)?;
             Ok(new_subst)
         }
     }
 }
 
-///  Main unification algorithm: find MGU of two types under current substitution
-fn unify(
-    ty1: &crate::typeck::Type,
-    ty2: &crate::typeck::Type,
+fn is_number_union(ty: &Type) -> bool {
+    matches!(ty, Type::Union(ms) if !ms.is_empty() && ms.iter().all(|m| matches!(m, Type::Int | Type::Float)))
+}
+
+fn solve_numeric(
+    bc: &BinaryConstraint,
     subst: &Substitution,
+    span: Option<Span>,
+) -> Result<Substitution, TypeError> {
+    let left = subst.apply(&bc.left);
+    let right = subst.apply(&bc.right);
+
+    if matches!(left, Type::Error) || matches!(right, Type::Error) {
+        if let Some(ref result) = bc.result {
+            return unify_at(&Type::Error, result, subst, span);
+        }
+        return Ok(subst.clone());
+    }
+    if matches!(left, Type::Unknown) || matches!(right, Type::Unknown) {
+        return Err(TypeError::UnificationFailure {
+            expected: "numeric type (int or float)".to_string(),
+            got: format!("{} and {}", format_type(&left), format_type(&right)),
+            span,
+        });
+    }
+
+    let promoted = match (&left, &right) {
+        (Type::Int, Type::Int) => Type::Int,
+        (Type::Float, Type::Float) | (Type::Int, Type::Float) | (Type::Float, Type::Int) => {
+            Type::Float
+        }
+        (Type::Float, u) | (u, Type::Float) if is_number_union(u) => Type::Float,
+        (Type::Int, u) | (u, Type::Int) if is_number_union(u) => {
+            Type::Union(vec![Type::Int, Type::Float])
+        }
+        (a, b) if is_number_union(a) && is_number_union(b) => {
+            Type::Union(vec![Type::Int, Type::Float])
+        }
+        (Type::String, Type::String) if bc.allow_string => Type::String,
+        (Type::Any, Type::Int) | (Type::Int, Type::Any) => Type::Int,
+        (Type::Any, Type::Float) | (Type::Float, Type::Any) => Type::Float,
+        (Type::Any, u) | (u, Type::Any) if is_number_union(u) => u.clone(),
+        (Type::Any, Type::String) | (Type::String, Type::Any) if bc.allow_string => Type::String,
+        (Type::Any, Type::Any) => Type::Any,
+        // Unresolved inference variables when paired with a concrete type:
+        (Type::TypeVar(v @ TypeVarId::Meta(_)), Type::Int)
+        | (Type::Int, Type::TypeVar(v @ TypeVarId::Meta(_))) => {
+            let s = subst.extend_at(v.clone(), Type::Int, span)?;
+            if let Some(ref result) = bc.result {
+                return unify_at(&Type::Int, result, &s, span);
+            }
+            return Ok(s);
+        }
+        (Type::TypeVar(v @ TypeVarId::Meta(_)), Type::Float)
+        | (Type::Float, Type::TypeVar(v @ TypeVarId::Meta(_))) => {
+            let s = subst.extend_at(v.clone(), Type::Float, span)?;
+            if let Some(ref result) = bc.result {
+                return unify_at(&Type::Float, result, &s, span);
+            }
+            return Ok(s);
+        }
+        (Type::TypeVar(v @ TypeVarId::Meta(_)), u) | (u, Type::TypeVar(v @ TypeVarId::Meta(_)))
+            if is_number_union(u) =>
+        {
+            let s = subst.extend_at(v.clone(), u.clone(), span)?;
+            if let Some(ref result) = bc.result {
+                return unify_at(u, result, &s, span);
+            }
+            return Ok(s);
+        }
+        (Type::TypeVar(v @ TypeVarId::Meta(_)), Type::String)
+        | (Type::String, Type::TypeVar(v @ TypeVarId::Meta(_)))
+            if bc.allow_string =>
+        {
+            let s = subst.extend_at(v.clone(), Type::String, span)?;
+            if let Some(ref result) = bc.result {
+                return unify_at(&Type::String, result, &s, span);
+            }
+            return Ok(s);
+        }
+        (Type::TypeVar(TypeVarId::Meta(_)), Type::TypeVar(TypeVarId::Meta(_))) => {
+            let s = unify_at(&left, &right, subst, span)?;
+            if let Some(ref result) = bc.result {
+                return unify_at(&left, result, &s, span);
+            }
+            return Ok(s);
+        }
+        (Type::TypeVar(TypeVarId::Meta(_)), Type::Any)
+        | (Type::Any, Type::TypeVar(TypeVarId::Meta(_))) => Type::Any,
+        // Rigid generic parameters or non-numeric concrete types must fail here.
+        _ => {
+            let expected = if bc.allow_string {
+                "numeric or string type".to_string()
+            } else {
+                "numeric type (int or float)".to_string()
+            };
+            return Err(TypeError::UnificationFailure {
+                expected,
+                got: format!("{} and {}", format_type(&left), format_type(&right)),
+                span,
+            });
+        }
+    };
+
+    if let Some(ref result) = bc.result {
+        unify_at(&promoted, result, subst, span)
+    } else {
+        Ok(subst.clone())
+    }
+}
+
+#[cfg(test)]
+fn unify(ty1: &Type, ty2: &Type, subst: &Substitution) -> Result<Substitution, TypeError> {
+    unify_at(ty1, ty2, subst, None)
+}
+
+fn unify_at(
+    ty1: &Type,
+    ty2: &Type,
+    subst: &Substitution,
+    span: Option<Span>,
 ) -> Result<Substitution, TypeError> {
     let t1 = subst.apply(ty1);
     let t2 = subst.apply(ty2);
 
     match (&t1, &t2) {
-        // Variable cases
-        //
-        // v0.102 修复：合一是等价关系的闭合，两条标准规则此前缺失——
-        //   1. **自反**：`unify(α, α) = Ok`（此前落入 occurs check，因为
-        //      `contains_typevar(TypeVar(α), α)` 对自身为真 → 误报
-        //      OccursCheck；触发条件是同一未解析 TypeVar 出现在两侧，
-        //      如 `fn(n) n * n end` 的两条 Eq(α, result) 约束消解后
-        //      两侧同为 β）。
-        //   2. **传递 occurs check**：绑定前沿替换链全解析，防止
-        //      `α → β, β → α` 形成无限类型（`contains_typevar` 只看
-        //      一层，链式发生时漏检）。
-        (crate::typeck::Type::TypeVar(v1), _) => {
-            if let crate::typeck::Type::TypeVar(v2) = &t2
+        (Type::Error, _) | (_, Type::Error) => Ok(subst.clone()),
+        (Type::Unknown, _) | (_, Type::Unknown) => Err(TypeError::UnificationFailure {
+            expected: format_type(&t1),
+            got: format_type(&t2),
+            span,
+        }),
+        (Type::TypeVar(TypeVarId::Rigid(a)), Type::TypeVar(TypeVarId::Rigid(b))) => {
+            if a == b {
+                Ok(subst.clone())
+            } else {
+                Err(TypeError::UnificationFailure {
+                    expected: format_type(&t1),
+                    got: format_type(&t2),
+                    span,
+                })
+            }
+        }
+        (Type::Any, _) | (_, Type::Any) => Ok(subst.clone()),
+        (Type::TypeVar(v1 @ TypeVarId::Meta(_)), _) => {
+            if let Type::TypeVar(v2) = &t2
                 && v1 == v2
             {
                 return Ok(subst.clone());
             }
-            if occurs_in_subst(subst, *v1, &t2) {
-                Err(TypeError::OccursCheck {
-                    var: *v1,
-                    with_ty: format!("{:?}", t2),
-                    span: None,
-                })
-            } else {
-                subst.extend(*v1, t2.clone())
-            }
+            subst.extend_at(v1.clone(), t2.clone(), span)
         }
-        (_, crate::typeck::Type::TypeVar(v2)) => {
-            if occurs_in_subst(subst, *v2, &t1) {
-                Err(TypeError::OccursCheck {
-                    var: *v2,
-                    with_ty: format!("{:?}", t1),
-                    span: None,
-                })
-            } else {
-                subst.extend(*v2, t1.clone())
-            }
+        (_, Type::TypeVar(v2 @ TypeVarId::Meta(_))) => {
+            subst.extend_at(v2.clone(), t1.clone(), span)
         }
-
-        // Same type constructor
-        (crate::typeck::Type::Int, crate::typeck::Type::Int) => Ok(subst.clone()),
-        (crate::typeck::Type::Float, crate::typeck::Type::Float) => Ok(subst.clone()),
-        // v0.103: BigInt 自反 —— v0.91 引入 BigInt 变体时漏加本 arm，
-        // 导致同一类型合一失败（`999n == 999n`、`x: bigint = 999n` 均报
-        // "expected bigint, got bigint"）。`compatible_with` 已自 v0.91 起
-        // 承认 BigInt 自反，此处是 unify 侧的同款遗漏。
-        (crate::typeck::Type::BigInt, crate::typeck::Type::BigInt) => Ok(subst.clone()),
-        (crate::typeck::Type::String, crate::typeck::Type::String) => Ok(subst.clone()),
-        (crate::typeck::Type::Bool, crate::typeck::Type::Bool) => Ok(subst.clone()),
-        (crate::typeck::Type::Nil, crate::typeck::Type::Nil) => Ok(subst.clone()),
-        (crate::typeck::Type::Any, crate::typeck::Type::Any) => Ok(subst.clone()),
-
-        // v0.75.16: Any 是 top type — 与任何类型合一成功（"未知类型"语义）。
-        // 修复：`ys[0]` 降成 `Call(Name("ys_index"))`（receiver_operation 糖），
-        // typeck 当未知调用时把 arg 约束到 callee_ty=Any，此前无 (X, Any) arm 报错。
-        (crate::typeck::Type::Any, _) | (_, crate::typeck::Type::Any) => Ok(subst.clone()),
-
-        // v0.75.92: Unknown fail-fast — 与任何类型合一都失败（v0.75.91 引入的
-        // 逃逸标签；fail-fast 语义迫使调用方用 TypeVar 推断路径产出精确类型）。
-        (crate::typeck::Type::Unknown, _) | (_, crate::typeck::Type::Unknown) => {
-            Err(crate::typeck::hm::error::TypeError::UnificationFailure {
-                expected: format!("{:?}", ty1),
-                got: format!("{:?}", ty2),
-                span: None,
+        (Type::TypeVar(TypeVarId::Rigid(_)), _) | (_, Type::TypeVar(TypeVarId::Rigid(_))) => {
+            Err(TypeError::UnificationFailure {
+                expected: format_type(&t1),
+                got: format_type(&t2),
+                span,
             })
         }
-
-        // v0.75.17: ForAll — 防御性合一（正常路径在 env.get 已实例化，
-        // 泛型值不会以 ForAll 形态进入约束；若进入，与内层合一）。
-        (crate::typeck::Type::ForAll(_, inner), other)
-        | (other, crate::typeck::Type::ForAll(_, inner)) => unify(inner, other, subst),
-
-        // v0.102: 声明式范式类型合一
-        (crate::typeck::Type::Goal, crate::typeck::Type::Goal) => Ok(subst.clone()),
-        (crate::typeck::Type::Cons(h1, t1), crate::typeck::Type::Cons(h2, t2)) => {
-            let s1 = unify(h1, h2, subst)?;
-            unify(t1, t2, &s1)
+        (Type::ForAll(_, inner), other) | (other, Type::ForAll(_, inner)) => {
+            unify_at(inner, other, subst, span)
         }
-        (crate::typeck::Type::Relation(p1), crate::typeck::Type::Relation(p2)) => {
-            if p1.len() != p2.len() {
-                return Err(TypeError::UnificationFailure {
-                    expected: format_type(&t1),
-                    got: format_type(&t2),
-                    span: None,
-                });
+        (Type::Cons(h1, t1_rest), Type::Cons(h2, t2_rest)) => {
+            let s1 = unify_at(h1, h2, subst, span)?;
+            unify_at(t1_rest, t2_rest, &s1, span)
+        }
+        (Type::List(elem1), Type::List(elem2)) => unify_at(elem1, elem2, subst, span),
+        (Type::Channel(elem1), Type::Channel(elem2)) => unify_at(elem1, elem2, subst, span),
+        (Type::TaskHandle(elem1), Type::TaskHandle(elem2)) => unify_at(elem1, elem2, subst, span),
+        (Type::Dict(k1, v1), Type::Dict(k2, v2)) => {
+            let s1 = unify_at(k1, k2, subst, span)?;
+            unify_at(v1, v2, &s1, span)
+        }
+        (Type::Result_(ok1, err1), Type::Result_(ok2, err2)) => {
+            let s1 = unify_at(ok1, ok2, subst, span)?;
+            unify_at(err1, err2, &s1, span)
+        }
+        (Type::Tuple(a), Type::Tuple(b)) if a.len() == b.len() => {
+            let mut s = subst.clone();
+            for (ea, eb) in a.iter().zip(b.iter()) {
+                s = unify_at(ea, eb, &s, span)?;
             }
-            let mut acc = subst.clone();
-            for (a, b) in p1.iter().zip(p2.iter()) {
-                acc = unify(a, b, &acc)?;
+            Ok(s)
+        }
+        (
+            Type::Trait {
+                name: a,
+                generics: ga,
+            },
+            Type::Trait {
+                name: b,
+                generics: gb,
+            },
+        ) if a == b && ga.len() == gb.len() => {
+            let mut s = subst.clone();
+            for (xa, xb) in ga.iter().zip(gb.iter()) {
+                s = unify_at(xa, xb, &s, span)?;
             }
-            Ok(acc)
+            Ok(s)
         }
-
-        // Compound types
-        (crate::typeck::Type::List(elem1), crate::typeck::Type::List(elem2)) => {
-            unify(elem1, elem2, subst)
+        (
+            Type::Concrete {
+                name: a,
+                generics: ga,
+                ..
+            },
+            Type::Concrete {
+                name: b,
+                generics: gb,
+                ..
+            },
+        ) if a == b && ga.len() == gb.len() => {
+            let mut s = subst.clone();
+            for (xa, xb) in ga.iter().zip(gb.iter()) {
+                s = unify_at(xa, xb, &s, span)?;
+            }
+            Ok(s)
         }
-        (crate::typeck::Type::Dict(k1, v1), crate::typeck::Type::Dict(k2, v2)) => {
-            let s1 = unify(k1, k2, subst)?;
-            unify(v1, v2, &s1)
+        (
+            Type::TraitObject {
+                trait_name: a,
+                generics: ga,
+            },
+            Type::TraitObject {
+                trait_name: b,
+                generics: gb,
+            },
+        ) if (a.is_empty() || b.is_empty() || a == b) && ga.len() == gb.len() => {
+            let mut s = subst.clone();
+            for (xa, xb) in ga.iter().zip(gb.iter()) {
+                s = unify_at(xa, xb, &s, span)?;
+            }
+            Ok(s)
         }
-        (crate::typeck::Type::Result_(ok1, err1), crate::typeck::Type::Result_(ok2, err2)) => {
-            let s1 = unify(ok1, ok2, subst)?;
-            unify(err1, err2, &s1)
-        }
-
-        // v0.80: Arrow — 函数类型合一：input/output 递归，effect row 走 unify_row。
-        (crate::typeck::Type::Arrow(i1, o1, r1), crate::typeck::Type::Arrow(i2, o2, r2)) => {
-            let s1 = unify(i1, i2, subst)?;
-            let s2 = unify(o1, o2, &s1)?;
-            let mut s3 = s2.clone();
-            crate::typeck::hm::row::unify_row(r1, r2, &mut s3)?;
+        (Type::Arrow(i1, o1, r1), Type::Arrow(i2, o2, r2)) => {
+            let s1 = unify_at(i1, i2, subst, span)?;
+            let s2 = unify_at(o1, o2, &s1, span)?;
+            let mut s3 = s2;
+            crate::typeck::hm::row::unify_row_at(r1, r2, &mut s3, span)?;
             Ok(s3)
         }
-
-        // v0.75.16: Union 合一 — 任一成员与另一侧匹配即通过（dict.get 返回
-        // Union<V, Nil>；`d.get("k") == x` 需允许 x 与 V 或 Nil 之一合一）。
-        // 防膨胀：成员为空或含 Any 时直接视为 Any（退化成功）。
-        (crate::typeck::Type::Union(members), other)
-        | (other, crate::typeck::Type::Union(members)) => {
-            if members.is_empty()
-                || members
-                    .iter()
-                    .any(|m| matches!(m, crate::typeck::Type::Any))
-            {
+        (Type::Union(members), other) | (other, Type::Union(members)) => {
+            if members.is_empty() || members.iter().any(|m| matches!(m, Type::Any)) {
                 Ok(subst.clone())
             } else {
-                // 任一成员成功合一即可；全部失败则报第一个失败
-                let mut first_err: Option<TypeError> = None;
+                let mut special_err: Option<TypeError> = None;
                 for m in members {
-                    match unify(m, other, subst) {
+                    match unify_at(m, other, subst, span) {
                         Ok(s) => return Ok(s),
-                        Err(e) => {
-                            if first_err.is_none() {
-                                first_err = Some(e);
+                        Err(
+                            e @ (TypeError::OccursCheck { .. }
+                            | TypeError::EffectRowMismatch { .. }),
+                        ) => {
+                            if special_err.is_none() {
+                                special_err = Some(e);
                             }
                         }
+                        Err(_) => {}
                     }
                 }
-                Err(first_err.unwrap_or(TypeError::UnificationFailure {
+                Err(special_err.unwrap_or(TypeError::UnificationFailure {
                     expected: format_type(&t1),
                     got: format_type(&t2),
-                    span: None,
+                    span,
                 }))
             }
         }
-
-        // v0.104.4: **自反性（通用）** —— `unify(τ, τ) = Ok` 对**任何**类型 τ
-        // 成立。这是合一作为等价关系的公理，不该按变体逐个列举。
-        //
-        // 缺陷背景：此前只在文件上方列了 Int/Float/BigInt/String/Bool/Nil/Any
-        // 七个具体类型的自反 arm，其余**所有**具体类型（Router、McpServer、
-        // Conversation、Agent、Stream、Document、HttpRequest、…）落到下面的
-        // Mismatch 分支 —— **同一类型与自己合一都失败**：
-        //   let mcp = McpServer::new()
-        //   mcp = mcp.tool("t", {}, handler)   -- "expected mcp_server,
-        //                                         got mcp_server"
-        // 触发面：任何「把方法返回值赋回同一变量」的链式累加（`x = x.m(…)`），
-        // 或任何需要 `Eq(τ,τ)` 的位点。而 `let y = x.m(…)`（新绑定走
-        // generalize、不推 Eq）正常 —— 呈现为「赋回自己失败、换个名字就好」
-        // 的怪象，正是 CI 里 `examples/mcp_server_demo.mora` 的报错。
-        // 与 v0.103 补 BigInt 自反是同一个坑，当时只补了那一个变体；此处
-        // 按公理修根，不再逐个变体列举（列举法正是漏项的成因）。
-        //
-        // 位置：必须在 **Unknown fail-fast 之后**（`Unknown` 与任何类型合一
-        // 都失败，包括它自己 —— 那是刻意的逃逸标签语义），也必须在
-        // TypeVar/Any/ForAll/结构化递归 arm 之后（那些有更具体的处理）。
         _ if t1 == t2 => Ok(subst.clone()),
-
-        // Mismatch
         _ => Err(TypeError::UnificationFailure {
             expected: format_type(&t1),
             got: format_type(&t2),
-            span: None,
+            span,
         }),
     }
 }
 
-///  Check if a type contains a specific type variable
-///
-/// v0.102: 补全嵌套载体 —— 此前只递归 List/Dict/Result_/Union/ForAll/Arrow，
-/// Tuple/Cons/Relation/Trait·Concrete·TraitObject 的泛型参数被整体遗漏
-/// （occurs check 对这些位置的变量失效）。
-fn contains_typevar(ty: &crate::typeck::Type, var: char) -> bool {
-    match ty {
-        crate::typeck::Type::TypeVar(v) => *v == var,
-        crate::typeck::Type::List(elem) | crate::typeck::Type::ForAll(_, elem) => {
-            contains_typevar(elem, var)
+fn unify_subtype_at(
+    sub: &Type,
+    sup: &Type,
+    subst: &Substitution,
+    span: Option<Span>,
+) -> Result<Substitution, TypeError> {
+    let t_sub = subst.apply(sub);
+    let t_sup = subst.apply(sup);
+
+    match (&t_sub, &t_sup) {
+        (Type::Error, _) | (_, Type::Error) => Ok(subst.clone()),
+        (Type::Unknown, _) | (_, Type::Unknown) => Err(TypeError::UnificationFailure {
+            expected: format_type(&t_sup),
+            got: format_type(&t_sub),
+            span,
+        }),
+        (Type::TypeVar(TypeVarId::Rigid(a)), Type::TypeVar(TypeVarId::Rigid(b))) => {
+            if a == b {
+                Ok(subst.clone())
+            } else {
+                Err(TypeError::UnificationFailure {
+                    expected: format_type(&t_sup),
+                    got: format_type(&t_sub),
+                    span,
+                })
+            }
         }
-        crate::typeck::Type::Dict(k, v) => contains_typevar(k, var) || contains_typevar(v, var),
-        crate::typeck::Type::Result_(ok, err) => {
-            contains_typevar(ok, var) || contains_typevar(err, var)
+        (Type::Any, _) | (_, Type::Any) => Ok(subst.clone()),
+        (Type::Union(ms), _) if ms.is_empty() => Ok(subst.clone()),
+        (_, Type::Union(ms)) if ms.is_empty() => Ok(subst.clone()),
+        // Subtype widening: Int <: Float (never Float <: Int).
+        (Type::Int, Type::Float) => Ok(subst.clone()),
+        (Type::TypeVar(v1 @ TypeVarId::Meta(_)), _) => {
+            if let Type::TypeVar(v2) = &t_sup
+                && v1 == v2
+            {
+                return Ok(subst.clone());
+            }
+            subst.extend_at(v1.clone(), t_sup.clone(), span)
         }
-        crate::typeck::Type::Union(members) => members.iter().any(|m| contains_typevar(m, var)),
-        // v0.80: Arrow — 递归检查 input/output（effect row 的 Var 是 String
-        // 命名空间，与 TypeVar(char) 不同，不参与 occurs check）。
-        crate::typeck::Type::Arrow(input, output, _) => {
-            contains_typevar(input, var) || contains_typevar(output, var)
+        (_, Type::TypeVar(v2 @ TypeVarId::Meta(_))) => {
+            subst.extend_at(v2.clone(), t_sub.clone(), span)
         }
-        // v0.83/v0.102: Tuple / Cons / Relation 元素
-        crate::typeck::Type::Tuple(elems) => elems.iter().any(|e| contains_typevar(e, var)),
-        crate::typeck::Type::Cons(h, t) => contains_typevar(h, var) || contains_typevar(t, var),
-        crate::typeck::Type::Relation(params) => params.iter().any(|p| contains_typevar(p, var)),
-        // 泛型载体（Trait / Concrete / TraitObject 的泛型实参）
-        crate::typeck::Type::Trait { generics, .. }
-        | crate::typeck::Type::Concrete { generics, .. }
-        | crate::typeck::Type::TraitObject { generics, .. } => {
-            generics.iter().any(|g| contains_typevar(g, var))
+        (Type::Union(members), _) => {
+            let mut s = subst.clone();
+            for m in members {
+                s = unify_subtype_at(m, &t_sup, &s, span)?;
+            }
+            Ok(s)
         }
-        _ => false,
+        (_, Type::Union(members)) => {
+            let mut special_err: Option<TypeError> = None;
+            for m in members {
+                match unify_subtype_at(&t_sub, m, subst, span) {
+                    Ok(s) => return Ok(s),
+                    Err(
+                        e @ (TypeError::OccursCheck { .. } | TypeError::EffectRowMismatch { .. }),
+                    ) => {
+                        if special_err.is_none() {
+                            special_err = Some(e);
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+            Err(special_err.unwrap_or(TypeError::UnificationFailure {
+                expected: format_type(&t_sup),
+                got: format_type(&t_sub),
+                span,
+            }))
+        }
+        (Type::TypeVar(TypeVarId::Rigid(_)), _) | (_, Type::TypeVar(TypeVarId::Rigid(_))) => {
+            Err(TypeError::UnificationFailure {
+                expected: format_type(&t_sup),
+                got: format_type(&t_sub),
+                span,
+            })
+        }
+        (Type::ForAll(_, inner), other) => unify_subtype_at(inner, other, subst, span),
+        (other, Type::ForAll(_, inner)) => unify_subtype_at(other, inner, subst, span),
+        (Type::List(a), Type::List(b)) => unify_subtype_at(a, b, subst, span),
+        // Channel<T> is INVARIANT in T because channels both receive and send.
+        (Type::Channel(a), Type::Channel(b)) => unify_at(a, b, subst, span),
+        // TaskHandle<T> is COVARIANT in T because join() only reads the produced result.
+        (Type::TaskHandle(a), Type::TaskHandle(b)) => unify_subtype_at(a, b, subst, span),
+        (Type::Dict(k1, v1), Type::Dict(k2, v2)) => {
+            let s1 = unify_subtype_at(k1, k2, subst, span)?;
+            unify_subtype_at(v1, v2, &s1, span)
+        }
+        (Type::Result_(ok1, err1), Type::Result_(ok2, err2)) => {
+            let s1 = unify_subtype_at(ok1, ok2, subst, span)?;
+            unify_subtype_at(err1, err2, &s1, span)
+        }
+        (Type::Cons(h1, t1_rest), Type::Cons(h2, t2_rest)) => {
+            let s1 = unify_subtype_at(h1, h2, subst, span)?;
+            unify_subtype_at(t1_rest, t2_rest, &s1, span)
+        }
+        (Type::Tuple(a), Type::Tuple(b)) if a.len() == b.len() => {
+            let mut s = subst.clone();
+            for (ta, tb) in a.iter().zip(b.iter()) {
+                s = unify_subtype_at(ta, tb, &s, span)?;
+            }
+            Ok(s)
+        }
+        (Type::Concrete { traits, .. }, Type::Trait { .. }) => {
+            for t in traits {
+                if let Ok(s) = unify_subtype_at(t, &t_sup, subst, span) {
+                    return Ok(s);
+                }
+            }
+            Err(TypeError::UnificationFailure {
+                expected: format_type(&t_sup),
+                got: format_type(&t_sub),
+                span,
+            })
+        }
+        (
+            Type::TraitObject {
+                trait_name: tn1,
+                generics: g1,
+            },
+            Type::Trait {
+                name: n2,
+                generics: g2,
+            },
+        ) if tn1 == n2 && g1.len() == g2.len() => {
+            let mut s = subst.clone();
+            for (a, b) in g1.iter().zip(g2.iter()) {
+                s = unify_subtype_at(a, b, &s, span)?;
+            }
+            Ok(s)
+        }
+        (
+            Type::Trait {
+                name: a,
+                generics: ga,
+            },
+            Type::Trait {
+                name: b,
+                generics: gb,
+            },
+        ) if a == b && ga.len() == gb.len() => {
+            let mut s = subst.clone();
+            for (xa, xb) in ga.iter().zip(gb.iter()) {
+                s = unify_subtype_at(xa, xb, &s, span)?;
+            }
+            Ok(s)
+        }
+        (
+            Type::TraitObject {
+                trait_name: tn1,
+                generics: g1,
+            },
+            Type::TraitObject {
+                trait_name: tn2,
+                generics: g2,
+            },
+        ) if (tn1.is_empty() || tn2.is_empty() || tn1 == tn2) && g1.len() == g2.len() => {
+            let mut s = subst.clone();
+            for (a, b) in g1.iter().zip(g2.iter()) {
+                s = unify_subtype_at(a, b, &s, span)?;
+            }
+            Ok(s)
+        }
+        (Type::Arrow(i1, o1, r1), Type::Arrow(i2, o2, r2)) => {
+            // Contravariant arg, covariant return, subsumed effect row.
+            let s1 = unify_subtype_at(i2, i1, subst, span)?;
+            let s2 = unify_subtype_at(o1, o2, &s1, span)?;
+            let r1_a = crate::typeck::hm::row::apply_row(r1, &s2);
+            let r2_a = crate::typeck::hm::row::apply_row(r2, &s2);
+            if matches!(
+                (&r1_a, &r2_a),
+                (_, crate::mir::effect::EffectRow::Var(_))
+                    | (crate::mir::effect::EffectRow::Var(_), _)
+            ) {
+                let mut s3 = s2;
+                crate::typeck::hm::row::unify_row_at(&r1_a, &r2_a, &mut s3, span)?;
+                return Ok(s3);
+            }
+            if !crate::typeck::effect_row_subsumes(&r1_a, &r2_a) {
+                return Err(TypeError::EffectRowMismatch {
+                    expected: r2_a.to_string(),
+                    got: r1_a.to_string(),
+                    span,
+                });
+            }
+            Ok(s2)
+        }
+        _ if t_sub == t_sup => Ok(subst.clone()),
+        _ => Err(TypeError::UnificationFailure {
+            expected: format_type(&t_sup),
+            got: format_type(&t_sub),
+            span,
+        }),
     }
 }
 
-/// v0.102: 沿替换链全解析后的 occurs check。
-///
-/// [`Substitution::apply`] 只解析一层（`α→β`, `β→τ` 时 `apply(α) = β`），
-/// 因此裸 [`contains_typevar`] 会漏掉链式出现（`α→β, β→α` 形成无限类型）。
-/// 本函数在解析结果上结构化递归，遇未彻底解析的 TypeVar 继续下潜其绑定。
-fn occurs_in_subst(s: &Substitution, var: char, ty: &crate::typeck::Type) -> bool {
+/// Transitive occurs check following substitution chains.
+fn occurs_in_subst(s: &Substitution, var: &TypeVarId, ty: &Type) -> bool {
     match s.apply(ty) {
-        crate::typeck::Type::TypeVar(c) => {
-            if c == var {
+        Type::TypeVar(id) => {
+            if &id == var {
                 true
             } else {
                 s.mapping
-                    .get(&c)
+                    .get(&id)
                     .is_some_and(|next| occurs_in_subst(s, var, next))
             }
         }
@@ -488,18 +831,24 @@ fn occurs_in_subst(s: &Substitution, var: char, ty: &crate::typeck::Type) -> boo
     }
 }
 
-/// [`occurs_in_subst`] 的结构化下潜部分（对复合类型的子位置逐一检查）。
-fn contains_typevar_resolved(s: &Substitution, var: char, ty: &crate::typeck::Type) -> bool {
-    use crate::typeck::Type;
+fn contains_typevar_resolved(s: &Substitution, var: &TypeVarId, ty: &Type) -> bool {
     match ty {
-        Type::List(elem) | Type::ForAll(_, elem) => occurs_in_subst(s, var, elem),
+        Type::List(elem) | Type::Channel(elem) | Type::TaskHandle(elem) => {
+            occurs_in_subst(s, var, elem)
+        }
+        Type::ForAll(bound, elem) => {
+            if bound.contains(var) {
+                false
+            } else {
+                occurs_in_subst(s, var, elem)
+            }
+        }
         Type::Dict(k, v) => occurs_in_subst(s, var, k) || occurs_in_subst(s, var, v),
         Type::Result_(ok, err) => occurs_in_subst(s, var, ok) || occurs_in_subst(s, var, err),
         Type::Union(members) => members.iter().any(|m| occurs_in_subst(s, var, m)),
         Type::Arrow(i, o, _) => occurs_in_subst(s, var, i) || occurs_in_subst(s, var, o),
         Type::Tuple(elems) => elems.iter().any(|e| occurs_in_subst(s, var, e)),
         Type::Cons(h, t) => occurs_in_subst(s, var, h) || occurs_in_subst(s, var, t),
-        Type::Relation(params) => params.iter().any(|p| occurs_in_subst(s, var, p)),
         Type::Trait { generics, .. }
         | Type::Concrete { generics, .. }
         | Type::TraitObject { generics, .. } => generics.iter().any(|g| occurs_in_subst(s, var, g)),
@@ -512,150 +861,137 @@ mod tests {
     use super::*;
     use crate::typeck::Type;
 
+    fn tv(id: u32) -> Type {
+        Type::TypeVar(TypeVarId::Meta(id))
+    }
+
+    fn tvid(id: u32) -> TypeVarId {
+        TypeVarId::Meta(id)
+    }
+
+    fn rigid(name: &str) -> Type {
+        Type::TypeVar(TypeVarId::Rigid(name.to_string()))
+    }
+
     #[test]
     fn test_unify_same_types() {
         let subst = Substitution::new();
-        let result = unify(&Type::Int, &Type::Int, &subst);
-        assert!(result.is_ok());
+        assert!(unify(&Type::Int, &Type::Int, &subst).is_ok());
     }
 
     #[test]
     fn test_unify_type_var() {
         let subst = Substitution::new();
-        let t1 = Type::TypeVar('a');
-        let t2 = Type::Int;
-
-        let result = unify(&t1, &t2, &subst).unwrap();
-        assert_eq!(result.mapping.get(&'a'), Some(&Type::Int));
+        let result = unify(&tv(0), &Type::Int, &subst).unwrap();
+        assert_eq!(result.mapping.get(&tvid(0)), Some(&Type::Int));
     }
 
     #[test]
     fn test_unify_list() {
         let subst = Substitution::new();
-        let t1 = Type::List(Box::new(Type::TypeVar('a')));
+        let t1 = Type::List(Box::new(tv(0)));
         let t2 = Type::List(Box::new(Type::Int));
-
         let result = unify(&t1, &t2, &subst).unwrap();
-        assert_eq!(result.mapping.get(&'a'), Some(&Type::Int));
+        assert_eq!(result.mapping.get(&tvid(0)), Some(&Type::Int));
     }
 
     #[test]
     fn test_occurs_check() {
         let subst = Substitution::new();
-        let t1 = Type::TypeVar('a');
-        let t2 = Type::List(Box::new(Type::TypeVar('a')));
-
-        let result = unify(&t1, &t2, &subst);
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), TypeError::OccursCheck { .. }));
+        let t2 = Type::List(Box::new(tv(0)));
+        let result = unify(&tv(0), &t2, &subst);
+        assert!(matches!(result, Err(TypeError::OccursCheck { .. })));
     }
 
-    // ─── v0.102: 合一的自反性与传递 occurs check ───
-
-    /// v0.104.4: **具体类型的自反性必须是通用的**，不能按变体逐个列举。
-    ///
-    /// 缺陷：此前只列了 Int/Float/BigInt/String/Bool/Nil/Any 七个具体类型的
-    /// 自反 arm，其余**所有**具体类型（Router、McpServer、Conversation、
-    /// Agent、Stream、Document、HttpRequest…）落到末尾 `_ => Err` ——
-    /// **同一类型与自己合一都失败**。触发面是任何「把方法返回值赋回同一变量」
-    /// 的链式累加（`x = x.method(…)`），或任何需要 `Eq(τ,τ)` 的位点。
-    /// 实测症状："expected mcp_server, got mcp_server"。
     #[test]
     fn unify_concrete_types_are_reflexive() {
         let subst = Substitution::new();
-        // 覆盖「有专门 arm」与「没有专门 arm」的两组具体类型
         for (name, ty) in [
             ("Int", Type::Int),
             ("String", Type::String),
-            ("BigInt", Type::BigInt),
-            ("Router", Type::Router),
-            ("McpServer", Type::McpServer),
-            ("Conversation", Type::Conversation),
-            ("Agent", Type::Agent),
-            ("Stream", Type::Stream),
+            ("Char", Type::Char),
+            ("RandomModule", Type::RandomModule),
+            ("BuiltinModule", Type::BuiltinModule("json".to_string())),
+            (
+                "Concrete",
+                Type::Concrete {
+                    name: "Foo".to_string(),
+                    generics: vec![],
+                    traits: vec![],
+                },
+            ),
         ] {
             let r = unify(&ty, &ty, &subst);
-            assert!(
-                r.is_ok(),
-                "unify({name}, {name}) 必须成功（具体类型自反性）"
-            );
+            assert!(r.is_ok(), "unify({name}, {name}) must succeed");
         }
     }
 
-    /// v0.104.4: 通用自反 arm **不得**吞掉 `Unknown` 的 fail-fast 语义。
-    ///
-    /// `Unknown` 是刻意的逃逸标签（v0.75.92）：与**任何**类型合成都失败，
-    /// **包括它自己**。通用 `_ if t1 == t2` 若放在 Unknown arm 之前，
-    /// `unify(Unknown, Unknown)` 会静默成功，破坏该语义。
     #[test]
-    fn unify_unknown_with_itself_still_fails() {
+    fn unify_unknown_with_itself_and_any_fails() {
         let subst = Substitution::new();
-        let r = unify(&Type::Unknown, &Type::Unknown, &subst);
-        assert!(
-            r.is_err(),
-            "Unknown 与自身合一必须仍失败（fail-fast 标签语义，不得被通用自反 arm 吞掉）"
-        );
+        assert!(unify(&Type::Unknown, &Type::Unknown, &subst).is_err());
+        assert!(unify(&Type::Unknown, &Type::Any, &subst).is_err());
+        assert!(unify(&tv(0), &Type::Unknown, &subst).is_err());
+        assert!(!Type::Unknown.compatible_with(&Type::Unknown));
+        assert!(!Type::Unknown.compatible_with(&Type::Any));
+        assert!(!Type::Unknown.subtype_of(&Type::Any));
+    }
+
+    #[test]
+    fn unify_error_sentinel_recovers_without_cascading() {
+        let subst = Substitution::new();
+        assert!(unify(&Type::Error, &Type::Int, &subst).is_ok());
+        assert!(unify(&Type::String, &Type::Error, &subst).is_ok());
+        assert!(Type::Error.compatible_with(&Type::Int));
+        assert!(Type::Error.subtype_of(&Type::String));
+    }
+
+    #[test]
+    fn unify_rigid_vars_enforce_parametricity() {
+        let subst = Substitution::new();
+        assert!(unify(&rigid("T"), &rigid("T"), &subst).is_ok());
+        assert!(unify(&rigid("T"), &rigid("U"), &subst).is_err());
+        assert!(unify(&rigid("T"), &Type::Int, &subst).is_err());
+        // A meta var may unify with a rigid var, not the inverse:
+        let res = unify(&tv(0), &rigid("T"), &subst).unwrap();
+        assert_eq!(res.mapping.get(&tvid(0)), Some(&rigid("T")));
     }
 
     #[test]
     fn unify_same_typevar_is_reflexive() {
-        // 此前 unify(α, α) 误报 OccursCheck（contains_typevar 对自身为真）。
-        // 触发链：`fn(n) n * n end` 的两条 Eq(α, result) 约束消解后两侧同为 β。
         let subst = Substitution::new();
-        let result = unify(&Type::TypeVar('a'), &Type::TypeVar('a'), &subst);
-        assert!(result.is_ok(), "unify(α, α) 必须成功（自反性）");
-        assert!(result.unwrap().mapping.is_empty(), "自反情形不产生绑定");
+        let result = unify(&tv(0), &tv(0), &subst).unwrap();
+        assert!(result.mapping.is_empty());
     }
 
     #[test]
     fn unify_same_typevar_after_resolution_is_reflexive() {
-        // α→β 后 unify(α, β) 两侧都解析为 β —— 同样必须成功
-        let subst = Substitution::new()
-            .extend('a', Type::TypeVar('b'))
-            .expect("bind");
-        let result = unify(&Type::TypeVar('a'), &Type::TypeVar('b'), &subst);
-        assert!(result.is_ok(), "解析后同变量的合一必须成功");
+        let subst = Substitution::new().extend(tvid(0), tv(1)).expect("bind");
+        assert!(unify(&tv(0), &tv(1), &subst).is_ok());
     }
 
     #[test]
     fn occurs_check_follows_substitution_chain() {
-        // α→β 已绑定；再 β = [α] 必须失败（传递 occur：α 经链出现在右侧）
-        let subst = Substitution::new()
-            .extend('a', Type::TypeVar('b'))
-            .expect("bind");
-        let rhs = Type::List(Box::new(Type::TypeVar('a')));
-        let result = unify(&Type::TypeVar('b'), &rhs, &subst);
-        assert!(
-            matches!(result, Err(TypeError::OccursCheck { .. })),
-            "链式自引用必须被 occur check 拦截，得到 {:?}",
-            result
-        );
+        let subst = Substitution::new().extend(tvid(0), tv(1)).expect("bind");
+        let rhs = Type::List(Box::new(tv(0)));
+        let result = unify(&tv(1), &rhs, &subst);
+        assert!(matches!(result, Err(TypeError::OccursCheck { .. })));
     }
 
     #[test]
-    fn occurs_check_covers_tuple_and_cons_and_relation() {
+    fn occurs_check_covers_tuple_and_cons() {
         let subst = Substitution::new();
-        // Tuple 元素
-        let tup = Type::Tuple(vec![Box::new(Type::TypeVar('a'))]);
+        let tup = Type::Tuple(vec![Box::new(tv(0))]);
         assert!(matches!(
-            unify(&Type::TypeVar('a'), &tup, &subst),
+            unify(&tv(0), &tup, &subst),
             Err(TypeError::OccursCheck { .. })
         ));
-        // Cons 头
-        let cons = Type::Cons(Box::new(Type::TypeVar('a')), Box::new(Type::Nil));
+        let cons = Type::Cons(Box::new(tv(0)), Box::new(Type::Nil));
         assert!(matches!(
-            unify(&Type::TypeVar('a'), &cons, &subst),
-            Err(TypeError::OccursCheck { .. })
-        ));
-        // Relation 参数
-        let rel = Type::Relation(vec![Type::TypeVar('a')]);
-        assert!(matches!(
-            unify(&Type::TypeVar('a'), &rel, &subst),
+            unify(&tv(0), &cons, &subst),
             Err(TypeError::OccursCheck { .. })
         ));
     }
-
-    // ─── v0.75.86: Type::subtype_of（非对称 subtype 关系）──
 
     fn trait_ty(name: &str, generics: Vec<Type>) -> Type {
         Type::Trait {
@@ -673,194 +1009,81 @@ mod tests {
     }
 
     #[test]
-    fn subtype_any_is_top() {
-        // Any 是 top type —— 与任何 subtype 关系成立
-        assert!(Type::Any.subtype_of(&Type::Int));
-        assert!(Type::String.subtype_of(&Type::Any));
-        assert!(Type::Any.subtype_of(&Type::Any));
+    fn subtype_int_widens_to_float_and_not_reverse() {
+        assert!(Type::Int.subtype_of(&Type::Float));
+        assert!(!Type::Float.subtype_of(&Type::Int));
+        let subst = Substitution::new();
+        let span = Span::new(4, 12);
+        let ok = SpannedConstraint::new(
+            Constraint::Subtype {
+                sub: Box::new(Type::Int),
+                sup: Box::new(Type::Float),
+            },
+            span,
+        );
+        assert!(solve_spanned(&ok, &subst).is_ok());
+        let bad = SpannedConstraint::new(
+            Constraint::Subtype {
+                sub: Box::new(Type::Float),
+                sup: Box::new(Type::Int),
+            },
+            span,
+        );
+        let err = solve_spanned(&bad, &subst).unwrap_err();
+        match err {
+            TypeError::UnificationFailure { span: s, .. } => assert_eq!(s, Some(span)),
+            other => panic!("expected UnificationFailure with span, got {other:?}"),
+        }
     }
 
     #[test]
-    fn subtype_is_asymmetric() {
-        // 关键不变量：A <: B 不蕴含 B <: A（区别于 compatible_with）
-        assert!(Type::Int.subtype_of(&Type::Int));
-        // Int 不 subtype String（同构严格相等——同构即 subtype，但不互通）
-        assert!(!Type::Int.subtype_of(&Type::String));
-        assert!(!Type::String.subtype_of(&Type::Int));
+    fn subtype_result_is_covariant_in_both_type_args() {
+        let r_int = Type::Result_(Box::new(Type::Int), Box::new(Type::Int));
+        let r_float = Type::Result_(Box::new(Type::Float), Box::new(Type::Float));
+        assert!(r_int.subtype_of(&r_float));
+        assert!(!r_float.subtype_of(&r_int));
     }
 
     #[test]
-    fn subtype_concrete_impls_trait() {
-        // Concrete 实现 trait → Concrete subtype Trait
+    fn subtype_arrow_uses_effect_row_subsumption() {
+        let pure_fn = Type::Arrow(
+            Box::new(Type::Int),
+            Box::new(Type::Int),
+            crate::mir::effect::EffectRow::Empty,
+        );
+        let ai_fn = Type::Arrow(
+            Box::new(Type::Int),
+            Box::new(Type::Int),
+            crate::mir::effect::EffectRow::Cons(
+                "Ai".to_string(),
+                Box::new(crate::mir::effect::EffectRow::Empty),
+            ),
+        );
+        assert!(pure_fn.subtype_of(&ai_fn));
+        assert!(!ai_fn.subtype_of(&pure_fn));
+    }
+
+    #[test]
+    fn subtype_concrete_and_trait_object_and_containers() {
         let comparable = trait_ty("Comparable", vec![Type::Int]);
         let int_val = concrete("MyInt", vec![Type::Int], vec![comparable.clone()]);
         assert!(int_val.subtype_of(&comparable));
-        // 反向不成立：Trait 不 subtype Concrete
         assert!(!comparable.subtype_of(&int_val));
-    }
 
-    #[test]
-    fn subtype_concrete_with_no_trait_fails() {
-        // Concrete 没有实现 super Trait → 不 subtype
-        let comparable = trait_ty("Comparable", vec![Type::Int]);
-        let bare = concrete("Plain", vec![Type::Int], vec![]);
-        assert!(!bare.subtype_of(&comparable));
-    }
-
-    #[test]
-    fn subtype_concrete_recurses_into_traits_list() {
-        // Concrete.traits 含多个 Trait——任一匹配即 subtype
-        let show = trait_ty("Show", vec![]);
-        let eq = trait_ty("Eq", vec![Type::Int]);
-        let val = concrete("Widget", vec![], vec![show.clone(), eq.clone()]);
-        assert!(val.subtype_of(&show));
-        assert!(val.subtype_of(&eq));
-    }
-
-    #[test]
-    fn subtype_trait_same_name_generics() {
-        // Trait<A> subtype Trait<B> 当 A subtype B（递归到 element）
-        let a = trait_ty("Container", vec![Type::Int]);
-        let b = trait_ty("Container", vec![Type::Int]);
-        // 同名 + 同 arity + 同 element → subtype（对称同构）
-        assert!(a.subtype_of(&b));
-        assert!(b.subtype_of(&a));
-        // 容器递归：A<Concrete<...>> subtype A<Trait> 通过 Concrete<:Trait
-        // 用真实类型 Foo（trait）和 ConcreteFoo（实现 Foo 的具体类型）
-        let foo = trait_ty("Foo", vec![]);
-        let concrete_foo = concrete("ConcreteFoo", vec![], vec![foo.clone()]);
-        let container_concrete = trait_ty("Container", vec![concrete_foo]);
-        let container_trait = trait_ty("Container", vec![foo]);
-        assert!(container_concrete.subtype_of(&container_trait));
-    }
-
-    #[test]
-    fn subtype_list_recurses_into_element() {
-        // List<Concrete> subtype List<Trait> 当 Concrete subtype Trait
-        let comparable = trait_ty("Comparable", vec![Type::Int]);
-        let int_val = concrete("MyInt", vec![Type::Int], vec![comparable.clone()]);
-        let list_concrete = Type::List(Box::new(int_val));
-        let list_trait = Type::List(Box::new(comparable));
-        assert!(list_concrete.subtype_of(&list_trait));
-        // 反向不成立
-        assert!(!list_trait.subtype_of(&list_concrete));
-    }
-
-    #[test]
-    fn subtype_dict_recurses() {
-        // Dict<Concrete, ...> subtype Dict<Trait, ...>
-        let comparable = trait_ty("Comparable", vec![]);
-        let key_concrete = concrete("MyKey", vec![], vec![comparable.clone()]);
-        let d1 = Type::Dict(Box::new(key_concrete), Box::new(Type::Int));
-        let d2 = Type::Dict(Box::new(comparable), Box::new(Type::Int));
-        assert!(d1.subtype_of(&d2));
-    }
-
-    #[test]
-    fn subtype_union_member_matches() {
-        // Union(m1, m2) subtype T 当任一 m subtype T
-        let comparable = trait_ty("Comparable", vec![Type::Int]);
-        let val = concrete("V", vec![Type::Int], vec![comparable.clone()]);
-        let union_ty = Type::Union(vec![Type::String, val.clone()]);
-        // Union 含 V，V subtype Comparable → Union subtype Comparable
-        assert!(union_ty.subtype_of(&comparable));
-        // 反向：Comparable 不 subtype Union[String, V]（Union 成员是 String
-        // 和 V，Comparable 都不是——保守方向 false）
-        assert!(!comparable.subtype_of(&union_ty));
-    }
-
-    #[test]
-    fn subtype_nil_only_self() {
-        assert!(Type::Nil.subtype_of(&Type::Nil));
-        // Nil 不 subtype 其他类型（v0.12 后门 2 关闭）
-        assert!(!Type::Nil.subtype_of(&Type::Int));
-        assert!(!Type::String.subtype_of(&Type::Nil));
-    }
-
-    #[test]
-    fn subtype_forall_recurses_inner() {
-        // ForAll<α.τ> subtype T 当 τ subtype T（命中 env 时已实例化，
-        // 此处防御——ForAll 是「所有实例化」的上界，递归到内层是保守策略）
-        let inner = Type::Int;
-        let forall = Type::ForAll(vec!['a'], Box::new(inner.clone()));
-        assert!(forall.subtype_of(&Type::Int)); // ForAll<α.Int> <: Int 当 Int <: Int
-        assert!(forall.subtype_of(&Type::Any)); // ForAll<α.Int> <: Any
-        // 反向：T subtype ForAll<α.U> 当 T subtype U 成立（α 重新实例化为 T 自身）——
-        // 这与 HM 标准的「T 是 ForAll 的实例」匹配：Int 是 ForAll<α.Int> 的实例
-        // （α 绑定为 Int 后，body 退化为 Int）。
-        assert!(inner.subtype_of(&forall)); // Int subtype ForAll<α.Int>
-        // String 不 subtype ForAll<α.Int>（String 不 <: Int）
-        assert!(!Type::String.subtype_of(&forall));
-    }
-
-    #[test]
-    fn subtype_trait_object_matches_trait_with_same_name_generics() {
-        // v0.75.86: TraitObject subtype Trait 升级为 trait_name + generics
-        // 同构判断（之前 unit variant 返 false 是 stub）。
-        let comparable = trait_ty("Comparable", vec![Type::Int]);
-        // name 不匹配 → false
-        let obj_other = Type::TraitObject {
-            trait_name: "Other".to_string(),
-            generics: vec![],
-        };
-        assert!(!obj_other.subtype_of(&comparable));
-        // name + generics 匹配 → true
         let obj_match = Type::TraitObject {
             trait_name: "Comparable".to_string(),
             generics: vec![Type::Int],
         };
         assert!(obj_match.subtype_of(&comparable));
-        // 反向不成立
         assert!(!comparable.subtype_of(&obj_match));
-    }
-
-    #[test]
-    fn subtype_existing_compatible_is_preserved() {
-        // subtype_of 的对称化形式（subtype_of(a,b) || subtype_of(b,a)）
-        // 应等价于 compatible_with(a,b) —— 这是这次重构的兼容性保证
-        let cases: Vec<(Type, Type)> = vec![
-            (Type::Int, Type::Int),
-            (Type::String, Type::String),
-            (
-                Type::List(Box::new(Type::Int)),
-                Type::List(Box::new(Type::Int)),
-            ),
-            (
-                Type::Dict(Box::new(Type::String), Box::new(Type::Int)),
-                Type::Dict(Box::new(Type::String), Box::new(Type::Int)),
-            ),
-        ];
-        for (a, b) in cases {
-            let symmetric = a.subtype_of(&b) || b.subtype_of(&a);
-            let compatible = a.compatible_with(&b);
-            assert_eq!(
-                symmetric, compatible,
-                "subtype symmetrization ≠ compatible_with for ({:?}, {:?})",
-                a, b
-            );
-        }
-    }
-
-    // ─── v0.80: Arrow unification tests ───
-
-    #[test]
-    fn unify_arrow_same_type() {
-        let subst = Substitution::new();
-        let arrow = Type::Arrow(
-            Box::new(Type::Int),
-            Box::new(Type::String),
-            crate::mir::effect::EffectRow::Empty,
-        );
-        let result = unify(&arrow, &arrow, &subst);
-        assert!(result.is_ok());
     }
 
     #[test]
     fn unify_arrow_binds_type_vars() {
         let subst = Substitution::new();
         let a = Type::Arrow(
-            Box::new(Type::TypeVar('a')),
-            Box::new(Type::TypeVar('b')),
+            Box::new(tv(0)),
+            Box::new(tv(1)),
             crate::mir::effect::EffectRow::Empty,
         );
         let b = Type::Arrow(
@@ -869,47 +1092,14 @@ mod tests {
             crate::mir::effect::EffectRow::Empty,
         );
         let result = unify(&a, &b, &subst).unwrap();
-        assert_eq!(result.mapping.get(&'a'), Some(&Type::Int));
-        assert_eq!(result.mapping.get(&'b'), Some(&Type::String));
+        assert_eq!(result.mapping.get(&tvid(0)), Some(&Type::Int));
+        assert_eq!(result.mapping.get(&tvid(1)), Some(&Type::String));
     }
 
     #[test]
-    fn unify_arrow_mismatch_fails() {
+    fn unify_arrow_effect_row_propagates_span() {
         let subst = Substitution::new();
-        let a = Type::Arrow(
-            Box::new(Type::Int),
-            Box::new(Type::String),
-            crate::mir::effect::EffectRow::Empty,
-        );
-        let b = Type::Arrow(
-            Box::new(Type::String),
-            Box::new(Type::String),
-            crate::mir::effect::EffectRow::Empty,
-        );
-        let result = unify(&a, &b, &subst);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn unify_arrow_effect_row_unifies() {
-        let subst = Substitution::new();
-        let row_a = crate::mir::effect::EffectRow::Cons(
-            "Ai".to_string(),
-            Box::new(crate::mir::effect::EffectRow::Empty),
-        );
-        let row_b = crate::mir::effect::EffectRow::Cons(
-            "Ai".to_string(),
-            Box::new(crate::mir::effect::EffectRow::Empty),
-        );
-        let a = Type::Arrow(Box::new(Type::Int), Box::new(Type::Int), row_a);
-        let b = Type::Arrow(Box::new(Type::Int), Box::new(Type::Int), row_b);
-        let result = unify(&a, &b, &subst);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn unify_arrow_different_effect_row_fails() {
-        let subst = Substitution::new();
+        let span = Span::new(9, 5);
         let row_a = crate::mir::effect::EffectRow::Cons(
             "Ai".to_string(),
             Box::new(crate::mir::effect::EffectRow::Empty),
@@ -918,31 +1108,17 @@ mod tests {
             "Fs".to_string(),
             Box::new(crate::mir::effect::EffectRow::Empty),
         );
-        let a = Type::Arrow(Box::new(Type::Int), Box::new(Type::Int), row_a);
-        let b = Type::Arrow(Box::new(Type::Int), Box::new(Type::Int), row_b);
-        let result = unify(&a, &b, &subst);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn unify_arrow_row_var_binds() {
-        let subst = Substitution::new();
-        let row_var = crate::mir::effect::EffectRow::Var("e".to_string());
-        let row_concrete = crate::mir::effect::EffectRow::Cons(
-            "Ai".to_string(),
-            Box::new(crate::mir::effect::EffectRow::Empty),
+        let sc = SpannedConstraint::new(
+            Constraint::Eq(
+                Box::new(Type::Arrow(Box::new(Type::Int), Box::new(Type::Int), row_a)),
+                Box::new(Type::Arrow(Box::new(Type::Int), Box::new(Type::Int), row_b)),
+            ),
+            span,
         );
-        let a = Type::Arrow(Box::new(Type::Int), Box::new(Type::Int), row_var);
-        let b = Type::Arrow(Box::new(Type::Int), Box::new(Type::Int), row_concrete);
-        let result = unify(&a, &b, &subst);
-        assert!(result.is_ok());
+        let err = solve_spanned(&sc, &subst).unwrap_err();
+        match err {
+            TypeError::EffectRowMismatch { span: s, .. } => assert_eq!(s, Some(span)),
+            other => panic!("expected EffectRowMismatch, got {other:?}"),
+        }
     }
-
-    // ─── v0.75.86: HMInference::diagnosed 双向 fallback 抑制 ───
-    // v0.75.94: 诊断测试（`diagnosed_*` 系列6 个 + helper `lit_witness`/`var_witness`）
-    // 已迁到 [`crate::typeck::hm::diag::tests`]——DiagFilter 是新主人。
-
-    // v0.75.92: Unknown fail-fast 测试在 [`crate::typeck::hm::unify::tests`] 已有
-    // （unknown_fails_subtype_with_any_type / unknown_unifies_fails /
-    // join_types_with_unknown_short_circuits_to_unknown）。
 }

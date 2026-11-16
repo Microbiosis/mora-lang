@@ -34,24 +34,24 @@
 //!
 //! 与同族一致：`document.parse` 的 path 同样要求字符串（D153 已修）。
 
-use mora::interpreter::Interpreter;
-use mora::mir::effect::Effects;
-use mora::mir::vm::execute;
 use mora::parser_v3::ParserV3;
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::execute_program;
 use std::sync::Arc;
 
 fn run(src: &str) -> Result<String, String> {
-    let (func, _w) = ParserV3::compile(src).map_err(|e| format!("COMPILE: {e}"))?;
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    let arc = Arc::new(func);
-    execute(&arc, &mut interp, &mut env, &mut Effects::new()).map(|v| format!("{v}"))
+    let (prog, _w) = ParserV3::compile(src).map_err(|e| format!("COMPILE: {e}"))?;
+    let mut core = CoreRuntime::default();
+    let arc = Arc::new(prog);
+    execute_program(arc, &mut core)
+        .map(|(v, _)| format!("{v}"))
+        .map_err(|e| e.to_string())
 }
 
 /// D155 主判据 ①：非字符串实参必须**报错**，不得被静默字符串化后解析。
 #[test]
 fn d155_json_parse_rejects_non_string_argument() {
-    for (arg, ty) in [("5", "float"), ("true", "bool"), ("[1,2]", "list")] {
+    for (arg, ty) in [("5", "int"), ("true", "bool"), ("[1,2]", "list")] {
         let res = run(&format!("json.parse({arg})\n"));
         let e = res.expect_err(&format!("json.parse({arg}) 传非字符串必须报错"));
         assert!(
@@ -94,19 +94,6 @@ fn d155_json_parse_string_paths_unchanged() {
     );
 }
 
-/// D155 对照组：同族里**本就严格**的那处不得回退。
-///
-/// `document.parse` 的 path 自 D153 起要求字符串 —— 它是 `json.parse`
-/// 的同族正面样板，钉住它以防「统一」时被改成宽松。
-#[test]
-fn d155_document_parse_still_requires_string() {
-    let e = run("document.parse(5)\n").expect_err("document.parse 传数字应报错");
-    assert!(
-        e.contains("path must be a string"),
-        "`document.parse` 必须仍然要求字符串路径; 实得: {e}"
-    );
-}
-
 /// **前提**判据：模块方法形参一律 `Type::Any` —— 所以 `json.parse` 传数字
 /// **过不了 typeck、只能靠运行期拦**。本文件前面那些运行期判据因此是**承重的**。
 ///
@@ -120,7 +107,7 @@ fn d155_document_parse_still_requires_string() {
 fn d155_module_method_params_are_declared_any() {
     let src = "json.parse(5)\n";
     let (_f, w) = mora::cli::compile_and_opt(src, None).expect("编译");
-    let errs = mora::typeck::check_mir::check_program_witnesses_bidirectional(&w);
+    let errs = mora::typeck::check_mir::check_program_witnesses(&w);
     assert!(
         errs.is_empty(),
         "前提：模块方法形参声明为 `Type::Any`，故 `json.parse(5)` 应**过不了 typeck**；\

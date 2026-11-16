@@ -26,12 +26,13 @@
 //! **不动的部分**：`max_concurrent = 0` 仍钳到 1（既有行为）；
 //! `max_concurrent` / `timeout_ms` 显式传 `nil` 与**缺参**同义。
 
-use mora::interpreter::Interpreter;
+use mora::runtime::CoreRuntime;
+use mora::runtime::builtins::call_exec_method;
 use mora::value::Value;
 
 fn exec(args: &[Value]) -> Result<Value, String> {
-    let interp = Interpreter::new();
-    interp.call_exec_method("parallel", args)
+    let mut core = CoreRuntime::default();
+    call_exec_method(&mut core, "parallel", args).map_err(|e| e.to_string())
 }
 
 fn cmds() -> Value {

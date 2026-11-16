@@ -26,7 +26,7 @@
 fn typeck(src: &str) -> Result<(), String> {
     let (_func, witnesses) =
         mora::cli::compile_and_opt(src, None).map_err(|e| format!("COMPILE: {e}"))?;
-    let errs = mora::typeck::check_mir::check_program_witnesses_bidirectional(&witnesses);
+    let errs = mora::typeck::check_mir::check_program_witnesses(&witnesses);
     if errs.is_empty() {
         Ok(())
     } else {
@@ -38,23 +38,6 @@ fn typeck(src: &str) -> Result<(), String> {
 /// 宏必须定义在**顶层**（不在 `task main()` 体内）—— 实测放在体内会
 /// `Failed to parse at line 2`。
 const MACRO_M1: &str = "macro m1(a, b)\n  a + b\nend\n";
-
-/// `batch_chat` → `List[String]`：**容器**收得住。
-#[test]
-fn batch_chat_returns_list_of_string() {
-    let ok = "let v: list<string> = batch_chat([\"a\", \"b\"])\nprint(1)\n";
-    assert!(
-        typeck(ok).is_ok(),
-        "`batch_chat` 必须接受 list 标注\n  src={ok:?}"
-    );
-    for bad in ["String", "bool", "Float"] {
-        let src = format!("let v: {bad} = batch_chat([\"a\"])\nprint(1)\n");
-        assert!(
-            typeck(&src).is_err(),
-            "[batch_chat] 返回 List[String]，配 `{bad}` 标注必须被拒"
-        );
-    }
-}
 
 /// `into` → `List[α]`：同样收得住**容器**。
 #[test]

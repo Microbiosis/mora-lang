@@ -19,6 +19,7 @@
 //! 算法保持 v0.91 语义不变：xoshiro256**（Vigna 2018）+ splitmix64 种子
 //! 派生。零外部依赖；密码学不可用但足够 AI/统计工作。
 
+use crate::error::{MoraError, MoraResult};
 use crate::value::Value;
 
 // ── xoshiro256** 状态（纯值）──
@@ -48,7 +49,7 @@ impl Xoshiro256 {
     }
 
     /// xoshiro256** 一步：返回 64-bit 随机数
-    fn next_u64(&mut self) -> u64 {
+    pub(crate) fn next_u64(&mut self) -> u64 {
         let result = (self.s[1].wrapping_mul(5)).rotate_left(7).wrapping_mul(9);
         let t = self.s[1].wrapping_shl(17);
         self.s[2] ^= self.s[0];
@@ -80,7 +81,7 @@ impl Xoshiro256 {
     /// （不含方法名 —— 操作已由标签编码）。`&mut self` 线性推进状态。
     ///
     /// 错误消息与 v0.91 保持逐字一致（运行时防御消息；类型层签名是第一道门）。
-    pub(crate) fn dispatch_op(&mut self, label: &str, args: &[Value]) -> Result<Value, String> {
+    pub(crate) fn dispatch_op(&mut self, label: &str, args: &[Value]) -> MoraResult<Value> {
         match label {
             "random_random" => Ok(Value::Float(self.next_f64())),
             "random_rand_int" => {
@@ -91,7 +92,9 @@ impl Xoshiro256 {
                         Value::Float(n) => Some(*n as i64),
                         _ => None,
                     })
-                    .ok_or_else(|| "random.rand_int requires (min, max)".to_string())?;
+                    .ok_or_else(|| {
+                        MoraError::Runtime("random.rand_int requires (min, max)".to_string())
+                    })?;
                 let max = args
                     .get(1)
                     .and_then(|v| match v {
@@ -99,7 +102,9 @@ impl Xoshiro256 {
                         Value::Float(n) => Some(*n as i64),
                         _ => None,
                     })
-                    .ok_or_else(|| "random.rand_int requires (min, max)".to_string())?;
+                    .ok_or_else(|| {
+                        MoraError::Runtime("random.rand_int requires (min, max)".to_string())
+                    })?;
                 // v0.104.6 D144：`min > max`（区间**写反**）此前被
                 // `next_i64_in` 的 `max <= min → return min` 一并吞掉 ——
                 // 实测 `random.rand_int(5, 1)` 得 `5.0`、exit 0、零诊断，
@@ -108,38 +113,42 @@ impl Xoshiro256 {
                 // `max == min` 是**单点区间**，返回 min 合理，保持不变
                 // （`rand_choice` / `shuffle` 两个内部调用点也依赖该行为）。
                 if min > max {
-                    return Err(format!(
+                    return Err(MoraError::Runtime(format!(
                         "random.rand_int: min({min}) > max({max}) —— 区间写反"
-                    ));
+                    )));
                 }
-                Ok(Value::Float(self.next_i64_in(min, max) as f64))
+                Ok(Value::Int(self.next_i64_in(min, max)))
             }
             "random_rand_float" => {
-                let min = args
-                    .first()
-                    .and_then(as_f64)
-                    .ok_or_else(|| "random.rand_float requires (min, max)".to_string())?;
-                let max = args
-                    .get(1)
-                    .and_then(as_f64)
-                    .ok_or_else(|| "random.rand_float requires (min, max)".to_string())?;
+                let min = args.first().and_then(as_f64).ok_or_else(|| {
+                    MoraError::Runtime("random.rand_float requires (min, max)".to_string())
+                })?;
+                let max = args.get(1).and_then(as_f64).ok_or_else(|| {
+                    MoraError::Runtime("random.rand_float requires (min, max)".to_string())
+                })?;
                 // v0.104.6 D144：同 `rand_int` —— 区间写反此前**静默**产出
                 // `[max, min)` 内的随机值（`min + (max-min)*rand` 在 max<min 时
                 // 仍落在两数之间），用户看不出方向反了。
                 if min > max {
-                    return Err(format!(
+                    return Err(MoraError::Runtime(format!(
                         "random.rand_float: min({min}) > max({max}) —— 区间写反"
-                    ));
+                    )));
                 }
                 Ok(Value::Float(min + (max - min) * self.next_f64()))
             }
             "random_rand_choice" => {
                 let items = match args.first() {
                     Some(Value::List(xs)) => xs,
-                    _ => return Err("random.rand_choice requires a list".to_string()),
+                    _ => {
+                        return Err(MoraError::Runtime(
+                            "random.rand_choice requires a list".to_string(),
+                        ));
+                    }
                 };
                 if items.is_empty() {
-                    return Err("random.rand_choice: empty list".to_string());
+                    return Err(MoraError::Runtime(
+                        "random.rand_choice: empty list".to_string(),
+                    ));
                 }
                 let idx = self.next_i64_in(0, items.len() as i64) as usize;
                 Ok(items[idx].clone())
@@ -152,14 +161,20 @@ impl Xoshiro256 {
                         Value::Float(n) => Some(*n as u64),
                         _ => None,
                     })
-                    .ok_or_else(|| "random.seed requires a numeric argument".to_string())?;
+                    .ok_or_else(|| {
+                        MoraError::Runtime("random.seed requires a numeric argument".to_string())
+                    })?;
                 *self = Xoshiro256::from_seed(n);
                 Ok(Value::Nil)
             }
             "random_shuffle" => {
                 let items = match args.first() {
                     Some(Value::List(xs)) => xs,
-                    _ => return Err("random.shuffle requires a list".to_string()),
+                    _ => {
+                        return Err(MoraError::Runtime(
+                            "random.shuffle requires a list".to_string(),
+                        ));
+                    }
                 };
                 // Fisher-Yates
                 // v0.104.6：`List` 不可变，没有 `swap`。取回一份可改的 Vec 做
@@ -172,7 +187,10 @@ impl Xoshiro256 {
                 }
                 Ok(Value::List(result.into()))
             }
-            other => Err(format!("random: unknown ambient effect label `{}`", other)),
+            other => Err(MoraError::Runtime(format!(
+                "random: unknown ambient effect label `{}`",
+                other
+            ))),
         }
     }
 }
@@ -309,11 +327,11 @@ mod tests {
         for label in ambient::RANDOM_LABELS {
             let outcome = rng.dispatch_op(label, &[]);
             if let Err(err) = outcome {
-                assert!(!err.contains("unknown ambient"), "{}", err);
+                assert!(!err.message().contains("unknown ambient"), "{}", err);
             }
         }
         // 未知标签有明确错误
         let err = rng.dispatch_op("random_nonsense", &[]).unwrap_err();
-        assert!(err.contains("unknown ambient"));
+        assert!(err.message().contains("unknown ambient"));
     }
 }

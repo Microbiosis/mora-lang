@@ -42,38 +42,38 @@
 
 use std::sync::Arc;
 
-use mora::interpreter::Interpreter;
-use mora::mir::effect::Effects;
-use mora::mir::vm::execute;
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::execute_program;
 use mora::value::Value;
 
 fn compile(src: &str) -> Result<(), String> {
-    let (func, witnesses) =
+    let (prog, witnesses) =
         mora::cli::compile_and_opt(src, None).map_err(|e| format!("COMPILE: {e}"))?;
-    let errs = mora::typeck::check_mir::check_program_witnesses_bidirectional(&witnesses);
+    let errs = mora::typeck::check_mir::check_program_witnesses(&witnesses);
     if !errs.is_empty() {
         return Err(format!(
             "TYPECK: {:?}",
             errs.iter().map(|e| e.message.clone()).collect::<Vec<_>>()
         ));
     }
-    let arc = Arc::new(func);
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    execute(&arc, &mut interp, &mut env, &mut Effects::new()).map(|_| ())
+    let arc = Arc::new(prog);
+    let mut core = CoreRuntime::default();
+    execute_program(arc, &mut core)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// 返回 `Ok(None)` 表示运行期结果是 `Nil`（无匹配 arm 时的正确结果）。
 fn run_f64(src: &str) -> Result<Option<f64>, String> {
-    let (func, _w) = mora::cli::compile_and_opt(src, None).map_err(|e| format!("COMPILE: {e}"))?;
-    let arc = Arc::new(func);
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    match execute(&arc, &mut interp, &mut env, &mut Effects::new()) {
-        Ok(Value::Float(f)) => Ok(Some(f)),
-        Ok(Value::Nil) => Ok(None),
-        Ok(other) => Err(format!("期望 Float/Nil，实得 {other:?}")),
-        Err(e) => Err(e),
+    let (prog, _w) = mora::cli::compile_and_opt(src, None).map_err(|e| format!("COMPILE: {e}"))?;
+    let arc = Arc::new(prog);
+    let mut core = CoreRuntime::default();
+    match execute_program(arc, &mut core) {
+        Ok((Value::Float(f), _)) => Ok(Some(f)),
+        Ok((Value::Int(i), _)) => Ok(Some(i as f64)),
+        Ok((Value::Nil, _)) => Ok(None),
+        Ok((other, _)) => Err(format!("期望 Float/Int/Nil，实得 {other:?}")),
+        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -334,7 +334,6 @@ fn valid_decl_blocks_still_work() {
     for (name, src) in [
         ("struct", "struct S\n  x: Int\n  y: Int\nend\nprint(111)\n"),
         ("enum", "enum E\n  A\n  B\nend\nprint(111)\n"),
-        ("app", "app a\n  model: M\n  msg: N\nend\nprint(111)\n"),
     ] {
         if let Err(e) = compile(src) {
             panic!("[{name}] 合法声明块必须可编译，实得: {e}");

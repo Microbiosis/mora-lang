@@ -87,29 +87,20 @@ fn write_gbk(dir: &Path, name: &str) -> PathBuf {
 }
 
 fn mora(dir: &Path, args: &[&str]) -> (String, i32) {
-    let out = Command::new(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/target/debug/mora.exe"
-    ))
-    .current_dir(dir)
-    .args(args)
-    .env_remove("OPENAI_API_KEY")
-    .env_remove("MORA_AI_BASE_URL")
-    .output()
-    .expect("跑 mora");
+    let out = Command::new(env!("CARGO_BIN_EXE_mora"))
+        .current_dir(dir)
+        .args(args)
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("MORA_AI_BASE_URL")
+        .output()
+        .expect("跑 mora");
     let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
     s.push_str(&String::from_utf8_lossy(&out.stderr));
     (s, out.status.code().unwrap_or(-1))
 }
 
 /// 五个会读源文件的入口。
-const READERS: &[&[&str]] = &[
-    &["__FILE__"],
-    &["--check", "__FILE__"],
-    &["record", "__FILE__", "rec"],
-    &["replay", "__FILE__", "rec"],
-    &["snapshot", "__FILE__", "snap"],
-];
+const READERS: &[&[&str]] = &[&["__FILE__"], &["--check", "__FILE__"]];
 
 /// **主判据**：每条路径都必须报出**原因**（而不是只有「读不到」）。
 #[test]
@@ -147,7 +138,7 @@ fn d192_encoding_error_tells_the_user_what_to_do() {
     let f = write_gbk(dir.path(), "gbk.mora");
     let f = f.to_str().unwrap();
 
-    for args in [vec![f], vec!["--check", f], vec!["record", f, "rec"]] {
+    for args in [vec![f], vec!["--check", f]] {
         let (out, code) = mora(dir.path(), &args);
         assert_ne!(code, 0, "[{}] 应判失败", args.join(" "));
         assert!(
@@ -168,7 +159,6 @@ fn d192_missing_file_still_says_not_found() {
     for args in [
         vec!["definitely-absent.mora"],
         vec!["--check", "definitely-absent.mora"],
-        vec!["record", "definitely-absent.mora", "rec"],
     ] {
         let (out, code) = mora(dir.path(), &args);
         assert_ne!(code, 0, "[{}] 应判失败", args.join(" "));
@@ -195,6 +185,6 @@ fn d192_utf8_file_still_runs() {
     std::fs::write(&p, "print(1)\n").expect("写");
     let (out, code) = mora(dir.path(), &[p.to_str().unwrap()]);
     assert_eq!(code, 0, "普通 UTF-8 文件应照常运行:\n{}", out);
-    assert!(out.contains("1.0"), "应正常输出:\n{}", out);
+    assert!(out.contains("1\n"), "应正常输出:\n{}", out);
     assert!(!out.contains("另存为"), "不该出现编码提示:\n{}", out);
 }

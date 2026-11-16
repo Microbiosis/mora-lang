@@ -25,7 +25,6 @@
 //! - `Value::Dict` 的 Display **已经**排序（浅层与深层两处分支都有）
 //!   ⇒ 打印 dict 不会因 HashMap 顺序而抖动。
 
-use mora::toolplane::{PlaneKind, ToolPlaneRegistry};
 use mora::value::Value;
 
 /// dict 的 `Display` 必须**按 key 有序**（跨进程可复现）。
@@ -86,42 +85,4 @@ fn d282_nested_dict_display_is_sorted_too() {
     let first_y = s.find('y').expect("内层应含 y");
     let first_z = s.find('z').expect("内层应含 z");
     assert!(first_y < first_z, "内层 dict 也应按 key 排序：{s}");
-}
-
-/// `toolplane.list_planes` 必须返回**有序**列表。
-///
-/// 修前担心它是 `HashMap` 遍历（D280 同类），实测**已经**有 `names.sort()`
-/// 且模块内已有单测 `list_planes_returns_sorted` 锁定 ⇒ **否定，不改**。
-/// 本条防的是将来有人「优化」掉那个 `sort`。
-#[test]
-fn d282_toolplane_list_planes_is_sorted() {
-    let mut reg = ToolPlaneRegistry::new();
-    for n in ["zeta", "alpha", "mid"] {
-        reg.create_plane(n.to_string(), PlaneKind::Core)
-            .expect("创建应成功");
-    }
-    assert_eq!(reg.list_planes(), vec!["alpha", "mid", "zeta"]);
-}
-
-/// `toolplane` 里的工具名列表也应有序（`list_tools` 里的 `names.sort()`）。
-#[test]
-fn d282_toolplane_tool_listing_is_sorted() {
-    let mut reg = ToolPlaneRegistry::new();
-    reg.create_plane("p".to_string(), PlaneKind::Extension)
-        .expect("创建应成功");
-    {
-        let plane = reg.get_plane_mut("p").expect("plane 应存在");
-        for t in ["zeta", "alpha", "mid"] {
-            plane
-                .register(mora::toolplane::ToolSpec {
-                    name: t.to_string(),
-                    description: "d".to_string(),
-                    parameters: "p".to_string(),
-                })
-                .expect("注册应成功");
-        }
-    }
-    let mut names: Vec<String> = reg.get_plane("p").unwrap().tools.keys().cloned().collect();
-    names.sort();
-    assert_eq!(names, vec!["alpha", "mid", "zeta"]);
 }

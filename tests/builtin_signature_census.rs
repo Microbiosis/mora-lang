@@ -39,7 +39,7 @@
 fn typeck(src: &str) -> Result<(), String> {
     let (_func, witnesses) =
         mora::cli::compile_and_opt(src, None).map_err(|e| format!("COMPILE: {e}"))?;
-    let errs = mora::typeck::check_mir::check_program_witnesses_bidirectional(&witnesses);
+    let errs = mora::typeck::check_mir::check_program_witnesses(&witnesses);
     if errs.is_empty() {
         Ok(())
     } else {
@@ -112,8 +112,8 @@ fn previously_registered_builtins_unchanged() {
         ("let v: Int = len(\"ab\")\nprint(1)\n", "len 返 Int"),
         ("let v: nil = print(1)\nprint(1)\n", "print 返 Nil"),
         (
-            "let v: String = compress(\"a\", \"head_tail\")\nprint(1)\n",
-            "compress 返 String",
+            "let v: String = type_of(1)\nprint(1)\n",
+            "type_of 返 String",
         ),
     ] {
         assert!(

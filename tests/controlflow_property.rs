@@ -367,17 +367,11 @@ static SAMPLE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicU
 fn check(stmts: Vec<Stmt>, init: [f64; 3]) {
     let src = render_program(&stmts, init);
     let expected = reference(&stmts, init);
-    let (func, _w) = mora::parser_v3::ParserV3::compile(&src)
+    let (prog, _w) = mora::parser_v3::ParserV3::compile(&src)
         .unwrap_or_else(|e| panic!("compile failed:\n{src}\nerror: {e}"));
-    let mut interp = mora::interpreter::Interpreter::new();
-    let mut env = interp.take_env();
-    let got = mora::mir::vm::execute(
-        &std::sync::Arc::new(func),
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    )
-    .unwrap_or_else(|e| panic!("run failed:\n{src}\nerror: {e}"));
+    let mut core = mora::runtime::CoreRuntime::default();
+    let (got, _) = mora::runtime::vm::execute_program(std::sync::Arc::new(prog), &mut core)
+        .unwrap_or_else(|e| panic!("run failed:\n{src}\nerror: {e}"));
     assert_eq!(
         format!("{got:?}"),
         format!("Float({expected:?})"),
@@ -506,16 +500,11 @@ proptest! {
         let src = render_program(&stmts, init);
         let expected = reference(&stmts, init);
 
-        let (func, _w) = mora::parser_v3::ParserV3::compile(&src)
+        let (prog, _w) = mora::parser_v3::ParserV3::compile(&src)
             .map_err(|e| TestCaseError::fail(format!("compile failed:\n{src}\nerror: {e}")))?;
-        let mut interp = mora::interpreter::Interpreter::new();
-        let mut env = interp.take_env();
-        let got = mora::mir::vm::execute(
-            &std::sync::Arc::new(func),
-            &mut interp,
-            &mut env,
-            &mut mora::mir::effect::Effects::new(),
-        );
+        let mut core = mora::runtime::CoreRuntime::default();
+        let got = mora::runtime::vm::execute_program(std::sync::Arc::new(prog), &mut core)
+            .map(|(v, _)| v);
         let got = got.map_err(|e| TestCaseError::fail(format!("run failed:\n{src}\nerror: {e}")))?;
 
         // `prop_assert_eq!` 的消息里不能插值局部变量，先拼好再传。

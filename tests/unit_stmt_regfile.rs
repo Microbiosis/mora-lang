@@ -69,30 +69,28 @@
 
 use std::sync::Arc;
 
-use mora::interpreter::Interpreter;
-use mora::mir::effect::Effects;
-use mora::mir::vm::execute;
-use mora::mir::{MirFunction, MirInst};
+use mora::mir::control::{
+    BasicBlock, BlockId, ControlConst, ControlFunction, ControlInst, ControlProgram,
+    ControlTerminator, FnId, FunctionKind, SymbolTable, VReg,
+};
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::execute_program;
 use mora::value::Value;
 
-/// 走生产路径（`cli::compile_and_opt` = 9 层管线 + 优化 + 差分回落）执行源码。
-///
-/// 修前这条会 panic —— Rust panic 会带毒整个测试进程，故本文件里
-/// 「不 panic」本身就是断言。
+/// 走生产路径（`cli::compile_and_opt` + `execute_program`）执行源码。
 fn run(src: &str) -> Result<Value, String> {
-    let (func, witnesses) =
+    let (prog, witnesses) =
         mora::cli::compile_and_opt(src, None).map_err(|e| format!("COMPILE: {e}"))?;
-    let errs = mora::typeck::check_mir::check_program_witnesses_bidirectional(&witnesses);
+    let errs = mora::typeck::check_mir::check_program_witnesses(&witnesses);
     if !errs.is_empty() {
         return Err(format!(
             "TYPECK: {:?}",
             errs.iter().map(|e| e.message.clone()).collect::<Vec<_>>()
         ));
     }
-    let arc = Arc::new(func);
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    execute(&arc, &mut interp, &mut env, &mut Effects::new())
+    let mut core = CoreRuntime::default();
+    let (v, _) = execute_program(Arc::new(prog), &mut core).map_err(|e| e.to_string())?;
+    Ok(v)
 }
 
 // ===================================================================
@@ -150,9 +148,6 @@ fn valueless_statements_as_sole_task_statement_all_run() {
         ("transaction commit", "transaction commit\nend"),
         ("worker", "worker w\n  1\nend"),
         ("parallel", "parallel\n  1\nend"),
-        ("observe", "observe tr do\n  1\nend"),
-        ("model", "model M\n  count: Int\nend"),
-        ("msg", "msg Inc\nend"),
     ];
     let mut failures = Vec::new();
     for (name, stmt) in cases {
@@ -173,48 +168,68 @@ fn valueless_statements_as_sole_task_statement_all_run() {
 // 3) 防御层直接测试
 // ===================================================================
 
-/// 寄存器文件与指令引用不一致时，`execute` 必须返回**错误**而不是 panic。
-///
-/// 手工构造一个说谎的 `MirFunction`：`Return(Some(0))` 引用 reg 0，
-/// 而 `n_regs = 0`。这是 `transaction` 修前那条链路的**精确形状** ——
-/// 把它独立出来，就不必依赖「某条源码恰好触发」来验证防御层。
+fn dummy_program(
+    n_regs: u32,
+    insts: Vec<ControlInst>,
+    terminator: ControlTerminator,
+) -> ControlProgram {
+    ControlProgram {
+        symbols: SymbolTable::new(),
+        functions: vec![ControlFunction {
+            id: FnId(0),
+            name: None,
+            kind: FunctionKind::Main,
+            params: Vec::new(),
+            upvalues: Vec::new(),
+            shared_locals: Vec::new(),
+            local_names: Vec::new(),
+            n_locals: 0,
+            n_regs,
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                params: Vec::new(),
+                insts,
+                terminator,
+            }],
+            entry: BlockId(0),
+            handler_k_slot: None,
+            handler_arg_slots: Vec::new(),
+        }],
+        entry: FnId(0),
+        globals: Vec::new(),
+    }
+}
+
+/// 寄存器文件与指令引用不一致时，`execute_program` 必须返回**错误**而不是 panic。
 #[test]
 fn regfile_inconsistency_is_a_clean_error_not_a_panic() {
-    let func = MirFunction {
-        params: vec![],
-        body: vec![MirInst::Return(Some(0))],
-        // 说谎：body 引用了 reg 0，寄存器文件却是空的
-        n_regs: 0,
-        ..Default::default()
-    };
-    let arc = Arc::new(func);
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    let res = execute(&arc, &mut interp, &mut env, &mut Effects::new());
-    let err = res.expect_err("越界寄存器引用必须返回错误；修前这里是索引越界 panic");
+    let prog = dummy_program(0, vec![], ControlTerminator::Return(Some(VReg(0))));
+    let mut core = CoreRuntime::default();
+    let res = execute_program(Arc::new(prog), &mut core);
+    let err = res
+        .expect_err("越界寄存器引用必须返回错误；否则索引越界 panic")
+        .to_string();
     assert!(
-        err.contains("references register 0") && err.contains("0 register"),
-        "错误信息应点名越界的寄存器号与实际寄存器数，实得: {err}"
+        err.contains("VReg(0)") && (err.contains("n_regs") || err.contains("undefined reg")),
+        "错误信息应点名越界/未定义的寄存器号 VReg(0)，实得: {err}"
     );
 }
 
 /// 写越界同样要拦住 —— 执行器里 `regs[d] = v` 也是直接按下标。
 #[test]
 fn out_of_range_write_is_a_clean_error() {
-    let func = MirFunction {
-        params: vec![],
-        // Const(3, …) 写 reg 3，但只有 1 个寄存器
-        body: vec![MirInst::Const(3, Value::Int(1))],
-        n_regs: 1,
-        ..Default::default()
-    };
-    let arc = Arc::new(func);
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    let res = execute(&arc, &mut interp, &mut env, &mut Effects::new());
-    let err = res.expect_err("越界写必须返回错误；否则 `regs[3]` 索引越界 panic");
+    let prog = dummy_program(
+        1,
+        vec![ControlInst::Const(VReg(3), ControlConst::Int(1))],
+        ControlTerminator::Return(None),
+    );
+    let mut core = CoreRuntime::default();
+    let res = execute_program(Arc::new(prog), &mut core);
+    let err = res
+        .expect_err("越界写必须返回错误；否则 regs[3] 索引越界 panic")
+        .to_string();
     assert!(
-        err.contains("references register 3"),
+        err.contains("VReg(3)"),
         "错误信息应点名越界写的寄存器号，实得: {err}"
     );
 }
@@ -222,16 +237,13 @@ fn out_of_range_write_is_a_clean_error() {
 /// 边界内不得误伤 —— 引用恰好等于 `n_regs - 1` 是**合法**的。
 #[test]
 fn in_range_highest_register_is_not_rejected() {
-    let func = MirFunction {
-        params: vec![],
-        body: vec![MirInst::Const(0, Value::Int(7)), MirInst::Return(Some(0))],
-        n_regs: 1,
-        ..Default::default()
-    };
-    let arc = Arc::new(func);
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    let v = execute(&arc, &mut interp, &mut env, &mut Effects::new())
+    let prog = dummy_program(
+        1,
+        vec![ControlInst::Const(VReg(0), ControlConst::Int(7))],
+        ControlTerminator::Return(Some(VReg(0))),
+    );
+    let mut core = CoreRuntime::default();
+    let (v, _) = execute_program(Arc::new(prog), &mut core)
         .expect("引用最高位寄存器是合法的，前置校验不得误拒");
     assert!(
         matches!(v, Value::Int(7)),

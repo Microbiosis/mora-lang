@@ -11,12 +11,9 @@
 //! - **独立 WitnessKind 枚举**（30 变体，captured_env 已删零消费死字段）。
 //!
 //! 复合类型同步镜像：WitnessCallee（MirCallee）、WitnessArm（MatchArm）、
-//! WitnessParam（Param）、WitnessPattern（Pattern）、WitnessOrchestrateKind
-//! （MirOrchestrateKind）、WitnessAgentDef / WitnessEdgeDef。
+//! WitnessParam（Param）、WitnessPattern（Pattern）。
 
 use crate::common::{BinaryOp, Literal, Span};
-use crate::mir::MirFunction;
-use crate::mir::orchestrate::{MirAgentDef, MirEdgeDef, MirOrchestrateKind};
 
 /// 轻量树骨架节点 — kind + span，无执行语义。
 #[derive(Debug, Clone, PartialEq)]
@@ -45,17 +42,14 @@ pub enum WitnessKind {
         args: Vec<MirWitness>,
     },
     Closure {
+        type_params: Vec<String>,
         params: Vec<WitnessParam>,
         body: Box<MirWitness>,
     },
     FnDef {
         name: String,
-        /// v0.104.6：显式声明的**类型参数**（`task f<T, U>(…)`）。
-        ///
-        /// 空 = 非泛型（与本刀之前逐字等价）。泛型声明时为各类型参数的**首字母**
-        /// （`Type::TypeVar` 是单 `char`；`fresh_type_var_id` 只发控制字符，
-        /// 故与用户声明的类型变量天然不撞名）。parser 保证首字母互不相同。
-        type_params: Vec<char>,
+        /// Explicit generic type parameters (e.g. `task f<T, U>(…)`).
+        type_params: Vec<String>,
         params: Vec<WitnessParam>,
         return_type: Option<crate::mir::hint::TypeHint>,
         body: Box<MirWitness>,
@@ -93,9 +87,6 @@ pub enum WitnessKind {
         trait_name: String,
         generics: Vec<crate::mir::hint::TypeHint>,
     },
-    Prompt {
-        parts: Vec<MirWitness>,
-    },
     LetBinding {
         name: String,
         type_hint: Option<crate::mir::hint::TypeHint>,
@@ -114,11 +105,6 @@ pub enum WitnessKind {
     Return(Option<Box<MirWitness>>),
     Break(String),
     Continue(String),
-    Orchestrate {
-        input_var: String,
-        result_var: String,
-        kind: Box<WitnessOrchestrateKind>,
-    },
     TypeAlias {
         name: String,
         target: crate::mir::hint::TypeHint,
@@ -151,47 +137,6 @@ pub enum WitnessKind {
         body: Box<MirWitness>,
     },
     Sequence(Vec<MirWitness>),
-    // v0.83: TEA (The Elm Architecture) 语法糖 witness
-    /// Model 定义 — 状态结构（类似 StructDef，但语义是 Model 容器）
-    ///
-    /// v0.104.6 D412：增 `defaults` —— 字段默认值（`name: T = expr`）的**表达式**。
-    ///
-    /// 此前它只在 `emit_definitions.rs` 里被发射进 emit 流（并登记为派生键
-    /// `Name.defaults`），而产出它的 witness **被 `_dw` 直接丢弃**
-    /// ⇒ 9 层管线（witness → Node → fcfg_lower）**结构上拿不到默认值**，
-    /// TEA 程序因此永远触发差分失败回落。
-    ModelDef {
-        name: String,
-        fields: Vec<(String, crate::mir::hint::TypeHint)>,
-        /// `(字段名, 默认值表达式)`，无默认值的字段不出现在此。
-        defaults: Vec<(String, MirWitness)>,
-    },
-    /// Msg 定义 — tagged union（每个变体可携带 payload 类型）
-    MsgDef {
-        name: String,
-        variants: Vec<crate::common::MsgVariant>,
-    },
-    /// Update 函数 — `(Model, Msg) -> (Model, Cmd)`
-    UpdateDef {
-        name: String,
-        params: Vec<crate::mir::witness::WitnessParam>,
-        return_type: Option<crate::mir::hint::TypeHint>,
-        body: Box<MirWitness>,
-    },
-    /// App 定义 — 完整 TEA app
-    AppDef {
-        name: String,
-        model_name: String,
-        msg_name: String,
-        init_w: Box<MirWitness>,
-        update_w: Box<MirWitness>,
-        view_w: Box<MirWitness>,
-    },
-    // v0.85: with 块（配置桥接）— 镜像 MirInst::WithConfig
-    WithConfig {
-        bindings: Vec<(String, MirWitness)>,
-        body: Box<MirWitness>,
-    },
     // v0.88: Quasiquote（反引号 `expr + ,unquote / ,,unquote-splice）
     /// segments 用 MirWitness 编码：Quote = Literal(String),
     /// Unquote = 被求值的子表达式 witness,
@@ -206,49 +151,6 @@ pub enum WitnessKind {
         name: String,
         params: Vec<crate::mir::hint::TypeHint>,
         result: Option<crate::mir::hint::TypeHint>,
-    },
-    // ── v0.102: 声明式范式（逻辑式/关系式）witness ──
-    /// 关系定义。`clauses` 是编译期子句模板数据（lower_witness 直接取用
-    /// 构造 MirInst::RelDef，单一事实源）；`clause_wits` 是与 clauses
-    /// 一一对应的类型推断镜像（头项 + 体目标）。
-    RelDef {
-        name: String,
-        clauses: Vec<crate::rel::Clause>,
-        clause_wits: Vec<RelClauseWit>,
-    },
-    /// solve 查询。goal 是目标构建表达式 witness（运行期构建 `Value::Goal`）；
-    /// query_vars 是 `?` 隐式逻辑变量名（首次出现序）；limit 是 run N 上界。
-    Solve {
-        limit: Option<usize>,
-        /// 投影变量名（`?name`，首次出现序）—— 解中返回其绑定。
-        query_vars: Vec<String>,
-        /// 存在性匿名变量名（`_`，每次出现独立）—— 分配 fresh 逻辑变量
-        /// 供目标引用，但不投影进解。
-        anon_vars: Vec<String>,
-        goal: Box<MirWitness>,
-    },
-    // ── v0.103: 命名 section 声明（prompt / document）──
-    /// `prompt "name" do ... end` — 构建 Value::PromptSection 绑定到环境。
-    PromptSection {
-        name: String,
-        body: Box<MirWitness>,
-    },
-    /// `document "name" do ... end` — 构建文档 section 绑定到环境。
-    DocumentSection {
-        name: String,
-        body: Box<MirWitness>,
-    },
-    // ── v0.103: 可观测性块（spec §11.4）──
-    /// `observe <kind> "<name>" do ... end` — 可观测性根块。
-    Observe {
-        config: String,
-        body: Box<MirWitness>,
-    },
-    /// `span "<name>" tags {...} do ... end` — 命名追踪 span。
-    Span {
-        name: String,
-        tags: Vec<(String, String)>,
-        body: Box<MirWitness>,
     },
     /// v0.103: `parallel ... end` — 并行块（spec §9.1/§9.2）。
     Parallel {
@@ -313,15 +215,51 @@ pub enum WitnessKind {
     Commit,
     /// `rollback` 语句 —— 与 `MirInst::Rollback` 同构（unit 指令）。
     Rollback,
+    /// `spawn <target>` — launches an isolated concurrent task returning `TaskHandle<R>`.
+    Spawn {
+        target: WitnessSpawnTarget,
+    },
+    /// `select ... end` — fair multiplexing over channel recv/send, timeout, and default arms.
+    Select {
+        arms: Vec<WitnessSelectArm>,
+    },
 }
 
-/// v0.102: 关系子句 witness —— 编译期模板数据 + 类型推断镜像。
+/// Target expression inside `spawn <target>`.
 #[derive(Debug, Clone, PartialEq)]
-pub struct RelClauseWit {
-    /// 头项镜像（与 `Clause::head` 一一对应）。
-    pub head: Vec<MirWitness>,
-    /// 体目标镜像。
-    pub body: Box<MirWitness>,
+pub enum WitnessSpawnTarget {
+    Call {
+        callee: WitnessCallee,
+        args: Vec<MirWitness>,
+    },
+    MethodCall {
+        receiver: Box<MirWitness>,
+        method: String,
+        args: Vec<MirWitness>,
+    },
+    Expr(Box<MirWitness>),
+}
+
+/// One branch inside `select ... end`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WitnessSelectArm {
+    Recv {
+        binding: Option<String>,
+        channel: Box<MirWitness>,
+        body: Box<MirWitness>,
+    },
+    Send {
+        channel: Box<MirWitness>,
+        value: Box<MirWitness>,
+        body: Box<MirWitness>,
+    },
+    Timeout {
+        ms: Box<MirWitness>,
+        body: Box<MirWitness>,
+    },
+    Default {
+        body: Box<MirWitness>,
+    },
 }
 
 /// 调用目标 — 镜像 MirCallee。
@@ -351,8 +289,6 @@ impl MirWitness {
             | WitnessKind::TypeAlias { .. }
             | WitnessKind::EnumDef { .. }
             | WitnessKind::StructDef { .. }
-            | WitnessKind::ModelDef { .. }
-            | WitnessKind::MsgDef { .. }
             | WitnessKind::EffectSig { .. } => Vec::new(),
             WitnessKind::Binary { left, right, .. } => vec![left.as_ref(), right.as_ref()],
             WitnessKind::Call { callee, args } => {
@@ -399,7 +335,6 @@ impl MirWitness {
             WitnessKind::List(items) => items.iter().collect(),
             WitnessKind::Dict(entries) => entries.iter().map(|(_, v)| v).collect(),
             WitnessKind::DynTrait { expr, .. } => vec![expr.as_ref()],
-            WitnessKind::Prompt { parts } => parts.iter().collect(),
             WitnessKind::LetBinding {
                 value, init_body, ..
             } => vec![value.as_ref(), init_body.as_ref()],
@@ -410,7 +345,6 @@ impl MirWitness {
                 value,
             } => vec![object.as_ref(), index.as_ref(), value.as_ref()],
             WitnessKind::Return(Some(v)) => vec![v.as_ref()],
-            WitnessKind::Orchestrate { kind, .. } => kind.child_witnesses(),
             WitnessKind::Perform { args, .. } => args.iter().collect(),
             // v0.104.6 D472：4 类新构造的子 witness 必须被枚举出来 ——
             // `child_witnesses` 是效果定位游走等树遍历的入口，
@@ -433,41 +367,240 @@ impl MirWitness {
             }
             WitnessKind::MacroDef { body, .. } => vec![body.as_ref()],
             WitnessKind::Sequence(items) => items.iter().collect(),
-            WitnessKind::UpdateDef { body, .. } => vec![body.as_ref()],
-            WitnessKind::AppDef {
-                init_w,
-                update_w,
-                view_w,
-                ..
-            } => vec![init_w.as_ref(), update_w.as_ref(), view_w.as_ref()],
-            WitnessKind::WithConfig { bindings, body } => {
-                let mut out: Vec<&MirWitness> = bindings.iter().map(|(_, v)| v).collect();
-                out.push(body.as_ref());
-                out
-            }
             WitnessKind::Quasiquote { segments } => segments.iter().collect(),
-            // v0.102: 声明式范式 — RelDef 的类型镜像子树（头项 + 体目标）；
-            // Solve 的目标构建表达式。
-            WitnessKind::RelDef { clause_wits, .. } => {
-                let mut out: Vec<&MirWitness> = Vec::new();
-                for cw in clause_wits {
-                    out.extend(cw.head.iter());
-                    out.push(cw.body.as_ref());
-                }
-                out
-            }
-            WitnessKind::Solve { goal, .. } => vec![goal.as_ref()],
-            // v0.103: section 声明的 body
-            WitnessKind::PromptSection { body, .. } | WitnessKind::DocumentSection { body, .. } => {
-                vec![body.as_ref()]
-            }
-            // v0.103: 可观测性块的 body
-            WitnessKind::Observe { body, .. } | WitnessKind::Span { body, .. } => {
-                vec![body.as_ref()]
-            }
             // v0.103: 并行块 body
             WitnessKind::Parallel { body } => vec![body.as_ref()],
             WitnessKind::Export { decl, .. } => vec![decl.as_ref()],
+            WitnessKind::Spawn { target } => match target {
+                WitnessSpawnTarget::Call { callee, args } => {
+                    let mut out = Vec::new();
+                    if let WitnessCallee::Evaluated(e) = callee {
+                        out.push(e.as_ref());
+                    }
+                    out.extend(args);
+                    out
+                }
+                WitnessSpawnTarget::MethodCall { receiver, args, .. } => {
+                    let mut out = vec![receiver.as_ref()];
+                    out.extend(args);
+                    out
+                }
+                WitnessSpawnTarget::Expr(e) => vec![e.as_ref()],
+            },
+            WitnessKind::Select { arms } => {
+                let mut out = Vec::new();
+                for arm in arms {
+                    match arm {
+                        WitnessSelectArm::Recv { channel, body, .. } => {
+                            out.push(channel.as_ref());
+                            out.push(body.as_ref());
+                        }
+                        WitnessSelectArm::Send {
+                            channel,
+                            value,
+                            body,
+                        } => {
+                            out.push(channel.as_ref());
+                            out.push(value.as_ref());
+                            out.push(body.as_ref());
+                        }
+                        WitnessSelectArm::Timeout { ms, body } => {
+                            out.push(ms.as_ref());
+                            out.push(body.as_ref());
+                        }
+                        WitnessSelectArm::Default { body } => out.push(body.as_ref()),
+                    }
+                }
+                out
+            }
+        }
+    }
+
+    /// W2.3: Iterative pre-order DFS over `roots` using an explicit heap stack
+    /// so deep witness chains never consume OS call-stack frames.
+    pub fn visit_preorder<'a>(roots: &'a [MirWitness], mut f: impl FnMut(&'a MirWitness)) {
+        let mut stack: Vec<&'a MirWitness> = roots.iter().rev().collect();
+        while let Some(node) = stack.pop() {
+            f(node);
+            let children = node.child_witnesses();
+            stack.extend(children.into_iter().rev());
+        }
+    }
+}
+
+fn push_owned_witness_children(kind: WitnessKind, out: &mut Vec<MirWitness>) {
+    match kind {
+        WitnessKind::Literal(_)
+        | WitnessKind::Variable(_)
+        | WitnessKind::Break(_)
+        | WitnessKind::Continue(_)
+        | WitnessKind::Import(_)
+        | WitnessKind::TypeAlias { .. }
+        | WitnessKind::EnumDef { .. }
+        | WitnessKind::StructDef { .. }
+        | WitnessKind::EffectSig { .. }
+        | WitnessKind::Commit
+        | WitnessKind::Rollback
+        | WitnessKind::Return(None) => {}
+        WitnessKind::Binary { left, right, .. }
+        | WitnessKind::Or { left, right }
+        | WitnessKind::And { left, right }
+        | WitnessKind::Pipe { left, right } => {
+            out.push(*left);
+            out.push(*right);
+        }
+        WitnessKind::Call { callee, args } => {
+            if let WitnessCallee::Evaluated(e) = callee {
+                out.push(*e);
+            }
+            out.extend(args);
+        }
+        WitnessKind::MethodCall { receiver, args, .. } => {
+            out.push(*receiver);
+            out.extend(args);
+        }
+        WitnessKind::Closure { params, body, .. } | WitnessKind::FnDef { params, body, .. } => {
+            for p in params {
+                if let Some(d) = p.default {
+                    out.push(d);
+                }
+            }
+            out.push(*body);
+        }
+        WitnessKind::Match { scrutinee, arms } => {
+            out.push(*scrutinee);
+            for arm in arms {
+                if let Some(g) = arm.guard {
+                    out.push(g);
+                }
+                out.push(arm.body);
+            }
+        }
+        WitnessKind::If { cond, then, r#else } => {
+            out.push(*cond);
+            out.push(*then);
+            if let Some(e) = r#else {
+                out.push(*e);
+            }
+        }
+        WitnessKind::Loop { iterable, body, .. }
+        | WitnessKind::While {
+            cond: iterable,
+            body,
+        } => {
+            out.push(*iterable);
+            out.push(*body);
+        }
+        WitnessKind::List(items) | WitnessKind::Sequence(items) => out.extend(items),
+        WitnessKind::Dict(entries) => {
+            for (_, v) in entries {
+                out.push(v);
+            }
+        }
+        WitnessKind::Quasiquote { segments } => out.extend(segments),
+        WitnessKind::Perform { args, .. } => out.extend(args),
+        WitnessKind::LetBinding {
+            value, init_body, ..
+        } => {
+            out.push(*value);
+            out.push(*init_body);
+        }
+        WitnessKind::Assign { value, .. }
+        | WitnessKind::DynTrait { expr: value, .. }
+        | WitnessKind::MacroDef { body: value, .. }
+        | WitnessKind::Parallel { body: value }
+        | WitnessKind::Export { decl: value, .. }
+        | WitnessKind::Worker { body: value, .. }
+        | WitnessKind::Aggregate { value, .. } => out.push(*value),
+        WitnessKind::Return(Some(v)) => out.push(*v),
+        WitnessKind::IndexAssign {
+            object,
+            index,
+            value,
+        } => {
+            out.push(*object);
+            out.push(*index);
+            out.push(*value);
+        }
+        WitnessKind::Handle { body, handler, .. }
+        | WitnessKind::Transaction {
+            body,
+            compensation: handler,
+        } => {
+            out.push(*body);
+            out.push(*handler);
+        }
+        WitnessKind::Eval { given, expects, .. } => {
+            out.push(*given);
+            out.extend(expects);
+        }
+        WitnessKind::Spawn { target } => match target {
+            WitnessSpawnTarget::Call { callee, args } => {
+                if let WitnessCallee::Evaluated(e) = callee {
+                    out.push(*e);
+                }
+                out.extend(args);
+            }
+            WitnessSpawnTarget::MethodCall { receiver, args, .. } => {
+                out.push(*receiver);
+                out.extend(args);
+            }
+            WitnessSpawnTarget::Expr(e) => out.push(*e),
+        },
+        WitnessKind::Select { arms } => {
+            for arm in arms {
+                match arm {
+                    WitnessSelectArm::Recv { channel, body, .. } => {
+                        out.push(*channel);
+                        out.push(*body);
+                    }
+                    WitnessSelectArm::Send {
+                        channel,
+                        value,
+                        body,
+                    } => {
+                        out.push(*channel);
+                        out.push(*value);
+                        out.push(*body);
+                    }
+                    WitnessSelectArm::Timeout { ms, body } => {
+                        out.push(*ms);
+                        out.push(*body);
+                    }
+                    WitnessSelectArm::Default { body } => out.push(*body),
+                }
+            }
+        }
+    }
+}
+
+/// W2.3: Iterative `Drop` so freeing deep witness chains (e.g. long Pratt or unary chains)
+/// uses a heap stack instead of overflowing the OS thread stack.
+impl Drop for MirWitness {
+    fn drop(&mut self) {
+        if matches!(
+            self.kind,
+            WitnessKind::Literal(_)
+                | WitnessKind::Variable(_)
+                | WitnessKind::Break(_)
+                | WitnessKind::Continue(_)
+                | WitnessKind::Import(_)
+                | WitnessKind::TypeAlias { .. }
+                | WitnessKind::EnumDef { .. }
+                | WitnessKind::StructDef { .. }
+                | WitnessKind::EffectSig { .. }
+                | WitnessKind::Commit
+                | WitnessKind::Rollback
+                | WitnessKind::Return(None)
+        ) {
+            return;
+        }
+        let mut stack: Vec<MirWitness> = Vec::new();
+        let root_kind = std::mem::replace(&mut self.kind, WitnessKind::Commit);
+        push_owned_witness_children(root_kind, &mut stack);
+        while let Some(mut node) = stack.pop() {
+            let kind = std::mem::replace(&mut node.kind, WitnessKind::Commit);
+            push_owned_witness_children(kind, &mut stack);
         }
     }
 }
@@ -522,256 +655,6 @@ pub struct WitnessParam {
     pub name: String,
     pub type_hint: Option<crate::mir::hint::TypeHint>,
     pub default: Option<MirWitness>,
-}
-
-/// Orchestrate 种类 — 镜像 MirOrchestrateKind。
-#[derive(Debug, Clone, PartialEq)]
-pub enum WitnessOrchestrateKind {
-    Sequential {
-        agents: Vec<WitnessAgentDef>,
-    },
-    Loop {
-        agents: Vec<WitnessAgentDef>,
-        rounds: Option<u64>,
-        exit_when: Option<MirWitness>,
-    },
-    Graph {
-        agents: Vec<WitnessAgentDef>,
-        edges: Vec<WitnessEdgeDef>,
-    },
-    Pregel {
-        agents: Vec<WitnessAgentDef>,
-        edges: Vec<WitnessEdgeDef>,
-        state_schema: Vec<crate::mir::orchestrate::MirStateChannel>,
-        checkpoint: Option<crate::mir::orchestrate::MirCheckpointConfig>,
-        interrupt_points: Vec<crate::mir::orchestrate::MirInterruptPoint>,
-        adjacency: std::collections::HashMap<String, Vec<String>>,
-    },
-    /// v0.75.84: MoA（Mixture-of-Agents）— 分层多模型协作声明。
-    Moa {
-        layers: usize,
-        proposers: Vec<String>,
-        aggregator: String,
-        prompt: Box<MirWitness>,
-    },
-    /// v0.75.85: MoE（Mixture-of-Experts）— 稀疏门控声明。
-    ///
-    /// v0.104.6 D270：`experts` 原为 `Vec<MirWitness>` —— **只装定义 witness，
-    /// 没有地方放专家名**。于是 `from_kind` 的 `map(|e| e.def.clone())` 把名字
-    /// 丢掉，反向转换再硬编码 `name: String::new()` 补空串，最终
-    /// `run_moe` 用 router 的键去 `find` 一张全叫 `""` 的表，**永远找不到**：
-    /// `orchestrate moe` 100% 不可用。详见 `WitnessMoeExpert`。
-    Moe {
-        experts: Vec<WitnessMoeExpert>,
-        router: Box<MirWitness>,
-        top_k: usize,
-        prompt: Box<MirWitness>,
-    },
-}
-
-/// v0.104.6 D270：MoE 专家（witness 层）— 镜像 `MirMoeExpert` 的**名字 + 定义**。
-///
-/// 与 `WitnessAgentDef` 同构：agent 侧一直带着 `name: String`，唯独 MoE
-/// 这里退化成了裸 `MirWitness`，名字在 v0.92 的 witness 迁移里漏掉了。
-#[derive(Debug, Clone, PartialEq)]
-pub struct WitnessMoeExpert {
-    /// 专家名（router 返回的 Dict 键必须与之匹配）。
-    pub name: String,
-    /// 专家定义：函数闭包或 `{model: "..."}` 字面量。
-    pub def: MirWitness,
-}
-
-impl WitnessOrchestrateKind {
-    /// v0.96: 按序枚举 orchestrate 声明内的全部子 witness。
-    pub fn child_witnesses(&self) -> Vec<&MirWitness> {
-        fn push_agent<'a>(a: &'a WitnessAgentDef, out: &mut Vec<&'a MirWitness>) {
-            out.push(&a.task_expr);
-            if let Some(v) = &a.verify_expr {
-                out.push(v);
-            }
-            if let Some(cfg) = &a.with_config {
-                out.extend(cfg.values());
-            }
-        }
-        fn push_agents_edges<'a>(
-            agents: &'a [WitnessAgentDef],
-            edges: &'a [WitnessEdgeDef],
-            out: &mut Vec<&'a MirWitness>,
-        ) {
-            for a in agents {
-                push_agent(a, out);
-            }
-            for e in edges {
-                if let Some(c) = &e.condition_expr {
-                    out.push(c);
-                }
-            }
-        }
-        let mut out: Vec<&MirWitness> = Vec::new();
-        match self {
-            WitnessOrchestrateKind::Sequential { agents } => {
-                for a in agents {
-                    push_agent(a, &mut out);
-                }
-            }
-            WitnessOrchestrateKind::Loop {
-                agents, exit_when, ..
-            } => {
-                for a in agents {
-                    push_agent(a, &mut out);
-                }
-                if let Some(e) = exit_when {
-                    out.push(e);
-                }
-            }
-            WitnessOrchestrateKind::Graph { agents, edges } => {
-                push_agents_edges(agents, edges, &mut out);
-            }
-            WitnessOrchestrateKind::Pregel { agents, edges, .. } => {
-                push_agents_edges(agents, edges, &mut out);
-            }
-            WitnessOrchestrateKind::Moa { prompt, .. } => out.push(prompt),
-            WitnessOrchestrateKind::Moe {
-                experts,
-                router,
-                prompt,
-                ..
-            } => {
-                // v0.104.6 D270：只 walk 专家的**定义** witness（名字不是
-                // 可 walk 的表达式节点）。`out` 是 `Vec<&MirWitness>`，
-                // 所以取 `&e.def` 而非克隆。
-                out.extend(experts.iter().map(|e| &e.def));
-                out.push(router);
-                out.push(prompt);
-            }
-        }
-        out
-    }
-
-    pub fn from_kind(kind: &MirOrchestrateKind) -> WitnessOrchestrateKind {
-        match kind {
-            MirOrchestrateKind::Sequential { agents } => WitnessOrchestrateKind::Sequential {
-                agents: agents.iter().map(WitnessAgentDef::from_agent).collect(),
-            },
-            MirOrchestrateKind::Loop {
-                agents,
-                rounds,
-                exit_when,
-            } => WitnessOrchestrateKind::Loop {
-                agents: agents.iter().map(WitnessAgentDef::from_agent).collect(),
-                rounds: *rounds,
-                exit_when: exit_when.clone(),
-            },
-            MirOrchestrateKind::Graph { agents, edges } => WitnessOrchestrateKind::Graph {
-                agents: agents.iter().map(WitnessAgentDef::from_agent).collect(),
-                edges: edges.iter().map(WitnessEdgeDef::from_edge).collect(),
-            },
-            MirOrchestrateKind::Pregel {
-                agents,
-                edges,
-                state_schema,
-                checkpoint,
-                interrupt_points,
-                adjacency,
-            } => WitnessOrchestrateKind::Pregel {
-                agents: agents.iter().map(WitnessAgentDef::from_agent).collect(),
-                edges: edges.iter().map(WitnessEdgeDef::from_edge).collect(),
-                state_schema: state_schema.clone(),
-                checkpoint: checkpoint.clone(),
-                interrupt_points: interrupt_points.clone(),
-                adjacency: adjacency.clone(),
-            },
-            // v0.75.84: MoA — 编译到 pregel 图，witness 记录声明参数。
-            // v0.104.4: 不再显式写 `prompt_fn: _,` —— 其后的 `..` 已覆盖全部
-            // 未列字段，clippy 1.98 的 unneeded_wildcard_pattern 拒绝该冗余。
-            MirOrchestrateKind::Moa {
-                layers,
-                proposers,
-                aggregator,
-                prompt,
-                ..
-            } => WitnessOrchestrateKind::Moa {
-                layers: *layers,
-                proposers: proposers.clone(),
-                aggregator: aggregator.clone(),
-                prompt: Box::new(prompt.clone()),
-            },
-            // v0.75.85: MoE — 稀疏门控（router 打分 → top-k → 加权）。
-            MirOrchestrateKind::Moe {
-                experts,
-                router,
-                top_k,
-                prompt,
-                ..
-            } => WitnessOrchestrateKind::Moe {
-                // v0.104.6 D270：连 `name` 一起搬（修前只搬 `e.def`，名字在此丢失）。
-                experts: experts
-                    .iter()
-                    .map(|e| WitnessMoeExpert {
-                        name: e.name.clone(),
-                        def: e.def.clone(),
-                    })
-                    .collect(),
-                router: Box::new(router.clone()),
-                top_k: *top_k,
-                prompt: Box::new(prompt.clone()),
-            },
-        }
-    }
-}
-
-/// Agent 定义 — 镜像 MirAgentDef。
-#[derive(Debug, Clone, PartialEq)]
-pub struct WitnessAgentDef {
-    pub name: String,
-    /// v0.104.6 D413：形参名（`agent a(x) => …` 的 `x`）。
-    ///
-    /// 此前 `parse_agent_def` 把解析出的形参绑到 `_params` **整个丢弃**，
-    /// 三个类型都没有这个字段 ⇒ 体内引用 `x` 恒得 `nil`，且 **exit 0 零诊断**。
-    ///
-    /// 语义（**单参**才允许，见 `parse_agent_def` 的多参拒绝）：
-    /// 运行期把 `input` 的值绑给 `params[0]`，即 `agent a(x)` 的 `x` **等价于**
-    /// `input`。
-    pub params: Vec<String>,
-    pub task_expr: MirWitness,
-    pub verify_expr: Option<MirWitness>,
-    pub with_config: Option<std::collections::HashMap<String, MirWitness>>,
-    pub task_body: MirFunction,
-    pub combiner_body: Option<MirFunction>,
-}
-
-impl WitnessAgentDef {
-    fn from_agent(agent: &MirAgentDef) -> WitnessAgentDef {
-        WitnessAgentDef {
-            name: agent.name.clone(),
-            params: agent.params.clone(),
-            task_expr: agent.task_expr.clone(),
-            verify_expr: agent.verify_expr.clone(),
-            with_config: agent.with_config.clone(),
-            task_body: agent.task_body.clone(),
-            combiner_body: agent.combiner_body.clone(),
-        }
-    }
-}
-
-/// Edge 定义 — 镜像 MirEdgeDef。
-#[derive(Debug, Clone, PartialEq)]
-pub struct WitnessEdgeDef {
-    pub from: String,
-    pub to: String,
-    pub condition_expr: Option<MirWitness>,
-    pub condition_body: Option<MirFunction>,
-}
-
-impl WitnessEdgeDef {
-    fn from_edge(edge: &MirEdgeDef) -> WitnessEdgeDef {
-        WitnessEdgeDef {
-            from: edge.from.clone(),
-            to: edge.to.clone(),
-            condition_expr: edge.condition_expr.clone(),
-            condition_body: edge.condition_body.clone(),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -885,11 +768,28 @@ mod tests {
     fn closure_has_no_captured_env() {
         let w = MirWitness {
             kind: WitnessKind::Closure {
+                type_params: vec![],
                 params: vec![],
                 body: Box::new(lit(1)),
             },
             span: Span::default(),
         };
         assert!(matches!(w.kind, WitnessKind::Closure { .. }));
+    }
+
+    #[test]
+    fn deep_chain_drop_is_iterative() {
+        let mut w = lit(1);
+        for _ in 0..20_000 {
+            w = MirWitness {
+                kind: WitnessKind::Binary {
+                    left: Box::new(w),
+                    op: BinaryOp::Add,
+                    right: Box::new(lit(1)),
+                },
+                span: Span::default(),
+            };
+        }
+        drop(w);
     }
 }

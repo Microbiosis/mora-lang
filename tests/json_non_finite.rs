@@ -31,22 +31,12 @@
 /// 跑一段源码，返回其末表达式值。
 fn run(src: &str) -> Result<mora::value::Value, String> {
     use std::sync::Arc;
-    let (func, _w) = mora::parser_v3::ParserV3::compile(src).map_err(|e| e.to_string())?;
-    let mut interp = mora::interpreter::Interpreter::new();
-    let mut env = interp.take_env();
-    let arc = Arc::new(func);
-    let r = mora::mir::vm::execute(
-        &arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    )?;
-    mora::mir::vm::run_main_task(
-        &arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    )?;
+    let (prog, _w) = mora::parser_v3::ParserV3::compile(src).map_err(|e| e.to_string())?;
+    let mut core = mora::runtime::CoreRuntime::default();
+    let arc = Arc::new(prog);
+    let (r, globals) = mora::runtime::vm::execute_program(Arc::clone(&arc), &mut core)
+        .map_err(|e| e.to_string())?;
+    mora::runtime::vm::run_main_task(arc, globals, &mut core).map_err(|e| e.to_string())?;
     Ok(r)
 }
 

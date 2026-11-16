@@ -55,17 +55,13 @@ use mora::test_support::TempDir;
 use std::process::Command;
 
 /// `value.rs::MODULE_OBJECTS` 里的 23 个模块名（与生产表逐项对照）。
-const MODULES: &[&str] = &[
-    "ai", "web", "json", "file", "memory", "agent", "document", "bus", "sandbox", "schedule",
-    "ccr", "mock", "exec", "tool", "skill", "plan", "mora", "math", "stats", "linalg", "random",
-    "tea", "xform",
-];
+const MODULES: &[&str] = &["json", "file", "exec", "math", "stats", "linalg", "random"];
 
 fn run_src(src: &str, tag: &str) -> String {
     let base = TempDir::new(tag);
     let prog = base.join("p.mora");
     std::fs::write(&prog, src).expect("写探针");
-    let mora = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+    let mora = env!("CARGO_BIN_EXE_mora");
     let out = Command::new(mora).arg(&prog).output().expect("跑 mora");
     let s = String::from_utf8_lossy(&out.stdout).into_owned();
     let _ = std::fs::remove_dir_all(&base);
@@ -149,28 +145,11 @@ fn d170_census_methods_of_module_objects() {
 
     assert!(
         not_builtin.is_empty(),
-        "前提：23 个模块都应是 `builtin` 值（否则结论不成立）; 实得: {not_builtin:?}"
+        "前提：7 个保留模块都应是 `builtin` 值（否则结论不成立）; 实得: {not_builtin:?}"
     );
-    // v0.104.6 D171：`module_method_signature` 已重构成**表驱动**
-    // （20 张方法组表），`module_method_names` 读**同一张表**，
-    // 故枚举与签名不可能漂移。D170 记的「23 个模块全是 `[]`」至此闭合。
-    //
-    // v0.104.6 D293：进一步把「名字表 + 组号选签名」两张手写表合成
-    // **一张**（`MethodGroup { names, min_arity, ret }`）—— D171 留下的
-    // 残余风险是组号 ↔ 签名仍靠 `Some(N)` 手工对齐。详见
-    // `tests/module_method_groups_single_table.rs`。
-    //
-    // v0.104.6 D175：原断言给 `ai` / `agent` / `random` 开了 `SIGNATURELESS`
-    // 豁免，理由写的是「有精确 Type 变体 + 专用分派 → 没有可枚举的表」。
-    // 那是**解释现状**，不是**豁免是对的**：实测 `ai.chat` / `ai.tokens` /
-    // `ai.critic` / `agent.create` / `agent.critic` / `random.rand_int` …
-    // 全部可达，而自省报空集等于告诉 agent「这个模块什么都不能做」。
-    // 三者已补进 `module_method_names`，**豁免整体撤销** ——
-    // 断言方向收紧为：23 个模块**全部**必须列出方法名。
     assert!(
         empty.is_empty(),
-        "23 个模块都应列出方法名（D171 接上分组表，D175 补齐 ai/agent/random）; \
-         仍为空: {empty:?}"
+        "7 个保留模块都应列出方法名; 仍为空: {empty:?}"
     );
     // 至少要有实质内容（防止「表存在但全空」这种假修复）
     let total: usize = non_empty
@@ -178,8 +157,8 @@ fn d170_census_methods_of_module_objects() {
         .map(|(_, v)| v.trim().matches(',').count() + 1)
         .sum();
     assert!(
-        total > 100,
-        "方法名总量应显著（20 张表 + 3 张名字表），实得 {total} —— 疑似表没接上"
+        total >= 40,
+        "保留模块的方法名总量应显著，实得 {total} —— 疑似表没接上"
     );
 }
 
@@ -193,29 +172,4 @@ fn d170_module_methods_actually_work_despite_empty_introspection() {
     // json / file：另两个 MODULE_OBJECTS 成员
     let j = run_src("print(json.stringify({a: 1}))\n", "m2");
     assert!(j.contains('a'), "json.stringify 应可用; 实得: {j}");
-}
-
-/// D170 对照组：D169 修好的 `document` 值（不是模块对象）**不得**被本轮影响。
-#[test]
-fn d170_document_value_introspection_still_listed() {
-    let base = TempDir::new("mora_d170_doc");
-    let md = base.join("s.md");
-    std::fs::write(&md, "# T\n\ntext\n").expect("写 md");
-    let prog = base.join("p.mora");
-    std::fs::write(
-        &prog,
-        format!(
-            "let d = document.parse(\"{p}\")\nprint(methods_of(d))\n",
-            p = md.display().to_string().replace('\\', "/")
-        ),
-    )
-    .expect("写探针");
-    let mora = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
-    let out = Command::new(mora).arg(&prog).output().expect("跑 mora");
-    let s = String::from_utf8_lossy(&out.stdout).into_owned();
-    let _ = std::fs::remove_dir_all(&base);
-    assert!(
-        s.contains("blocks") && s.contains("text"),
-        "`document` **值**的 methods_of（D169 已修）不得回退; 实得: {s}"
-    );
 }

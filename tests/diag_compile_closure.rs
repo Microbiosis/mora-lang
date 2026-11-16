@@ -13,10 +13,11 @@ fn test_token_stream_inline_closure() {
     }
 
     match ParserV3::compile(src) {
-        Ok((func, _)) => {
-            println!("SUCCESS: {} insts", func.body.len());
-            for (i, inst) in func.body.iter().enumerate() {
-                println!("  [{}] {:?}", i, inst);
+        Ok((prog, _)) => {
+            let func = prog.func(prog.entry);
+            println!("SUCCESS: {} blocks", func.blocks.len());
+            for block in &func.blocks {
+                println!("  block {:?}: {:?}", block.id, block.insts);
             }
         }
         Err(e) => {
@@ -31,10 +32,11 @@ fn test_direct_compile_closure() {
     println!("Trying to compile: {:?}", src);
     let result = ParserV3::compile(src);
     match &result {
-        Ok((func, _)) => {
-            println!("OK: {} insts, n_regs={}", func.body.len(), func.n_regs);
-            for (i, inst) in func.body.iter().enumerate() {
-                println!("  [{}] {:?}", i, inst);
+        Ok((prog, _)) => {
+            let func = prog.func(prog.entry);
+            println!("OK: {} blocks, n_regs={}", func.blocks.len(), func.n_regs);
+            for block in &func.blocks {
+                println!("  block {:?}: {:?}", block.id, block.insts);
             }
         }
         Err(e) => {
@@ -53,10 +55,11 @@ fn test_compile_closure_with_end() {
     let src = "fn(f)\n  f(21)\nend";
     let result = ParserV3::compile(src);
     match &result {
-        Ok((func, _)) => {
-            println!("OK: {} insts", func.body.len());
-            for (i, inst) in func.body.iter().enumerate() {
-                println!("  [{}] {:?}", i, inst);
+        Ok((prog, _)) => {
+            let func = prog.func(prog.entry);
+            println!("OK: {} blocks", func.blocks.len());
+            for block in &func.blocks {
+                println!("  block {:?}: {:?}", block.id, block.insts);
             }
         }
         Err(e) => {
@@ -71,10 +74,11 @@ fn test_compile_closure_with_braces() {
     let src = "fn(f) { f(21) }";
     let result = ParserV3::compile(src);
     match &result {
-        Ok((func, _)) => {
-            println!("OK: {} insts", func.body.len());
-            for (i, inst) in func.body.iter().enumerate() {
-                println!("  [{}] {:?}", i, inst);
+        Ok((prog, _)) => {
+            let func = prog.func(prog.entry);
+            println!("OK: {} blocks", func.blocks.len());
+            for block in &func.blocks {
+                println!("  block {:?}: {:?}", block.id, block.insts);
             }
         }
         Err(e) => {

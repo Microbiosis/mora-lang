@@ -37,7 +37,7 @@
 
 use mora::test_support::TempDir;
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// 一条对拍记录。
 ///
@@ -76,7 +76,7 @@ const CASES: &[Case] = &[
         module: "math",
         method: "abs",
         call: "math.abs(-3)",
-        runtime: "float",
+        runtime: "int",
     },
     Case {
         key: "math.is_nan",
@@ -193,181 +193,7 @@ const CASES: &[Case] = &[
         call: "file.home_dir()",
         runtime: "string",
     },
-    // ── ccr ── 注意 `ccr.len` 是**全语言少数几个 Int 来源之一**
-    Case {
-        key: "ccr.put",
-        module: "ccr",
-        method: "put",
-        call: "ccr.put(\"payload\")",
-        runtime: "string",
-    },
-    Case {
-        key: "ccr.len",
-        module: "ccr",
-        method: "len",
-        call: "ccr.len()",
-        runtime: "int",
-    },
-    // ── bus ──
-    Case {
-        key: "bus.subscribe",
-        module: "bus",
-        method: "subscribe",
-        call: "bus.subscribe(\"rt-*\")",
-        runtime: "float",
-    },
-    Case {
-        key: "bus.emit",
-        module: "bus",
-        method: "emit",
-        call: "bus.emit(\"rt-a\", 1)",
-        runtime: "nil",
-    },
-    // ── mock / plan ──
-    Case {
-        key: "mock.count",
-        module: "mock",
-        method: "count",
-        call: "mock.count()",
-        runtime: "float",
-    },
-    Case {
-        key: "mock.names",
-        module: "mock",
-        method: "names",
-        call: "mock.names()",
-        runtime: "list",
-    },
-    // ── plan（第 2 参是 steps 列表，见 d88_param_comments_match_runtime）──
-    Case {
-        key: "plan.create",
-        module: "plan",
-        method: "create",
-        call: "plan.create(\"rtp\", [{id: \"a\", text: \"b\"}])",
-        runtime: "string",
-    },
-    Case {
-        key: "plan.add",
-        module: "plan",
-        method: "add",
-        call: "plan.add(\"rtp\", \"s1\", \"d\")",
-        runtime: "bool",
-    },
-    Case {
-        key: "plan.info",
-        module: "plan",
-        method: "info",
-        call: "plan.info(\"rtp\")",
-        runtime: "dict",
-    },
-    Case {
-        key: "plan.list",
-        module: "plan",
-        method: "list",
-        call: "plan.list()",
-        runtime: "list",
-    },
-    // ── memory ──
-    Case {
-        key: "memory.size",
-        module: "memory",
-        method: "size",
-        call: "memory.size()",
-        runtime: "float",
-    },
-    Case {
-        key: "memory.keys",
-        module: "memory",
-        method: "keys",
-        call: "memory.keys()",
-        runtime: "list",
-    },
-    // ── sandbox ──
-    Case {
-        key: "sandbox.mode",
-        module: "sandbox",
-        method: "mode",
-        call: "sandbox.mode()",
-        runtime: "string",
-    },
-    Case {
-        key: "sandbox.check_builtin",
-        module: "sandbox",
-        method: "check_builtin",
-        call: "sandbox.check_builtin(\"print\")",
-        runtime: "bool",
-    },
-    Case {
-        key: "sandbox.check_path",
-        module: "sandbox",
-        method: "check_path",
-        call: "sandbox.check_path(\".\")",
-        runtime: "bool",
-    },
-    Case {
-        key: "sandbox.container_clear",
-        module: "sandbox",
-        method: "container_clear",
-        call: "sandbox.container_clear()",
-        runtime: "bool",
-    },
-    // ── tea ──
-    Case {
-        key: "tea.init",
-        module: "tea",
-        method: "init",
-        call: "tea.init()",
-        runtime: "tea_app",
-    },
-    Case {
-        key: "tea.model_type",
-        module: "tea",
-        method: "model_type",
-        call: "tea.model_type()",
-        runtime: "string",
-    },
-    Case {
-        key: "tea.replay",
-        module: "tea",
-        method: "replay",
-        call: "tea.replay(tea.init())",
-        runtime: "nil",
-    },
-    // ── mora ──
-    Case {
-        key: "mora.list_refines",
-        module: "mora",
-        method: "list_refines",
-        call: "mora.list_refines()",
-        runtime: "list",
-    },
-    // ── document ── 实参是占位符 `@TMP_MD@`，由 `program_source` 替换成
-    // 测试现写的临时 `.md` 绝对路径（不依赖 CWD，也不往仓库里写文件）。
-    Case {
-        key: "document.parse",
-        module: "document",
-        method: "parse",
-        call: "document.parse(\"@TMP_MD@\")",
-        runtime: "document",
-    },
 ];
-
-/// 临时 `.md` 的路径（`document.parse` 的实参）。每次调用都确保文件存在。
-///
-/// v0.104.6 D475：返回**守卫**而非裸路径 —— 裸路径没有生命周期，
-/// 守卫一析构文件就被删了（调用方需要文件在断言期间一直存在）。
-/// 临时 `.md` 所在的目录（`document.parse` 的实参）：返回**守卫**。
-///
-/// v0.104.6 D475：返回**守卫**而非裸路径 —— 裸路径没有生命周期，
-/// 守卫一析构文件就被删了（调用方需要文件在断言期间一直存在）。
-fn tmp_md_dir() -> TempDir {
-    let dir = TempDir::new("mora_d88_return_types");
-    let p = dir.join("doc.md");
-    if !p.exists() {
-        std::fs::write(&p, "# d88\n\nbody\n").expect("write temp md");
-    }
-    dir
-}
 
 /// 把 `Type` 展开成它**允许**的运行期类型名集合。
 ///
@@ -389,9 +215,6 @@ fn allowed_runtime_names(ty: &mora::typeck::Type) -> BTreeSet<String> {
         Type::Float => {
             out.insert("float".into());
         }
-        Type::BigInt => {
-            out.insert("bigint".into());
-        }
         Type::Bool => {
             out.insert("bool".into());
         }
@@ -403,12 +226,6 @@ fn allowed_runtime_names(ty: &mora::typeck::Type) -> BTreeSet<String> {
         }
         Type::Dict(_, _) => {
             out.insert("dict".into());
-        }
-        Type::Document => {
-            out.insert("document".into());
-        }
-        Type::TeaApp { .. } => {
-            out.insert("tea_app".into());
         }
         Type::Union(members) => {
             for m in members {
@@ -423,19 +240,10 @@ fn allowed_runtime_names(ty: &mora::typeck::Type) -> BTreeSet<String> {
 }
 
 /// 生成 `.mora` 源码，逐行打印 `key=type_of(call)`。
-fn program_source(md_file: &Path) -> String {
-    // v0.104.6 D475：`md` 此前是**同名遮蔽**守卫的那一行 ——
-    // `let md = md.to_string_lossy()` 把守卫覆盖掉 ⇒ 守卫当场析构 ⇒
-    // doc.md 被删 ⇒ 探针程序引用的文件不存在 ⇒ 探针跑不起来。
-    // ⇒ 守卫留在调用方（`observe_runtime`）持有，这里只收路径。
-    let md = md_file.to_string_lossy().replace('\\', "/");
+fn program_source() -> String {
     let mut s = String::from("task main()\n");
     for c in CASES {
-        s.push_str(&format!(
-            "  print(\"{}=\" + type_of({}))\n",
-            c.key,
-            c.call.replace("@TMP_MD@", &md)
-        ));
+        s.push_str(&format!("  print(\"{}=\" + type_of({}))\n", c.key, c.call));
     }
     s.push_str("end\n");
     s
@@ -445,9 +253,7 @@ fn program_source(md_file: &Path) -> String {
 fn observe_runtime() -> BTreeSet<(String, String)> {
     let dir = TempDir::new("mora_d88_return_types");
     let prog: PathBuf = dir.join("probe.mora");
-    // 守卫必须活到探针**跑完** —— 探针要读 doc.md。
-    let md_dir = tmp_md_dir();
-    std::fs::write(&prog, program_source(&md_dir.join("doc.md"))).expect("write probe");
+    std::fs::write(&prog, program_source()).expect("write probe");
 
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_mora"))
         .arg("run")
@@ -551,8 +357,8 @@ fn census_covers_every_module_that_has_a_signature() {
         );
     }
     assert!(
-        CASES.len() >= 40,
-        "对拍用例只有 {} 条（D88 建立时实测为 40 条），覆盖面在缩小 —— 确认是有意为之并更新本断言",
+        CASES.len() >= 19,
+        "对拍用例只有 {} 条（Wave 1 保留模块实测 19 条），覆盖面在缩小 —— 确认是有意为之并更新本断言",
         CASES.len()
     );
 }
@@ -567,67 +373,4 @@ fn census_covers_every_module_that_has_a_signature() {
 /// - `schedule` / `tool` / `skill` / `xform` / `web` / `ai` / `agent` / `random`
 ///   —— 要么需要外部资源（网络 / 容器 / 已注册的处理函数），要么返回值
 ///   随注册内容变化，构造确定性调用比不写这条测试更贵。
-const KNOWN_NONEMPTY_MODULES: &[&str] = &[
-    "math", "json", "file", "stats", "linalg", "mora", "bus", "mock", "ccr", "plan", "tea",
-    "sandbox", "memory", "document",
-];
-
-/// D88 期间抓到的两条**注释与运行期不符**（签名本身没错，错的是参数说明）。
-///
-/// 断言写成测试是为了让注释不能再漂回去：
-/// - `plan.create` 第 2 参是 **steps 列表**（`{id, text}` 字典数组），不是「kind」
-/// - `mora.refine` 第 1 参是**文件路径**，不是脚本文本
-#[test]
-fn d88_param_comments_match_runtime() {
-    // plan.create：传字符串当第 2 参必须被运行期拒绝，且消息提到 steps
-    let dir = TempDir::new("mora_d88_return_types");
-    let prog: PathBuf = dir.join("plan_create.mora");
-    std::fs::write(&prog, "task main()\n  plan.create(\"p\", \"kind\")\nend\n").expect("write");
-
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_mora"))
-        .arg("run")
-        .arg(&prog)
-        .output()
-        .expect("run mora");
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        !out.status.success(),
-        "`plan.create(\"p\", \"kind\")` 应被运行期拒绝（第 2 参是 steps 列表，不是 kind）"
-    );
-    assert!(
-        combined.contains("steps must be a list of {id, text} dicts"),
-        "运行期消息应指明第 2 参是 steps 列表。实际输出：\n{combined}"
-    );
-    let _ = std::fs::remove_file(&prog);
-
-    // mora.refine：第 1 参当路径用；传一段脚本文本必须报「找不到文件」
-    let prog2: PathBuf = dir.join("mora_refine.mora");
-    std::fs::write(
-        &prog2,
-        "task main()\n  mora.refine(\"task main() end\", \"clean\")\nend\n",
-    )
-    .expect("write");
-    let out2 = std::process::Command::new(env!("CARGO_BIN_EXE_mora"))
-        .arg("run")
-        .arg(&prog2)
-        .output()
-        .expect("run mora");
-    let combined2 = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out2.stdout),
-        String::from_utf8_lossy(&out2.stderr)
-    );
-    assert!(
-        !out2.status.success(),
-        "把脚本文本当 `mora.refine` 第 1 参应失败（它是文件路径）"
-    );
-    assert!(
-        combined2.contains("mora.refine: read task main() end"),
-        "运行期应把第 1 参当路径去 read。实际输出：\n{combined2}"
-    );
-    let _ = std::fs::remove_file(&prog2);
-}
+const KNOWN_NONEMPTY_MODULES: &[&str] = &["math", "json", "file", "stats", "linalg"];

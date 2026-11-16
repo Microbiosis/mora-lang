@@ -18,7 +18,7 @@
 //!
 //! ## 根因：D128 的三元组去重对这条**失效**
 //!
-//! `check_program_witnesses_bidirectional` 跑两层：双向层 + HM 层，
+//! `check_program_witnesses` 跑两层：双向层 + HM 层，
 //! D128 加了 `(line, expected, actual)` 三元组去重。但**两个**维度都不同：
 //!
 //! | | 位置 | `expected` / `actual` 文本 |
@@ -70,17 +70,14 @@ impl Drop for WorkDir {
 }
 
 fn check(dir: &Path, file: &Path) -> (String, i32) {
-    let out = Command::new(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/target/debug/mora.exe"
-    ))
-    .current_dir(dir)
-    .arg("--check")
-    .arg(file)
-    .env_remove("OPENAI_API_KEY")
-    .env_remove("MORA_AI_BASE_URL")
-    .output()
-    .expect("跑 mora --check");
+    let out = Command::new(env!("CARGO_BIN_EXE_mora"))
+        .current_dir(dir)
+        .arg("--check")
+        .arg(file)
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("MORA_AI_BASE_URL")
+        .output()
+        .expect("跑 mora --check");
     let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
     s.push_str(&String::from_utf8_lossy(&out.stderr));
     (s, out.status.code().unwrap_or(-1))

@@ -356,17 +356,12 @@ fn while_continue_bare_expression() {
 fn if_as_value_not_starved_by_dead_branch() {
     use std::sync::Arc;
     let run = |src: &str| -> Value {
-        let (f, _w) = mora::cli::compile_and_opt(src, None).expect("compile");
-        let mut interp = mora::interpreter::Interpreter::new();
-        let mut env = interp.take_env();
-        let arc = Arc::new(f);
-        mora::mir::vm::execute(
-            &arc,
-            &mut interp,
-            &mut env,
-            &mut mora::mir::effect::Effects::new(),
-        )
-        .expect("execute")
+        let (p, _w) = mora::cli::compile_and_opt(src, None).expect("compile");
+        let mut core = mora::runtime::CoreRuntime::default();
+        let arc = Arc::new(p);
+        mora::runtime::vm::execute_program(arc, &mut core)
+            .expect("execute")
+            .0
     };
 
     // 条件是常量 → else 臂折叠成死块（本缺陷的触发形态）

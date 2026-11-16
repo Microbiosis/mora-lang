@@ -64,7 +64,7 @@ fn lsp_session(doc: &str) -> String {
     let payload =
         frame(init) + &frame(&open) + &frame(r#"{"jsonrpc":"2.0","method":"exit","params":{}}"#);
 
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora-lsp.exe");
+    let exe = env!("CARGO_BIN_EXE_mora-lsp");
     let mut child = Command::new(exe)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

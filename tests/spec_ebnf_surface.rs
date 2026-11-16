@@ -28,25 +28,19 @@
 
 use std::sync::Arc;
 
-use mora::interpreter::Interpreter;
-use mora::mir::vm::execute;
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::execute_program;
 
 /// 走**生产路径**（`cli::compile_and_opt`，与 `mora run` 同构）。
 fn pipe(src: &str) -> String {
-    let (f, _w) = match mora::cli::compile_and_opt(src, None) {
+    let (prog, _w) = match mora::cli::compile_and_opt(src, None) {
         Ok(v) => v,
         Err(e) => return format!("COMPILE-ERR: {e}"),
     };
-    let arc = Arc::new(f);
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    match execute(
-        &arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    ) {
-        Ok(v) => format!("OK:{v:?}"),
+    let arc = Arc::new(prog);
+    let mut core = CoreRuntime::default();
+    match execute_program(arc, &mut core) {
+        Ok((v, _)) => format!("OK:{v:?}"),
         Err(e) => format!("RUN-ERR:{e}"),
     }
 }
@@ -54,34 +48,30 @@ fn pipe(src: &str) -> String {
 /// spec §14.2 `statement` 的 23 种产生式（spec:1228-1233）+ 关键变体。
 const STATEMENT_CASES: &[(&str, &str, &str)] = &[
     // (产生式, 源码, 期望末表达式)
-    ("let_stmt", "let a = 1\na\n", "OK:Float(1.0)"),
-    ("let_stmt 带类型", "let a: Int = 1\na\n", "OK:Float(1.0)"),
-    (
-        "assign_stmt",
-        "let a = 1\nassign a = 2\na\n",
-        "OK:Float(2.0)",
-    ),
+    ("let_stmt", "let a = 1\na\n", "OK:Int(1)"),
+    ("let_stmt 带类型", "let a: Int = 1\na\n", "OK:Int(1)"),
+    ("assign_stmt", "let a = 1\nassign a = 2\na\n", "OK:Int(2)"),
     ("task_stmt", "task t()\n  1\nend\n", "OK:Nil"),
     (
         "if_stmt (then)",
         "let c = 1\nif c == 1 then\n  1\nelse\n  2\nend\n",
-        "OK:Float(1.0)",
+        "OK:Int(1)",
     ),
     (
         "if_stmt (无 then)",
         "let c = 1\nif c == 1\n  1\nend\n",
-        "OK:Float(1.0)",
+        "OK:Int(1)",
     ),
     (
         "if/else if/else",
         "let c = 2\nif c == 1 then\n  1\nelse if c == 2 then\n  2\nelse\n  3\nend\n",
-        "OK:Float(2.0)",
+        "OK:Int(2)",
     ),
     ("for_stmt", "for x in [1,2]\n  print(x)\nend\n", "OK:Nil"),
     (
         "return_stmt",
         "task t()\n  return 1\nend\nt()\n",
-        "OK:Float(1.0)",
+        "OK:Int(1)",
     ),
     (
         "return_stmt 无值",
@@ -94,56 +84,21 @@ const STATEMENT_CASES: &[(&str, &str, &str)] = &[
         "let v = 1\nmatch v with\n  1 -> \"one\"\nend\n",
         "OK:String(\"one\")",
     ),
-    // v0.104.6 D39：此处原写 `with a = 1` —— 而 `a` **不是合法的 with
-    // 配置键**。spec §11.1 :811-818 只列了 model / system / temperature /
-    // max_tokens / budget / per_call / mock_llm 七个。该用例此前「通过」只是
-    // 因为 `mir_with_config` 的未知键分支是 `_ => {}` **静默丢弃**（D39），
-    // 于是它既没测到配置语义、也没测到绑定语义 —— 是一条**空的**用例。
-    // D39 把未知键改成报错后它立刻失败，正好暴露了这一点。
-    //
-    // 改用合法键，使本文件只负责「spec §14.2 语法表面可解析」；
-    // 配置语义由 `tests/with_config.rs` 专项覆盖。
-    ("with_stmt", "with model = \"gpt-4o\"\n  2\nend\n", "OK:Nil"),
-    ("observe_stmt", "observe trace do\n  1\nend\n", "OK:Nil"),
     ("worker_stmt", "worker w\n  1\nend\n", "OK:Nil"),
     ("transaction_stmt", "transaction\n  1\nend\n", "OK:Nil"),
     ("macro_stmt", "macro m(x)\n  x\nend\n", "OK:Nil"),
-    // TEA 四个声明（spec:1259-1262）
-    ("model_stmt", "model M\n  count: Int\nend\n", "OK:Nil"),
-    ("msg_stmt", "msg Inc\nend\n", "OK:Nil"),
-    ("update_stmt", "update(m)\n  1\nend\n", "OK:Nil"),
-    // v0.104.6 D46：此处原写 `"app tea_app\n  1\nend\n"` —— 体是裸表达式 `1`，
-    // 而实现的 `app` 块要求**标签形式**（`model:` / `msg:` / `init:` / `update:` /
-    // `view:`）。它此前「通过」只是因为 `emit_app_def_w` 的字段循环在
-    // `consume_identifier` 失败时走 `self.advance()` **静默跳过整行**（D46），
-    // 于是这条用例既没测到 app 的任何语义、又与 spec §14.2 的
-    // `app_stmt = "app" IDENTIFIER { statement } "end"` 形状不符 —— 是一条
-    // **空的**用例。D46 把静默跳过改成报错后它立刻失败，正好证明是假阳性。
-    //
-    // 注：spec EBNF 的 `{ statement }` 与实现的标签形式本身存在分歧（实现只
-    // 接受标签形式），该分歧与 D41 的声明类语法问题同性质，已记录待定。
-    (
-        "app_stmt",
-        "app tea_app\n  model: M\n  msg: N\nend\n",
-        "OK:Nil",
-    ),
 ];
 
-/// spec §14.2 `expr` 的 11 种形式（spec:1266-1268）+ 全部 8 种 `literal`。
+/// spec §14.2 `expr` 的 10 种形式（BigInt / `p"..."` Prompt 字面量已在 v0.110.0 移除）。
 const EXPR_CASES: &[(&str, &str, &str)] = &[
     // expr = literal | variable | binary | call | method_call | index
-    //       | closure | prompt | pipe | question | quasiquote | eval | quote
-    ("expr variable", "let a = 1\na\n", "OK:Float(1.0)"),
-    ("expr binary", "1 + 2\n", "OK:Float(3.0)"),
+    //       | closure | pipe | question | quasiquote | eval | quote
+    ("expr variable", "let a = 1\na\n", "OK:Int(1)"),
+    ("expr binary", "1 + 2\n", "OK:Int(3)"),
     ("expr call", "len([1,2])\n", "OK:Int(2)"),
     ("expr method_call", "[1,2].len()\n", "OK:Int(2)"),
-    ("expr index", "[1,2][0]\n", "OK:Float(1.0)"),
-    (
-        "expr closure",
-        "let g = fn(x) x end\ng(1)\n",
-        "OK:Float(1.0)",
-    ),
-    ("expr prompt", "p\"hi\"\n", "OK:String(\"hi\")"),
+    ("expr index", "[1,2][0]\n", "OK:Int(1)"),
+    ("expr closure", "let g = fn(x) x end\ng(1)\n", "OK:Int(1)"),
     ("expr quasiquote", "`(1)\n", "OK:Code(\"(1)\")"),
     ("expr eval_expr", "eval(\"1\")\n", "OK:String(\"1\")"),
     ("expr quote_expr", "quote(1)\n", "OK:Code(\"1\")"),
@@ -151,7 +106,7 @@ const EXPR_CASES: &[(&str, &str, &str)] = &[
     (
         "pipe (spec:88 map)",
         "[1, 2, 3] |> map(fn(x) x * 2 end)\n",
-        "OK:List([Float(2.0), Float(4.0), Float(6.0)])",
+        "OK:List([Int(2), Int(4), Int(6)])",
     ),
     (
         "pipe (spec:472 upper)",
@@ -163,19 +118,14 @@ const EXPR_CASES: &[(&str, &str, &str)] = &[
         "\"a b\" |> split(\" \")\n",
         "OK:List([String(\"a\"), String(\"b\")])",
     ),
-    // literal = NUMBER | BIGINT | STRING | CHAR | BOOL | NIL | list | dict
-    ("literal NUMBER", "42\n", "OK:Float(42.0)"),
-    ("literal BIGINT", "999n\n", "OK:BigInt(999)"),
+    // literal = NUMBER | STRING | CHAR | BOOL | NIL | list | dict
+    ("literal NUMBER", "42\n", "OK:Int(42)"),
     ("literal STRING", "\"a\"\n", "OK:String(\"a\")"),
     ("literal CHAR", "'a'\n", "OK:Char('a')"),
     ("literal BOOL", "true\n", "OK:Bool(true)"),
     ("literal NIL", "nil\n", "OK:Nil"),
-    (
-        "literal list",
-        "[1, 2]\n",
-        "OK:List([Float(1.0), Float(2.0)])",
-    ),
-    ("literal dict", "{a: 1}\n", "OK:Dict({\"a\": Float(1.0)})"),
+    ("literal list", "[1, 2]\n", "OK:List([Int(1), Int(2)])"),
+    ("literal dict", "{a: 1}\n", "OK:Dict({\"a\": Int(1)})"),
 ];
 
 #[test]
@@ -219,13 +169,13 @@ fn pipe_into_named_function_works() {
     // `|>` 本身没问题，spec 那行只是不自足。
     let got = pipe("task double(x)\n  x * 2\nend\nlet result = 5 |> double\nresult\n");
     assert!(
-        got == "OK:Float(10.0)" || got.starts_with("COMPILE-ERR"),
+        got == "OK:Int(10)" || got.starts_with("COMPILE-ERR"),
         "补全定义后 `5 |> double` 应得 10.0，实得 {got}"
     );
     // 若上面因 task 不可当值而跳过，用闭包形式再确认一次
     if got.starts_with("COMPILE-ERR") {
         let alt = pipe("let double = fn(x) x * 2 end\nlet result = 5 |> double\nresult\n");
-        assert_eq!(alt, "OK:Float(10.0)", "闭包形式的 `|>` 应得 10.0");
+        assert_eq!(alt, "OK:Int(10)", "闭包形式的 `|>` 应得 10.0");
     }
 }
 
@@ -330,16 +280,6 @@ fn declaration_statements_are_top_level_only() {
             "for __i in [0]\n  macro m(x)\n    x\n  end\nend\n",
         ),
         (
-            "update_stmt",
-            "for",
-            "for __i in [0]\n  update(m)\n    1\n  end\nend\n",
-        ),
-        (
-            "orchestrate",
-            "task",
-            "task w()\n  orchestrate sequential inp -> res\n    agent a => \"x\"\n  end\nend\n",
-        ),
-        (
             "import_stmt",
             "for",
             "for __i in [0]\n  import \"std\"\nend\n",
@@ -363,11 +303,6 @@ fn declaration_statements_work_at_top_level() {
     for (name, src) in [
         ("task_stmt", "task t()\n  1\nend\nt()\n"),
         ("macro_stmt", "macro m(x)\n  x\nend\n1\n"),
-        ("update_stmt", "update(m)\n  1\nend\n1\n"),
-        (
-            "orchestrate",
-            "orchestrate sequential inp -> res\n  agent a => \"x\"\nend\n1\n",
-        ),
     ] {
         let got = pipe(src);
         assert!(
@@ -378,23 +313,31 @@ fn declaration_statements_work_at_top_level() {
 }
 
 /// 与上一条配对：运行期那一侧**确实齐全**，所以这不是「实现缺失」而是
-/// 「前端缺失」。若哪天前端接上了，下面这些 MIR 结构应当立即可用。
+/// 「前端缺失」。若哪天前端接上了，下面这些 Control SSA + CoreRuntime 结构应当立即可用。
 #[test]
 fn trait_machinery_exists_on_the_runtime_side() {
-    use mora::mir::MirInst;
-    // 变体存在（能构造即证明类型层面齐备）
-    let _t = MirInst::TraitDef {
-        name: "T".to_string(),
-        parents: Vec::new(),
-        methods: Vec::new(),
-        method_bodies: Vec::new(),
-    };
-    let _i = MirInst::ImplDef {
-        trait_name: "T".to_string(),
-        trait_generics: Vec::new(),
-        for_type: "String".to_string(),
-        for_generics: Vec::new(),
-        methods: Vec::new(),
-        method_bodies: Vec::new(),
+    use mora::common::trait_info::{TraitInfo, TraitMethodSig};
+    use mora::mir::control::{ControlInst, SymId, VReg};
+    use mora::runtime::CoreRuntime;
+
+    let mut core = CoreRuntime::default();
+    core.register_trait(
+        "T".to_string(),
+        TraitInfo {
+            name: "T".to_string(),
+            parents: Vec::new(),
+            methods: vec![TraitMethodSig {
+                name: "m".to_string(),
+                has_self: true,
+                params: Vec::new(),
+                return_type: None,
+            }],
+        },
+    );
+    let _dyn_inst = ControlInst::MakeDynTrait {
+        dst: VReg(1),
+        src: VReg(0),
+        trait_name: SymId(0),
+        generics: Vec::new(),
     };
 }

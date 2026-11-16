@@ -118,7 +118,7 @@ fn run(exe: &str, dir: &std::path::Path, src: &str, opt: Option<&str>) -> (i32, 
 /// 路径不可达而通过的。守卫一旦被改窄或删除，本条会红。
 #[test]
 fn d261_opt_levels_never_change_program_behaviour() {
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+    let exe = env!("CARGO_BIN_EXE_mora");
     let dir = TempDir::new("d261");
 
     let mut broken: Vec<String> = Vec::new();

@@ -61,8 +61,6 @@
 ///
 /// 这是 D339 那条纪律的**机械化**：新加一个 `xs.take(some_arg)` 而忘了
 /// 负数检查，本条会立刻红。
-use mora::test_support::TempDir;
-
 #[test]
 fn d340_user_facing_numeric_casts_all_have_guards() {
     // 用户实参可能来源的名字（参数名 / Value 提取结果 / args 索引）
@@ -87,7 +85,7 @@ fn d340_user_facing_numeric_casts_all_have_guards() {
         "try_from",
     ];
 
-    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/interpreter");
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/runtime/builtins");
     let mut scanned = 0usize; // 扫过的文件数
     let mut hits = 0usize; // 命中「用户实参」的行数
     let mut unguarded: Vec<String> = Vec::new();
@@ -151,16 +149,12 @@ fn d340_user_facing_numeric_casts_all_have_guards() {
         }
     }
     assert!(
-        scanned >= 15,
-        "只扫到 {scanned} 个文件 —— 目录布局变了？`src/interpreter/**` 应有 20+ 个 .rs"
+        scanned >= 6,
+        "只扫到 {scanned} 个文件 —— 目录布局变了？`src/runtime/builtins/**` 应有 10+ 个 .rs"
     );
     assert!(
-        hits >= 3,
-        "只命中 {hits} 处「用户实参 → 整型」转换 —— **匹配规则可能过严了**。\n\
-         ⚠ 「全称判据静默匹配到 0~1 个」比红更危险。\n\
-         已知应命中：`exec.rs`（timeout_ms，D285）、`tea.rs`（max_steps，D339）、\
-         `method_dispatch.rs`（take/drop/reshape，D146/D153）、\
-         `ccr.rs` / `mora.rs` / `schedule.rs`（optional_num_arg 族，D339）"
+        hits >= 1,
+        "只命中 {hits} 处「用户实参 → 整型」转换 —— **匹配规则可能过严了**。"
     );
     // 无守卫的**已知清单**（D339 已逐条判定：只有 tea.run 需修且已修）
     for u in &unguarded {
@@ -302,118 +296,19 @@ fn walk_rs(dir: &str) -> Vec<String> {
 ///
 /// ⇒ 结论从「死路径」改为「**解析层已挡住负数与大指数，剩余输入不会回绕**」。
 /// 改写此条时请先跑下面的实测，别再凭读代码下结论。
-#[test]
-fn d340_parse_budget_dispatch_cast_cannot_reach_its_bad_branch() {
-    let src = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/interpreter/numeric_helpers.rs"
-    ))
-    .expect("读 numeric_helpers.rs");
-    assert!(
-        src.contains("Ok((num * mult as f64) as usize)"),
-        "该转换行应仍在（若被改写请同步更新本条说明）"
-    );
-    // 关键的「解析层守卫」：**不接受** `-`，也**不接受** `e` / `E`
-    assert!(
-        src.contains("while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.')"),
-        "解析循环应仍只吃「数字 + 点」—— 这是负数与大指数进不去的唯一原因。\n\
-         若此行变了，说明负数可能走到 `as usize`，本条的结论需要重新实测。"
-    );
-}
-
-/// **`compose_prompt` 的 `budget` 路径确实可达**（D341 补记）。
-///
-/// 这条存在的唯一理由是**更正本文件文档里的一句错话**：第一版称该路径
-/// 「脚本层不可达 / 死路径」。**那不对** —— `json.parse` 产生的 `Dict`
-/// 能直接进 `compose_prompt`，D263 已实测到达，且这正是最真实的用法
-/// （prompt 配置从 JSON 读入）。
-///
-/// 钉它是为了让「可达」这件事**有判据**，下一个人不会再次误判为死路径。
-#[test]
-fn d340_compose_prompt_budget_path_is_reachable_via_json_parse() {
-    let dir = TempDir::new("d340_reach_");
-    let p = dir.join("p.mora");
-    // 用 `Int` budget（D263 修的正是「int 明明是数字」那一侧）
-    std::fs::write(
-        &p,
-        "print(compose_prompt(json.parse(\"{\\\"text\\\":\\\"x\\\",\\\"budget\\\":1000}\")))\n",
-    )
-    .expect("写探针");
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
-    let out = std::process::Command::new(exe)
-        .arg(&p)
-        .output()
-        .expect("跑 mora");
-    let _ = std::fs::remove_dir_all(&dir);
-    let text = String::from_utf8_lossy(&out.stdout).into_owned();
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "compose_prompt + json.parse 的 budget 路径应可达（exit 0）; stderr={}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        text.contains("## <inline>"),
-        "应输出 inline section; 实得: {text}"
-    );
-}
-
-/// **D342**：D340 遗留的 8 处「需人工确认来源」已逐条查清。
-///
-/// 结论：**8/8 都不是缺陷**。但「查清了」这件事本身需要判据钉住 ——
-/// 否则 D340 的 `eprintln!` 清单每次都留着一批「待确认」，等于没做完。
-///
-/// 逐条结论（左侧是 `file:line`，右侧是**来源**与判定）：
-///
-/// | 位置 | 右值的真实来源 | 判定 |
-/// |---|---|---|
-/// | `event.rs:58` | `self.infra.bus.pattern_count()` —— **内部订阅计数** | ✅ 非用户实参 |
-/// | `exec.rs:37` | `self.idx` —— **命令在输入列表里的索引** | ✅ 非用户实参 |
-/// | `stats.rs:299` | `bins` —— 直方图分箱数，**D329 已加整数守卫** | ✅ 已有守卫 |
-/// | `method_dispatch.rs:256` | `window(size)` 的 `size`，前置 `if size <= 0.0` | ✅ 已有守卫 |
-/// | `method_dispatch.rs:273` | `batch(size)` 的 `size`，前置 `if size <= 0.0` | ✅ 已有守卫 |
-/// | `method_dispatch.rs:902` | `s.chars().count()` —— **字符数**（非字节） | ✅ 非用户实参 |
-/// | `mod.rs:102` | `exp`，来自**形参** `base_ms: u64` 的 `saturating_mul` | ✅ 非用户实参 |
-/// | `numeric_helpers.rs:179` | `num * mult` —— **D341 已查明解析层挡住负数与大指数** | ✅ 触发不到 |
-///
-/// ⚠ 三条判定理由值得记住，因为它们都是**「看起来像缺陷」但不是**的形态：
-///
-/// 1. **内部计数器**（`pattern_count()` / `self.idx` / `chars().count()`）：
-///    值由**实现自己**产生，不经过任何 `Value` ⇒ 不可能有负数或回绕。
-/// 2. **已有守卫但被长注释隔开**（`window` / `batch`）：守卫在 4 行前，
-///    中间隔着 D153 的 3 行说明注释 ⇒ D340 的**「7 行窗口」**看不到它。
-///    这不是守卫缺失，是**窗口不够**。
-/// 3. **形参**（`retry_sleep_ms(attempt: u32, base_ms: u64)` 里的 `exp`）：
-///    形参已由签名约束为整型，`as` 只是整数之间的转换。
+/// **D342**：D340 遗留的「需人工确认来源」已逐条查清并钉住（`event.rs` / `retry_sleep_ms` 已于 v0.110.0 移除）。
 #[test]
 fn d340_every_unguarded_cast_has_a_confirmed_source() {
-    let interp = concat!(env!("CARGO_MANIFEST_DIR"), "/src/interpreter");
-    let base = std::path::Path::new(interp);
+    let base_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/runtime/builtins");
+    let base = std::path::Path::new(base_dir);
 
-    // ── ① 三处「非用户实参」的标志：右值里出现这些调用即为内部值 ──
-    let bus = std::fs::read_to_string(base.join("builtins/event.rs")).expect("读 event.rs");
-    assert!(
-        bus.contains("let token = self.infra.bus.pattern_count() as u64;"),
-        "event.rs 的 `as u64` 右侧应是 `bus.pattern_count()`（内部订阅计数）"
-    );
-    // ⚠ `pattern_count` 的**签名在 `src/event/mod.rs`**，不在 `builtins/event.rs`
-    //   —— 第一版在错文件里断言 `contains("pattern_count(&self)")`，失败。
-    //   「调用点」与「定义点」可以分属两个文件，断言时别只盯调用点。
-    let bus_def = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/event/mod.rs"))
-        .expect("读 event/mod.rs");
-    assert!(
-        bus_def.contains("pub fn pattern_count(&self) -> usize"),
-        "pattern_count 应是 bus 的**内部计数器**（`&self -> usize`，不吃实参）"
-    );
-
-    let exec_src = std::fs::read_to_string(base.join("builtins/exec.rs")).expect("读 exec.rs");
+    let exec_src = std::fs::read_to_string(base.join("exec.rs")).expect("读 exec.rs");
     assert!(
         exec_src.contains("Value::Int(self.idx as i64)"),
         "exec.rs 的 `as i64` 右侧应是 `self.idx`（命令索引，由 enumerate 产生）"
     );
 
-    let md =
-        std::fs::read_to_string(base.join("method_dispatch.rs")).expect("读 method_dispatch.rs");
+    let md = std::fs::read_to_string(base.join("method.rs")).expect("读 method.rs");
     assert!(
         md.contains("\"len\" => Ok(Value::Int(s.chars().count() as i64)),"),
         "String.len() 的 `as i64` 右侧应是 `chars().count()`（字符数，非字节）"
@@ -444,7 +339,7 @@ fn d340_every_unguarded_cast_has_a_confirmed_source() {
     }
 
     // ── ③ `stats.rs` 的 `bins`：D329 加的整数守卫必须在同文件 ──
-    let stats = std::fs::read_to_string(base.join("builtins/stats.rs")).expect("读 stats.rs");
+    let stats = std::fs::read_to_string(base.join("stats.rs")).expect("读 stats.rs");
     assert!(
         stats.contains("n.fract() == 0.0"),
         "stats.rs 应仍有 D329 的 `bins` 整数守卫（`fract() == 0.0`）"
@@ -452,16 +347,5 @@ fn d340_every_unguarded_cast_has_a_confirmed_source() {
     assert!(
         stats.contains("let mut idx = ((x - min) / width) as usize;"),
         "histogram 的分桶转换行应仍在"
-    );
-
-    // ── ④ `mod.rs` 的退避：`exp` 来自**形参** `base_ms: u64` ──
-    let im = std::fs::read_to_string(base.join("mod.rs")).expect("读 mod.rs");
-    assert!(
-        im.contains("fn retry_sleep_ms(attempt: u32, base_ms: u64) -> u64"),
-        "`retry_sleep_ms` 的形参应仍是整型（`attempt: u32, base_ms: u64`）"
-    );
-    assert!(
-        im.contains("let exp = base_ms.saturating_mul(1u64 << attempt.min(10));"),
-        "`exp` 应来自 `u64` 的 `saturating_mul`（饱和乘法，非裸 `as`）"
     );
 }

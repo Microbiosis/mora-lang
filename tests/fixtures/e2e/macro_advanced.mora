@@ -18,7 +18,7 @@ end
 let s4 = square(6i)
 let c3 = cube(3i)
 let f5 = factorial(5i)
-print("square(6)=" + s4)
-print("cube(3)=" + c3)
-print("factorial(5)=" + f5)
+print("square(6)=" + str(s4))
+print("cube(3)=" + str(c3))
+print("factorial(5)=" + str(f5))
 f5

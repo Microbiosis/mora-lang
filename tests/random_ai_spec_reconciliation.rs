@@ -57,7 +57,7 @@ fn ev(body: &str) -> (i32, String) {
     std::fs::write(&p, body).expect("写探针");
     let home = dir.join("home");
     std::fs::create_dir_all(&home).expect("建 home");
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+    let exe = env!("CARGO_BIN_EXE_mora");
     let out = Command::new(exe)
         .arg(&p)
         .env("HOME", &home)
@@ -78,6 +78,7 @@ fn ev(body: &str) -> (i32, String) {
                 && !l.starts_with("AI 原语")
                 && !l.starts_with("显式 API")
                 && !l.starts_with("Trait 系统")
+                && !l.starts_with("类型与执行")
                 && !l.starts_with("Built-in")
                 && !l.starts_with("v0.15 CLI")
                 && !l.starts_with('⚠')
@@ -94,9 +95,9 @@ fn ev(body: &str) -> (i32, String) {
 fn d348_random_six_signatures_match_spec() {
     for (body, want) in [
         ("print(type_of(random.random()))", "float"),
-        ("print(type_of(random.rand_int(1, 5)))", "float"),
+        ("print(type_of(random.rand_int(1, 5)))", "int"),
         ("print(type_of(random.rand_float(0.0, 1.0)))", "float"),
-        ("print(type_of(random.rand_choice([1,2,3])))", "float"),
+        ("print(type_of(random.rand_choice([1,2,3])))", "int"),
         ("print(type_of(random.seed(42)))", "nil"),
         ("print(type_of(random.shuffle([1,2,3])))", "list"),
     ] {
@@ -127,7 +128,7 @@ fn d348_rand_int_is_half_open_interval() {
     );
 }
 
-/// **契约 ③**：`rand_int(3, 3)` → `3.0` 是**单点区间**分支，**有意为之**。
+/// **契约 ③**：`rand_int(3, 3)` → `3` 是**单点区间**分支，**有意为之**。
 ///
 /// 源码注释明写「`rand_choice` / `shuffle` 两个内部调用点也依赖该行为」。
 #[test]
@@ -135,8 +136,8 @@ fn d348_rand_int_equal_bounds_is_deliberate() {
     let (code, got) = ev("print(random.rand_int(3, 3))\n");
     assert_eq!(code, 0, "单点区间应成功; 实得 exit={code} out={got}");
     assert_eq!(
-        got, "3.0",
-        "`rand_int(3,3)` → 3.0（`max <= min → return min`）; 实得 {got}"
+        got, "3",
+        "`rand_int(3,3)` → 3（`max <= min → return min`）; 实得 {got}"
     );
 }
 
@@ -164,47 +165,5 @@ fn d348_random_guards_are_complete() {
     assert_eq!(
         got, "true",
         "同种子应产生**同序列**（`seed` 的 spec 承诺是「重置本运行时的种子」）; 实得 {got}"
-    );
-}
-
-/// **契约 ⑤**：`ai.chat` 是 **1 参**（prompt 在前），而 spec 写 `ai.chat(cfg, prompt)`。
-///
-/// 这是 D348 唯一的**新分叉**。不可达的 `ai.stream` / `ai.create`
-/// 属 D59 已记范围，本条不重复。
-#[test]
-fn d348_ai_chat_takes_prompt_first_contrary_to_spec() {
-    // 1 参（prompt）应通过
-    let (code, got) = ev("print(ai.chat(\"hi\"))\n");
-    assert_eq!(
-        code, 0,
-        "`ai.chat(\"hi\")`（1 参 prompt）应成功; 实得 exit={code} out={got}"
-    );
-    // 2 参（spec 写的 cfg, prompt 形态）应被 typeck 拒
-    let (code, got) = ev("print(ai.chat({role: \"user\"}, \"hi\"))\n");
-    assert_eq!(
-        code, 2,
-        "`ai.chat(cfg, prompt)`（spec 形态）应被 typeck 拒 —— 实测确被拒; 实得 exit={code} out={got}\n\
-         ⇒ 分叉确认：spec 写的是「cfg 在前」，实现是「prompt 在前」"
-    );
-    assert!(
-        got.contains("arguments"),
-        "应是**元数**错误（2 参不被接受）; 实得: {got}"
-    );
-}
-
-/// **源码侧**：`ai` 裸名只暴露 3 个方法（`ai.stream` / `ai.create` 不可达）。
-///
-/// 这部分**不是**本轮的新发现（D59 已记），此处只是把「不可达」钉成源码判据，
-/// 让它与 `ai.chat` 的参数顺序分叉**区分开**。
-#[test]
-fn d348_ai_module_exposes_only_three_methods() {
-    let src = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/typeck/dispatch.rs"
-    ))
-    .expect("读 dispatch.rs");
-    assert!(
-        src.contains(r#"const AI_MODULE_METHODS: &[&str] = &["chat", "tokens", "critic"];"#),
-        "`ai` 裸名应只暴露 chat / tokens / critic —— `stream` / `create` 不可达（D59 已记）"
     );
 }

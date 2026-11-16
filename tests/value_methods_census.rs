@@ -45,7 +45,7 @@ fn run_src(src: &str, tag: &str) -> String {
     let base = TempDir::new(tag);
     let prog = base.join("p.mora");
     std::fs::write(&prog, src).expect("写探针");
-    let mora = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+    let mora = env!("CARGO_BIN_EXE_mora");
     let out = Command::new(mora).arg(&prog).output().expect("跑 mora");
     let s = String::from_utf8_lossy(&out.stdout).into_owned();
     let _ = std::fs::remove_dir_all(&base);
@@ -66,7 +66,7 @@ fn d171_variants_without_dispatchers_are_empty_and_explicitly_uncallable() {
         let _ = std::fs::create_dir_all(&base);
         let prog = base.join("p.mora");
         std::fs::write(&prog, format!("print(methods_of({expr}))\n")).expect("写");
-        let mora = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+        let mora = env!("CARGO_BIN_EXE_mora");
         let out = Command::new(mora).arg(&prog).output().expect("跑");
         let s = String::from_utf8_lossy(&out.stdout).into_owned();
         assert!(
@@ -132,7 +132,7 @@ fn d171_trait_dispatch_is_wired_but_has_no_impls() {
     let _ = std::fs::create_dir_all(&dir);
     let prog = dir.join("p.mora");
     std::fs::write(&prog, "let x: dyn Foo = 1\nx.anything()\n").expect("写探针");
-    let mora = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+    let mora = env!("CARGO_BIN_EXE_mora");
     let out = Command::new(mora).arg(&prog).output().expect("跑 mora");
     let err = String::from_utf8_lossy(&out.stderr).into_owned();
     let _ = std::fs::remove_dir_all(&dir);

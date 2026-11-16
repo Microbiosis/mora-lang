@@ -46,13 +46,11 @@ use std::collections::BTreeSet;
 const TERMINALS: &[&str] = &[
     "IDENTIFIER",
     "NUMBER",
-    "BIGINT",
     "STRING",
     "CHAR",
     "BOOL",
     "NIL",
     "QUASIWORD",
-    "digits",
 ];
 
 fn spec() -> String {

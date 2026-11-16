@@ -24,23 +24,17 @@
 use mora::test_support::TempFile;
 use std::sync::Arc;
 
-use mora::interpreter::Interpreter;
-use mora::mir::vm::execute;
 use mora::parser_v3::ParserV3;
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::execute_program;
 use mora::typeck::dispatch::builtin_signatures;
 
 fn run(src: &str) -> String {
-    let (func, _w) = ParserV3::compile(src).unwrap_or_else(|e| panic!("compile: {e}"));
-    let arc = Arc::new(func);
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    match execute(
-        &arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    ) {
-        Ok(v) => format!("{v:?}"),
+    let (prog, _w) = ParserV3::compile(src).unwrap_or_else(|e| panic!("compile: {e}"));
+    let arc = Arc::new(prog);
+    let mut core = CoreRuntime::default();
+    match execute_program(arc, &mut core) {
+        Ok((v, _)) => format!("{v:?}"),
         Err(e) => format!("ERR: {e}"),
     }
 }
@@ -104,11 +98,6 @@ fn declared_type_string(t: &mora::typeck::Type) -> String {
 /// （domain prefix 无独立返回语义）。
 fn call_for(name: &str) -> Option<&'static str> {
     Some(match name {
-        "both" => "both(succeed(), succeed())",
-        "either" => "either(succeed(), succeed())",
-        "fail" => "fail()",
-        "succeed" => "succeed()",
-        "project" => "project(fn(x) x end, 1, 1)",
         "merge_with" => "merge_with(\"k\", \"lww\")",
         "print" => "print(1)",
         "range" => "range(0, 3)",
@@ -122,25 +111,18 @@ fn call_for(name: &str) -> Option<&'static str> {
         // 无上界变参，这里各给一个最小实参数的对拍调用。
         "compose" => "compose(fn(x) x end)",
         "partial" => "partial(fn(x) x end)",
-        "ai.chat" => "ai.chat(\"hi\")",
-        "Router::new" => "Router::new()",
-        "McpServer::new" => "McpServer::new()",
-        // domain prefix 模块，无独立返回值语义
-        "math" | "stats" | "linalg" => return None,
-        // v0.104.6 D68 补登记的 `compose_prompt` 无法用单表达式对拍：
-        // 它按名去环境里查 `Value::PromptSection`，必须先有
-        // `prompt "s" do … end` 块，而 `call_for` 只能给一个表达式
-        // （`runtime_type_of` 把它包进 `type_of(...)`）。
-        // 其返回类型（String）由 `tests/builtin_return_types.rs` 覆盖。
-        "compose_prompt" => return None,
+        "channel" => "channel(1)",
+        "context" => "context()",
+        "sleep" => "sleep(1)",
+        // domain prefix 模块 / 宏展开，无独立固定返回值语义
+        "math" | "stats" | "linalg" | "macroexpand" => return None,
         _ => return None,
     })
 }
 
-/// 有意不参与对拍的 builtin：domain prefix 模块，没有独立的返回语义
-/// （`math.floor(x)` 走方法分派，签名表里那三条 marker 声明只用于前缀解析），
-/// 以及 `compose_prompt`（需前置 `prompt … end` 块，非单表达式，见 `call_for`）。
-const INTENTIONALLY_SKIPPED: &[&str] = &["math", "stats", "linalg", "compose_prompt"];
+/// 有意不参与对拍的 builtin：domain prefix 模块及泛型宏展开，没有独立的固定返回语义
+/// （`math.floor(x)` 走方法分派，签名表里那三条 marker 声明只用于前缀解析）。
+const INTENTIONALLY_SKIPPED: &[&str] = &["math", "stats", "linalg", "macroexpand"];
 
 #[test]
 fn builtin_declared_return_type_matches_runtime() {
@@ -167,7 +149,7 @@ fn builtin_declared_return_type_matches_runtime() {
 
     // 防止将来新增 builtin 却忘了给本测试补调用 —— 那会退化成「静默漏检」。
     assert!(
-        checked >= 16,
+        checked >= 8,
         "只覆盖了 {checked} 个 builtin，签名表可能有新增却没纳入对拍"
     );
     assert!(
@@ -201,15 +183,12 @@ fn range_element_type_matches_runtime() {
         other => panic!("range 应返回 List，实得 {other:?}"),
     };
     assert_eq!(
-        list_ty, "float",
-        "range 元素应为 Float（运行期推 Value::Float）"
+        list_ty, "int",
+        "range 元素应为 Int（Stage 3A-1 推 Value::Int）"
     );
     // 运行期确认
-    assert_eq!(
-        run("range(0, 3)\n"),
-        "List([Float(0.0), Float(1.0), Float(2.0)])"
-    );
-    assert_eq!(runtime_type_of("range(0, 3)[0]"), "float");
+    assert_eq!(run("range(0, 3)\n"), "List([Int(0), Int(1), Int(2)])");
+    assert_eq!(runtime_type_of("range(0, 3)[0]"), "int");
 }
 
 /// `len` 的返回类型与 `int()` 的返回类型必须是**同一个**。
@@ -240,37 +219,16 @@ fn len_and_int_agree_on_return_type() {
     assert_eq!(run("type_of(int(\"2\"))\n"), "String(\"int\")");
 }
 
-/// `ai.chat` 的返回类型必须是 `String`（修前是 `AiResult`，那个类型在 `Value`
-/// 里根本没有对应变体，导致返回值谁也消费不了 —— D9）。
-#[test]
-fn ai_chat_returns_string_not_phantom_type() {
-    let sig = builtin_signatures()
-        .into_iter()
-        .find(|(n, _)| n == "ai.chat")
-        .expect("ai.chat 应在签名表里")
-        .1;
-    assert_eq!(
-        declared_type_string(&sig.return_type),
-        "string",
-        "ai.chat 返回 Value::String，声明必须随之"
-    );
-    assert_eq!(runtime_type_of("ai.chat(\"hi\")"), "string");
-}
-
 /// `print` 的形参 Union 必须覆盖**运行期 Display 有专门实现**的类型 ——
-/// 修前只列 9 个原始类型，`print(router)` / `print(mcp_server)` 被拒（D11）。
+/// 修前只列 9 个原始类型（D11）。
 ///
 /// 这条用真实 CLI 判（库内路径绕过 typeck）。
 #[test]
 fn print_param_union_covers_every_displayable_value_type() {
     use std::process::Command;
     let cases: &[(&str, &str)] = &[
-        ("Router", "print(Router::new())\n"),
-        ("McpServer", "print(McpServer::new())\n"),
-        ("Agent", "let a = agent.create(\"x\", {})\nprint(a)\n"),
         ("Int", "print(int(\"1\"))\n"),
         ("Float", "print(1.5)\n"),
-        ("BigInt", "print(2n)\n"),
         ("List", "print([1])\n"),
         ("Dict", "print({k: 1})\n"),
         ("String", "print(\"a\")\n"),
@@ -332,9 +290,9 @@ const METHOD_CASES: &[(&str, &str, &str, &str, &str, &str)] = &[
         "",
         "[1].filter(fn(x) true end)",
     ),
-    ("List", "push", "list", "list", "", "[1].push(2)"),
-    ("List", "pop", "float", "float", "", "[1].pop()"),
-    ("List", "get", "float", "float", "", "[1].get(0)"),
+    ("List", "push", "list", "list", "", "[1.0].push(2.0)"),
+    ("List", "pop", "float", "float", "", "[1.0].pop()"),
+    ("List", "get", "float", "float", "", "[1.0].get(0)"),
     ("List", "len", "int", "int", "", "[1,2].len()"),
     // `Dict.get` 声明 `Union<value, Nil>` —— 键不存在时运行期确实返 Nil，
     // 声明比「非空」更准，故声明侧期望写 `float | nil`，运行期取存在的键。
@@ -344,7 +302,7 @@ const METHOD_CASES: &[(&str, &str, &str, &str, &str, &str)] = &[
         "float | nil",
         "float",
         "",
-        "{a: 1}.get(\"a\")",
+        "{a: 1.0}.get(\"a\")",
     ),
     ("Dict", "set", "dict", "dict", "", "{a: 1}.set(\"b\", 2)"),
     ("Dict", "keys", "list", "list", "", "{a: 1}.keys()"),
@@ -394,22 +352,6 @@ const METHOD_CASES: &[(&str, &str, &str, &str, &str, &str)] = &[
         "",
         "\"a,b\".split(\",\")",
     ),
-    (
-        "Router",
-        "route",
-        "router",
-        "router",
-        "let r = Router::new()\nlet h = fn(x) x end\n",
-        "r.route(\"GET\", \"/x\", h)",
-    ),
-    (
-        "McpServer",
-        "tool",
-        "mcp_server",
-        "mcp_server",
-        "let m = McpServer::new()\n",
-        "m.tool(\"t\", {a: 1}, fn(x) x end)",
-    ),
 ];
 
 /// 拼出可交给运行期的完整程序：先跑 setup，再求值末表达式。
@@ -449,8 +391,6 @@ fn method_declared_return_types_match_expectations() {
             "List" => Type::List(Box::new(Type::Float)),
             "Dict" => Type::Dict(Box::new(Type::String), Box::new(Type::Float)),
             "String" => Type::String,
-            "Router" => Type::Router,
-            "McpServer" => Type::McpServer,
             other => panic!("未知 receiver {other}"),
         }
     };
@@ -499,20 +439,6 @@ fn method_declared_arity_matches_runtime() {
         ("String", "starts_with", 1, "", "\"ab\".starts_with(\"a\")"),
         ("Dict", "get", 1, "", "{a: 1}.get(\"a\")"),
         ("Dict", "set", 2, "", "{a: 1}.set(\"b\", 2)"),
-        (
-            "Router",
-            "route",
-            3,
-            "let r = Router::new()\nlet h = fn(x) x end\n",
-            "r.route(\"GET\", \"/x\", h)",
-        ),
-        (
-            "McpServer",
-            "tool",
-            3,
-            "let m = McpServer::new()\n",
-            "m.tool(\"t\", {a: 1}, fn(x) x end)",
-        ),
     ];
 
     let recv_ty = |r: &str| -> Type {
@@ -520,8 +446,6 @@ fn method_declared_arity_matches_runtime() {
             "List" => Type::List(Box::new(Type::Float)),
             "Dict" => Type::Dict(Box::new(Type::String), Box::new(Type::Float)),
             "String" => Type::String,
-            "Router" => Type::Router,
-            "McpServer" => Type::McpServer,
             other => panic!("未知 receiver {other}"),
         }
     };

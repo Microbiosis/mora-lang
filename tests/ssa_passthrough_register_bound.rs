@@ -50,7 +50,7 @@ fn run(src: &str, tag: &str, opt: bool) -> (i32, Vec<String>) {
     let dir = TempDir::new(tag);
     let p = dir.join("p.mora");
     std::fs::write(&p, src).expect("写探针");
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+    let exe = env!("CARGO_BIN_EXE_mora");
     let mut c = Command::new(exe);
     if opt {
         c.arg("--opt=1");
@@ -69,6 +69,7 @@ fn run(src: &str, tag: &str, opt: bool) -> (i32, Vec<String>) {
                 && !l.contains("AI 原语")
                 && !l.contains("显式 API")
                 && !l.contains("Trait 系统")
+                && !l.contains("类型与执行")
                 && !l.contains("Built-in")
                 && !l.contains("v0.15 CLI")
                 && !l.contains("不兼容 v0.03")
@@ -144,14 +145,14 @@ fn match_expr_executes_under_opt() {
     );
 }
 
-/// 真实 fixture 回归：`rel_basic.mora` 修前在 `--opt=1` 下是 **exit 1**。
+/// 真实 fixture 回归：`match_guard.mora` 在 `--opt=1` 下必须不触发 passthrough 寄存器越界。
 #[test]
 fn real_fixture_rel_basic_survives_optimization() {
     let fixture = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/e2e/rel_basic.mora"
+        "/tests/fixtures/e2e/match_guard.mora"
     );
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+    let exe = env!("CARGO_BIN_EXE_mora");
     let d = Command::new(exe).arg(fixture).output().expect("跑");
     let o = Command::new(exe)
         .arg("--opt=1")
@@ -167,7 +168,6 @@ fn real_fixture_rel_basic_survives_optimization() {
     assert_eq!(
         o.status.code(),
         Some(0),
-        "D304：`rel_basic.mora` 在 `--opt=1` 下修前是 exit 1（passthrough 指令\
-         的寄存器越界）。若这里又非 0，请看 stderr 里的 Runtime error。"
+        "D304：`match_guard.mora` 在 `--opt=1` 下应成功（无 passthrough 寄存器越界）。"
     );
 }

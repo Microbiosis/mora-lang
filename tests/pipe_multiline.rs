@@ -19,23 +19,17 @@
 //! （`let a = 1` 换行 `print(6)`），被吞掉的换行就是语句分隔符 ——
 //! 两条语句会被并成一条。本文件的对照组专门盯这一条。
 
-use mora::interpreter::Interpreter;
-use mora::mir::vm::execute;
 use mora::parser_v3::ParserV3;
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::execute_program;
 use std::sync::Arc;
 
 fn last_value(src: &str) -> String {
-    let (func, _w) = ParserV3::compile(src).expect("compile");
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    let arc = Arc::new(func);
-    match execute(
-        &arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    ) {
-        Ok(v) => format!("{v:?}"),
+    let (prog, _w) = ParserV3::compile(src).expect("compile");
+    let mut core = CoreRuntime::default();
+    let arc = Arc::new(prog);
+    match execute_program(arc, &mut core) {
+        Ok((v, _)) => format!("{v:?}"),
         Err(e) => format!("Err({e})"),
     }
 }
@@ -51,7 +45,7 @@ fn d119_spec_section_7_6_multiline_pipe_runs() {
     ParserV3::compile(src).expect("spec §7.6 的跨行管道必须可解析");
     assert_eq!(
         last_value(src),
-        "List([Float(4.0), Float(6.0)])",
+        "List([Int(4), Int(6)])",
         "跨行管道必须逐级求值：[1,2,3] |> map(*2) => [2,4,6] |> filter(>2) => [4,6]"
     );
 }
@@ -100,7 +94,7 @@ fn d119_newlines_do_not_merge_following_statements() {
     ParserV3::compile(src).expect("普通多语句必须可解析");
     assert_eq!(
         last_value(src),
-        "Float(2.0)",
+        "Int(2)",
         "`let a = 1` 后的换行若被吞，`let b = a + 1` 会被并进上一条，末值不是 2.0"
     );
 
@@ -109,7 +103,7 @@ fn d119_newlines_do_not_merge_following_statements() {
     ParserV3::compile(src2).expect("管道后接普通语句必须可解析");
     assert_eq!(
         last_value(src2),
-        "Float(100.0)",
+        "Int(100)",
         "管道后的换行若被吞，`let z = 100` 会被并进管道表达式"
     );
 }
@@ -126,7 +120,7 @@ fn d119_single_line_pipe_is_unchanged() {
     // 裸标识符形态 → 值应用 `f(x)`（§7.6 `5 |> double`）
     assert_eq!(
         last_value("let double = fn(x) x * 2\nlet r = 5 |> double\nr\n"),
-        "Float(10.0)",
+        "Int(10)",
         "裸标识符管道走值应用，不得被改成方法调用"
     );
 }
@@ -139,7 +133,7 @@ fn d119_sources_without_pipe_are_unaffected() {
     // 裸函数调用 + 后续语句：换行分隔必须完好
     let src = "let a = len([1, 2])\nprint(a)\nlet b = 1\nb\n";
     ParserV3::compile(src).expect("无管道源码必须照常解析");
-    assert_eq!(last_value(src), "Float(1.0)");
+    assert_eq!(last_value(src), "Int(1)");
 }
 
 /// 反向对照两则：别的换行容忍不能被本修复「顺手」扩进来。
@@ -153,7 +147,7 @@ fn d119_bare_or_union_annotation_is_not_treated_as_a_pipe() {
     // 后续语句仍在顶层（没被并进标注表达式）
     assert_eq!(
         last_value("let x: string | number = 1\nlet y = 7\ny\n"),
-        "Float(7.0)",
+        "Int(7)",
         "union 标注后的换行必须退回给块语句循环"
     );
     let _ = wits;

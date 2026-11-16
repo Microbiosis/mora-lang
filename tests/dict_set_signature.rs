@@ -35,12 +35,12 @@
 
 use mora::cli::compile_and_opt;
 use mora::parser_v3::ParserV3;
-use mora::typeck::check_mir::check_program_witnesses_bidirectional;
+use mora::typeck::check_mir::check_program_witnesses;
 use mora::typeck::format_error;
 
 fn diagnostics(src: &str) -> Vec<String> {
     let (_f, wits) = compile_and_opt(src, None).expect("应能编译");
-    check_program_witnesses_bidirectional(&wits)
+    check_program_witnesses(&wits)
         .iter()
         .map(format_error)
         .collect()
@@ -161,7 +161,7 @@ fn d127_neighbouring_dict_signatures_are_untouched() {
                let g = d.get(\"a\")\n\
                print(ks, vs, n, g)\n";
     let (_f, wits) = ParserV3::compile(src).expect("语法应通过");
-    let errs = check_program_witnesses_bidirectional(&wits);
+    let errs = check_program_witnesses(&wits);
     assert!(
         errs.is_empty(),
         "keys/values/len/get 的签名不受 `set` 改动影响; 实际: {:?}",

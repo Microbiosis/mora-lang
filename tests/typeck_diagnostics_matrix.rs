@@ -65,7 +65,7 @@ fn ev(body: &str) -> (i32, String) {
     std::fs::write(&p, body).expect("写探针");
     let home = dir.join("home");
     std::fs::create_dir_all(&home).expect("建 home");
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+    let exe = env!("CARGO_BIN_EXE_mora");
     let out = Command::new(exe)
         .arg(&p)
         .env("HOME", &home)
@@ -86,6 +86,7 @@ fn ev(body: &str) -> (i32, String) {
                 && !l.starts_with("AI 原语")
                 && !l.starts_with("显式 API")
                 && !l.starts_with("Trait 系统")
+                && !l.starts_with("类型与执行")
                 && !l.starts_with("Built-in")
                 && !l.starts_with("v0.15 CLI")
                 && !l.starts_with('⚠')
@@ -161,22 +162,15 @@ fn d351_string_plus_number_is_rejected_directly_but_passes_inside_closure() {
         "`\"s\" + 1` 在直接位置应被 typeck 拒; 实得 exit={code} out={got}"
     );
     assert!(
-        got.contains("expected") && got.contains("String"),
-        "错误应是「期望 String」; 实得: {got}"
+        got.contains("expected") && got.contains("string") && got.contains("int"),
+        "错误应点名 string 与 int; 实得: {got}"
     );
 
-    // ② 闭包内：typeck **放行**（参数是 `Any`），落到运行期拼接语义
+    // ② Stage 3A-2 HM：`fn(x) x + 1 end` 从 `+ 1` 约束 x 为数值型，传 `f("s")` 同样被静态拒绝
     let (code, got) = ev("let f = fn(x) x + 1 end\nprint(f(\"s\"))\n");
     assert_eq!(
-        code, 0,
-        "闭包内 `f(\"s\")` 实测**成功**（`x` 推断为 `Any` ⇒ `Any + 1` 放行）; \
-         实得 exit={code} out={got}\n\
-         ⇒ 这就是分叉：同一运算，**直接位置被拒、闭包内放行**"
-    );
-    assert_eq!(
-        got, "s1.0",
-        "闭包内落到 `flow.rs:201` 的拼接语义（String + 任意 → 拼接）; 实得 {got}\n\
-         ⚠ 若本条红，说明 typeck 已开始收紧了闭包路径，或运行期语义改了 —— 都是**有意的**变更"
+        code, 2,
+        "Stage 3A-2 统一 HM 下 `fn(x) x + 1 end` 传字符串必须在编译期拒绝; 实得 exit={code} out={got}"
     );
 }
 
@@ -190,7 +184,7 @@ fn d351_language_has_closures_not_named_fn_declarations() {
     // 闭包形态可用
     let (code, got) = ev("let f = fn(x) x + 1 end\nprint(f(1))\n");
     assert_eq!(code, 0, "闭包形态应可用; 实得 exit={code} out={got}");
-    assert_eq!(got, "2.0", "闭包应正确求值; 实得 {got}");
+    assert_eq!(got, "2", "闭包应正确求值; 实得 {got}");
 
     // 具名声明形态**解析失败**（不是 typeck 静默）
     let (code, got) = ev("fn f() -> Int { 1 }\nprint(f())\n");

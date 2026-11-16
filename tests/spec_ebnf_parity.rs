@@ -64,41 +64,6 @@ fn d108_old_on_arrow_handle_form_does_not_parse() {
     );
 }
 
-/// spec §14.2 原文的 `model_stmt`：`model` IDENT + 缩进字段 + `end`。
-#[test]
-fn d108_spec_model_stmt_form_parses() {
-    let prod = spec_production("model_stmt");
-    assert!(
-        prod.contains("\"end\""),
-        "model_stmt 应是缩进 + end 形式。实际：{prod}"
-    );
-    let src = "model M\n  count: number = 0\n  label: string = \"x\"\nend\nprint(1)\n";
-    assert!(
-        ParserV3::compile(src).is_ok(),
-        "spec 原文的 model 形式应可解析"
-    );
-}
-
-/// spec §14.2 原文的 `msg_stmt`。
-#[test]
-fn d108_spec_msg_stmt_form_parses() {
-    let src = "msg Inc\n  Bump\n  Set(number)\nend\nprint(1)\n";
-    assert!(
-        ParserV3::compile(src).is_ok(),
-        "spec 原文的 msg 形式应可解析"
-    );
-}
-
-/// spec §14.2 原文的 `update_stmt`。
-#[test]
-fn d108_spec_update_stmt_form_parses() {
-    let src = "update(msg, model)\n  model\nend\nprint(1)\n";
-    assert!(
-        ParserV3::compile(src).is_ok(),
-        "spec 原文的 update 形式应可解析"
-    );
-}
-
 /// spec §14.2 原文的 `transaction_stmt`（含 `compensation` 子句）。
 #[test]
 fn d108_spec_transaction_stmt_form_parses() {

@@ -81,9 +81,9 @@
 //! 这正是 D273 里拒绝直接遍历 `sub_witnesses()` 的同一条理由：
 //! **假阳性比假阴性更糟。**
 
-use mora::interpreter::Interpreter;
-use mora::mir::vm::execute;
 use mora::parser_v3::ParserV3;
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::execute_program;
 use mora::value::Value;
 use std::sync::Arc;
 
@@ -93,16 +93,12 @@ fn typeck_error_count(src: &str) -> usize {
 }
 
 fn run(source: &str) -> Result<Value, String> {
-    let (func, _w) = ParserV3::compile(source).map_err(|e| format!("compile: {e}"))?;
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    let arc = Arc::new(func);
-    execute(
-        &arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    )
+    let (prog, _w) = ParserV3::compile(source).map_err(|e| format!("compile: {e}"))?;
+    let mut core = CoreRuntime::default();
+    let arc = Arc::new(prog);
+    execute_program(arc, &mut core)
+        .map(|(v, _)| v)
+        .map_err(|e| e.to_string())
 }
 
 fn printed(source: &str) -> String {
@@ -195,14 +191,9 @@ fn d274_runtime_macro_body_sees_outer_variables() {
 /// **运行时契约（正向）**：宏的**形参被正确绑定**。
 #[test]
 fn d274_runtime_macro_params_are_bound() {
-    // 注意宏的返回值是 **Float**（`1 + 2` 走数值塔），
-    // CLI 的 `print` 把它显示成 `3.0`，但 `Value` 本身是 `Value::Float(3.0)`。
     match run("macro add(a, b)\n  a + b\nend\nadd(1, 2)\n").expect("应跑通") {
-        Value::Float(f) => assert!(
-            (f - 3.0).abs() < 1e-9,
-            "宏形参应被实参绑定 ⇒ 1 + 2 = 3.0，实际：{f}"
-        ),
-        other => panic!("期望数值结果，实际：{other:?}"),
+        Value::Int(i) => assert_eq!(i, 3, "宏形参应被实参绑定 ⇒ 1 + 2 = 3，实际：{i}"),
+        other => panic!("期望整数结果，实际：{other:?}"),
     }
 }
 

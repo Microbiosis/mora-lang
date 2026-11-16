@@ -18,23 +18,18 @@
 //! （`nan + 1`、`nan > 0` 都不报错）；而 `matmul` 返回 `[]` 时，调用方
 //! **无法区分「结果就是空矩阵」与「参数写错了」**。
 
-use mora::interpreter::Interpreter;
-use mora::mir::vm::execute;
 use mora::parser_v3::ParserV3;
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::execute_program;
 use std::sync::Arc;
 
 fn run(src: &str) -> Result<String, String> {
-    let (func, _w) = ParserV3::compile(src).map_err(|e| format!("COMPILE: {e}"))?;
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    let arc = Arc::new(func);
-    execute(
-        &arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    )
-    .map(|v| format!("{v}"))
+    let (prog, _w) = ParserV3::compile(src).map_err(|e| format!("COMPILE: {e}"))?;
+    let mut core = CoreRuntime::default();
+    let arc = Arc::new(prog);
+    execute_program(arc, &mut core)
+        .map(|(v, _)| format!("{v}"))
+        .map_err(|e| e.to_string())
 }
 
 /// D142 主判据：三处维度不匹配都必须**明确报错**，不得静默给 `NaN` / `[]`。

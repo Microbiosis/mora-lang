@@ -44,7 +44,7 @@ fn ev(body: &str) -> (i32, String) {
     std::fs::write(&p, body).expect("写探针");
     let home = dir.join("home");
     std::fs::create_dir_all(&home).expect("建 home");
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+    let exe = env!("CARGO_BIN_EXE_mora");
     let out = Command::new(exe)
         .arg(&p)
         .env("HOME", &home)
@@ -66,6 +66,7 @@ fn ev(body: &str) -> (i32, String) {
                 && !l.starts_with("AI 原语")
                 && !l.starts_with("显式 API")
                 && !l.starts_with("Trait 系统")
+                && !l.starts_with("类型与执行")
                 && !l.starts_with("Built-in")
                 && !l.starts_with("v0.15 CLI")
                 && !l.starts_with('⚠')
@@ -97,7 +98,7 @@ fn is_bare_path_line(line: &&str, path: &str) -> bool {
 fn d357_harness_collects_print_output() {
     let (code, got) = ev("print(7)\n");
     assert_eq!(code, 0, "探针应正常退出; 实得 exit={code} out=[{got}]");
-    assert_eq!(got.trim(), "7.0", "采集器失效（本文件全部断言依赖它）");
+    assert_eq!(got.trim(), "7", "采集器失效（本文件全部断言依赖它）");
 }
 
 // ─────────────────── 字符字面量 ───────────────────
@@ -212,12 +213,12 @@ fn d357_closed_quote_is_always_a_char() {
 fn d357_line_comments_are_stripped() {
     let (code, got) = ev("-- 头部注释\nprint(1)\n-- 中间\nprint(2)\n");
     assert_eq!(code, 0, "注释应被剥离; 实得 exit={code} out={got}");
-    assert_eq!(got.trim(), "1.0 | 2.0", "两行 print 都应执行; 实得: {got}");
+    assert_eq!(got.trim(), "1 | 2", "两行 print 都应执行; 实得: {got}");
 
     // 尾随注释
     let (code, got) = ev("print(1) -- 尾随\nprint(2)\n");
     assert_eq!(code, 0, "尾随注释应被剥离; 实得 exit={code} out={got}");
-    assert_eq!(got.trim(), "1.0 | 2.0", "实得: {got}");
+    assert_eq!(got.trim(), "1 | 2", "实得: {got}");
 
     // 注释在文件末尾且无换行
     let (code, got) = ev("let x = 5\n-- 文件末尾的注释");
@@ -248,42 +249,6 @@ fn d357_comment_string_interaction() {
             code, 0,
             "注释里的引号不应开启字符串; 实得 exit={code} out={got}"
         );
-        assert_eq!(got.trim(), "1.0 | 2.0", "两行都应执行; 实得: {got}");
+        assert_eq!(got.trim(), "1 | 2", "两行都应执行; 实得: {got}");
     }
-}
-
-// ─────────────────── `document` 块 ───────────────────
-
-/// `document` 块：内容里的 `--` 与 `{` 都不该被误处理。
-#[test]
-fn d357_document_block_content_is_opaque() {
-    for (what, body) in [
-        (
-            "内容含 `--`",
-            "document \"内容里有 -- 双横杠\"\n  print(1)\nend\nprint(2)\n",
-        ),
-        (
-            "内容含未闭合 `{`",
-            "document \"内容里有 {未闭合的括号\"\n  print(1)\nend\nprint(2)\n",
-        ),
-    ] {
-        let (code, got) = ev(body);
-        assert_eq!(
-            code, 0,
-            "document 块{what} 应正常跑; 实得 exit={code} out={got}"
-        );
-        assert_eq!(got.trim(), "1.0 | 2.0", "块内与块后都应执行; 实得: {got}");
-    }
-}
-
-/// 多个 `document` 块连续出现。
-#[test]
-fn d357_consecutive_document_blocks() {
-    let (code, got) =
-        ev("document \"第一段\" do\n  print(1)\nend\ndocument \"第二段\" do\n  print(2)\nend\n");
-    assert_eq!(
-        code, 0,
-        "连续 document 块应正常; 实得 exit={code} out={got}"
-    );
-    assert_eq!(got.trim(), "1.0 | 2.0", "两个块都应执行; 实得: {got}");
 }

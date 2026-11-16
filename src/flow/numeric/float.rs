@@ -34,6 +34,7 @@ pub fn arith(op: &BinaryOp, a: f64, b: f64) -> Result<f64, MoraError> {
                 a - (a / b).trunc() * b
             }
         }
+        BinaryOp::Pow => a.powf(b),
         _ => {
             return Err(MoraError::Other(format!(
                 "unsupported float operation: {op:?}"

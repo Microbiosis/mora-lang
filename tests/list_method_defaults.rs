@@ -39,25 +39,25 @@
 
 use std::sync::Arc;
 
-use mora::interpreter::Interpreter;
-use mora::mir::effect::Effects;
-use mora::mir::vm::execute;
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::execute_program;
 use mora::value::Value;
 
 fn run(src: &str) -> Result<Value, String> {
-    let (func, witnesses) =
+    let (prog, witnesses) =
         mora::cli::compile_and_opt(src, None).map_err(|e| format!("COMPILE: {e}"))?;
-    let errs = mora::typeck::check_mir::check_program_witnesses_bidirectional(&witnesses);
+    let errs = mora::typeck::check_mir::check_program_witnesses(&witnesses);
     if !errs.is_empty() {
         return Err(format!(
             "TYPECK: {:?}",
             errs.iter().map(|e| e.message.clone()).collect::<Vec<_>>()
         ));
     }
-    let arc = Arc::new(func);
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    execute(&arc, &mut interp, &mut env, &mut Effects::new())
+    let arc = Arc::new(prog);
+    let mut core = CoreRuntime::default();
+    execute_program(arc, &mut core)
+        .map(|(v, _)| v)
+        .map_err(|e| e.to_string())
 }
 
 fn debug_of(src: &str) -> String {
@@ -111,24 +111,21 @@ fn reduce_without_initial_value_is_rejected() {
 /// 给了初值必须照常工作 —— D48 收紧的是**校验**，不是归约语义。
 #[test]
 fn reduce_with_initial_value_still_works() {
-    assert_eq!(
-        debug_of("[1,2,3].reduce(fn(a, b) a + b end, 0)"),
-        "Float(6.0)"
-    );
+    assert_eq!(debug_of("[1,2,3].reduce(fn(a, b) a + b end, 0)"), "Int(6)");
     assert_eq!(
         debug_of("[1,2,3].reduce(fn(a, b) a + b end, 10)"),
-        "Float(16.0)"
+        "Int(16)"
     );
     assert_eq!(
         debug_of("[1,2,3,4].reduce(fn(a, b) a * b end, 1)"),
-        "Float(24.0)"
+        "Int(24)"
     );
     assert_eq!(
         debug_of("[\"a\",\"b\",\"c\"].reduce(fn(a, b) a + b end, \"\")"),
         "String(\"abc\")"
     );
     // 空列表 + 显式初值 = 初值本身
-    assert_eq!(debug_of("[].reduce(fn(a, b) a + b end, 42)"), "Float(42.0)");
+    assert_eq!(debug_of("[].reduce(fn(a, b) a + b end, 42)"), "Int(42)");
 }
 
 // ===================================================================
@@ -162,11 +159,11 @@ fn transpose_of_ragged_list_is_rejected() {
 fn transpose_of_rectangular_list_still_works() {
     assert_eq!(
         debug_of("[[1,2],[3,4]].transpose()"),
-        "List([List([Float(1.0), Float(3.0)]), List([Float(2.0), Float(4.0)])])"
+        "List([List([Int(1), Int(3)]), List([Int(2), Int(4)])])"
     );
     assert_eq!(
         debug_of("[[1,2,3]].transpose()"),
-        "List([List([Float(1.0)]), List([Float(2.0)]), List([Float(3.0)])])"
+        "List([List([Int(1)]), List([Int(2)]), List([Int(3)])])"
     );
     // 空表：各行等长（都空）→ 合法，返回空
     assert_eq!(debug_of("[[],[]].transpose()"), "List([])");

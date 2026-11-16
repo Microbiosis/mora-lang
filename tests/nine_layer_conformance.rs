@@ -29,7 +29,7 @@
 //! 抄下来」—— 凡与推导不符的，以推导为准并修实现。
 //!
 //! ⚠ 浮点打印格式：Mora 的 `print` 把数值渲染成 `1.0`（带 `.0`），
-//! 而 `p"…{x}"` 模板插值走 `mir::vm::value_to_string`（Rust `f64::to_string`
+//! 而 quasiquote 插值走 `value_ops::value_to_string`（Rust `f64::to_string`
 //! ⇒ 整数值渲染成 `1`）。两条路径的差异是**既有事实**，本表按实测钉住。
 
 use mora::test_support::TempDir;
@@ -54,48 +54,20 @@ enum Expect {
 ///   而 spec §14.2 写的是 `handle IDENT "on" IDENT "->" {stmt} "end"`；
 /// - `model` / `msg` / `update` 是**无花括号**的 `name … end` 形态。
 const CONSTRUCTS: &[(&str, &str, Expect)] = &[
-    // ── 块形态（observe / span / parallel / section）──
-    (
-        "observe",
-        "observe trace \"t\" do\n  print(1)\nend\n",
-        Expect::Out("1.0"),
-    ),
-    (
-        "span",
-        "span \"s\" do\n  print(1)\nend\n",
-        Expect::Out("1.0"),
-    ),
-    (
-        "parallel",
-        "parallel\n  print(1)\nend\n",
-        Expect::Out("1.0"),
-    ),
-    (
-        "prompt_section",
-        "prompt \"p\" do\n  print(1)\nend\n",
-        Expect::Out("1.0"),
-    ),
-    (
-        "document_section",
-        "document \"d\" do\n  print(1)\nend\n",
-        Expect::Out("1.0"),
-    ),
+    // ── 块形态（parallel）──
+    ("parallel", "parallel\n  print(1)\nend\n", Expect::Out("1")),
     // ── 效果 / 事务 ──
-    (
-        "worker",
-        "worker w do\n  print(1)\nend\n",
-        Expect::Out("1.0"),
-    ),
+    ("worker", "worker w do\n  print(1)\nend\n", Expect::Out("1")),
     (
         "transaction",
         "transaction\n  print(1)\nend\n",
-        Expect::Out("1.0"),
+        Expect::Out("1"),
     ),
     (
         "transaction_comp",
         "transaction\n  print(1)\ncompensation\n  print(2)\nend\n",
-        // 补偿段只在**回滚**时执行；此处事务正常提交 ⇒ 只看到 `1.0`。
-        Expect::Out("1.0"),
+        // 补偿段只在**回滚**时执行；此处事务正常提交 ⇒ 只看到 `1`。
+        Expect::Out("1"),
     ),
     (
         "perform_bare",
@@ -118,7 +90,7 @@ const CONSTRUCTS: &[(&str, &str, Expect)] = &[
     (
         "commit",
         "transaction\n  print(1)\nend\ncommit\n",
-        Expect::Out("1.0"),
+        Expect::Out("1"),
     ),
     (
         "rollback",
@@ -126,53 +98,28 @@ const CONSTRUCTS: &[(&str, &str, Expect)] = &[
         // 事务外的 `rollback` 是运行期错误（`h_rollback` 的既定契约）。
         Expect::RuntimeErr("Transaction rolled back"),
     ),
-    // ── 声明形态（TEA）──
-    (
-        "model",
-        "model Counter\n  count: number = 0\nend\nprint(1)\n",
-        Expect::Out("1.0"),
-    ),
-    (
-        "model_default",
-        "model Counter\n  count: number = 7\nend\nprint(1)\n",
-        Expect::Out("1.0"),
-    ),
-    (
-        "msg",
-        "msg CounterMsg\n  Increment\n  Decrement\nend\nprint(1)\n",
-        Expect::Out("1.0"),
-    ),
+    // ── 声明形态（struct / enum）──
     (
         "struct",
         "struct P\n  x: number\nend\nprint(1)\n",
-        Expect::Out("1.0"),
+        Expect::Out("1"),
     ),
     (
         "enum",
         "enum E\n  A\n  B\nend\nprint(1)\n",
-        Expect::Out("1.0"),
-    ),
-    (
-        "tea_standalone",
-        "model C\n  count: number = 0\nend\nmsg M\n  Inc\nend\nupdate(msg, model)\n  model\nend\nprint(1)\n",
-        Expect::Out("1.0"),
-    ),
-    (
-        "update",
-        "update(msg, model)\n  model\nend\nprint(1)\n",
-        Expect::Out("1.0"),
+        Expect::Out("1"),
     ),
     (
         "effect_sig",
         "effect MyEff(number) : number\nprint(1)\n",
-        Expect::Out("1.0"),
+        Expect::Out("1"),
     ),
     // ── 同像性（eval / quote / quasiquote）──
     (
         "eval",
         "print(eval(\"1 + 1\"))\n",
-        // spec §14.2：`eval(code)` 运行时编译并执行 Mora 代码 ⇒ `2.0`。
-        Expect::Out("2.0"),
+        // spec §14.2：`eval(code)` 运行时编译并执行 Mora 代码 ⇒ `2`。
+        Expect::Out("2"),
     ),
     (
         "eval_bare",
@@ -193,31 +140,31 @@ const CONSTRUCTS: &[(&str, &str, Expect)] = &[
         Expect::Out("code:(10+20)"),
     ),
     // ── 绑定 / 赋值 / 控制流 ──
-    ("let", "let x = 1\nprint(x)\n", Expect::Out("1.0")),
+    ("let", "let x = 1\nprint(x)\n", Expect::Out("1")),
     (
         "assign",
         "let x = 1\nassign x = 2\nprint(x)\n",
-        Expect::Out("2.0"),
+        Expect::Out("2"),
     ),
     (
         "if",
         "let c = 1\nif c == 1 then\n  print(1)\nelse\n  print(2)\nend\n",
-        Expect::Out("1.0"),
+        Expect::Out("1"),
     ),
     (
         "if_elseif",
         "let c = 1\nif c == 1 then\n  print(1)\nelse if c == 2 then\n  print(2)\nelse\n  print(3)\nend\n",
-        Expect::Out("1.0"),
+        Expect::Out("1"),
     ),
     (
         "for",
         "for x in [1, 2, 3]\n  print(x)\nend\n",
-        Expect::Out("1.0\n2.0\n3.0"),
+        Expect::Out("1\n2\n3"),
     ),
     (
         "while",
         "let i = 0\nwhile i < 3\n  print(i)\n  i = i + 1\nend\n",
-        Expect::Out("0.0\n1.0\n2.0"),
+        Expect::Out("0\n1\n2"),
     ),
     (
         "match",
@@ -230,29 +177,24 @@ const CONSTRUCTS: &[(&str, &str, Expect)] = &[
         Expect::Out("pos"),
     ),
     (
-        "with",
-        "with model = \"m\"\n  print(1)\nend\n",
-        Expect::Out("1.0"),
-    ),
-    (
         "task",
         "task t()\n  print(1)\nend\ntask main()\n  t()\nend\n",
-        Expect::Out("1.0"),
+        Expect::Out("1"),
     ),
     (
         "return",
         "task t()\n  return 1\nend\ntask main()\n  print(t())\nend\n",
-        Expect::Out("1.0"),
+        Expect::Out("1"),
     ),
     (
         "macro",
         "macro m(x)\n  print(x)\nend\nprint(1)\n",
-        Expect::Out("1.0"),
+        Expect::Out("1"),
     ),
     (
         "closure",
         "let f = fn(x) x + 1\nprint(f(1))\n",
-        Expect::Out("2.0"),
+        Expect::Out("2"),
     ),
     // ── 逻辑运算符（短路求值）──
     //
@@ -296,33 +238,24 @@ const CONSTRUCTS: &[(&str, &str, Expect)] = &[
     (
         "list_lit",
         "let xs = [1, 2, 3]\nprint(xs)\n",
-        Expect::Out("[1.0, 2.0, 3.0]"),
+        Expect::Out("[1, 2, 3]"),
     ),
     (
         "dict_lit",
         "let d = {a: 1, b: 2}\nprint(d)\n",
-        Expect::Out("{a: 1.0, b: 2.0}"),
+        Expect::Out("{a: 1, b: 2}"),
     ),
     (
-        "template",
-        "let n = 1\nprint(p\"v={n}\")\n",
-        // 模板插值走 `value_to_string`（Rust `f64::to_string`）⇒ 整数值是 `1`，
-        // 而 `print` 走另一条格式化路径 ⇒ `1.0`。两者不一致是**既有事实**。
-        Expect::Out("v=1"),
+        "quasiquote_unquote",
+        "let n = 1\nlet q = `v=,n\nprint(q)\n",
+        // v0.110.0 W2.6 移除了 `p"..."` 模板字面量；模板插值统一由 quasiquote (`,expr`) 承担。
+        // unquote 走 `value_to_string`（Rust `f64::to_string`）⇒ 整数值是 `1`。
+        Expect::Out("code:v=1"),
     ),
-    ("bigint", "let n = 123n\nprint(n)\n", Expect::Out("123n")),
     (
         "dyn_coerce",
         "let d = 1 as dyn T\nprint(d)\n",
-        Expect::Out("<trait_object for=float as T data=Float(1.0)>"),
-    ),
-    // ── 编排（agent 体**只应执行一次**）──
-    (
-        "orchestrate",
-        "orchestrate graph input -> result\n  agent a => print(\"A\")\n  agent b => print(\"B\")\n  @start -> a\n  a -> b\nend\n",
-        // ⚠ D473 修过一个「agent 体双执行」缺陷（编排块此前被发射进主上下文，
-        // 出现平铺副本）⇒ agent 体跑两次。这条期望值把它钉住。
-        Expect::Out("A\nB"),
+        Expect::Out("<trait_object for=int as T data=Int(1)>"),
     ),
 ];
 
@@ -382,7 +315,7 @@ fn every_construct_produces_its_expected_output() {
 fn conformance_table_covers_the_whole_language_surface() {
     assert_eq!(
         CONSTRUCTS.len(),
-        49,
+        37,
         "行为契约表现在 {} 条 —— 若有意增删，请同步更新本断言与 CHANGELOG（D474 建表、D477 增补）",
         CONSTRUCTS.len()
     );

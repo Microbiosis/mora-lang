@@ -19,11 +19,15 @@ proptest! {
         // 不 panic 即通过
     }
 
-    /// 成功编译的程序 body 不应为空（除非输入为空）。
+    /// 成功编译的程序 ControlProgram 应通过 verify_program 且非空（除非输入为空）。
     #[test]
     fn successful_compile_has_nonempty_body(src in proptest::string::string_regex("[a-z0-9+\\-*/() ]+").unwrap()) {
-        if let Ok((func, _)) = mora::parser_v3::ParserV3::compile(&src) {
-            prop_assert!(!func.body.is_empty() || src.trim().is_empty(),
+        if let Ok((prog, _)) = mora::parser_v3::ParserV3::compile(&src) {
+            prop_assert!(mora::mir::control::verify_program(&prog).is_ok());
+            let entry = prog.func(prog.entry);
+            let has_code = entry.blocks.iter().any(|b| !b.insts.is_empty())
+                || prog.functions.len() > 1;
+            prop_assert!(has_code || src.trim().is_empty(),
                 "successful compile should have non-empty body for: {:?}", src);
         }
     }

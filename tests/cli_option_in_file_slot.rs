@@ -65,16 +65,13 @@ impl Drop for WorkDir {
 }
 
 fn mora(dir: &Path, args: &[&str]) -> (String, i32) {
-    let out = Command::new(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/target/debug/mora.exe"
-    ))
-    .current_dir(dir)
-    .args(args)
-    .env_remove("OPENAI_API_KEY")
-    .env_remove("MORA_AI_BASE_URL")
-    .output()
-    .expect("跑 mora");
+    let out = Command::new(env!("CARGO_BIN_EXE_mora"))
+        .current_dir(dir)
+        .args(args)
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("MORA_AI_BASE_URL")
+        .output()
+        .expect("跑 mora");
     let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
     s.push_str(&String::from_utf8_lossy(&out.stderr));
     (s, out.status.code().unwrap_or(-1))
@@ -88,13 +85,7 @@ fn blames_a_missing_file(out: &str) -> bool {
 }
 
 /// 落在**文件位置**的已知选项 —— 各条命令路径。
-const KNOWN_OPTION_IN_FILE_SLOT: &[&[&str]] = &[
-    &["--check", "--opt=1"],
-    &["record", "--update"],
-    &["replay", "--opt=1"],
-    &["snapshot", "--update"],
-    &["run", "--opt=1"],
-];
+const KNOWN_OPTION_IN_FILE_SLOT: &[&[&str]] = &[&["--check", "--opt=1"], &["run", "--opt=1"]];
 
 /// **主判据（有牙齿）**：每条路径都**不得**把「选项写错位置」报成
 /// 「文件不存在」。
@@ -107,12 +98,8 @@ fn d189_option_in_file_slot_is_not_reported_as_a_missing_file() {
     let p = f.to_str().unwrap().to_string();
 
     for args in KNOWN_OPTION_IN_FILE_SLOT {
-        // 补齐各命令的位置参数（`record/replay/snapshot` 要 2 个）。
         let mut argv: Vec<&str> = args.to_vec();
         argv.push(p.as_str());
-        if argv[0] != "run" && matches!(argv[0], "record" | "replay" | "snapshot") {
-            argv.push("n");
-        }
         let (out, code) = mora(dir.path(), &argv);
         assert_ne!(code, 0, "[{}] 应判失败", argv.join(" "));
         assert!(
@@ -177,7 +164,11 @@ fn d189_normal_invocations_are_unaffected() {
 
     let (out, code) = mora(dir.path(), &[p]);
     assert_eq!(code, 0, "普通运行不该被拒:\n{}", out);
-    assert!(out.contains("1.0"), "应正常输出:\n{}", out);
+    assert!(
+        out.contains("\n1\n") || out.starts_with("1\n"),
+        "应正常输出:\n{}",
+        out
+    );
 }
 
 /// 文件**真的**不存在时，仍要照实说「找不到文件」—— 不能把守卫变成

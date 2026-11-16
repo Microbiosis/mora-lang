@@ -73,25 +73,25 @@ fn mentions_arity(e: &str, expected: usize, got: usize) -> bool {
         || e.contains(&format!("Expected {expected} arguments, got {got}"))
 }
 
-use mora::interpreter::Interpreter;
-use mora::mir::effect::Effects;
-use mora::mir::vm::execute;
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::execute_program;
 use mora::value::Value;
 
 fn run(src: &str) -> Result<Value, String> {
-    let (func, witnesses) =
+    let (prog, witnesses) =
         mora::cli::compile_and_opt(src, None).map_err(|e| format!("COMPILE: {e}"))?;
-    let errs = mora::typeck::check_mir::check_program_witnesses_bidirectional(&witnesses);
+    let errs = mora::typeck::check_mir::check_program_witnesses(&witnesses);
     if !errs.is_empty() {
         return Err(format!(
             "TYPECK: {:?}",
             errs.iter().map(|e| e.message.clone()).collect::<Vec<_>>()
         ));
     }
-    let arc = Arc::new(func);
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    execute(&arc, &mut interp, &mut env, &mut Effects::new())
+    let arc = Arc::new(prog);
+    let mut core = CoreRuntime::default();
+    execute_program(arc, &mut core)
+        .map(|(v, _)| v)
+        .map_err(|e| e.to_string())
 }
 
 fn err_of(src: &str) -> String {
@@ -198,16 +198,17 @@ fn too_many_args_is_rejected_for_closure_and_macro() {
     // 「被拒绝」这一事实。
     must_err("let f = fn(a) a end\nprint(f(1, 2, 3))\n");
 
-    // 宏：运行期拦（无 typeck 签名），文案应点名 arity
+    // 宏：Stage 3A 起 precompute_fn_signatures 与 precompute_fn_arities 一并
+    // 登记 MacroDef，typeck 先拦（Expected 1 arguments, got ...），运行期也会拦。
     let e = err_of("macro m(x)\n  x\nend\nprint(m(1, 2))\n");
     assert!(
-        e.contains("expects"),
+        e.contains("expects") || mentions_arity(&e, 1, 2),
         "宏多余实参必须报错（修前静默丢弃），实得: {e}"
     );
 
     let e = err_of("macro m(x)\n  x\nend\nprint(m())\n");
     assert!(
-        e.contains("expects"),
+        e.contains("expects") || mentions_arity(&e, 1, 0),
         "宏缺参必须报错（修前静默填 Nil），实得: {e}"
     );
 }

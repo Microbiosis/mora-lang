@@ -21,8 +21,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = ROOT / "tests" / "fixtures" / "e2e"
-EXE = ROOT / "target" / "debug" / "mora.exe"
-SNAPSHOT = ROOT / "target" / "tmp" / "opt_snapshot.txt"
+_raw_target = os.environ.get("CARGO_TARGET_DIR", "").strip()
+TARGET_DIR = Path(_raw_target) if _raw_target else (ROOT / "target")
+if not TARGET_DIR.is_absolute():
+    TARGET_DIR = ROOT / TARGET_DIR
+EXE = TARGET_DIR / "debug" / ("mora.exe" if os.name == "nt" else "mora")
+SNAPSHOT = TARGET_DIR / "tmp" / "opt_snapshot.txt"
 
 # CLI 横幅 / 能力清单 —— 与 opt 档位无关，噪声。
 NOISE_PREFIXES = (

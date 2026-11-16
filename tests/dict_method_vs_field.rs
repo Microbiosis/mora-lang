@@ -45,23 +45,23 @@
 
 use std::sync::Arc;
 
-use mora::interpreter::Interpreter;
-use mora::mir::effect::Effects;
-use mora::mir::vm::execute;
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::execute_program;
 use mora::value::Value;
 
 fn run(src: &str) -> Result<Value, String> {
-    let (func, witnesses) =
+    let (prog, witnesses) =
         mora::cli::compile_and_opt(src, None).map_err(|e| format!("COMPILE: {e}"))?;
-    let errs = mora::typeck::check_mir::check_program_witnesses_bidirectional(&witnesses);
+    let errs = mora::typeck::check_mir::check_program_witnesses(&witnesses);
     if !errs.is_empty() {
         let msgs: Vec<String> = errs.iter().map(|e| e.message.clone()).collect();
         return Err(format!("TYPECK: {msgs:?}"));
     }
-    let arc = Arc::new(func);
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    execute(&arc, &mut interp, &mut env, &mut Effects::new())
+    let arc = Arc::new(prog);
+    let mut core = CoreRuntime::default();
+    execute_program(arc, &mut core)
+        .map(|(v, _)| v)
+        .map_err(|e| e.to_string())
 }
 
 /// 错标注必须被拒 —— 修前 Dict 方法这一路全部被静默接受。
@@ -148,15 +148,18 @@ fn dict_field_access_still_works() {
             Err(e) => panic!("[{name}] 字段访问应继续可用，实得: {e}\n  src={src:?}"),
         }
     }
-    // Float 值配 Int 标注必须被拒，且理由与标量同口径（本语言 `5` 是 Float）
+    // Stage 3A：`{count: 5}` 的值类型是 Int，可配 Int，而 Float 值配 Int 标注必须被拒
     assert!(
-        run("let d = {count: 5}\nlet n: Int = d.count\nn\n").is_err(),
-        "`{{count: 5}}` 的值类型是 Float，配 `Int` 标注必须被拒 \
-         （与 `let n: Int = 5` 同口径）"
+        run("let d = {count: 5}\nlet n: Int = d.count\nn\n").is_ok(),
+        "`{{count: 5}}` 的值类型是 Int，配 `Int` 标注应通过"
+    );
+    assert!(
+        run("let d = {count: 5.0}\nlet n: Int = d.count\nn\n").is_err(),
+        "`{{count: 5.0}}` 的值类型是 Float，配 `Int` 标注必须被拒"
     );
     // 字段参与运算（v0.103 注释里举的原例）
     match run("let d = {count: 5}\nlet t = d.count + 1\nt\n") {
-        Ok(Value::Float(f)) => assert_eq!(f, 6.0),
+        Ok(Value::Int(i)) => assert_eq!(i, 6),
         Ok(other) => panic!("实得 {other:?}"),
         Err(e) => panic!("`d.count + 1` 应继续可用，实得: {e}"),
     }
@@ -167,14 +170,18 @@ fn dict_field_access_still_works() {
     }
 }
 
-/// `d.get` 的值类型、缺失键的 `Nil` 契约不受影响。
+/// `d.get` 返回 `V | nil`；精确可选标注 `string | nil` 通过，而裸 `String` 被拒。
 #[test]
 fn dict_get_semantics_unchanged() {
-    match run("let d = {a: \"s\"}\nlet n: String = d.get(\"a\")\nn\n") {
+    match run("let d = {a: \"s\"}\nlet n: string | nil = d.get(\"a\")\nn\n") {
         Ok(Value::String(s)) => assert_eq!(s, "s"),
         Ok(other) => panic!("实得 {other:?}"),
-        Err(e) => panic!("`d.get(\"a\")` 应通过，实得: {e}"),
+        Err(e) => panic!("`d.get(\"a\")` 配 `string | nil` 应通过，实得: {e}"),
     }
+    assert!(
+        run("let d = {a: \"s\"}\nlet n: String = d.get(\"a\")\nn\n").is_err(),
+        "`d.get` 可能返回 Nil，裸 `String` 标注应被健全的 Union 子类型拒掉"
+    );
     // 缺失键 → Nil（D14 定的运行期契约）
     match run("let d = {a: 1}\nd.get(\"zz\")\n") {
         Ok(Value::Nil) => {}
@@ -183,15 +190,15 @@ fn dict_get_semantics_unchanged() {
     }
 }
 
-/// 遍历字典求和 —— 修复前实测一度被 `Union(V, Nil)` 回归误伤，钉住它。
+/// 遍历字典求和 —— 钉住索引 `d[k]` 返回 `V`（非 Union）。
 #[test]
 fn iterating_a_dict_still_typechecks() {
     let src = "let d = {a: 1, b: 2}\nlet t = 0\nlet ks = d.keys()\nlet i = 0\n\
                while i < 2\n  let t = t + d[ks[i]]\n  let i = i + 1\nend\nt\n";
     match run(src) {
-        Ok(Value::Float(f)) => assert_eq!(f, 3.0),
+        Ok(Value::Int(i)) => assert_eq!(i, 3),
         Ok(other) => panic!("实得 {other:?}"),
-        Err(e) => panic!("遍历字典求和必须照常编译并得 3.0，实得: {e}"),
+        Err(e) => panic!("遍历字典求和必须照常编译并得 3，实得: {e}"),
     }
 }
 
@@ -204,61 +211,5 @@ fn list_and_string_len_unchanged() {
         Ok(Value::Int(i)) => assert_eq!(i, 2),
         Ok(other) => panic!("实得 {other:?}"),
         Err(e) => panic!("`xs.len()` 应通过，实得: {e}"),
-    }
-}
-
-/// v0.104.6 D58：`with` 块的**结果寄存器**指错了地方。
-///
-/// `Node::WithConfig` 此前**没有**结果寄存器字段，于是
-/// `witness_to_fcfg::node_result_reg_of` 落 `_ => None` → `unwrap_or(0)`
-/// → 块结果指向**寄存器 0**，而 reg 0 恰恰是第一个配置绑定值：
-///
-/// ```mora
-/// with model = "gpt-4o"
-///   2
-/// end
-/// 裸（emit）路径 = Nil  ✅
-/// 9 层管线       = String("gpt-4o")  ❌ 返回了配置绑定值
-/// ```
-///
-/// 与 D35 给 `Node::Handle` 补 `dst` 是同一类修复、同一���失败形态
-/// （「缺此 arm 时 `let` 绑定只能拿到哨兵 0」）。
-///
-/// 修法三处：`Node::WithConfig` 加 `dst: Reg`；`witness_to_fcfg` 预分配并
-/// 给 `node_result_reg_of` 补 arm；`fcfg_lower` 补 `Const(dst, Nil)`
-/// （`with` 的值恒为 Nil —— 子 body 的返回值不传播）。
-#[test]
-fn with_block_result_is_nil_not_the_first_binding() {
-    // 块的结果必须是 Nil，**不是** `model = "gpt-4o"` 那个绑定值。
-    // 单独跑（tail 是该块的值）：两条路径都必须得 Nil。
-    let src = "with model = \"gpt-4o\"\n  2\nend\n";
-    match run(src) {
-        Ok(Value::Nil) => {}
-        Ok(other) => panic!(
-            "`with` 块的值应为 Nil（子 body 返回值不传播），实得 {other:?} —— \
-             D58 回归：结果寄存器指向了第一个配置绑定值"
-        ),
-        Err(e) => panic!("`with` 块应能编译并求值为 Nil，实得: {e}"),
-    }
-}
-
-/// `with` 块在**两条编译路径**下必须一致（差分检查不再对它回落）。
-#[test]
-fn with_block_agrees_across_both_compile_paths() {
-    // 形如 `pipeline_equivalence` 的逐特性比对，但只针对 `with` ——
-    // 这是 D57 放开「条数差异」的前提：D58 修好后 `with` 才配得上走管线。
-    let (func, ws) = mora::cli::compile_and_opt("with model = \"gpt-4o\"\n  2\nend\n", None)
-        .expect("compile_and_opt");
-    let type_errs = mora::typeck::check_mir::check_program_witnesses_bidirectional(&ws);
-    assert!(type_errs.is_empty(), "不应有类型错: {type_errs:?}");
-    // `compile_and_opt` 返回的就是生产最终采用的函数（回落时是 emit 侧）。
-    // 差分不再回落 ⇒ 返回的是**管线**侧 —— 值必须是 Nil。
-    let arc = Arc::new(func);
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    match execute(&arc, &mut interp, &mut env, &mut Effects::new()) {
-        Ok(Value::Nil) => {}
-        Ok(other) => panic!("生产路径上 `with` 块的值应为 Nil，实得 {other:?}"),
-        Err(e) => panic!("生产路径上 `with` 块应能运行，实得: {e}"),
     }
 }

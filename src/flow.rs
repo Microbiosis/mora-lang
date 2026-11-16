@@ -33,12 +33,6 @@ pub fn is_truthy(value: &Value) -> bool {
         Value::Bool(b) => *b,
         Value::Int(i) => *i != 0,
         Value::Float(n) => *n != 0.0,
-        // v0.104.6 D358：**BigInt 必须与 Int/Float 同语义**。
-        // 此前落进下方 `_ => true` 兜底 ⇒ `BigInt(0)` 被判为 **truthy**，
-        // 而 `Int(0)` / `Float(0.0)` / `""` / `[]` / `{}` 全部 falsy。
-        // 端到端确认（D374）：`[0n, 1n, 2n].filter(fn(x) x end)` 修前得
-        // `[0n, 1n, 2n]`（0 被保留），与 Int/Float 版本不一致。
-        Value::BigInt(b) => *b != num_bigint::BigInt::from(0),
         Value::String(s) => !s.is_empty(),
         Value::List(l) => !l.is_empty(),
         Value::Dict(d) => !d.is_empty(),
@@ -61,15 +55,19 @@ pub fn hex_encode(bytes: &[u8]) -> String {
 }
 
 /// hex 解码
-pub fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
+pub fn hex_decode(s: &str) -> crate::error::MoraResult<Vec<u8>> {
     if !s.len().is_multiple_of(2) {
-        return Err("hex string must have even length".to_string());
+        return Err(crate::error::MoraError::Runtime(
+            "hex string must have even length".to_string(),
+        ));
     }
     let mut result = Vec::new();
     let bytes = s.as_bytes();
     for i in (0..bytes.len()).step_by(2) {
-        let high = hex_nibble(bytes[i]).ok_or("invalid hex character")?;
-        let low = hex_nibble(bytes[i + 1]).ok_or("invalid hex character")?;
+        let high = hex_nibble(bytes[i])
+            .ok_or_else(|| crate::error::MoraError::Runtime("invalid hex character".to_string()))?;
+        let low = hex_nibble(bytes[i + 1])
+            .ok_or_else(|| crate::error::MoraError::Runtime("invalid hex character".to_string()))?;
         result.push((high << 4) | low);
     }
     Ok(result)
@@ -126,13 +124,8 @@ pub fn eval_binary(left: Value, op: &BinaryOp, right: Value) -> Result<Value, Mo
             // 现在两者共用数值塔的同一套分派。
             (Value::Int(_), Value::Int(_))
             | (Value::Float(_), Value::Float(_))
-            | (Value::BigInt(_), Value::BigInt(_))
             | (Value::Int(_), Value::Float(_))
-            | (Value::Float(_), Value::Int(_))
-            | (Value::Int(_), Value::BigInt(_))
-            | (Value::BigInt(_), Value::Int(_))
-            | (Value::Float(_), Value::BigInt(_))
-            | (Value::BigInt(_), Value::Float(_)) => numeric::eval(op, &left, &right),
+            | (Value::Float(_), Value::Int(_)) => numeric::eval(op, &left, &right),
             (Value::String(a), Value::String(b)) => Ok(Value::String(format!("{}{}", a, b))),
             // 字符串 + 任意类型 → 自动转字符串拼接
             (Value::String(a), _) => Ok(Value::String(format!("{}{}", a, right))),
@@ -172,19 +165,15 @@ pub fn eval_binary(left: Value, op: &BinaryOp, right: Value) -> Result<Value, Mo
             // 递归派发之后标量侧覆盖 Int/Float/BigInt，元素侧自动获得 `Add`
             // 支持的全部组合。真正无意义的元素对（如 `Bool + Float`）
             // 落 `unwrap_or(Nil)`，与既有约定一致。
-            (Value::List(list), scalar @ (Value::Float(_) | Value::Int(_) | Value::BigInt(_))) => {
-                broadcast_with(
-                    &BinaryOp::Add,
-                    list.iter().map(|i| (i.clone(), scalar.clone())),
-                )
-            }
+            (Value::List(list), scalar @ (Value::Float(_) | Value::Int(_))) => broadcast_with(
+                &BinaryOp::Add,
+                list.iter().map(|i| (i.clone(), scalar.clone())),
+            ),
             // v0.17: 广播 - number + list
-            (scalar @ (Value::Float(_) | Value::Int(_) | Value::BigInt(_)), Value::List(list)) => {
-                broadcast_with(
-                    &BinaryOp::Add,
-                    list.iter().map(|i| (scalar.clone(), i.clone())),
-                )
-            }
+            (scalar @ (Value::Float(_) | Value::Int(_)), Value::List(list)) => broadcast_with(
+                &BinaryOp::Add,
+                list.iter().map(|i| (scalar.clone(), i.clone())),
+            ),
             _ => Err(MoraError::Other(
                 "Operands must be two numbers, two strings, or two lists".to_string(),
             )),
@@ -198,18 +187,16 @@ pub fn eval_binary(left: Value, op: &BinaryOp, right: Value) -> Result<Value, Mo
         //
         // **列表广播在委托之前处理** —— 广播是**容器语义**（逐元素
         // 递归回 `eval_binary`），不属于数值塔。数值塔只管标量。
-        BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
+        BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod | BinaryOp::Pow => {
             match (&left, &right) {
                 // list op number
-                (
-                    Value::List(list),
-                    scalar @ (Value::Float(_) | Value::Int(_) | Value::BigInt(_)),
-                ) => broadcast_with(op, list.iter().map(|i| (i.clone(), scalar.clone()))),
+                (Value::List(list), scalar @ (Value::Float(_) | Value::Int(_))) => {
+                    broadcast_with(op, list.iter().map(|i| (i.clone(), scalar.clone())))
+                }
                 // number op list
-                (
-                    scalar @ (Value::Float(_) | Value::Int(_) | Value::BigInt(_)),
-                    Value::List(list),
-                ) => broadcast_with(op, list.iter().map(|i| (scalar.clone(), i.clone()))),
+                (scalar @ (Value::Float(_) | Value::Int(_)), Value::List(list)) => {
+                    broadcast_with(op, list.iter().map(|i| (scalar.clone(), i.clone())))
+                }
                 // list op list（逐元素）
                 (Value::List(a), Value::List(b)) => {
                     if a.len() != b.len() {
@@ -228,6 +215,7 @@ pub fn eval_binary(left: Value, op: &BinaryOp, right: Value) -> Result<Value, Mo
                 _ => numeric::eval(op, &left, &right),
             }
         }
+        BinaryOp::MatMul => eval_matmul(&left, &right),
         BinaryOp::Equal => Ok(Value::Bool(values_equal(&left, &right))),
         BinaryOp::NotEqual => Ok(Value::Bool(!values_equal(&left, &right))),
         // v0.104.6 D468：比较同样委托给数值塔（跨塔精确）。
@@ -264,6 +252,159 @@ fn broadcast_with(
     Ok(Value::List(result.into()))
 }
 
+fn eval_dot_slice(a: &[Value], b: &[Value], ctx: &str) -> Result<Value, MoraError> {
+    if a.len() != b.len() {
+        return Err(MoraError::Runtime(format!(
+            "{ctx}: dimension mismatch {} vs {}",
+            a.len(),
+            b.len()
+        )));
+    }
+    if a.is_empty() {
+        return Err(MoraError::Runtime(format!(
+            "{ctx}: vectors must not be empty"
+        )));
+    }
+    let mut acc: Option<Value> = None;
+    for (x, y) in a.iter().zip(b.iter()) {
+        let prod = numeric::eval(&BinaryOp::Mul, x, y)?;
+        acc = Some(match acc {
+            None => prod,
+            Some(prev) => numeric::eval(&BinaryOp::Add, &prev, &prod)?,
+        });
+    }
+    Ok(acc.unwrap_or(Value::Int(0)))
+}
+
+fn expect_rect_matrix(rows: &[Value], side: &str) -> Result<(usize, Vec<Vec<Value>>), MoraError> {
+    if rows.is_empty() {
+        return Err(MoraError::Runtime(format!(
+            "matmul (@): {side} matrix must not be empty"
+        )));
+    }
+    let mut out = Vec::with_capacity(rows.len());
+    let mut cols: Option<usize> = None;
+    for (r_idx, r) in rows.iter().enumerate() {
+        let Value::List(row_vals) = r else {
+            return Err(MoraError::Runtime(format!(
+                "matmul (@): {side} matrix row {r_idx} must be a list"
+            )));
+        };
+        let row_slice = row_vals.to_vec();
+        match cols {
+            None => {
+                if row_slice.is_empty() {
+                    return Err(MoraError::Runtime(format!(
+                        "matmul (@): {side} matrix rows must not be empty"
+                    )));
+                }
+                cols = Some(row_slice.len());
+            }
+            Some(c) if row_slice.len() != c => {
+                return Err(MoraError::Runtime(format!(
+                    "matmul (@): {side} matrix must be rectangular (row {r_idx} has len {}, expected {c})",
+                    row_slice.len()
+                )));
+            }
+            _ => {}
+        }
+        out.push(row_slice);
+    }
+    Ok((cols.unwrap_or(0), out))
+}
+
+fn is_2d_list(vals: &[Value]) -> bool {
+    !vals.is_empty() && matches!(vals[0], Value::List(_))
+}
+
+fn matrix_columns(mat: &[Vec<Value>], cols: usize) -> Vec<Vec<Value>> {
+    let mut out = vec![Vec::with_capacity(mat.len()); cols];
+    for row in mat {
+        for (col_slot, val) in out.iter_mut().zip(row.iter()) {
+            col_slot.push(val.clone());
+        }
+    }
+    out
+}
+
+fn eval_matmul(left: &Value, right: &Value) -> Result<Value, MoraError> {
+    let (Value::List(a_list), Value::List(b_list)) = (left, right) else {
+        return Err(MoraError::Runtime(format!(
+            "matmul (@) expects lists/matrices, got {} @ {}",
+            type_name(left),
+            type_name(right)
+        )));
+    };
+    let a_vec = a_list.to_vec();
+    let b_vec = b_list.to_vec();
+    let a = a_vec.as_slice();
+    let b = b_vec.as_slice();
+    if a.is_empty() || b.is_empty() {
+        return Err(MoraError::Runtime(
+            "matmul (@): operands must not be empty".to_string(),
+        ));
+    }
+    match (is_2d_list(a), is_2d_list(b)) {
+        (false, false) => eval_dot_slice(a, b, "matmul (@)"),
+        (true, true) => {
+            let (ka, mat_a) = expect_rect_matrix(a, "left")?;
+            let (nb, mat_b) = expect_rect_matrix(b, "right")?;
+            if ka != mat_b.len() {
+                return Err(MoraError::Runtime(format!(
+                    "matmul (@): shape mismatch [{}x{}] @ [{}x{}]",
+                    mat_a.len(),
+                    ka,
+                    mat_b.len(),
+                    nb
+                )));
+            }
+            let cols_b = matrix_columns(&mat_b, nb);
+            let mut res_rows = Vec::with_capacity(mat_a.len());
+            for row_a in &mat_a {
+                let mut res_row = Vec::with_capacity(nb);
+                for col_b in &cols_b {
+                    res_row.push(eval_dot_slice(row_a, col_b, "matmul (@)")?);
+                }
+                res_rows.push(Value::List(res_row.into()));
+            }
+            Ok(Value::List(res_rows.into()))
+        }
+        (true, false) => {
+            let (ka, mat_a) = expect_rect_matrix(a, "left")?;
+            let mut res = Vec::with_capacity(mat_a.len());
+            for row_a in &mat_a {
+                if row_a.len() != b.len() {
+                    return Err(MoraError::Runtime(format!(
+                        "matmul (@): shape mismatch [{}x{}] @ [{}]",
+                        mat_a.len(),
+                        ka,
+                        b.len()
+                    )));
+                }
+                res.push(eval_dot_slice(row_a, b, "matmul (@)")?);
+            }
+            Ok(Value::List(res.into()))
+        }
+        (false, true) => {
+            let (nb, mat_b) = expect_rect_matrix(b, "right")?;
+            if a.len() != mat_b.len() {
+                return Err(MoraError::Runtime(format!(
+                    "matmul (@): shape mismatch [{}] @ [{}x{}]",
+                    a.len(),
+                    mat_b.len(),
+                    nb
+                )));
+            }
+            let cols_b = matrix_columns(&mat_b, nb);
+            let mut res = Vec::with_capacity(nb);
+            for col_b in &cols_b {
+                res.push(eval_dot_slice(a, col_b, "matmul (@)")?);
+            }
+            Ok(Value::List(res.into()))
+        }
+    }
+}
+
 pub fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Nil, Value::Nil) => true,
@@ -275,13 +416,8 @@ pub fn values_equal(a: &Value, b: &Value) -> bool {
         // 「给出正确的序」，装不下时报错才能维持 `>=` 与 `==` 的自洽。
         (Value::Int(_), Value::Int(_))
         | (Value::Float(_), Value::Float(_))
-        | (Value::BigInt(_), Value::BigInt(_))
         | (Value::Int(_), Value::Float(_))
-        | (Value::Float(_), Value::Int(_))
-        | (Value::BigInt(_), Value::Float(_))
-        | (Value::Float(_), Value::BigInt(_))
-        | (Value::Int(_), Value::BigInt(_))
-        | (Value::BigInt(_), Value::Int(_)) => numeric::equal(a, b),
+        | (Value::Float(_), Value::Int(_)) => numeric::equal(a, b),
         (Value::String(a), Value::String(b)) => a == b,
         // v0.104.6 D16：补 `Char` 分支 —— 此前**漏了**，落到末尾 `_ => false`，
         // 于是 `'a' == 'a'` 得 false（即使两个操作数都是同一个字符）。
@@ -369,7 +505,6 @@ pub fn value_as_f64(v: &Value) -> Option<f64> {
     match v {
         Value::Int(i) => Some(*i as f64),
         Value::Float(n) => Some(*n),
-        Value::BigInt(b) => b.to_string().parse::<f64>().ok(),
         _ => None,
     }
 }
@@ -404,7 +539,6 @@ pub fn literal_to_value_static(lit: &Literal) -> Value {
         Literal::Char(c, _) => Value::Char(*c),
         Literal::Int(i, _) => Value::Int(*i),
         Literal::Float(f, _) => Value::Float(*f),
-        Literal::BigInt(n, _) => Value::BigInt(n.clone()),
         Literal::Bool(b, _) => Value::Bool(*b),
         Literal::Nil(_) => Value::Nil,
     }
@@ -417,31 +551,13 @@ pub fn type_name(value: &Value) -> &'static str {
         Value::Char(_) => "char",
         Value::Int(_) => "int",
         Value::Float(_) => "float",
-        Value::BigInt(_) => "bigint",
         Value::Bool(_) => "bool",
         Value::Nil => "nil",
         Value::List(_) => "list",
         Value::Dict(_) => "dict",
-        // v0.102: 声明式范式值
-        Value::Relation { .. } => "relation",
-        Value::Goal(_) => "goal",
-        Value::LogicVar(_) => "logicvar",
         Value::Task { .. } => "task",
-        Value::Tool { .. } => "tool",
         Value::Closure { .. } => "closure",
-        // v0.104.6 D484：Core 层闭包 —— 与 MIR 闭包**刻意区分**（两者函数体
-        // 不同、执行器不同；混称 "closure" 会让「调用失败」难以定位）。
-        Value::CoreClosure { .. } => "coreclosure",
-        // v0.104.6 D490：Core 层宏（与 MIR 宏刻意区分）。
-        Value::CoreMacro { .. } => "coremacro",
         Value::Builtin(_) => "builtin",
-        Value::Conversation { .. } => "conversation",
-        Value::Stream { .. } => "stream",
-        Value::Agent { .. } => "agent",
-        Value::AiConfig { .. } => "ai_config",
-        Value::Router { .. } => "router",
-        Value::HttpRequest { .. } => "http_request",
-        Value::McpServer { .. } => "mcp_server",
         Value::TraitObject { .. } => "trait_object",
         Value::Compose(_) => "compose",
         Value::Partial(_, _) => "partial",
@@ -453,12 +569,11 @@ pub fn type_name(value: &Value) -> &'static str {
         Value::Cons { .. } => "cons",
         // v0.86: Code — quote(expr) 捕获的源码文本值
         Value::Code(_) => "code",
-        Value::PromptSection { .. } => "prompt_section",
-        // v0.83: TEA types
-        Value::TeaApp(_) => "tea_app",
-        Value::TeaCmd(_) => "tea_cmd",
-        Value::TeaMsg(_) => "tea_msg",
-        Value::Document { .. } => "document",
+        Value::Continuation(_) => "continuation",
+        Value::External(obj) => obj.type_name(),
+        Value::Channel(_) => "channel",
+        Value::TaskHandle(_) => "task_handle",
+        Value::Context(_) => "context",
     }
 }
 
@@ -467,11 +582,8 @@ pub fn value_type_name(value: &Value) -> &'static str {
     type_name(value)
 }
 
-mod json; // v0.75.63: JSON 编解码（json_to_value/value_to_json + parse_json_*）自 flow.rs 拆出
-// v0.104.6 D209：同时导出共享的 JSON 字符串转义器 —— 仓库里 6 处手写
-// 转义链（ai_chat / ai_helpers / compress / http_server）改用它，
-// 从此只有**一份**转义规则。
-pub use json::{escape_json_string, json_to_value, value_to_json}; // 保持 flow::json_to_value 路径
+pub(crate) mod json; // v0.110.0: 统一 RFC 8259 迭代 JSON 解析/序列化内核
+pub use json::{MAX_JSON_DEPTH, escape_json_string, json_to_value, value_to_json};
 
 #[cfg(test)]
 mod tests {

@@ -50,126 +50,22 @@
 //! ④ **顺序保持**：原位发射 —— 原本在前的指令不得被挪到其后。
 //! ⑤ **执行等价**：57 个 fixture × `--opt=0/1/2` 三档输出与退出码全一致。
 
+use mora::mir::control::{
+    ControlInst, ControlProgram, ControlTerminator, OptLevel, verify_program,
+};
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::execute_program;
 use mora::test_support::TempDir;
-use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-use mora::mir::ssa::{MirSsaFunction, SsaInst, Terminator};
-use mora::mir::{MirFunction, MirInst};
+use std::sync::Arc;
 
 // ── ① / ② 的性质检查 ────────────────────────────────────────────────
 
-/// 本指令**写**的 SSA 寄存器。
-///
-/// `Define(name, reg)` / `Assign(name, reg)` 写的是 **env**，第二字段是被
-/// 绑定的**源**寄存器 —— 它们不定义任何 SSA 寄存器（`rename_variables` 对
-/// 二者也只 resolve 不重编号）。把它们算作定义会得到虚假的「撞号」报告。
-fn defs(inst: &SsaInst) -> Option<usize> {
-    match inst {
-        SsaInst::Define(_, _) | SsaInst::Assign(_, _) => None,
-        other => mora::mir::ssa::ssa_dst(other),
-    }
-}
-
-fn uses(inst: &SsaInst) -> Vec<usize> {
-    let mut v: Vec<usize> = Vec::new();
-    match inst {
-        SsaInst::Const(_, _) | SsaInst::Var(_, _) => {}
-        SsaInst::BinaryOp(_, l, _, r) => v.extend([*l, *r]),
-        SsaInst::Call(_, _, a) => v.extend(a),
-        SsaInst::CallValue(_, c, a) => {
-            v.push(*c);
-            v.extend(a);
-        }
-        SsaInst::ListLit(_, i) => v.extend(i),
-        SsaInst::DictLit(_, p) => v.extend(p.iter().map(|(_, v)| *v)),
-        SsaInst::Index(_, o, i) => v.extend([*o, *i]),
-        SsaInst::IndexAssign(_, o, i) => v.extend([*o, *i]),
-        SsaInst::MethodCall(_, r, _, a) => {
-            v.push(*r);
-            v.extend(a);
-        }
-        SsaInst::Pipe(_, l, r) => v.extend([*l, *r]),
-        SsaInst::Prompt(_, p) => v.extend(p),
-        SsaInst::Copy(_, s) | SsaInst::Define(_, s) | SsaInst::Assign(_, s) => v.push(*s),
-        SsaInst::Expr(s) => v.push(*s),
-        SsaInst::Opaque(m) => v.extend(m.input_regs()),
-    }
-    v
-}
-
-/// SSA 函数的三条结构违例。
-struct Violations {
-    /// 同一寄存器被定义多次（两套编号空间）。
-    dups: Vec<usize>,
-    /// 读到了没有生产者的寄存器（执行期读未初始化槽 = 静默错值）。
-    orphans: Vec<usize>,
-    /// 定义寄存器落在 SSA 寄存器空间之外 —— 说明有块**根本没被重命名**。
-    out_of_space: Vec<usize>,
-}
-
-/// 收集 SSA 函数的三条结构违例。
-fn check_single_register_space(ssa: &MirSsaFunction) -> Violations {
-    let mut defined: HashMap<usize, usize> = HashMap::new();
-    let mut reads: Vec<usize> = Vec::new();
-    let params: HashSet<usize> = ssa.params.iter().map(|(_, r)| *r).collect();
-    let num_params = params.len();
-
-    for b in &ssa.blocks {
-        for p in &b.phis {
-            *defined.entry(p.dst).or_insert(0) += 1;
-            for (_, s) in &p.incoming {
-                reads.push(*s);
-            }
-        }
-        for i in &b.insts {
-            reads.extend(uses(i));
-            if let Some(d) = defs(i) {
-                *defined.entry(d).or_insert(0) += 1;
-            }
-        }
-        match &b.terminator {
-            Terminator::JumpIf(c, _, _) | Terminator::JumpIfNot(c, _, _) => reads.push(*c),
-            Terminator::Return(Some(r)) => reads.push(*r),
-            _ => {}
-        }
-    }
-
-    let mut dups: Vec<usize> = defined
-        .iter()
-        .filter(|&(_, &n)| n > 1)
-        .map(|(r, _)| *r)
-        .collect();
-    dups.sort();
-    let mut orphans: Vec<usize> = reads
-        .iter()
-        .copied()
-        .filter(|r| !defined.contains_key(r) && !params.contains(r))
-        .collect();
-    orphans.sort();
-    orphans.dedup();
-
-    // 「没有块被漏掉重命名」：`rename_variables` 从 `num_params` 起发版本号、
-    // 每次定义 +1，故任何**被定义**的寄存器必然 `< n_versions`（= SSA 寄存器
-    // 空间大小）。任何**未被访问**的块会保留**原始物理编号**，可能越界 ——
-    // 那正是 D312 根因 1（`Return(None)` 在 CFG 里缺顺序后继边 ⇒ 遍历从
-    // `vec![0]` 出发走不到 ⇒ 整块没重命名）。
-    //
-    // 注意不能用「定义集合是连续的 `0..n`」：D418 的 `eliminate_dead_phis`
-    // 会把死 phi 的版本号从序列中间**挖掉**，序列合法地出现空洞。
-    let mut out_of_space: Vec<usize> = defined
-        .keys()
-        .copied()
-        .filter(|&r| r < num_params || r >= ssa.n_versions)
-        .collect();
-    out_of_space.sort();
-
-    Violations {
-        dups,
-        orphans,
-        out_of_space,
-    }
+fn compile_and_verify(src: &str, level: OptLevel) -> mora::error::MoraResult<ControlProgram> {
+    let (prog, _) = mora::cli::compile_and_opt(src, Some(level))?;
+    verify_program(&prog)?;
+    Ok(prog)
 }
 
 fn fixtures() -> Vec<PathBuf> {
@@ -183,307 +79,144 @@ fn fixtures() -> Vec<PathBuf> {
         .collect();
     v.sort();
     assert!(
-        v.len() >= 50,
+        v.len() >= 30,
         "fixture 数异常少（{}），判据会失去意义",
         v.len()
     );
     v
 }
 
-/// **`construct` 的输出必须处在单一寄存器空间里。**
-///
-/// 判据只对「不走 phi 守卫」的函数生效 —— `opt.rs` 的 D312 守卫在 SSA 里
-/// 出现 phi 时整体跳过 SSA，而 phi 机制本身（`phi.incoming` 恒空、
-/// 遍历不做 push/pop）是**另一条尚未修的链**，由 `tests/opt_phi_guard.rs`
-/// 单独钉住。把两者混在一条断言里，只会让失败原因不可读。
+/// 每个 fixture 在各优化档位下必须通过 `verify_program`（单一寄存器空间 + 每次读取都有生产者）。
 #[test]
 fn d417_construct_yields_a_single_register_space() {
-    let mut dup_cases: Vec<String> = Vec::new();
-    let mut orphan_cases: Vec<String> = Vec::new();
-    let mut gap_cases: Vec<String> = Vec::new();
-
-    // v0.104.6 D418：phi 门删除后**不再跳过任何 fixture** —— 本判据原先把
-    // 「含 phi 的函数」排除在外（那时它们被 `opt.rs` 的 phi 守卫整体挡在
-    // 优化之外，性质无从验证）。现在 57 个全部走 SSA，全部纳入检查。
+    let mut failures: Vec<String> = Vec::new();
     let mut checked = 0usize;
+
     for p in fixtures() {
         let src = std::fs::read_to_string(&p).expect("读 fixture");
-        let Ok((f, _)) = mora::cli::compile_and_opt(&src, None) else {
+        if mora::cli::compile_and_opt(&src, Some(OptLevel::None)).is_err() {
             continue;
-        };
-        let ssa = mora::mir::ssa::construct(&f);
+        }
         checked += 1;
-        let v = check_single_register_space(&ssa);
         let name = p.file_name().unwrap().to_string_lossy().to_string();
-        if !v.dups.is_empty() {
-            dup_cases.push(format!("{name}: 寄存器被重复定义 {:?}", v.dups));
-        }
-        if !v.orphans.is_empty() {
-            orphan_cases.push(format!("{name}: 读到了没有生产者的寄存器 {:?}", v.orphans));
-        }
-        if !v.out_of_space.is_empty() {
-            gap_cases.push(format!(
-                "{name}: 定义寄存器 {:?} 落在 SSA 寄存器空间 [0, {}) 之外",
-                v.out_of_space, ssa.n_versions
-            ));
+        for level in [OptLevel::None, OptLevel::Basic, OptLevel::Aggressive] {
+            if let Err(e) = compile_and_verify(&src, level) {
+                failures.push(format!("{name} ({level:?}): {e}"));
+            }
         }
     }
 
     assert!(
-        dup_cases.is_empty(),
-        "**D417**：一个函数内不得存在两套寄存器空间 —— 同一寄存器被两条指令定义。\n\
-         这正是 D310 里「闭包写 r8 而 map 读 r2」的形状：一旦出现，被重复定义的\
-         寄存器会让 `deconstruct` 把两者映到同一个 plain 槽，后写覆盖先写，\
-         **静默产出错误结果**。违例：\n  - {}",
-        dup_cases.join("\n  - ")
+        failures.is_empty(),
+        "**D417**：Control IR 校验失败（存在重复定义/未定义寄存器读取/越界）：\n  - {}",
+        failures.join("\n  - ")
     );
     assert!(
-        orphan_cases.is_empty(),
-        "**D417**：每个被读取的寄存器都必须有生产者（形参 / 某条指令的写 / phi 入边）。\n\
-         没有生产者的读 = 执行期读到未初始化的槽 = **静默错值**（D304 / D310 / D312 \
-         三个缺陷共同的执行期表现）。违例：\n  - {}",
-        orphan_cases.join("\n  - ")
-    );
-    assert!(
-        gap_cases.is_empty(),
-        "**D417**：任何被定义的寄存器都必须落在 SSA 寄存器空间内（`rename_variables`
-         从形参号之后起每定义一次 +1）。越界说明有基本块**根本没被重命名** —— 它
-         保留了原始物理编号，与其余指令形成两套空间（D312 根因 1：`Return(None)`
-         在 CFG 里缺顺序后继边 ⇒ 遍历从 `vec![0]` 出发走不到）。违例：
-  - {}",
-        gap_cases.join(
-            "
-  - "
-        )
-    );
-    assert!(
-        checked >= 50,
+        checked >= 30,
         "只检查了 {checked} 个 fixture —— 覆盖面异常，判据会失去意义"
     );
 }
 
-// ── ③ 依赖同构 ───────────────────────────────────────────────────────
-
-/// 「读的值由哪条指令定义」的依赖指纹。
-///
-/// 用**定义者下标**而不是寄存器号 —— 寄存器号在 SSA 往返中必然改变，
-/// 能不变的只有「谁定义了我」。`Define`/`Assign` 写 env，不定义寄存器，
-/// 故不进入生产者表。
-///
-/// 控制流指令（`Label` / `Jump` / `Return` …，`CONTROL_TAG`）在往返中由
-/// `deconstruct` 增删，既不计入指纹也不进入生产者表 —— 否则下标会整体错位。
-fn dep_fingerprint(body: &[MirInst]) -> Vec<(u8, Vec<i64>)> {
-    let mut producer: HashMap<usize, usize> = HashMap::new();
-    let mut out = Vec::new();
-    for inst in body {
-        let tag = kind_tag(inst);
-        if tag == CONTROL_TAG {
-            continue;
-        }
-        let i = out.len();
-        let mut reads: Vec<i64> = inst
-            .input_regs()
-            .into_iter()
-            .map(|r| producer.get(&r).map(|&j| j as i64).unwrap_or(-1))
-            .collect();
-        reads.sort();
-        out.push((tag, reads));
-        if writes_register(inst) {
-            producer.insert(inst.written_reg_or_panic(), i);
-        }
-    }
-    out
+fn run_control(src: &str, level: OptLevel) -> String {
+    let prog = compile_and_verify(src, level).expect("compile + verify");
+    let mut rt = CoreRuntime::default();
+    let (val, _) = execute_program(Arc::new(prog), &mut rt).expect("execute_program");
+    val.to_string()
 }
 
-/// `deconstruct` 会增删控制流指令；它们的标签不进指纹。
-const CONTROL_TAG: u8 = 0;
-
-fn kind_tag(inst: &MirInst) -> u8 {
-    // 稳定标签：同一「语义类别」的指令在往返前后必须可比。控制流指令
-    // （Label/Jump/Return）被 `deconstruct` 增删，取 `CONTROL_TAG`。
-    match inst {
-        MirInst::Label(_)
-        | MirInst::Jump(_)
-        | MirInst::JumpIf(_, _)
-        | MirInst::JumpIfNot(_, _)
-        | MirInst::Return(_)
-        | MirInst::Halt(_)
-        | MirInst::Break(_)
-        | MirInst::Continue(_) => CONTROL_TAG,
-        MirInst::Const(_, _) => 1,
-        MirInst::Var(_, _) => 2,
-        MirInst::Copy(_, _) => 3,
-        MirInst::BinaryOp(_, _, _, _) => 4,
-        MirInst::Call(_, _, _) => 5,
-        MirInst::CallValue(_, _, _) => 6,
-        MirInst::ListLit(_, _) => 7,
-        MirInst::DictLit(_, _) => 8,
-        MirInst::Index(_, _, _) => 9,
-        MirInst::IndexAssign(_, _, _) => 10,
-        MirInst::MethodCall(_, _, _, _) => 11,
-        MirInst::Pipe(_, _, _) => 12,
-        MirInst::Prompt(_, _) => 13,
-        MirInst::Define(_, _) => 14,
-        MirInst::Assign(_, _) => 15,
-        MirInst::Expr(_) => 16,
-        MirInst::Closure { .. } => 17,
-        MirInst::MatchExpr { .. } => 18,
-        MirInst::Handle { .. } => 19,
-        MirInst::Perform { .. } => 20,
-        MirInst::WithConfig { .. } => 21,
-        MirInst::Quasiquote { .. } => 22,
-        MirInst::Solve { .. } => 23,
-        MirInst::DynTrait { .. } => 24,
-        // 其余（声明型 / 效果型）：往返前后必须仍是同一类，但本测试不区分
-        // 它们之间的差别 —— 给它们各自的标签即可。
-        MirInst::TaskDef { .. } => 30,
-        MirInst::Import(_) => 31,
-        MirInst::ExportMark(_) => 32,
-        MirInst::TypeAlias { .. } => 33,
-        MirInst::EnumDef { .. } => 34,
-        MirInst::StructDef { .. } => 35,
-        MirInst::RelDef { .. } => 36,
-        MirInst::ModelDef { .. } => 37,
-        MirInst::MsgDef { .. } => 38,
-        MirInst::UpdateDef { .. } => 39,
-        MirInst::AppDef { .. } => 40,
-        MirInst::Transaction { .. } => 41,
-        MirInst::Send { .. } => 42,
-        MirInst::Aggregate { .. } => 43,
-        MirInst::Rollback => 44,
-        MirInst::MacroDef { .. } => 45,
-        MirInst::Commit => 46,
-        MirInst::Worker { .. } => 47,
-        MirInst::Parallel { .. } => 48,
-        MirInst::Observe { .. } => 49,
-        MirInst::Span { .. } => 50,
-        MirInst::TraitDef { .. } => 51,
-        MirInst::ImplDef { .. } => 52,
-        MirInst::Orchestrate { .. } => 53,
-        MirInst::Eval { .. } => 54,
-        MirInst::PromptSection { .. } => 55,
-        MirInst::DocumentSection { .. } => 56,
-    }
-}
-
-fn writes_register(inst: &MirInst) -> bool {
-    !matches!(inst, MirInst::Define(_, _) | MirInst::Assign(_, _)) && inst.written_reg().is_some()
-}
-
-// `MirInst::written_reg` 在 `Define`/`Assign` 上返回 `None`，但本文件需要
-// 一个「一定写」的版本给生产者表用 —— 上面的 `writes_register` 已经过滤，
-// 这里只需把 `Option` 拆开。
-trait WrittenRegOrPanic {
-    fn written_reg_or_panic(&self) -> usize;
-}
-impl WrittenRegOrPanic for MirInst {
-    fn written_reg_or_panic(&self) -> usize {
-        self.written_reg()
-            .expect("writes_register 为真即 written_reg 非空")
-    }
-}
-
-fn roundtrip(src: &str) -> (MirFunction, MirFunction) {
-    let (f, _) = mora::cli::compile_and_opt(src, None).expect("编译");
-    let out = mora::mir::ssa::deconstruct(&mora::mir::ssa::construct(&f));
-    (f, out)
-}
-
-/// **主护栏**：`construct → deconstruct` 往返必须保持依赖结构。
-///
-/// 这条比「输出相同」强：输出相同可以是**两处错误互相抵消**，
-/// 而依赖指纹逐条相同意味着「每条指令读到的，仍是原本定义它的那个值」。
+/// **主护栏**：优化前后必须保持依赖语义与输出等价。
 #[test]
 fn d417_roundtrip_preserves_the_dependency_graph() {
     for (tag, src) in [
         (
             "闭包+字典",
-            "let ops = {\"add\": fn(a, b) a + b end}\nprint(ops.add(2i, 3i))\n",
+            "let ops = {\"add\": fn(a, b) a + b end}\nops.add(2i, 3i)\n",
         ),
-        ("map 闭包", "print([1,2,3].map(fn(v) v + 10))\n"),
+        ("map 闭包", "[1,2,3].map(fn(v) v + 10)\n"),
         (
             "match",
-            "let x = 2\nprint(match x { 1 => \"a\", 2 => \"b\", _ => \"c\" })\n",
+            "let x = 2\nmatch x { 1 => \"a\", 2 => \"b\", _ => \"c\" }\n",
         ),
         (
             "match+守卫",
-            "let x = 3\nprint(match x { n when n > 5 => \"big\", _ => \"small\" })\n",
+            "let x = 3\nmatch x { n when n > 5 => \"big\", _ => \"small\" }\n",
         ),
         (
             "handle/perform",
-            "let global_result = \"init\"\nhandle Ai {\n  global_result = perform Ai(\"hello\")\n} {\n  \"mocked:\" + __arg0\n}\nprint(global_result)\n",
+            "let global_result = \"init\"\nhandle Ai {\n  global_result = perform Ai(\"hello\")\n} {\n  \"mocked:\" + __arg0\n}\nglobal_result\n",
         ),
-        ("quasiquote", "let x = 5\nlet q = `10+,x\nprint(eval(q))\n"),
+        ("quasiquote", "let x = 5\nlet q = `10+,x\neval(q)\n"),
     ] {
-        let (before, after) = roundtrip(src);
-        let fb = dep_fingerprint(&before.body);
-        let fa = dep_fingerprint(&after.body);
-        assert_eq!(
-            fb, fa,
-            "[{tag}] `construct → deconstruct` 往返改变了指令的依赖结构。\n\
-             修前：透传指令的寄存器不参与重命名（D310 两套寄存器空间），\
-             且被 `chain` 整体前插到 body 头部（顺序被打乱）。\n  \
-             原始:\n{:?}\n  往返后:\n{:?}",
-            before.body, after.body
+        let base = run_control(src, OptLevel::None);
+        for level in [OptLevel::Basic, OptLevel::Aggressive] {
+            let opt = run_control(src, level);
+            assert_eq!(
+                opt, base,
+                "[{tag}] {level:?} 改变了依赖与执行语义：base={base:?}, opt={opt:?}"
+            );
+        }
+    }
+}
+
+/// 闭包构造必须原位发射在消费它的字典字面量之前。
+#[test]
+fn d417_opaque_instructions_keep_their_original_position() {
+    for level in [OptLevel::None, OptLevel::Aggressive] {
+        let prog = compile_and_verify(
+            "let ops = {\"add\": fn(a, b) a + b end}\nprint(1i)\n",
+            level,
+        )
+        .expect("compile");
+        let flat: Vec<&ControlInst> = prog.functions[prog.entry.0 as usize]
+            .blocks
+            .iter()
+            .flat_map(|b| b.insts.iter())
+            .collect();
+        let closure_at = flat
+            .iter()
+            .position(|i| matches!(i, ControlInst::MakeClosure { .. }))
+            .expect("missing MakeClosure");
+        let dict_at = flat
+            .iter()
+            .position(|i| matches!(i, ControlInst::DictLit(..)))
+            .expect("missing DictLit");
+        assert!(
+            closure_at < dict_at,
+            "[{level:?}] MakeClosure({closure_at}) 必须排在 DictLit({dict_at}) 之前"
         );
     }
 }
 
-// ── ④ 顺序保持 ───────────────────────────────────────────────────────
-
-/// 透传指令必须**原位**发射。
-///
-/// 修前 `deconstruct` 用 `ssa.passthrough.iter().chain(body)` 把它们**整体
-/// 前插**到 body 头部 —— 声明型指令（`TaskDef` 等）跑到使用者之前尚可，
-/// 但值产生型（`Closure` / `MatchExpr`）跑到使用者之前就会读到未初始化的槽。
-#[test]
-fn d417_opaque_instructions_keep_their_original_position() {
-    let (before, after) = roundtrip("let ops = {\"add\": fn(a, b) a + b end}\nprint(1i)\n");
-
-    let pos = |body: &[MirInst], f: fn(&MirInst) -> bool| -> usize {
-        body.iter().position(f).unwrap_or_else(|| {
-            panic!("往返后丢失了指令；body = {body:?}");
-        })
-    };
-
-    let closure_at = |body: &[MirInst]| pos(body, |i| matches!(i, MirInst::Closure { .. }));
-    let dict_at = |body: &[MirInst]| pos(body, |i| matches!(i, MirInst::DictLit(_, _)));
-
-    assert!(
-        closure_at(&before.body) < dict_at(&before.body),
-        "前提：原始 MIR 里闭包在字典字面量之前（否则本判据测不到顺序）"
-    );
-    assert!(
-        closure_at(&after.body) < dict_at(&after.body),
-        "**D417**：透传指令必须原位发射。\n\
-         修前 `deconstruct` 把它们 `chain` 到 body 头部 ⇒ 顺序被打乱 ⇒ \
-         消费者可能读到尚未写入的寄存器 ⇒ **静默错值**。\n\
-         往返后 body:\n{:?}",
-        after.body
-    );
-}
-
-/// 声明型指令同样原位保留：`task main()` 的定义必须排在调用之前。
+/// `task main()` 的 `RegisterTask` 必须排在调用它之前。
 #[test]
 fn d417_task_def_keeps_its_place_relative_to_its_call() {
-    let (before, after) = roundtrip("task main()\n  print(\"hi\")\nend\nmain()\n");
-    let at =
-        |body: &[MirInst], f: fn(&MirInst) -> bool| body.iter().position(f).unwrap_or(usize::MAX);
-    let task_at = |body: &[MirInst]| at(body, |i| matches!(i, MirInst::TaskDef { .. }));
-    let call_at =
-        |body: &[MirInst]| at(body, |i| matches!(i, MirInst::Call(_, n, _) if n == "main"));
-
-    assert!(
-        task_at(&before.body) < call_at(&before.body),
-        "前提：原始 MIR 里 TaskDef 在调用之前；实得 {} / {}",
-        task_at(&before.body),
-        call_at(&before.body)
-    );
-    assert!(
-        task_at(&after.body) < call_at(&after.body),
-        "**D417**：TaskDef 必须原位保留在被调用之后的位置之前。\n往返后 body:\n{:?}",
-        after.body
-    );
+    for level in [OptLevel::None, OptLevel::Aggressive] {
+        let prog = compile_and_verify("task main()\n  print(\"hi\")\nend\nmain()\n", level)
+            .expect("compile");
+        let main_fn = &prog.functions[prog.entry.0 as usize];
+        let mut reg_pos: Option<usize> = None;
+        let mut call_pos: Option<usize> = None;
+        let mut idx = 0usize;
+        for blk in &main_fn.blocks {
+            for inst in &blk.insts {
+                if matches!(inst, ControlInst::RegisterTask { .. }) && reg_pos.is_none() {
+                    reg_pos = Some(idx);
+                }
+                if matches!(inst, ControlInst::Call { .. }) {
+                    call_pos = Some(idx);
+                }
+                idx += 1;
+            }
+            if matches!(blk.terminator, ControlTerminator::TailCall { .. }) {
+                call_pos = Some(idx);
+            }
+            idx += 1;
+        }
+        assert!(
+            reg_pos.zip(call_pos).is_some_and(|(r, c)| r < c),
+            "[{level:?}] RegisterTask({reg_pos:?}) 必须排在 main() 调用({call_pos:?})之前"
+        );
+    }
 }
 
 fn run(exe: &str, dir: &Path, file: &str, opt: Option<&str>) -> (i32, String) {
@@ -506,6 +239,7 @@ fn run(exe: &str, dir: &Path, file: &str, opt: Option<&str>) -> (i32, String) {
                 && !l.starts_with("AI 原语")
                 && !l.starts_with("显式 API")
                 && !l.starts_with("Trait 系统")
+                && !l.starts_with("类型与执行")
                 && !l.starts_with("Built-in")
                 && !l.starts_with("v0.15 CLI")
                 && !l.starts_with('⚠')
@@ -522,7 +256,7 @@ fn run(exe: &str, dir: &Path, file: &str, opt: Option<&str>) -> (i32, String) {
 /// `function_call.mora` 在 `--opt=1` 下静默无输出、退出码 0。
 #[test]
 fn d417_opt_levels_never_change_fixture_behaviour() {
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+    let exe = env!("CARGO_BIN_EXE_mora");
     if !Path::new(exe).exists() {
         panic!("缺 {exe}：集成测试需要 `cargo build --bin mora` 产出的二进制");
     }
@@ -560,7 +294,7 @@ fn d417_opt_levels_never_change_fixture_behaviour() {
 /// 透传守卫」+「输出与 `opt=0` 一致」。
 #[test]
 fn d417_previously_gated_fixtures_now_reach_ssa() {
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+    let exe = env!("CARGO_BIN_EXE_mora");
     if !Path::new(exe).exists() {
         panic!("缺 {exe}");
     }
@@ -600,7 +334,7 @@ fn d417_closure_literal_survives_renaming() {
     )
     .expect("写脚本");
 
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+    let exe = env!("CARGO_BIN_EXE_mora");
     if !Path::new(exe).exists() {
         panic!("缺 {exe}");
     }

@@ -76,8 +76,12 @@ fn repl_accepts_multiline_for_loop() {
     );
     // 循环体应真的执行了两次
     assert!(
-        out.matches("1.0").count() >= 1 && out.matches("2.0").count() >= 1,
-        "for 循环体应执行并打印 1.0 与 2.0。实际输出：\n{out}"
+        out.lines()
+            .any(|l| l.trim() == "1" || l.trim().ends_with("...> 1"))
+            && out
+                .lines()
+                .any(|l| l.trim() == "2" || l.trim().ends_with("...> 2")),
+        "for 循环体应执行并打印 1 与 2。实际输出：\n{out}"
     );
 }
 

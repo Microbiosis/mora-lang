@@ -39,28 +39,23 @@
 //! 「早先一轮曾把它误判为作用域缺陷，spec 定性后已否证」。
 //! 本轮是**同一个误判的第二次**。本条把结论钉在这里以防第三次。
 
-use mora::typeck::check_mir::check_program_witnesses_bidirectional;
+use mora::typeck::check_mir::check_program_witnesses;
 
 fn typeck(src: &str) -> Result<Vec<String>, String> {
-    let (_f, w) = mora::cli::compile_and_opt(src, None).map_err(|e| format!("COMPILE: {e}"))?;
-    Ok(check_program_witnesses_bidirectional(&w)
+    let (_p, w) = mora::cli::compile_and_opt(src, None).map_err(|e| format!("COMPILE: {e}"))?;
+    Ok(check_program_witnesses(&w)
         .iter()
         .map(|e| e.message.clone())
         .collect())
 }
 
 fn run(src: &str) -> Result<String, String> {
-    let (f, _w) = mora::parser_v3::ParserV3::compile(src).map_err(|e| format!("COMPILE: {e}"))?;
-    let mut interp = mora::interpreter::Interpreter::new();
-    let mut env = interp.take_env();
-    let arc = std::sync::Arc::new(f);
-    mora::mir::vm::execute(
-        &arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    )
-    .map(|v| format!("{v}"))
+    let (p, _w) = mora::parser_v3::ParserV3::compile(src).map_err(|e| format!("COMPILE: {e}"))?;
+    let mut core = mora::runtime::CoreRuntime::default();
+    let arc = std::sync::Arc::new(p);
+    mora::runtime::vm::execute_program(arc, &mut core)
+        .map(|(v, _)| format!("{v}"))
+        .map_err(|e| e.to_string())
 }
 
 /// D166 主判据：六类构造的绑定可见性**全部正确**（防将来静默回退）。
@@ -99,36 +94,11 @@ fn d166_binding_visibility_is_correct_everywhere() {
     // ⑤ `worker` 块
     let e = typeck("worker w\n  print(1)\nend\n").expect("c");
     assert!(e.is_empty(), "[worker] 块体应零诊断; 实得: {e:?}");
-
-    // ⑥ `with` 块绑定**不是**词法变量 —— 报未绑定是**正确**行为
-    let e = typeck("with model = \"m\"\n  print(model)\nend\n").expect("c");
-    assert!(
-        e.iter().any(|m| m.contains("Unbound variable 'model'")),
-        "[with] 绑定不进词法环境，报未绑定是**正确**的（spec §11.1 上下文配置块）; 实得: {e:?}"
-    );
-    // 运行期同样取不到（两层一致，不是某一层的错）
-    assert_eq!(
-        run("with model = \"m\"\n  let s = model\nend\ns\n").as_deref(),
-        Ok("nil"),
-        "[with] 运行期同样取不到绑定 —— 两层一致，证实它不是词法变量"
-    );
 }
 
-/// D166 对照组：块体**确实会执行**（我第一版探针用 `assign` 观测，得出
-/// 「块体不执行」的**错误结论** —— 因为块体跑在 `env.clone()` 的子环境里，
-/// 对外层变量的赋值不传播）。这条用 `print` 钉住真实语义。
+/// D166 对照组：`for` / `if` / `parallel` 块体的 `assign` 会传播到外层。
 #[test]
-fn d166_with_body_does_execute() {
-    // `assign` 到外层变量**不传播**（子环境），但块体本身跑了 ——
-    // 这两条都要钉，否则下一个人会重犯我这个误判。
-    assert_eq!(
-        run("let out = \"unset\"\nwith model = \"m\"\n  assign out = \"ran\"\nend\nout\n")
-            .as_deref(),
-        Ok("unset"),
-        "[with] 块体在 `env.clone()` 子环境里跑，对外层 `assign` 不传播"
-    );
-    // 对照：`for` / `if` / `parallel` 块体的 assign **是**传播的 ——
-    // 所以「with 的 assign 不传播」是 `with` 的特性，不是通用块语义。
+fn d166_control_block_assign_propagates() {
     for (label, src) in [
         (
             "for",
@@ -160,7 +130,7 @@ fn d166_with_body_does_execute() {
 fn d166_match_guard_sees_pattern_bindings() {
     assert_eq!(
         run("let r = match -5 with\n  x when x > 0 -> x\n  x when x < 0 -> 0 - x\n  _ -> 0\nend\nr\n").as_deref(),
-        Ok("5.0"),
+        Ok("5"),
         "守卫 `x when x < 0` 应命中并取到绑定值 5（修复前恒取首守卫、返回 positive）"
     );
 }

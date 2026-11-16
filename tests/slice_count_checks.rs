@@ -21,23 +21,18 @@
 //! `take`/`drop` 漏了。同批还修了 `compress` 的 `k_first` / `k_last`
 //! （与 D145 的 `max_bytes` **同函数同型**）。
 
-use mora::interpreter::Interpreter;
-use mora::mir::vm::execute;
 use mora::parser_v3::ParserV3;
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::execute_program;
 use std::sync::Arc;
 
 fn run(src: &str) -> Result<String, String> {
-    let (func, _w) = ParserV3::compile(src).map_err(|e| format!("COMPILE: {e}"))?;
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    let arc = Arc::new(func);
-    execute(
-        &arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    )
-    .map(|v| format!("{v}"))
+    let (prog, _w) = ParserV3::compile(src).map_err(|e| format!("COMPILE: {e}"))?;
+    let mut core = CoreRuntime::default();
+    let arc = Arc::new(prog);
+    execute_program(arc, &mut core)
+        .map(|(v, _)| format!("{v}"))
+        .map_err(|e| e.to_string())
 }
 
 /// D146 主判据：`take` / `drop` 的负数 count 必须报错。
@@ -77,11 +72,11 @@ fn d146_negative_compress_boundary_counts_are_rejected() {
 #[test]
 fn d146_normal_take_drop_results_are_unchanged() {
     for (name, src, expect) in [
-        ("take_2", "[1,2,3,4,5,6].take(2)\n", "[1.0, 2.0]"),
-        ("drop_4", "[1,2,3,4,5,6].drop(4)\n", "[5.0, 6.0]"),
+        ("take_2", "[1,2,3,4,5,6].take(2)\n", "[1, 2]"),
+        ("drop_4", "[1,2,3,4,5,6].drop(4)\n", "[5, 6]"),
         ("take_0", "[1,2,3].take(0)\n", "[]"),
-        ("drop_0", "[1,2,3].drop(0)\n", "[1.0, 2.0, 3.0]"),
-        ("take_all", "[1,2,3].take(3)\n", "[1.0, 2.0, 3.0]"),
+        ("drop_0", "[1,2,3].drop(0)\n", "[1, 2, 3]"),
+        ("take_all", "[1,2,3].take(3)\n", "[1, 2, 3]"),
         ("drop_all", "[1,2,3].drop(3)\n", "[]"),
     ] {
         let got = run(src).unwrap_or_else(|e| panic!("[{name}] 正常参数不应报错: {e}"));
@@ -104,26 +99,21 @@ fn d146_normal_take_drop_results_are_unchanged() {
 /// ③ `tail` 改用**真实签名** `tail(path, max)`，path 指向工作区内确实存在的文件。
 #[test]
 fn d146_siblings_that_already_reject_negatives_still_do() {
-    for (name, src, needle) in [
-        ("crush_json", "crush_json([1,2,3], -1)\n", "non-negative"),
-        // ⚠ 真实签名是 `tail(path, max)` —— 首参必须是**字符串路径**。
-        // 修前写的 `tail([1,2,3], 5, -1)` 是三参 + list，编译期就挂了。
-        ("tail", "tail(\"Cargo.toml\", -1)\n", "non-negative"),
-    ] {
-        let res = run(src);
-        assert!(
-            res.is_err(),
-            "[{name}] 本就有的非负校验不得回退（它们是 take/drop 的正确样板）"
-        );
-        let err = res.unwrap_err();
-        assert!(
-            !err.starts_with("COMPILE:"),
-            "[{name}] 不该是**编译错误** —— 那说明用例本身写错了（签名/元数/类型），\
-             蒙对了断言。实际: {err}"
-        );
-        assert!(
-            err.contains(needle),
-            "[{name}] 错误信息应点明 `{needle}`（这才是验证那条守卫）; 实际: {err}"
-        );
-    }
+    // ⚠ 真实签名是 `tail(path, max)` —— 首参必须是**字符串路径**。
+    let (name, src, needle) = ("tail", "tail(\"Cargo.toml\", -1)\n", "non-negative");
+    let res = run(src);
+    assert!(
+        res.is_err(),
+        "[{name}] 本就有的非负校验不得回退（它们是 take/drop 的正确样板）"
+    );
+    let err = res.unwrap_err();
+    assert!(
+        !err.starts_with("COMPILE:"),
+        "[{name}] 不该是**编译错误** —— 那说明用例本身写错了（签名/元数/类型），\
+         蒙对了断言。实际: {err}"
+    );
+    assert!(
+        err.contains(needle),
+        "[{name}] 错误信息应点明 `{needle}`（这才是验证那条守卫）; 实际: {err}"
+    );
 }

@@ -4,42 +4,20 @@
 [![Release](https://img.shields.io/github/v/release/Microbiosis/mora-lang)](https://github.com/Microbiosis/mora-lang/releases/latest)
 [![CI](https://github.com/Microbiosis/mora-lang/actions/workflows/ci.yml/badge.svg)](https://github.com/Microbiosis/mora-lang/actions/workflows/ci.yml)
 
-**Mora** — an AI-native statically-typed scripting language for LLM
-agent orchestration and cloud-native observability. One binary ships both
-an HTTP server and an MCP server.
+**Mora** — a statically-typed functional scripting language with Hindley-Milner type inference, algebraic effects, persistent data structures, a Control SSA VM scheduled on Tokio, and a built-in LSP server (`mora-lsp`).
 
 [Architecture](docs/architecture-diagram.md) · [CHANGELOG](CHANGELOG.md) · [Influences](docs/influences.md) · [Spec](docs/mora-spec.md)
 
 ## Highlights
 
-- **AI-native primitives** — first-class prompt literals `p"..."`,
-  `ai.chat(prompt)` / `ai.critic(answer, ctx?)` / `ai.tokens`,
-  `agent.create(name, config).run(task)`, `with model = "...",
-  temperature = 0.7` config blocks, SHA-256 audit-log hash chain.
-- **HTTP + MCP in one binary** — `Router::new()` + `router.route(method,
-  path, handler)` + `router.listen(addr)` for REST, and `McpServer::new()`
-  + `server.tool(name, schema, handler)` + `server.serve()` for MCP over
-  stdio; CLI subcommand `mora mcp tool-list` enumerates tools.
-- **Pregel BSP for multi-agent orchestration** — `state` / `node` /
-  `channel` / `checkpoint` / `command` / `send` / `interrupt` / `rewind`
-  primitives (v0.50); `orchestrate moa` (parallel LLM aggregation,
-  v0.75.84) and `orchestrate moe` (sparse top-k experts, v0.75.85)
-  built on top.
-- **Record / replay / diff** — `mora record` / `replay` / `diff` for
-  deterministic AI-call regression testing, `.mora/recordings/*.jsonl`.
-- **Single-pass compile + MIR SSA + JIT** — Lexer → ParserV3 →
-  `MirFunction<MirInst>` + `MirWitness` → witness typecheck → MIR
-  optimize → DAG → `vm::execute`; copy-and-patch JIT always compiled
-  (v0.75.43, no feature gate).
-- **HM type inference** — Hindley-Milner inference is the default
-  type checker (`src/typeck/hm/`); v0.75.29 removed the dead
-  `MORA_HM=1` opt-in switch. Type checking always runs.
-- **LSP server (`mora-lsp`)** — hover / completion / definition /
-  references / rename / semanticTokens / foldingRange /
-  publishDiagnostics over stdio JSON-RPC 2.0.
-- **9-language heritage** — Clojure, Common Lisp, Prolog, Lisp,
-  Ballerina, StreamIt, APL, Logo, Smalltalk (see
-  [docs/influences.md](docs/influences.md)).
+- **Single-pass Control SSA compiler** — Lexer (strict Int vs Float literals, width suffixes, `**`, `@`, `!`) → iterative Pratt `ParserV3::compile` → `MirWitness[]` + `ControlProgram` SSA IR → optional SSA optimization (`--opt=0/1/2` or `MORA_OPT`) → heap-framed stackful VM (`runtime::vm`).
+- **Unified Span-tracked Hindley-Milner type checking** — single constraint solver (`src/typeck/check_mir.rs` + `src/typeck/hm/`) supporting rigid generic parameters, qualified let-polymorphism with ML Value Restriction, covariant `result<T, E>`, fail-closed `unknown`, effect-row subsumption, and module checks across `import` boundaries before execution.
+- **Algebraic effects & delimited continuations** — `perform` / `handle` with multi-shot `resume` continuations (`Value::Continuation`).
+- **Dynamic dispatch & host extensibility** — `dyn` dispatch (`as dyn` coercion, default trait methods, runtime trait objects) plus the Rust `HostObject` trait (`Value::External(Arc<dyn HostObject>)`) for opaque stateful host objects.
+- **Tokio concurrency, channels & confined filesystem** — Go-style `spawn`, typed invariant `channel<T>`, fair `select` (`case recv`/`send`/`timeout`/`default`), hierarchical cooperative cancellation `context` (`task_handle<T>`), cancellable `sleep`, multi-threaded `TaskScheduler`, non-blocking `AsyncIoReactor`, and `FsPolicy` / `CheckedPath` confinement with isolated per-runtime virtual `cwd`.
+- **Functional core & persistent lists** — chunked persistent `Value::List` (`value/list.rs`), lexical `HashMap` + `Arc<Environment>` parent-chain bindings (`value.rs`), `EngineShared` runtime services, atoms (`atom` / `swap` / `deref`), `compose` / `partial`, pattern matching with guards, and macros.
+- **LSP server (`mora-lsp`)** — stdio JSON-RPC 2.0 server with unified HM hover/completion (`infer_program_types`), bounded headers (`MAX_CONTENT_LENGTH`), and shared iterative RFC 8259 JSON engine (`MAX_JSON_DEPTH = 256`).
+- **9-language heritage** — Clojure, Common Lisp, Prolog, Lisp, Ballerina, StreamIt, APL, Logo, Smalltalk (see [docs/influences.md](docs/influences.md)).
 
 ## Install
 
@@ -57,323 +35,160 @@ include both `mora` and `mora-lsp`.
 
 Add the extracted binary to `PATH`; you get both `mora` and `mora-lsp`.
 
-From source: `cargo build --release` produces the same binaries.
+From source (Rust stable toolchain):
+
+```bash
+cargo build --release     # builds target/release/mora and target/release/mora-lsp
+```
 
 ## Quick start
 
 ```bash
 mora script.mora          # run a script
-mora --repl               # interactive REPL
-mora --check script.mora  # type check only
+mora run script.mora      # explicit run subcommand
 mora --opt=1 script.mora  # SSA optimization: 0=off / 1=basic / >=2=aggressive
+mora --check script.mora  # type check only
+mora --repl               # interactive REPL
+mora install <url>        # install a .mora script into vendor/
+mora --version            # print version
+mora --help               # print CLI help
 mora-lsp                  # language server (stdio JSON-RPC)
 ```
 
-## Example — HTTP + MCP + tracing in one script
+## Language at a glance
 
 ```mora
--- v0.104.5: explicit constructors + method chaining (no `serve as` blocks)
-let router = Router::new()
-let router = router.route("GET", "/health", fn(req) => {status: "ok"})
+-- Named tasks, closures, lists, and pattern matching
+task double_all(xs)
+  return xs.map(fn(x) x * 2 end)
+end
 
-let server = McpServer::new()
-let server = server.tool("search", {query: {type: "string"}}, fn(args)
-  return "found docs for: " + args["query"]
-end)
+let nums = [1, 2, 3, 4]
+let doubled = double_all(nums)
+print("doubled =", doubled)
 
--- observability: block-scoped, kind is trace / metric / log
-observe trace do
-  span "user_request" tags {path: "/chat"} do
-    let answer = ai.chat(p"answer this")
+let classify = fn(n)
+  match n with
+    x when x > 0 -> "positive"
+    0 -> "zero"
+    _ -> "negative"
   end
 end
 
--- config block: comma-separated bindings, applies to enclosed calls
-with model = "gpt-4o", temperature = 0.7
-  let reply = ai.chat(p"summarize")
-end
-
--- both entry points block; run one per process
-router.listen("127.0.0.1:3000")
--- server.serve()
+print(classify(5))
 ```
-
-Run with `mora script.mora` — pick one blocking entry point (`listen` for
-HTTP, `serve` for MCP over stdio) per process. `mora mcp tool-list`
-enumerates the registered MCP tools.
-
-## Language at a glance
 
 | Concept            | Syntax                                                       |
 |--------------------|--------------------------------------------------------------|
 | Variables          | `let x = 1`, `let s: string = ""`                            |
-| Tasks (named fns)  | `task foo(x) ... end` (bare params, no type annotations)    |
-| Anonymous fns      | `fn(x) return x + 1 end`                                     |
-| Lists              | `[1, 2, 3]`, `list.map(fn)`, `list.filter(fn)`, `list.reduce(fn, init)` |
+| Tasks (named fns)  | `task foo(x) ... end`, `task add(a: number, b: number): number` |
+| Anonymous fns      | `fn(x) return x + 1 end`, `fn(x: number) x + 1 end`         |
+| Lists              | `[1, 2, 3]`, `.map(fn)`, `.filter(fn)`, `.reduce(fn, init)` |
 | Dicts              | `{key: val}`, `dict.get("key")`                              |
 | String methods     | `.len()`, `.upper()`, `.lower()`, `.trim()`, `.split()`, `.contains()`, `.replace()` |
 | Control flow       | `if/then/end`, `for x in list/end`, `match expr with/end`    |
 | Pipe               | `data \|> func()`                                            |
+| Concurrency        | `spawn f()`, `channel(cap)`, `select ... end`, `context()`, `sleep(ms)` |
 | Parallel           | `parallel ... end`                                           |
+| Algebraic effects  | `perform Name(arg)`, `handle Name { ... } { ... resume(...) }` |
+| Dyn dispatch & OO  | `expr as dyn Name`, `dyn Name<T>`                            |
 | Modules            | `import "path"`, `export let/task`                           |
-| Dyn dispatch       | `expr as dyn Name` coercion, `dyn Name<T>` annotations       |
-| Generics           | annotations only: `list<T>`, `dict<K, V>`                    |
-| Types              | `type Name = TargetType` (definition only, not an annotation) |
-| Enums              | `enum Name` / `  V1` / `end` (multi-line, no payloads)       |
-| Structs            | `struct Name` / `  field: Type` / `end` (multi-line)         |
+| Types              | `type Name = TargetType`                                     |
+| Enums & structs    | `enum Name ... end`, `struct Name ... end`                   |
 | Macros             | `macro name(params) ... end`                                 |
-
-### Borrowed-from history (v0.16 → v0.24)
-
-| Version | Feature | From | Example |
-|---------|---------|------|---------|
-| v0.16 | Pattern match guards | Prolog | `match n with x when x > 0 -> ... end` |
-| v0.17 | Pipe `\|>` | StreamIt | `5 \|> fn(x) return x * 2 end` |
-| v0.17 | Sliding window | StreamIt | `[1,2,3,4,5].window(3)` |
-| v0.17 | Array shape/reshape | APL | `.shape()`, `.flatten()`, `.transpose()`, `.reshape()` |
-| v0.18 | Function compose | Clojure | `compose(f, g, h)` |
-| v0.18 | Partial application | Lisp | `partial(add, 10)` |
-| v0.19 | Atoms + swap/deref | Clojure | `atom(0)`, `swap()`, `deref()` |
-| v0.19 | Worker pool | Ballerina | `parallel worker w1 ... end end` |
-| v0.19 | Transaction with compensation | Ballerina | `transaction ... compensation ... end` |
-| v0.20 | Reflection | Smalltalk | `type_of()`, `is_instance()`, `methods_of()` |
-| v0.20 | Macros | Common Lisp | `macro name(params) ... end` |
-| v0.22 | First-class AI primitives | — | prompt literal `p"..."` + `ai.chat()` |
-| v0.24 | Type alias / enum / struct | — | `type Name = T` (definition only) / multi-line `enum` / `struct` |
-
-## Standard library
-
-| Namespace | Functions |
-|-----------|-----------|
-| `json.*`  | `json.parse(text)`, `json.stringify(value)` |
-| `web.*`   | `web.fetch(url)` (HTTP via `ureq`) |
-| `file.*`  | `read_text` / `write_text` / `append_text` / `read_bytes` / `write_bytes`, `exists` / `is_file` / `is_dir` / `size` / `list` / `mkdir` / `remove` / `rename` / `copy` / `touch`, `cwd` / `chdir` / `home_dir` / `join` / `abs` / `basename` / `dirname` / `extname` |
-| Persistence | `save "file.json", value` / `load "file.json", var` |
-| Stream I/O | `read "a.txt" into x` / `write "a.txt", content` / `append "a.txt", content` |
-| Memory    | `memory.store` / `recall` / `search` / `forget` / `clear` / `size` / `keys` |
-| Event     | `bus.emit(name, payload)`, `bus.count()` |
-| Sandbox   | `sandbox.check_builtin`, `sandbox.check_path` |
-| Schedule  | `schedule.add(name, schedule, payload, [interval_seconds])`, `schedule.count()` |
-| CCR       | `ccr.put(content)` / `ccr.get(hash)` |
-| Mock      | mock backend for testing |
-| Skill     | dual registry (CLI-Anything SKILL.md pattern, v0.46) |
-| ToolPlane | Core/Extension adapter (v0.45) |
-
-## AI surface
-
-| Group | Construct | Notes |
-|-------|-----------|-------|
-| Prompt | `p"hello {name}"` | first-class prompt literal with interpolation |
-| Chat | `ai.chat(prompt)` / `ai.chat(prompt, {model: "..."})` | mock mode without `OPENAI_API_KEY`; optional dict picks the model |
-| Critic | `ai.critic(answer)` / `ai.critic(answer, ctx)` | structured `{verdict, critique, score}` |
-| Context | `with model = "...", temperature = 0.7` | comma-separated bindings; applies to enclosed calls |
-| Token accounting | `ai.tokens` → `.input` / `.output` / `.total` | per-run counters |
-| Tool calling | `McpServer::new()` + `server.tool(name, schema, handler)` | MCP over stdio; `mora mcp tool-list` enumerates |
-| Observability | `observe trace do ... end`, `span "name" tags {k: "v"} do ... end` | kind is `trace` / `metric` / `log`; tag values are strings or bare identifiers |
-| Memory | `memory.store` / `recall` / `search` / `forget` / `clear` / `size` / `keys` | |
-| Agent | `agent.create(name, config).run(task)`; `.name` / `.max_steps`; `agent.critic(text)` / `agent.critic(text, ctx)` | |
-| Multi-agent | `orchestrate moe` (v0.75.85 sparse top-k), `orchestrate moa` (v0.75.84 parallel aggregation) | declared form, sequential or BSP depending on kind |
-
-## Environment variables
-
-| Var | Meaning | Default |
-|-----|---------|---------|
-| `OPENAI_API_KEY`     | AI API key            | unset → mock mode |
-| `MORA_AI_MODEL`      | Default AI model      | `gpt-4o-mini` |
-| `MORA_AI_BASE_URL`   | AI base URL           | `https://api.openai.com/v1` |
-| `MORA_OPT`           | SSA optimization level (`0`/`1`/`2`) | unset → no opt |
-
-## Server modes
-
-Two explicit entry points, both blocking — run one per process:
-
-| Mode | API | Purpose |
-|------|-----|---------|
-| HTTP | `Router::new()` → `router.route(method, path, handler)` → `router.listen("127.0.0.1:3000")` | REST API |
-| MCP  | `McpServer::new()` → `server.tool(name, schema, handler)` → `server.serve()` | Claude Desktop / MCP clients over stdio |
-
-**v0.11 four-port fallback**: the HTTP listener requests port N; on
-`EADDRINUSE` it falls back to N+1, N+2, N+3 in sequence. Banner line:
-`[serve] requested port 3000 unavailable, using 3001 instead`.
-
-## Routing & observability
-
-```mora
--- config block: pick the model per call site
-with model = "gpt-4o-mini", temperature = 0.7
-  let summary = ai.chat(p"summarize: {text}")
-end
-
--- observe + span (kinds: trace / metric / log)
-observe trace do
-  span "user_request" tags {path: "/chat"} do
-    let answer = ai.chat(p"analyze: {question}")
-  end
-end
-
--- structured self-critique + token counters
-let verdict = ai.critic("some answer text", "context")
-let usage = ai.tokens.total
-```
-
-## Recording & replay
-
-```bash
-mora record script.mora my-recording         # → .mora/recordings/my-recording.jsonl
-mora replay script.mora my-recording          # deterministic replay
-mora diff a-recording b-recording             # compare two recordings
-mora record list                              # list recordings
-mora record stats my-recording                # stats
-mora record timeline my-recording             # call timeline
-mora record export my-recording --format md   # export JSONL / Markdown
-mora record audit my-recording                # secret scan (default `.moraignore`)
-mora record report my-recording --verify "…"  # evidence report
-mora snapshot script.mora my-snapshot         # snapshot test
-mora mcp tool-list                            # list MCP tools
-mora mcp tool-search <query>                  # search MCP tools
-mora mcp toolsets                             # list toolsets
-```
 
 ## Type checking
 
 ```mora
-let name: string = "mora"          -- OK
-let age: number = "thirty"         -- typeck: string → number
-let a: number = 1
-let b: number = 2
-a + b                               -- OK（number 塔）
-a + "x"                             -- error: arg must be number
-```
+let name: string = "mora"
+let count: number = 42
 
-形参与返回类型标注同样生效（v0.104.6 起）：
-
-```mora
 task add(a: number, b: number): number
   return a + b
 end
-add(1, 2)                          -- OK
-add(1)                             -- error: 2 args expected
-add("x", 2)                        -- error: arg 1 must be number
 
-let f = fn(x: number) x + 1 end    -- OK
+let total = add(count, 8)
+let inc = fn(x: number) x + 1 end
+print(inc(total))
 ```
 
-> **v0.104.6 说明**：本节此前无法展示上例——`task` / `fn` 的形参标注当时
-> **尚未实现**，实测 `Parse error: Expected ')' after parameters`，故只能用
-> `let` 标注演示类型系统。该缺口已补齐：标注在**调用点**按声明检查实参。
-> 裸形参（`task f(x)` / `fn(x)`）行为不变，仍不做实参类型约束。
+Type checking runs automatically before execution and on `mora --check <file>` (emitting `Type error at line N: ...` on mismatches).
 
-Errors emit `Type error at line N: …`. Library / builtin tasks fall back
-to `Any` only when no signature is declared. Type checking always runs —
-there is no opt-out switch.
+## Algebraic effects
 
-## LSP
+```mora
+let total = handle Flip {
+  let a = perform Flip()
+  let b = perform Flip()
+  a + b
+} {
+  resume(1i) + resume(10i)
+}
 
-`mora-lsp` (binary in every release) speaks JSON-RPC over stdio. Editors
-should configure it as the LSP launch command. Capabilities advertised
-in `initialize`:
+print(total)
+```
 
-- `textDocumentSync` (full sync)
-- `hover` — types / signatures for variables and tasks
-- `completion` — local symbols + keywords + tasks + builtins
-- `definition` — go-to-definition
-- `references` — symbol references
-- `documentSymbol` — outline
-- `documentFormatting` + `documentRangeFormatting`
-- `rename`
-- `semanticTokens`
-- `foldingRange` — `if` / `for` / `task` blocks
-- `publishDiagnostics` — typeck results
+## Standard library builtins
 
-Smoke test: `cargo run --example lsp_smoke` spawns `mora-lsp`, opens a
-buffer, and asserts typeck diagnostics / hover / completion.
+| Namespace   | Highlights |
+|-------------|------------|
+| `json.*`    | `json.parse(text)`, `json.stringify(value)` |
+| `file.*`    | `read_text`, `write_text`, `append_text`, `read_bytes`, `write_bytes`, `exists`, `is_file`, `is_dir`, `size`, `list`, `mkdir`, `remove`, `rename`, `copy`, `touch`, `cwd`, `chdir`, `home_dir`, `join`, `abs`, `basename`, `dirname`, `extname` |
+| `exec.*`    | `exec.run(...)`, `exec.parallel(...)` |
+| `math.*`    | scalar math helpers (`abs`, `floor`, `sqrt`, `pow`, trigonometry, `is_nan`, ...) |
+| `stats.*`   | `sum`, `mean`, `median`, `histogram`, ... |
+| `linalg.*`  | `norm`, `transpose`, `matmul`, `cross`, ... |
+| `random.*`  | deterministic / ambient PRNG helpers |
 
-## Editor support
+Additional std workspace crates live under `std/` (including `std/math/bigint` / `mora-std-bigint`).
 
-See [editors/](editors/) for the six supported editors:
+## LSP & editor support
 
-| Editor        | Folder                       | Format                       |
-|---------------|------------------------------|------------------------------|
-| VS Code       | [vscode/](editors/vscode/)   | VSIX, TextMate grammar in `package.json` |
-| Neovim        | [neovim/](editors/neovim/)   | `lua/mora-lsp.lua`           |
-| Helix         | [helix/](editors/helix/)     | `languages.toml`             |
-| Sublime Text  | [sublime/](editors/sublime/) | `mora.sublime-settings`      |
-| Vim           | [vim/](editors/vim/)         | `ftplugin/mora.vim`          |
-| Emacs         | [emacs/](editors/emacs/)     | `mora-mode.el`               |
+`mora-lsp` speaks JSON-RPC 2.0 over stdio and provides diagnostics (`publishDiagnostics`), hover, completion, go-to-definition, references, rename, document symbols, formatting, semantic tokens, and folding ranges.
 
-CI builds `mora` + `mora-lsp` for the five targets above via
-`.github/workflows/release.yml` and uploads to GitHub Releases.
+Smoke check:
 
-## Pipeline
+```bash
+cargo run --release --example lsp_smoke -- ./target/release/mora-lsp
+```
+
+See [editors/](editors/) for editor integrations (`vscode/`, `neovim/`, `helix/`, `sublime/`, `vim/`, `emacs/`).
+
+## Architecture & modules
 
 ```
-.mora ──► lexer ──► tokens ──► parser_v3 ──► MirFunction<MirInst> + MirWitness
-        ──► witness typecheck ──► MIR SSA optimize (--opt=1/2)
-        ──► DAG (pregel worker pool) ──► value runtime
-                ├──► ai.chat / ai.critic / ai.tokens / with / observe
-                ├──► memory.store / recall
-                ├──► agent.create().run()
-                ├──► web.fetch / json.* / file.*
-                └──► HTTP / MCP / record / replay
+.mora ──► lexer ──► parser_v3::compile ──► MirWitness[] + ControlProgram SSA IR
+        ──► typeck (unified Span-tracked HM solver) ──► mir::control optimize (--opt=0/1/2)
+        ──► runtime::vm (stackful VM) + runtime::scheduler / runtime::reactor (Tokio)
+                ├──► traits / algebraic effects / closures / delimited continuations
+                ├──► json.* / file.* (FsPolicy + CheckedPath) / exec.* / math.* / stats.* / linalg.* / random.*
+                └──► Value::External(Arc<dyn HostObject>) host extensions
                                 ▼
-                LSP (mora-lsp) ──► hover / completion / diagnostics
+                LSP (mora-lsp) ──► stdio transport + JSON-RPC + providers
 ```
 
 Key modules under `src/`:
 
-- `lexer.rs` — tokens
-- `parser_v3/` — Arena-based MIR expression builder (v0.55)
-- `mir/` — SSA IR + DAG + copy-and-patch JIT (v0.75.43) + `witness` typeck
-- `interpreter/` — value runtime, AI builtins (`ai_chat.rs` + `builtins/`)
-- `typeck/` — HM inference (default type checker, `src/typeck/hm/`) + `witness` checker
-- `lsp/` — JSON-RPC server + 9 providers
-- `pregel/` — v0.50 BSP worker pool
-- `checkpoint/` — v0.50 Memory + SQLite persistence (optional `checkpoint-sqlite` feature)
-- `audit/` — v0.42.1 SHA-256 hash-chained JSONL audit log
-- `toolplane/` + `ccr/` — v0.45 Core/Extension adapter
-- `compress/` — v0.29 context compression + JSON crush
-- `skill/` — v0.46 dual registry
-- `mcp_server.rs` / `http_server.rs` — server entry points
+- `lexer.rs` — tokenizer (Int/Float precision, numeric underscores, scientific notation, width suffixes)
+- `parser_v3/` — iterative Pratt expression parser and single-pass Control SSA witness compiler
+- `mir/control/` — SSA IR, lowering helpers, verifier, and optimizer (`OptLevel`)
+- `typeck/` — unified Span-tracked Hindley-Milner solver (`src/typeck/check_mir.rs`, `src/typeck/hm/`) and `import` module symbol verification
+- `runtime/` — stackful VM (`vm/`), `CoreRuntime`, `EngineShared`, `TaskScheduler` / `MoraChannel` / `AsyncIoReactor` (`scheduler.rs`, `reactor.rs`), built-in function/method domain handlers (`builtins/`), and `FsPolicy` / `CheckedPath` confinement (`fs.rs`)
+- `value/` & `value.rs` — `Value` (including `Channel`, `TaskHandle`, `Context`, `External(Arc<dyn HostObject>)`), chunked persistent `list.rs`, lexical `Environment`, and `display.rs`
+- `flow/` & `flow.rs` — shared iterative RFC 8259 JSON parser/serializer and unified numeric tower
+- `lsp/` — bounded stdio transport, JSON-RPC router, and HM-unified LSP providers
+- `cli/` — shared CLI compilation, interactive REPL (`repl.rs`), and path helpers
+- `error.rs` — unified `MoraError` / `MoraResult`
 
-## Examples
+## Examples & tests
 
-Run any file with `mora path/to/file.mora`:
+Run the demo script or test suites:
 
-- `mcp_server_demo.mora` — MCP tool registration via `McpServer::new()` + `.tool()`
-- `compress_demo.mora` / `compress_smart_demo.mora` / `compact_demo.mora` — v0.29/v0.30 compress + SmartCrusher
-- `hm_basic_demo.mora` — HM type inference walk-through (HM is the default type checker)
-- `integration_v0_34.mora` — bus / sandbox / schedule / ccr / mock builtin tour
-- `jit_bench.rs` — `cargo run --release --example jit_bench` (JIT vs interpreter)
-- `lsp_smoke.rs` / `lsp_v04_smoke.py` — LSP end-to-end
-- `hm_inference_examples.md` — HM inference playbook
-
-## Specs & design
-
-- [docs/mora-spec.md](docs/mora-spec.md) — language spec, 20 chapters
-- [docs/influences.md](docs/influences.md) — 9-language heritage
-- [docs/learning-plan.md](docs/learning-plan.md) — 6-stage learning path
-- [docs/architecture-diagram.md](docs/architecture-diagram.md) — module-level runtime architecture (current)
-- [CHANGELOG.md](CHANGELOG.md) — full version history
-
-## Tests
-
-1265 tests across 30 suites (`cargo test --all-targets`, 2026-09-21):
-959 unit tests in the `mora` crate plus 306 integration tests under
-`tests/`, with 0 failures.
-
-Recent CHANGELOG highlights:
-
-- **v0.104.4** (2026-09-17) — CI first green: reflexive unification, clippy 1.98 lints, repo-wide rustfmt
-- **v0.104** (2026-09-16) — DAG executor / optimizer fixes (loop bodies, CSE rename loops, sequence stitching) + numeric tower unification
-- **v0.103** (2026-09-14) — explicit API constructors (`Router::new()` / `McpServer::new()`), `observe` / `span` blocks wired, `ai.critic(answer, ctx?)`
-- **v0.99** (2026-09-13) — `random` module as ambient effect
-- **v0.75.85** (2026-08-04) — `orchestrate moe` (sparse top-k Mixture-of-Experts)
-- **v0.75.84** (2026-08-04) — `orchestrate moa` (Mixture-of-Agents)
-- **v0.75.43** — copy-and-patch JIT (no external deps, always compiled)
-- **v0.50** — Pregel BSP + Checkpoint (Memory / SQLite)
-- **v0.45** — ToolPlane Core/Extension adapter
-- **v0.42** — Capability Token + SHA-256 hash-chained Audit Sink
-- **v0.22** — first-class AI primitives (`p"..."` / `with` / `ai.chat`)
+```bash
+cargo run -- examples/hm_basic_demo.mora
+cargo test --all-targets
+cargo test -p mora-std-bigint
+```
 
 ## License
 

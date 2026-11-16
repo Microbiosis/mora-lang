@@ -26,22 +26,17 @@
 //! 即：差异**恰好**落在修复目标上，且**零附带损伤**。本文件把这 26 个结果
 //! 钉成基线，任何后续分块改动一旦溢出到 if/else 之外就会立刻暴露。
 
-use mora::interpreter::Interpreter;
 use mora::parser_v3::ParserV3;
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::execute_program;
 use std::sync::Arc;
 
 fn run(src: &str) -> String {
-    let (func, _w) = ParserV3::compile(src).unwrap_or_else(|e| panic!("compile: {e}"));
-    let arc = Arc::new(func);
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    match mora::mir::vm::execute(
-        &arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    ) {
-        Ok(v) => format!("{v:?}"),
+    let (prog, _w) = ParserV3::compile(src).unwrap_or_else(|e| panic!("compile: {e}"));
+    let arc = Arc::new(prog);
+    let mut core = CoreRuntime::default();
+    match execute_program(arc, &mut core) {
+        Ok((v, _)) => format!("{v:?}"),
         Err(e) => format!("ERR: {e}"),
     }
 }
@@ -54,25 +49,25 @@ fn run(src: &str) -> String {
 fn cases() -> Vec<(&'static str, String, String)> {
     vec![
         // ── A. if/else 汇合点（E1 的目标区；A1/A3 是 A/B 中仅有的两处差异）
-        ("A1.if_value_then", "let c = 1\nlet x = if c == 1 then 5 else 7 end\nx + 1\n".into(), "Float(6.0)".into()),
-        ("A2.if_value_else", "let c = 2\nlet x = if c == 1 then 5 else 7 end\nx + 1\n".into(), "Float(8.0)".into()),
-        ("A3.block_if_then", "let c = 1\nlet x = 0\nif c == 1 then\n  x = 5\nelse\n  x = 7\nend\nx + 1\n".into(), "Float(6.0)".into()),
-        ("A4.block_if_else", "let c = 2\nlet x = 0\nif c == 1 then\n  x = 5\nelse\n  x = 7\nend\nx + 1\n".into(), "Float(8.0)".into()),
-        ("A5.bare_if_then", "let c = 1\nlet n = 0\nif c == 1 then\n  let n = 7\nend\nn + 1\n".into(), "Float(8.0)".into()),
-        ("A6.bare_if_else", "let c = 2\nlet n = 0\nif c == 1 then\n  let n = 7\nend\nn + 1\n".into(), "Float(1.0)".into()),
-        ("A7.nested_if", "let a = 1\nlet b = 2\nlet n = 0\nif a == 1 then\n  if b == 2 then\n    let n = 5\n  else\n    let n = 6\n  end\nend\nn + 1\n".into(), "Float(6.0)".into()),
-        ("A8.if_chain", "let x = 5\nlet n = 0\nif x > 9 then\n  let n = 1\nelse if x > 4 then\n  let n = 2\nelse\n  let n = 3\nend\nn * 10\n".into(), "Float(20.0)".into()),
+        ("A1.if_value_then", "let c = 1\nlet x = if c == 1 then 5 else 7 end\nx + 1\n".into(), "Int(6)".into()),
+        ("A2.if_value_else", "let c = 2\nlet x = if c == 1 then 5 else 7 end\nx + 1\n".into(), "Int(8)".into()),
+        ("A3.block_if_then", "let c = 1\nlet x = 0\nif c == 1 then\n  x = 5\nelse\n  x = 7\nend\nx + 1\n".into(), "Int(6)".into()),
+        ("A4.block_if_else", "let c = 2\nlet x = 0\nif c == 1 then\n  x = 5\nelse\n  x = 7\nend\nx + 1\n".into(), "Int(8)".into()),
+        ("A5.bare_if_then", "let c = 1\nlet n = 0\nif c == 1 then\n  let n = 7\nend\nn + 1\n".into(), "Int(8)".into()),
+        ("A6.bare_if_else", "let c = 2\nlet n = 0\nif c == 1 then\n  let n = 7\nend\nn + 1\n".into(), "Int(1)".into()),
+        ("A7.nested_if", "let a = 1\nlet b = 2\nlet n = 0\nif a == 1 then\n  if b == 2 then\n    let n = 5\n  else\n    let n = 6\n  end\nend\nn + 1\n".into(), "Int(6)".into()),
+        ("A8.if_chain", "let x = 5\nlet n = 0\nif x > 9 then\n  let n = 1\nelse if x > 4 then\n  let n = 2\nelse\n  let n = 3\nend\nn * 10\n".into(), "Int(20)".into()),
 
         // ── B. 纯循环（E1 未触碰，但分块改动会波及 —— 这是重点监控区）
-        ("B1.for_sum", "let t = 0\nfor i in [1, 2, 3, 4]\n  let t = t + i\nend\nt\n".into(), "Float(10.0)".into()),
-        ("B2.for_bind", "let s = 0\nfor v in [10, 20, 30]\n  let s = s + 1\nend\ns\n".into(), "Float(3.0)".into()),
-        ("B3.while", "let i = 0\nlet s = 0\nwhile i < 5\n  let s = s + i\n  let i = i + 1\nend\ns\n".into(), "Float(10.0)".into()),
-        ("B4.for_break", "let t = 0\nfor i in [1, 2, 3, 4, 5]\n  if i == 3 then\n    break\n  end\n  let t = t + i\nend\nt\n".into(), "Float(3.0)".into()),
-        ("B5.for_continue", "let t = 0\nfor i in [1, 2, 3, 4, 5]\n  if i == 3 then\n    continue\n  end\n  let t = t + i\nend\nt\n".into(), "Float(12.0)".into()),
-        ("B6.nested_break", "let t = 0\nfor i in [1, 2, 3]\n  for j in [1, 2, 3]\n    if j == 2 then\n      break\n    end\n    let t = t + 1\n  end\nend\nt\n".into(), "Float(3.0)".into()),
-        ("B7.nested_continue", "let t = 0\nfor i in [1, 2, 3]\n  for j in [1, 2, 3]\n    if j == 2 then\n      continue\n    end\n    let t = t + 1\n  end\nend\nt\n".into(), "Float(6.0)".into()),
-        ("B8.while_break_continue", "let i = 0\nlet s = 0\nwhile i < 8\n  let i = i + 1\n  if i == 3 then\n    continue\n  end\n  if i == 7 then\n    break\n  end\n  let s = s + i\nend\ns\n".into(), "Float(18.0)".into()),
-        ("B9.for_then_sum", "let t = 0\nfor i in [1, 2, 3]\n  if i > 1 then\n    let t = t + i\n  end\nend\nt\n".into(), "Float(5.0)".into()),
+        ("B1.for_sum", "let t = 0\nfor i in [1, 2, 3, 4]\n  let t = t + i\nend\nt\n".into(), "Int(10)".into()),
+        ("B2.for_bind", "let s = 0\nfor v in [10, 20, 30]\n  let s = s + 1\nend\ns\n".into(), "Int(3)".into()),
+        ("B3.while", "let i = 0\nlet s = 0\nwhile i < 5\n  let s = s + i\n  let i = i + 1\nend\ns\n".into(), "Int(10)".into()),
+        ("B4.for_break", "let t = 0\nfor i in [1, 2, 3, 4, 5]\n  if i == 3 then\n    break\n  end\n  let t = t + i\nend\nt\n".into(), "Int(3)".into()),
+        ("B5.for_continue", "let t = 0\nfor i in [1, 2, 3, 4, 5]\n  if i == 3 then\n    continue\n  end\n  let t = t + i\nend\nt\n".into(), "Int(12)".into()),
+        ("B6.nested_break", "let t = 0\nfor i in [1, 2, 3]\n  for j in [1, 2, 3]\n    if j == 2 then\n      break\n    end\n    let t = t + 1\n  end\nend\nt\n".into(), "Int(3)".into()),
+        ("B7.nested_continue", "let t = 0\nfor i in [1, 2, 3]\n  for j in [1, 2, 3]\n    if j == 2 then\n      continue\n    end\n    let t = t + 1\n  end\nend\nt\n".into(), "Int(6)".into()),
+        ("B8.while_break_continue", "let i = 0\nlet s = 0\nwhile i < 8\n  let i = i + 1\n  if i == 3 then\n    continue\n  end\n  if i == 7 then\n    break\n  end\n  let s = s + i\nend\ns\n".into(), "Int(18)".into()),
+        ("B9.for_then_sum", "let t = 0\nfor i in [1, 2, 3]\n  if i > 1 then\n    let t = t + i\n  end\nend\nt\n".into(), "Int(5)".into()),
 
         // ── C. 直线 + return
         //
@@ -82,19 +77,19 @@ fn cases() -> Vec<(&'static str, String, String)> {
         // return** 传值正确」—— 这与 return 是否在顶层无关，故把 return
         // 连同它所在的控制流一起放进 task：E1 的汇合点结构
         // （if/for 体内的提前 return + 之后的兜底值）原样保留。
-        ("C1.linear", "let a = 1 + 2\nlet b = a * 3\nb\n".into(), "Float(9.0)".into()),
-        ("C2.return_in_if", "task f()\n  let c = 1\n  if c == 1 then\n    return 42\n  end\n  7\nend\nf()\n".into(), "Float(42.0)".into()),
-        ("C3.return_in_loop", "task f()\n  for i in [1, 2, 3]\n    if i == 2 then\n      return i * 10\n    end\n  end\n  0\nend\nf()\n".into(), "Float(20.0)".into()),
+        ("C1.linear", "let a = 1 + 2\nlet b = a * 3\nb\n".into(), "Int(9)".into()),
+        ("C2.return_in_if", "task f()\n  let c = 1\n  if c == 1 then\n    return 42\n  end\n  7\nend\nf()\n".into(), "Int(42)".into()),
+        ("C3.return_in_loop", "task f()\n  for i in [1, 2, 3]\n    if i == 2 then\n      return i * 10\n    end\n  end\n  0\nend\nf()\n".into(), "Int(20)".into()),
 
         // ── D. 闭包 / task / 列表
-        ("D1.closure", "let base = 10\nlet f = fn(x) x + base end\nf(5)\n".into(), "Float(15.0)".into()),
-        ("D2.task_call", "task double(n)\n  return n * 2\nend\ndouble(5)\n".into(), "Float(10.0)".into()),
+        ("D1.closure", "let base = 10\nlet f = fn(x) x + base end\nf(5)\n".into(), "Int(15)".into()),
+        ("D2.task_call", "task double(n)\n  return n * 2\nend\ndouble(5)\n".into(), "Int(10)".into()),
         ("D3.list_ops", "let xs = [1, 2, 3]\nlet ys = xs.push(4)\nlen(ys)\n".into(), "Int(4)".into()),
         ("D4.loop_build_list", "let xs = []\nlet i = 0\nwhile i < 4\n  let xs = xs.push(i * 2)\n  let i = i + 1\nend\nlen(xs)\n".into(), "Int(4)".into()),
 
         // ── E. 循环 + 分支复合
-        ("E1.loop_if_assign", "let t = 0\nfor i in [1, 2, 3, 4, 5]\n  if i % 2 == 0 then\n    let t = t + i\n  else\n    let t = t + 1\n  end\nend\nt\n".into(), "Float(9.0)".into()),
-        ("E2.if_in_while_break", "let i = 0\nlet s = 0\nwhile i < 10\n  let i = i + 1\n  if i == 4 then\n    break\n  end\n  let s = s + i\nend\ns\n".into(), "Float(6.0)".into()),
+        ("E1.loop_if_assign", "let t = 0\nfor i in [1, 2, 3, 4, 5]\n  if i % 2 == 0 then\n    let t = t + i\n  else\n    let t = t + 1\n  end\nend\nt\n".into(), "Int(9)".into()),
+        ("E2.if_in_while_break", "let i = 0\nlet s = 0\nwhile i < 10\n  let i = i + 1\n  if i == 4 then\n    break\n  end\n  let s = s + i\nend\ns\n".into(), "Int(6)".into()),
     ]
 }
 
@@ -145,7 +140,7 @@ fn if_else_both_paths_reach_the_tail() {
         // 尾部一旦没跑，then 侧会停在分支值上（5.0 / 5.0 / 7.0）而非求和结果。
         for (path, got) in [("then", &then_run), ("else", &else_run)] {
             assert!(
-                matches!(got.as_str(), "Float(6.0)" | "Float(8.0)" | "Float(1.0)"),
+                matches!(got.as_str(), "Int(6)" | "Int(8)" | "Int(1)"),
                 "[{label}/{path}] 尾部未执行或结果异常: {got}  (src={src:?})"
             );
         }

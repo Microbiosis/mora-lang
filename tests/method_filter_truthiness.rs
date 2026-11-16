@@ -32,7 +32,7 @@ fn ev(body: &str) -> (i32, String) {
     std::fs::write(&p, body).expect("写探针");
     let home = dir.join("home");
     std::fs::create_dir_all(&home).expect("建 home");
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+    let exe = env!("CARGO_BIN_EXE_mora");
     let out = Command::new(exe)
         .arg(&p)
         .env("HOME", &home)
@@ -54,6 +54,7 @@ fn ev(body: &str) -> (i32, String) {
                 && !l.starts_with("AI 原语")
                 && !l.starts_with("显式 API")
                 && !l.starts_with("Trait 系统")
+                && !l.starts_with("类型与执行")
                 && !l.starts_with("Built-in")
                 && !l.starts_with("v0.15 CLI")
                 && !l.contains("不兼容 v0.03")
@@ -75,11 +76,8 @@ fn is_bare_path_line(line: &&str, path: &str) -> bool {
 #[test]
 fn d374_filter_predicate_treats_zero_falsy_for_all_numeric_types() {
     for (lit, expected) in [
-        ("[0n, 1n, 2n]", "[1n, 2n]"),
-        // ⚠ 裸数字字面量在 mora 里是 **Float**（D356 已钉），
-        // 所以 `0` 打印成 `0.0`、`1` 打印成 `1.0`。
-        // 首版这里写期望 `[1, 2]` ⇒ 假红。
-        ("[0, 1, 2]", "[1.0, 2.0]"),
+        ("[0i, 1i, 2i]", "[1, 2]"),
+        ("[0, 1, 2]", "[1, 2]"),
         ("[0.0, 1.0, 2.0]", "[1.0, 2.0]"),
     ] {
         let (code, got) = ev(&format!("print({lit}.filter(fn(x) x end))\n"));
@@ -97,8 +95,8 @@ fn d374_filter_predicate_treats_zero_falsy_for_all_numeric_types() {
 fn d374_filter_treats_empty_containers_and_false_as_falsy() {
     for (lit, expected) in [
         (r#"["", "a"]"#, "[a]"),
-        ("[[], [1]]", "[[1.0]]"),
-        ("[{}, {a: 1}]", "[{a: 1.0}]"),
+        ("[[], [1]]", "[[1]]"),
+        ("[{}, {a: 1}]", "[{a: 1}]"),
         ("[false, true]", "[true]"),
     ] {
         let (code, got) = ev(&format!("print({lit}.filter(fn(x) x end))\n"));
@@ -113,11 +111,11 @@ fn d374_filter_treats_empty_containers_and_false_as_falsy() {
 /// `is_truthy` **无关**，返回全列表是**正确**的。
 #[test]
 fn d374_map_does_not_filter() {
-    let (code, got) = ev("let xs = [0n, 1n, 2n]\nprint(xs.map(fn(x) x end))\n");
+    let (code, got) = ev("let xs = [0i, 1i, 2i]\nprint(xs.map(fn(x) x end))\n");
     assert_eq!(code, 0, "应正常跑; 实得 exit={code} out={got}");
     assert_eq!(
         got.trim(),
-        "[0n, 1n, 2n]",
+        "[0, 1, 2]",
         "`map` 不做过滤（`push(mapped)`），零也保留; 实得: {got}"
     );
 }
@@ -130,10 +128,10 @@ fn d374_map_does_not_filter() {
 #[test]
 fn d374_take_count_boundaries() {
     for (arg, expected) in [
-        ("2", "[1.0, 2.0]"),
-        ("2.0", "[1.0, 2.0]"), // D153：Float 实参
+        ("2", "[1, 2]"),
+        ("2.0", "[1, 2]"), // D153：Float 实参
         ("0", "[]"),
-        ("99", "[1.0, 2.0, 3.0]"), // 超过长度 ⇒ 全取
+        ("99", "[1, 2, 3]"), // 超过长度 ⇒ 全取
     ] {
         let (code, got) = ev(&format!("print([1, 2, 3].take({arg}))\n"));
         assert_eq!(code, 0, "`take({arg})` 应正常; 实得 exit={code} out={got}");
@@ -149,7 +147,7 @@ fn d374_take_count_boundaries() {
         code, 0,
         "`take(1)`（Int 实参）应被接受; 实得 exit={code} out={got}"
     );
-    assert_eq!(got.trim(), "[1.0]", "实得: {got}");
+    assert_eq!(got.trim(), "[1]", "实得: {got}");
 }
 
 /// **`take` 负数必须报错**，不是静默返回空列表。
@@ -167,9 +165,9 @@ fn d374_take_rejects_negative_count() {
 /// 也不是 `(initial, reducer)`。本条把参数**顺序**钉住。
 #[test]
 fn d374_reduce_takes_reducer_then_initial() {
-    let (code, got) = ev("print([1n, 2n, 3n].reduce(fn(a, b) a + b end, 0n))\n");
+    let (code, got) = ev("print([1i, 2i, 3i].reduce(fn(a, b) a + b end, 0i))\n");
     assert_eq!(code, 0, "应正常跑; 实得 exit={code} out={got}");
-    assert_eq!(got.trim(), "6n", "reduce 应得 1+2+3+0=6; 实得: {got}");
+    assert_eq!(got.trim(), "6", "reduce 应得 1+2+3+0=6; 实得: {got}");
 
     // **反向对照**：缺 initial 必须报错
     let (code, got) = ev("print([1, 2, 3].reduce(fn(a, b) a + b end))\n");

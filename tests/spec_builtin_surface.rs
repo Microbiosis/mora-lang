@@ -1,52 +1,24 @@
-//! v0.104.6 D60：spec 逐字承诺的 **41 个 `ns.func(...)`** 点号内建里，
-//! **39 个已实现、2 个不存在**。
+//! v0.110.0：spec §12 保留的 **23 个 `ns.func(...)`** 核心点号内建
+//! （覆盖 7 个保留模块中的 `file` / `json` / `linalg` / `math` / `random` / `stats`）全部可解析到已知方法。
 //!
 //! ## 本文件检验的是「**名称表面**」而不是「跑通」
 //!
 //! 断言的是：**该名字能被解析到一个已知方法**。不要求执行成功 ——
-//! `web.fetch` 会因无网络而报 network error、`file.read_text` 会因文件不存在
-//! 而报错，这些都**不是**表面问题。判据只排除四类「名字没解析上」的失败：
+//! `file.read_text` 会因文件不存在而报错，这些都**不是**表面问题。
+//! 判据只排除四类「名字没解析上」的失败：
 //! `Unknown method` / `Unknown function` / `Unbound variable '<ns>'` /
 //! `'<ns>' is a module, not a function`。
 //!
-//! 早先一版用「跑通」做断言，误报了 11 个 —— 全部是**参数给错或环境所致**
-//! （`tea.*` 要 TeaApp、`web.fetch` 要网络），不是缺陷。**过滤器漏掉错误类别
-//! 时，「全绿」与「全错」是同一件事** —— 探针本身必须先被验证。
-//!
-//! ## spec 承诺清单怎么来的
-//!
-//! 从 `docs/mora-spec.md` 逐行正则提取 `` `ns.func(` `` 形式的承诺，共 42 处命中，
-//! 其中 `router.route` 来自 §832 的一句**散文**（「`router |> route(...)` 与
-//! `router.route(...)` 等价」），指的是 `Router::new()` 之后的**值方法**、
-//! 不是裸命名空间 —— 实测 `let router = Router::new()` 后 `router.route(…)`
-//! 正常。故不计入裸命名空间承诺，实际为 **41 个**。
-//!
-//! ## 2 个未实现的
-//!
-//! ```text
-//! ai.create(name, config)  spec §1100  string, dict -> agent   → Unknown method: AiChat.create
-//! ai.stream(prompt)        spec §1099  string -> stream      → Unknown method: AiChat.stream
-//! ```
-//!
-//! **基础设施已齐，只缺生产者**：`Value::Stream { reader, done, xform }` 定义完整
-//! （带 Clojure 风格 transducer 管线，`transducer.rs` 的 `Send+Sync+Debug` 约束
-//! 就是为它写的），方法 `collect` / `is_done` 已登记并由
-//! `method_dispatch.rs::call_method_stream` 分派 —— 但全仓**零构造点**；
-//! `Value::Agent` 同样存在且有 `call_method_agent`。
-//! 故与 D4（`int`/`float`/`bool` 只在 typeck 有签名、运行期没分支）同类的
-//! 「承诺语法未接线」。
-//!
-//! ## 为什么只记录不实现
-//!
+//! v0.110.0 Wave 1 移除了 `ai.*` / `agent.*` / `document.*` / `tea.*` / `web.*` /
+//! `xform.*` / `Router::new` 等内置，仅保留 7 个核心模块；本测试同步收敛。
 //! `ai.stream` 在 mock 模式下「流」产出什么、`ai.create` 的 config 支持哪些键，
 //! spec 均未成文（§708 示例只给�� `tools` / `model`）—— 属功能设计，未擅自做。
 //! 本文件钉住**当前事实**：将来接线后这 2 条会通过，测试会失败并提示移组。
 
 use std::sync::Arc;
 
-use mora::interpreter::Interpreter;
-use mora::mir::effect::Effects;
-use mora::mir::vm::execute;
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::execute_program;
 use mora::value::Value;
 
 /// 「名字没解析上」的四类失败 —— 出现任一即表面失守。
@@ -58,17 +30,18 @@ fn is_unresolved(err: &str, ns: &str) -> bool {
 }
 
 fn run(src: &str) -> Result<Value, String> {
-    let (func, witnesses) =
+    let (prog, witnesses) =
         mora::cli::compile_and_opt(src, None).map_err(|e| format!("COMPILE: {e}"))?;
-    let errs = mora::typeck::check_mir::check_program_witnesses_bidirectional(&witnesses);
+    let errs = mora::typeck::check_mir::check_program_witnesses(&witnesses);
     if !errs.is_empty() {
         let msgs: Vec<String> = errs.iter().map(|e| e.message.clone()).collect();
         return Err(format!("TYPECK: {msgs:?}"));
     }
-    let arc = Arc::new(func);
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    execute(&arc, &mut interp, &mut env, &mut Effects::new())
+    let arc = Arc::new(prog);
+    let mut core = CoreRuntime::default();
+    execute_program(arc, &mut core)
+        .map(|(v, _)| v)
+        .map_err(|e| e.to_string())
 }
 
 /// v0.104.6 D151：`%TMP%` 占位符 → 一个**本次运行专属**的临时目录。
@@ -97,12 +70,8 @@ fn expand_tmp(src: &str) -> String {
     src.replace("%TMP%", &s)
 }
 
-/// spec 逐字承诺、且**已实现**的点号内建（附一组能走到方法体的实参）。
+/// spec 逐字承诺、且**已实现**的 23 个核心点号内建（附一组能走到方法体的实参）。
 const WORKING: &[(&str, &str)] = &[
-    ("agent.create", r#"agent.create("a", {tools: []})"#),
-    ("ai.chat", r#"ai.chat("hi")"#),
-    ("ai.critic", r#"ai.critic("hi")"#),
-    ("document.parse", r#"document.parse("x.md")"#),
     ("file.exists", r#"file.exists("a.txt")"#),
     ("file.join", r#"file.join("a", "b")"#),
     ("file.list", r#"file.list(".")"#),
@@ -126,30 +95,15 @@ const WORKING: &[(&str, &str)] = &[
     ("random.shuffle", r#"random.shuffle([1])"#),
     ("stats.histogram", r#"stats.histogram([1.0], 2)"#),
     ("stats.quantile", r#"stats.quantile([1.0], 0.5)"#),
-    ("tea.dispatch", r#"tea.dispatch(1, 2, 3)"#),
-    ("tea.init", r#"tea.init(1)"#),
-    ("tea.model", r#"tea.model(1)"#),
-    ("tea.run", r#"tea.run(1)"#),
-    ("tea.update", r#"tea.update(1, 2, 3)"#),
-    ("tea.view", r#"tea.view(1)"#),
-    ("web.fetch", r#"web.fetch("http://x")"#),
-    ("xform.attach", r#"xform.attach([1])"#),
-    ("xform.comp", r#"xform.comp([1])"#),
-    ("xform.filter", r#"xform.filter([1])"#),
-    ("xform.map", r#"xform.map([1])"#),
-    ("xform.take", r#"xform.take([1])"#),
 ];
 
-/// spec 逐字承诺、但**当前不存在**的点号内建。
-const MISSING: &[(&str, &str)] = &[
-    ("ai.create", r#"ai.create("researcher", {tools: []})"#),
-    ("ai.stream", r#"ai.stream("hi")"#),
-];
+/// v0.110.0 Wave 1 已移除所有已承诺但未实现的点号占位（如 `ai.create` / `ai.stream`）。
+const MISSING: &[(&str, &str)] = &[];
 
-/// 39 个已实现的必须**解析到已知方法**。
+/// 23 个保留的点号内建必须**解析到已知方法**。
 ///
-/// 不要求执行成功 —— `web.fetch` 无网络、`file.read_text` 文件不存在都会
-/// 报错，但那是**运行期**问题，不是「名字没解析上」。
+/// 不要求执行成功 —— `file.read_text` 文件不存在会报错，但那是**运行期**问题，
+/// 不是「名字没解析上」。
 #[test]
 fn spec_promised_dotted_builtins_that_exist_resolve() {
     let mut failures = Vec::new();
@@ -199,48 +153,14 @@ fn d151_surface_census_writes_nothing_relative_to_cwd() {
     }
 }
 
-/// `router.route` 是**值方法**（`Router::new()` 之后），不是裸命名空间 ——
-/// spec §832 的那句散文指的是它。单独钉住，免得日后误当裸命名空间来测。
-#[test]
-fn router_route_is_a_value_method_not_a_bare_namespace() {
-    let e = run("print(router.route(\"GET\", \"/\", 1))\n").expect_err(
-        "裸名 `router` **不是**已注册的内建（spec §125 用的是显式 API `Router::new()`）；\
-         若已注册，请把它移进 WORKING 组",
-    );
-    assert!(
-        e.contains("Unbound variable 'router'") || e.contains("type error"),
-        "期望报 `Unbound variable 'router'`，实得: {e}"
-    );
-    // 而值方法形态照常可用
-    assert!(
-        run("let router = Router::new()\nprint(router.route(\"GET\", \"/\", 1))\n").is_ok(),
-        "`Router::new()` 之后的 `router.route(...)` 必须照常可用"
-    );
-}
-
-/// 2 个未实现的必须**以可识别的方式**被拒 —— 将来接线后本测试会失败并提示移组。
-#[test]
-fn spec_promised_dotted_builtins_that_are_missing_are_pinned() {
-    for (name, src) in MISSING {
-        let e = run(&format!("print({src})\n")).err().unwrap_or_else(|| {
-            panic!("[{name}] spec 承诺了它却仍未实现；请把它移进 WORKING 组并更新本文件")
-        });
-        assert!(
-            e.contains("Unknown method: AiChat"),
-            "[{name}] 期望 `Unknown method: AiChat.*`（AiChat 上缺该分支），实得: {e}"
-        );
-    }
-}
-
-/// 覆盖完整性：spec 承诺 41 个（42 处正则命中减去散文句里的 `router.route`），
-/// 本测试必须把 41 个**全部**钉住。
+/// 覆盖完整性：v0.110.0 核心点号内建抽样共 23 个，本测试必须把 23 个**全部**钉住。
 #[test]
 fn spec_dotted_surface_is_fully_covered() {
-    const SPEC_COUNT: usize = 41;
+    const SPEC_COUNT: usize = 23;
     assert_eq!(
         WORKING.len() + MISSING.len(),
         SPEC_COUNT,
-        "本测试钉住了 {} 项，但 spec 承诺 {SPEC_COUNT} 个点号内建 —— \
+        "本测试钉住了 {} 项，但期望 {SPEC_COUNT} 个核心点号内建 —— \
          有承诺没被覆盖。改动 spec 的内建表时，请同步更新 WORKING / MISSING 两组。",
         WORKING.len() + MISSING.len()
     );

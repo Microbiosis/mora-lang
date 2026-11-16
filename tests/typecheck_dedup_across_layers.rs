@@ -17,7 +17,7 @@
 //!
 //! ## 根因：已有的去重按 (line, column)，而两层**位置不同**
 //!
-//! `check_program_witnesses_bidirectional` 早就有去重机制
+//! `check_program_witnesses` 早就有去重机制
 //! （`diag.is_diagnosed_at_line_column`，v0.75.94），但按的是 **line+column**：
 //!
 //! - bidirectional 把错误标在**值**上（`a` → column 17）
@@ -31,12 +31,12 @@
 //! 比「只比 line」保守 —— 同一行内**不同**类型对的冲突仍各自保留。
 
 use mora::cli::compile_and_opt;
-use mora::typeck::check_mir::check_program_witnesses_bidirectional;
+use mora::typeck::check_mir::check_program_witnesses;
 use mora::typeck::format_error;
 
 fn diagnostics(src: &str) -> Vec<String> {
     let (_f, wits) = compile_and_opt(src, None).expect("应能编译");
-    check_program_witnesses_bidirectional(&wits)
+    check_program_witnesses(&wits)
         .iter()
         .map(format_error)
         .collect()
@@ -54,12 +54,12 @@ fn d128_let_annotation_conflict_is_reported_once() {
     );
     // 保留的那条应是 bidirectional 的 —— 位置指向**出问题的值**（`a`），更精确
     assert!(
-        errs[0].contains("type mismatch"),
-        "应保留 bidirectional 的诊断（措辞带反引号、位置指向值）; 实际: {}",
+        errs[0].contains("Type mismatch"),
+        "应保留统一检查器诊断（位置指向出错值）; 实际: {}",
         errs[0]
     );
     assert!(
-        errs[0].contains("String") && errs[0].contains("Float"),
+        errs[0].contains("string") && errs[0].contains("int"),
         "诊断应给出两种类型; 实际: {}",
         errs[0]
     );

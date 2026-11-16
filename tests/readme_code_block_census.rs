@@ -46,7 +46,8 @@ fn d117_census_of_readme_mora_blocks() {
     let mut bad = Vec::new();
     for (line, src) in &blocks {
         if let Err(e) = ParserV3::compile(src) {
-            let first = e.lines().next().unwrap_or("").to_string();
+            let msg = e.to_string();
+            let first = msg.lines().next().unwrap_or("").to_string();
             bad.push(format!("README 行 {line}: {first}"));
             eprintln!(
                 "  README:{line} 不可解析 — {first}\n    |{}|",

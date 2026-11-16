@@ -30,8 +30,6 @@ impl std::fmt::Display for Value {
                     }
                 }
             }
-            // v0.91: BigInt Display — 直接 to_string
-            Value::BigInt(n) => write!(f, "{}n", n),
             Value::Bool(b) => write!(f, "{}", b),
             Value::Nil => write!(f, "nil"),
             Value::List(items) => {
@@ -74,44 +72,8 @@ impl std::fmt::Display for Value {
                 write!(f, "}}")
             }
             Value::Task { name, .. } => write!(f, "<task {}>", name),
-            Value::Tool { name, .. } => write!(f, "<tool {}>", name),
             Value::Closure { .. } => write!(f, "<closure>"),
-            // v0.104.6 D484：Core 层闭包（与 MIR 闭包刻意区分 —— 函数体是
-            // Core IR，只能由 Core 执行器调用）。
-            Value::CoreClosure { .. } => write!(f, "<coreclosure>"),
-            // v0.104.6 D490：Core 层宏（与 MIR 宏刻意区分 —— 体是 Core IR，
-            // 只能由 Core 执行器展开）。
-            Value::CoreMacro { .. } => write!(f, "<coremacro>"),
             Value::Builtin(name) => write!(f, "<builtin {}>", name),
-            Value::Conversation {
-                model, messages, ..
-            } => {
-                write!(f, "<conversation {} ({} messages)>", model, messages.len())
-            }
-            Value::Stream { .. } => write!(f, "<stream>"),
-            Value::Agent { name, .. } => write!(f, "<agent {}>", name),
-            Value::AiConfig {
-                model,
-                temperature,
-                max_tokens,
-                system,
-                budget,
-            } => {
-                write!(
-                    f,
-                    "AiConfig(model={:?}, temp={:?}, max_tokens={:?}, system={:?}, budget={:?})",
-                    model, temperature, max_tokens, system, budget
-                )
-            }
-            Value::Router { routes } => {
-                // v0.35: Display must be infallible; parking_lot::Mutex does not poison.
-                let route_count = routes.lock().len();
-                write!(f, "<router ({} routes)>", route_count)
-            }
-            Value::HttpRequest { method, path, .. } => {
-                write!(f, "<http_request {} {}>", method, path)
-            }
-            Value::McpServer { tools } => write!(f, "<mcp_server ({} tools)>", tools.len()),
             Value::TraitObject {
                 for_type,
                 trait_name,
@@ -132,12 +94,6 @@ impl std::fmt::Display for Value {
                 write!(f, "<partial>")
             }
             Value::Atom(arc) => {
-                // v0.35: Display must be infallible; parking_lot::Mutex does not poison.
-                //
-                // v0.104.6 D393：此处持锁**不是**环安全的关键 —— 牙齿验证把它
-                // 改成 `arc.lock().clone()`（解锁后格式化）后，自引用 atom 判据
-                // **照样全绿**。真正的环断开器是 parking_lot 自己的
-                // `Mutex: Debug`：`try_lock()` 失败时打印 `<locked>` 而不下钻。
                 let v = arc.lock();
                 write!(f, "<atom {:?}>", v)
             }
@@ -157,42 +113,21 @@ impl std::fmt::Display for Value {
             },
             // v0.86: Code — 显示为 "code:source_text"，与 eval/quote 配对可读。
             Value::Code(s) => write!(f, "code:{s}"),
-            Value::PromptSection {
-                name,
-                role,
-                budget_bytes,
-                ..
-            } => {
+            Value::Continuation(_) => write!(f, "<continuation>"),
+            Value::External(obj) => obj.display(f),
+            Value::Channel(ch) => {
                 write!(
                     f,
-                    "<prompt_section name={} role={:?} budget={:?}>",
-                    name, role, budget_bytes
+                    "<channel cap={} len={} closed={}>",
+                    ch.capacity(),
+                    ch.len(),
+                    ch.is_closed()
                 )
             }
-            Value::Document { backend, .. } => {
-                write!(f, "<document origin=\"{}\">", backend.origin())
+            Value::TaskHandle(h) => write!(f, "<task_handle done={}>", h.is_done()),
+            Value::Context(ctx) => {
+                write!(f, "<context cancelled={}>", ctx.status().is_err())
             }
-            // v0.83: TEA types — 占位
-            Value::TeaApp(_) => write!(f, "<tea_app>"),
-            Value::TeaCmd(cmd) => match cmd {
-                crate::tea::Cmd::None => write!(f, "Cmd::None"),
-                crate::tea::Cmd::Batch(items) => {
-                    write!(f, "Cmd::Batch(len={})", items.len())
-                }
-                crate::tea::Cmd::Perform { effect, .. } => {
-                    write!(f, "Cmd::Perform({})", effect)
-                }
-                crate::tea::Cmd::Dispatch(msg) => {
-                    write!(f, "Cmd::Dispatch(<{:?}>)", msg)
-                }
-            },
-            Value::TeaMsg(msg) => write!(f, "Msg({:?})", msg.tag),
-            // v0.102: 声明式范式 — 关系/目标/逻辑变量
-            Value::Relation { name, clauses } => {
-                write!(f, "<relation {}/{} clause(s)>", name, clauses.len())
-            }
-            Value::Goal(_) => write!(f, "<goal>"),
-            Value::LogicVar(id) => write!(f, "_.{}", id),
         }
     }
 }

@@ -15,13 +15,13 @@
 //!
 //! 本文件锁住「能解析 + 标注生效 + 裸形参零回归」三条性质。
 
-use mora::typeck::check_mir::check_program_witnesses_bidirectional;
+use mora::typeck::check_mir::check_program_witnesses;
 
 /// 编译并 typecheck，返回类型错误数。
 fn typecheck(src: &str) -> Result<usize, String> {
     let (_, witnesses) = mora::parser_v3::ParserV3::compile(src)
         .map_err(|e| format!("解析失败（应能解析）: {e}"))?;
-    Ok(check_program_witnesses_bidirectional(&witnesses).len())
+    Ok(check_program_witnesses(&witnesses).len())
 }
 
 /// `task` 形参标注：能解析，且正确实参通过。
@@ -85,10 +85,19 @@ fn bare_params_are_unaffected() {
         typecheck("task g(a)\n  return a\nend\nprint(g(1))\nprint(g(\"s\"))\n"),
         Ok(0)
     );
-    // 裸闭包：同上。
+    // 无标注恒等闭包：let-polymorphism 同时接纳两种类型。
     assert_eq!(
-        typecheck("let f = fn(x) x + 1 end\nprint(f(1))\nprint(f(\"s\"))\n"),
+        typecheck("let id = fn(x) x end\nprint(id(1))\nprint(id(\"s\"))\n"),
         Ok(0)
+    );
+    // 裸闭包带数值约束（`x + 1`）：不同数值实参通过，字符串实参在 Stage 3A-2 下被静态拒绝。
+    assert_eq!(
+        typecheck("let f = fn(x) x + 1 end\nprint(f(1))\nprint(f(2.5))\n"),
+        Ok(0)
+    );
+    assert!(
+        typecheck("let f = fn(x) x + 1 end\nprint(f(\"s\"))\n").unwrap() > 0,
+        "`x + 1` 约束 x 为数值型，传字符串应报错"
     );
 }
 

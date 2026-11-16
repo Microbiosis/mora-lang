@@ -7,32 +7,24 @@
 //! α.12 验证 DynTrait cast 表达式从 parser → lowering → interp 完整链路，
 //! 构造 Value::TraitObject 包内嵌 expr。
 
-use mora::interpreter::Interpreter;
-use mora::mir::vm::{execute, run_main_task};
 use mora::parser_v3::ParserV3;
-use mora::typeck::check_mir::check_program_witnesses_bidirectional;
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::{execute_program, run_main_task};
+use mora::typeck::check_mir::check_program_witnesses;
 
 fn run_via_execute(source: &str) -> Result<(), String> {
-    let (func, witnesses) = ParserV3::compile(source)?;
-    let type_errs = check_program_witnesses_bidirectional(&witnesses);
+    let (prog, witnesses) = ParserV3::compile(source).map_err(|e| e.to_string())?;
+    let type_errs = check_program_witnesses(&witnesses);
     if !type_errs.is_empty() {
         return Err(format!("typeck: {} error(s)", type_errs.len()));
     }
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    let func_arc = std::sync::Arc::new(func);
-    execute(
-        &func_arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    )?;
-    run_main_task(
-        &func_arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    )
+    let mut core = CoreRuntime::default();
+    let arc = std::sync::Arc::new(prog);
+    let (_, globals) =
+        execute_program(std::sync::Arc::clone(&arc), &mut core).map_err(|e| e.to_string())?;
+    run_main_task(arc, globals, &mut core)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 #[test]
@@ -67,115 +59,57 @@ end
 // These tests use `ParserV3::compile` (single-pass emit path) which
 // exercises the new emit_call_tail_w / emit_let_w / emit_with_w code.
 
-use mora::mir::MirInst;
+use mora::mir::control::{ControlInst, ControlProgram};
 
-/// Helper: compile via single-pass path and return the MirFunction body.
-fn compile_body(source: &str) -> Vec<MirInst> {
-    let (func, _witnesses) =
+/// Helper: compile via single-pass path and return the ControlProgram.
+fn compile_prog(source: &str) -> ControlProgram {
+    let (prog, _witnesses) =
         mora::parser_v3::ParserV3::compile(source).expect("compile should succeed");
-    func.body
+    prog
 }
 
-/// Helper: find first instruction of a given kind.
-fn find_inst(body: &[MirInst], pred: impl Fn(&MirInst) -> bool) -> Option<&MirInst> {
-    body.iter().find(|inst| pred(inst))
+/// Helper: find first matching `ControlInst` across entry function blocks.
+fn find_dyn_trait(prog: &ControlProgram) -> Option<(String, u32, u32)> {
+    let entry = prog.func(prog.entry);
+    for block in &entry.blocks {
+        for inst in &block.insts {
+            if let ControlInst::MakeDynTrait {
+                dst,
+                src,
+                trait_name,
+                ..
+            } = inst
+            {
+                return Some((prog.symbols.resolve(*trait_name).to_string(), src.0, dst.0));
+            }
+        }
+    }
+    None
 }
 
 #[test]
 fn as_dyn_trait_in_emit_path_works() {
-    let src = "42 as dyn Any";
-    let (func, _witnesses) =
-        mora::parser_v3::ParserV3::compile(src).expect("compile should succeed");
-    let dyn_inst = find_inst(&func.body, |inst| matches!(inst, MirInst::DynTrait { .. }));
+    let prog = compile_prog("42 as dyn Any");
+    let found = find_dyn_trait(&prog);
     assert!(
-        dyn_inst.is_some(),
-        "expected MirInst::DynTrait in compile path body, got: {:?}",
-        func.body
+        found.is_some(),
+        "expected ControlInst::MakeDynTrait in compile path, got: {:?}",
+        prog.func(prog.entry).blocks
     );
-    if let MirInst::DynTrait {
-        trait_name,
-        src: src_reg,
-        dst,
-        ..
-    } = dyn_inst.unwrap()
-    {
-        assert_eq!(trait_name, "Any");
-        assert_ne!(*src_reg, *dst, "DynTrait should write to a new register");
-    }
+    let (trait_name, src_reg, dst) = found.unwrap();
+    assert_eq!(trait_name, "Any");
+    assert_ne!(src_reg, dst, "MakeDynTrait should write to a new register");
 }
 
 #[test]
 fn let_dyn_trait_auto_coerces() {
-    let body = compile_body("let p: dyn Any = 42");
-    let dyn_inst = find_inst(&body, |inst| matches!(inst, MirInst::DynTrait { .. }));
+    let prog = compile_prog("let p: dyn Any = 42");
+    let found = find_dyn_trait(&prog);
     assert!(
-        dyn_inst.is_some(),
-        "expected MirInst::DynTrait auto-coercion for `let p: dyn Any = 42`, got: {:?}",
-        body
+        found.is_some(),
+        "expected ControlInst::MakeDynTrait auto-coercion for `let p: dyn Any = 42`, got: {:?}",
+        prog.func(prog.entry).blocks
     );
-    if let MirInst::DynTrait { trait_name, .. } = dyn_inst.unwrap() {
-        assert_eq!(trait_name, "Any");
-    }
-}
-
-#[test]
-fn with_mock_llm_block_parses() {
-    // `with` at top level (not nested inside task body) — WithConfig lands directly in func.body
-    let body = compile_body(
-        r#"
-with mock_llm = ["hello", "world"]
-  print("test")
-end
-"#,
-    );
-    let with_inst = find_inst(&body, |inst| matches!(inst, MirInst::WithConfig { .. }));
-    assert!(
-        with_inst.is_some(),
-        "expected MirInst::WithConfig in compile path body, got: {:?}",
-        body
-    );
-    if let MirInst::WithConfig {
-        bindings,
-        body: nested,
-        ..
-    } = with_inst.unwrap()
-    {
-        assert!(
-            bindings.iter().any(|(name, _)| name == "mock_llm"),
-            "expected mock_llm binding in WithConfig, got: {:?}",
-            bindings
-        );
-        assert!(
-            !nested.body.is_empty(),
-            "WithConfig body should contain at least one instruction"
-        );
-    }
-}
-
-#[test]
-fn with_mock_llm_inside_task_parses() {
-    // `with` inside task body — verifies emit_statement_expr_w dispatch
-    let (func, _witnesses) = mora::parser_v3::ParserV3::compile(
-        r#"
-task main()
-  with mock_llm = ["hello"]
-    print("ok")
-  end
-end
-"#,
-    )
-    .expect("compile should succeed");
-
-    fn find_with_config(body: &[MirInst]) -> bool {
-        body.iter().any(|inst| match inst {
-            MirInst::WithConfig { .. } => true,
-            MirInst::TaskDef { body: nested, .. } => find_with_config(&nested.body),
-            _ => false,
-        })
-    }
-    assert!(
-        find_with_config(&func.body),
-        "expected MirInst::WithConfig in task body, got: {:?}",
-        func.body
-    );
+    let (trait_name, _, _) = found.unwrap();
+    assert_eq!(trait_name, "Any");
 }

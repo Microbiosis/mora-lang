@@ -203,16 +203,13 @@ print(\"<<<\" + json.stringify({\"k\\ny\": \"v\"}) + \">>>\")
 ";
     let p = dir.0.join("t.mora");
     std::fs::write(&p, body).expect("写脚本");
-    let out = Command::new(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/target/debug/mora.exe"
-    ))
-    .current_dir(&dir.0)
-    .arg(&p)
-    .env_remove("OPENAI_API_KEY")
-    .env_remove("MORA_AI_BASE_URL")
-    .output()
-    .expect("跑 mora");
+    let out = Command::new(env!("CARGO_BIN_EXE_mora"))
+        .current_dir(&dir.0)
+        .arg(&p)
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("MORA_AI_BASE_URL")
+        .output()
+        .expect("跑 mora");
     assert_eq!(
         out.status.code(),
         Some(0),

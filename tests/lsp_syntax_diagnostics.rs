@@ -174,7 +174,7 @@ fn d101_type_errors_unchanged() {
     );
     assert_eq!(src, "mora-typeck");
     assert!(
-        msg.contains("Int") && msg.contains("String"),
+        msg.contains("int") && msg.contains("string"),
         "诊断应仍包含两种类型; 实际: {msg}"
     );
 }

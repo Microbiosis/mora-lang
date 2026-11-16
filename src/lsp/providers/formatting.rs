@@ -316,7 +316,7 @@ fn push_indent(out: &mut String, depth: usize) {
     }
 }
 
-/// Mora `"…"` / `p"…"` 字面量的**正文**转义（不含外层引号）。
+/// Mora `"…"` 字面量的**正文**转义（不含外层引号）。
 ///
 /// v0.104.6 D210：转义 `\` `"` 与**全部控制字符**。
 ///
@@ -326,8 +326,7 @@ fn push_indent(out: &mut String, depth: usize) {
 /// 破坏 `simple_format` 的保行数不变式。
 ///
 /// 规则与 JSON 字符串转义一致（`flow::escape_json_string` 的同款语义），
-/// 但**这是 Mora 源码字面量**、不是 JSON，故单列一份而不是复用 ——
-/// 两者的定界符规则将来可能分道扬镳（`p"…"` 的转义规则本就与 `"…"` 不同）。
+/// 但**这是 Mora 源码字面量**、不是 JSON，故单列一份。
 fn mora_string_body(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     for c in s.chars() {
@@ -400,15 +399,8 @@ fn token_text(tt: &crate::lexer::TokenType) -> String {
         TokenType::Continue => "continue".into(),
         TokenType::Macro => "macro".into(),
         TokenType::Quote => "quote".into(),
-        TokenType::Orchestrate => "orchestrate".into(),
         TokenType::Loop => "loop".into(),
-        TokenType::MaxRounds => "max_rounds".into(),
-        TokenType::Prompt => "prompt".into(),
-        TokenType::Document => "document".into(),
         TokenType::With => "with".into(),
-        TokenType::App => "app".into(),
-        TokenType::Rel => "rel".into(),
-        TokenType::Solve => "solve".into(),
         TokenType::Type => "type".into(),
         TokenType::Enum => "enum".into(),
         TokenType::Struct => "struct".into(),
@@ -439,12 +431,15 @@ fn token_text(tt: &crate::lexer::TokenType) -> String {
         //  不是本条的缺陷。）
         TokenType::String(s) => format!("\"{}\"", mora_string_body(s)),
         TokenType::Char(c) => format!("'{}'", mora_char_body(*c)),
-        TokenType::PromptString(s) => format!("p\"{}\"", mora_string_body(s)),
-        // ⚠ D102 之前**没有**这两条：`Int` 会变成 `"int"`、
-        // `BigInt` 会变成 `"bigint(123)"`。
         TokenType::Int(n) => n.to_string(),
-        TokenType::Float(n) => n.to_string(),
-        TokenType::BigInt(n) => format!("{}n", n),
+        TokenType::Float(n) => {
+            let s = n.to_string();
+            if n.is_finite() && !s.contains(['.', 'e', 'E']) {
+                format!("{s}.0")
+            } else {
+                s
+            }
+        }
         TokenType::Lifetime(s) => format!("'{}'", s),
         // v0.104.6 D202：注释**原样**带出。正文里已经含 `--` 之后的
         // 那个空格（`-- foo` 的正文是 `" foo"`），所以这里只补 `--` 前缀，
@@ -455,6 +450,7 @@ fn token_text(tt: &crate::lexer::TokenType) -> String {
         TokenType::Plus => "+".into(),
         TokenType::Minus => "-".into(),
         TokenType::Star => "*".into(),
+        TokenType::StarStar => "**".into(),
         TokenType::Slash => "/".into(),
         TokenType::Percent => "%".into(),
         TokenType::Assign => "=".into(),

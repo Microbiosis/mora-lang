@@ -28,68 +28,23 @@
 
 use std::sync::Arc;
 
-use mora::interpreter::Interpreter;
-use mora::mir::effect::Effects;
-use mora::mir::vm::execute;
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::execute_program;
 use mora::value::Value;
 
 fn run(src: &str) -> Result<Value, String> {
-    let (func, witnesses) =
+    let (prog, witnesses) =
         mora::cli::compile_and_opt(src, None).map_err(|e| format!("COMPILE: {e}"))?;
-    let errs = mora::typeck::check_mir::check_program_witnesses_bidirectional(&witnesses);
+    let errs = mora::typeck::check_mir::check_program_witnesses(&witnesses);
     if !errs.is_empty() {
         let msgs: Vec<String> = errs.iter().map(|e| e.message.clone()).collect();
         return Err(format!("TYPECK: {msgs:?}"));
     }
-    let arc = Arc::new(func);
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    execute(&arc, &mut interp, &mut env, &mut Effects::new())
-}
-
-/// D63：`bigint` 标注放行，且 BigInt 运算在标注之下照常工作。
-#[test]
-fn bigint_annotation_is_writable() {
-    match run("let x: bigint = 999n\nx\n") {
-        Ok(v) => assert_eq!(
-            v,
-            Value::BigInt(999i64.into()),
-            "`bigint` 标注必须接住 `999n`（spec §3.1 :113）"
-        ),
-        Err(e) => {
-            panic!("`let x: bigint = 999n` 必须通过（修前报 unsupported type annotation）：{e}")
-        }
-    }
-    match run("let x: bigint = 999n\nlet y = x + 1n\ny\n") {
-        Ok(v) => assert_eq!(
-            v,
-            Value::BigInt(1000i64.into()),
-            "带 `bigint` 标注的变量参与 BigInt 运算应得 1000n"
-        ),
-        Err(e) => panic!("`bigint` 标注不得破坏 BigInt 运算：{e}"),
-    }
-}
-
-/// D63 的紧邻不变量：`bigint` 不是 `any`，且**不属于** `number`
-/// （v0.91 明确 BigInt 不参与 `Int <: Float` 提升，避免隐式精度损失）。
-#[test]
-fn bigint_annotation_is_precise() {
-    assert!(
-        run("let x: bigint = 1\nx\n").is_err(),
-        "`bigint` 不该接住 Float 字面量 `1`"
-    );
-    assert!(
-        run("let x: bigint = 1i\nx\n").is_err(),
-        "`bigint` 不该接住 `1i`"
-    );
-    assert!(
-        run("let x: bigint = \"hi\"\nx\n").is_err(),
-        "`bigint` 不该接住 String"
-    );
-    assert!(
-        run("let x: number = 999n\nx\n").is_err(),
-        "BigInt 不属于数值塔 `number`（v0.91：不参与 Int <: Float 提升）"
-    );
+    let arc = Arc::new(prog);
+    let mut core = CoreRuntime::default();
+    execute_program(arc, &mut core)
+        .map(|(v, _)| v)
+        .map_err(|e| e.to_string())
 }
 
 /// D64：`nil` 标注可达（含 union 形态），且不得被放得过松。

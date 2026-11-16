@@ -44,7 +44,7 @@
 //! 一律返回**声明的**结果类型（`peel_all_arrows`）。内建的返回类型永远不是
 //! 函数，故剥到最里层安全；用户闭包可能真的返回函数，那条路径**不剥**。
 
-use mora::typeck::check_mir::check_program_witnesses_bidirectional;
+use mora::typeck::check_mir::check_program_witnesses;
 
 /// **只跑类型检查**，不执行。
 ///
@@ -55,7 +55,7 @@ use mora::typeck::check_mir::check_program_witnesses_bidirectional;
 fn typeck(src: &str) -> Result<(), String> {
     let (_func, witnesses) =
         mora::cli::compile_and_opt(src, None).map_err(|e| format!("COMPILE: {e}"))?;
-    let errs = check_program_witnesses_bidirectional(&witnesses);
+    let errs = check_program_witnesses(&witnesses);
     if errs.is_empty() {
         Ok(())
     } else {
@@ -70,23 +70,12 @@ fn newly_registered_builtins_reject_wrong_annotation() {
     // **覆盖完整性**：钉住「4 个」这个数 —— 将来增删内建而无人更新本文件时
     // 会当场失守（与 D60 / D61 的覆盖完整性断言同型）。
     let cases = [
-        (
-            "compress",
-            "let v: Int = compress(\"abcdef\", \"head_tail\")\nprint(1)\n",
-        ),
-        (
-            "crush_json",
-            "let v: Int = crush_json([1, 2], 10)\nprint(1)\n",
-        ),
         ("tail", "let v: Int = tail(\"f.txt\", 10)\nprint(1)\n"),
-        (
-            "compose_prompt",
-            "let v: Int = compose_prompt(\"s\")\nprint(1)\n",
-        ),
+        ("str", "let v: Int = str(1)\nprint(1)\n"),
     ];
     assert_eq!(
         cases.len(),
-        4,
+        2,
         "内建负例清单被改动 —— 增删用例请同步更新本断言，否则「返回类型是否被追踪」\
          就失去钉子"
     );
@@ -103,23 +92,9 @@ fn newly_registered_builtins_reject_wrong_annotation() {
 #[test]
 fn newly_registered_builtins_accept_string_annotation() {
     for (name, src) in [
-        (
-            "compress",
-            "let v: String = compress(\"abcdef\", \"head_tail\")\nprint(1)\n",
-        ),
-        (
-            "crush_json",
-            "let v: String = crush_json([1, 2], 10)\nprint(1)\n",
-        ),
         ("tail", "let v: String = tail(\"f.txt\", 10)\nprint(1)\n"),
-        (
-            "compose_prompt",
-            "let v: String = compose_prompt(\"s\")\nprint(1)\n",
-        ),
-        (
-            "compress 无标注",
-            "let v = compress(\"abcdef\", \"head_tail\")\nprint(1)\n",
-        ),
+        ("str", "let v: String = str(1)\nprint(1)\n"),
+        ("tail 无标注", "let v = tail(\"f.txt\", 10)\nprint(1)\n"),
     ] {
         if let Err(e) = typeck(src) {
             panic!("[{name}] String 标注必须被接受\n  err={e}\n  src={src:?}");
@@ -131,34 +106,13 @@ fn newly_registered_builtins_accept_string_annotation() {
 /// 残差 `Arrow` 会顶掉返回类型（`range` 修前就是这样）。两种写法都必须过。
 #[test]
 fn optional_trailing_argument_still_typechecks() {
-    for (name, src) in [
-        // 3 参（带 opts）
-        (
-            "compress 带 opts",
-            "let v: String = compress(\"abcdefgh\", \"head_tail\", {head_pct: 0.4, tail_pct: 0.4})\nprint(1)\n",
-        ),
-        // 2 参（省略 opts）
-        (
-            "compress 省略 opts",
-            "let v: String = compress(\"abcdefgh\", \"head_tail\")\nprint(1)\n",
-        ),
-        (
-            "crush_json 带 opts",
-            "let v: String = crush_json([1, 2], 10, {})\nprint(1)\n",
-        ),
-        (
-            "crush_json 省略 opts",
-            "let v: String = crush_json([1, 2], 10)\nprint(1)\n",
-        ),
-        // range 声明 3 参却常被 2 参调用 —— 修前返回残差 Arrow
-        (
-            "range 少传 step",
-            "let v: list<number> = range(0, 3)\nprint(1)\n",
-        ),
-    ] {
-        if let Err(e) = typeck(src) {
-            panic!("[{name}] 可选尾参省略时返回类型不得退化成残差 Arrow\n  err={e}\n  src={src:?}");
-        }
+    // range 声明 3 参却常被 2 参调用 —— 修前返回残差 Arrow
+    let (name, src) = (
+        "range 少传 step",
+        "let v: list<number> = range(0, 3)\nprint(1)\n",
+    );
+    if let Err(e) = typeck(src) {
+        panic!("[{name}] 可选尾参省略时返回类型不得退化成残差 Arrow\n  err={e}\n  src={src:?}");
     }
 }
 

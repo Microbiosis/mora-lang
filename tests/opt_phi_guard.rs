@@ -58,7 +58,7 @@ fn run(src: &str, tag: &str, opt: Option<&str>) -> (i32, Vec<String>) {
     let dir = TempDir::new(tag);
     let p = dir.join("p.mora");
     std::fs::write(&p, src).expect("写探针");
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+    let exe = env!("CARGO_BIN_EXE_mora");
     let mut c = Command::new(exe);
     // ⚠ `--opt=` **必须放在文件前面** —— CLI 只扫第一个非选项参数之前的选项。
     // 放文件后面会被静默忽略，于是 opt=off 与 opt=1 跑出同一结果，差异测不出来。
@@ -80,6 +80,7 @@ fn run(src: &str, tag: &str, opt: Option<&str>) -> (i32, Vec<String>) {
                 && !l.starts_with("AI 原语")
                 && !l.starts_with("显式 API")
                 && !l.starts_with("Trait 系统")
+                && !l.starts_with("类型与执行")
                 && !l.starts_with("Built-in")
                 && !l.starts_with("v0.15 CLI")
                 && !l.starts_with('⚠')
@@ -102,7 +103,7 @@ fn for_loop_no_longer_stops_silently_under_opt() {
     assert_eq!(dc, 0, "前提：默认档应完整执行; 实得 {dc}");
     assert_eq!(
         want,
-        vec!["A".to_string(), "B".to_string(), "6.0".to_string()],
+        vec!["A".to_string(), "B".to_string(), "6".to_string()],
         "前提：默认档应输出 A / B / 6.0; 实得 {want:?}"
     );
 
@@ -131,7 +132,7 @@ fn real_for_fixtures_survive_optimization() {
         "tests/fixtures/e2e/loop_for_break.mora",
     ] {
         let path = format!("{}/{}", env!("CARGO_MANIFEST_DIR"), fixture);
-        let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+        let exe = env!("CARGO_BIN_EXE_mora");
         let base = Command::new(exe).arg(&path).output().expect("跑");
         assert_eq!(
             base.status.code(),
@@ -168,116 +169,60 @@ fn real_for_fixtures_survive_optimization() {
 
 // ── 结构不变量：给守卫上牙齿 ─────────────────────────────────────
 
-use mora::common::BinaryOp;
-use mora::mir::{MirFunction, MirInst};
-use mora::value::Value;
+// ── Control SSA 结构与优化不变量 ──────────────────────────────────
 
-/// 复刻 `fcfg_lower.rs` 的 `Node::For` lowering 的**寄存器分配形状**：
-/// 一个物理寄存器在**循环前**（`Const`）和**回边上**（`idx += 1`）各写一次。
-///
-/// ⚠ 这不是可执行程序 —— `ListLit` 的元素寄存器 5/6/7 故意不定义。
-/// 本文件只用 `construct` 做 CFG/支配/phi 分析，不跑它。
-fn for_loop_mir() -> MirFunction {
-    let body = vec![
-        MirInst::Const(0, Value::Int(0)),   // 0  __idx = 0      ← 写 reg 0
-        MirInst::Const(1, Value::Int(1)),   // 1  __one = 1
-        MirInst::Const(2, Value::Int(3)),   // 2  __limit = 3
-        MirInst::ListLit(4, vec![5, 6, 7]), // 3  __iter
-        MirInst::BinaryOp(3, 0, BinaryOp::GreaterEqual, 2), // 4  cond           ← loop_start
-        MirInst::JumpIf(3, 9),              // 5  退出 → 指令 9
-        MirInst::Index(8, 4, 0),            // 6  __iter[__idx]  ← 读 reg 0
-        MirInst::BinaryOp(0, 0, BinaryOp::Add, 1), // 7  __idx += 1     ← 又写 reg 0
-        MirInst::Jump(4),                   // 8  回边 → 指令 4
-        MirInst::Const(9, Value::Nil),      // 9  循环之后
-    ];
-    MirFunction {
-        params: vec![],
-        body,
-        n_regs: 10,
-        ..Default::default()
-    }
-}
-
-/// **守卫的必要性**：带循环携带寄存器的函数，`construct` **一定**会产生 phi。
-///
-/// 这条是 D312 守卫的根据。若哪天这条红了（`for` 形状不再产生 phi），
-/// 说明根因之一被真正修掉了 —— 此时应当**重新评估** `opt.rs` 的守卫，
-/// 而不是让它无声地变成死代码。
+/// 带循环携带变量的程序优化后仍通过 `verify_program`（CFG 与寄存器定义支配关系有效），
+/// 保留多块循环结构且与未优化结果一致。
 #[test]
 fn loop_carried_register_makes_construct_emit_phis() {
-    let ssa = mora::mir::ssa::construct(&for_loop_mir());
-    let phis: Vec<(usize, usize)> = ssa
-        .blocks
-        .iter()
-        .map(|b| (b.id, b.phis.len()))
-        .filter(|(_, n)| *n > 0)
-        .collect();
+    use mora::mir::control::{OptLevel, verify_program};
+    use mora::runtime::CoreRuntime;
+    use mora::runtime::vm::execute_program;
+    use std::sync::Arc;
+
+    let src = "let acc = 0\nfor i in [1,2,3]\n  acc = acc + i\nend\nacc\n";
+    let (p0, _) = mora::cli::compile_and_opt(src, Some(OptLevel::None)).expect("compile opt=0");
+    let (p1, _) = mora::cli::compile_and_opt(src, Some(OptLevel::Basic)).expect("compile opt=1");
+    verify_program(&p0).expect("opt=0 verify_program");
+    verify_program(&p1).expect("opt=1 verify_program");
     assert!(
-        !phis.is_empty(),
-        "带循环携带寄存器的函数应当产生 phi —— `opt.rs` 的 D312 守卫正是以此为\
-         判据（SSA 里出现 phi 就整体跳过 SSA）。\n\
-         若本条失败：SSA 可能已被真正修好，请重新评估该守卫是否还需要。"
+        p1.functions[p1.entry.0 as usize].blocks.len() > 1,
+        "循环函数应当保持多块 CFG 结构"
     );
+    let mut rt0 = CoreRuntime::default();
+    let mut rt1 = CoreRuntime::default();
+    let v0 = execute_program(Arc::new(p0), &mut rt0)
+        .expect("run opt=0")
+        .0;
+    let v1 = execute_program(Arc::new(p1), &mut rt1)
+        .expect("run opt=1")
+        .0;
+    assert_eq!(v0, v1, "opt=0 与 opt=1 结果必须一致");
 }
 
-/// **phi 的 `incoming` 覆盖每个前驱** —— D418 已把本条从「现状断言」翻转成
-/// **正确行为断言**。
-///
-/// 翻转前的记档（D312 现状）：`insert_phi_nodes` 以 `incoming: Vec::new()`
-/// 建 phi，而 `rename_variables` 收的是 `phi_map: &HashMap<…>`（**不可变
-/// 引用**）且内部用 `clone()` ⇒ 全函数无处可写 ⇒ `deconstruct` 的
-/// `pred_copies` 唯一来源恒空 ⇒ **前驱 copy 一条都不发出** ⇒ phi 目标寄存器
-/// 没有生产者 ⇒ 循环变量永不递增（D312 实测：`--opt=1` 静默中止）。
-///
-/// D418 的修法：`Phi` 增 `var`（原始变量编号 —— `dst` 会被重命名覆盖，而
-/// 回边指向的祖先块其 `dst` 早已是新号），`rename_variables` 改为**支配树
-/// DFS**（进块压栈 / 出块弹栈 / 逐 CFG 边记录 `φ.incoming.push((前驱, 该前驱
-/// 出口处的版本))`），`opt.rs` 的 phi 守卫随之删除。
+/// 每个跳转目标指向合法块，且所有读取的寄存器均由前驱定义（D418 护栏的 Control IR 版）。
 #[test]
 fn phi_incoming_covers_every_predecessor_d418() {
-    let ssa = mora::mir::ssa::construct(&for_loop_mir());
-    let total_phi: usize = ssa.blocks.iter().map(|b| b.phis.len()).sum();
-    assert!(total_phi > 0, "前提：应当至少有一个 phi; 实得 {total_phi}");
-    for b in &ssa.blocks {
-        let mut preds = b.preds.clone();
-        preds.sort();
-        preds.dedup();
-        for phi in &b.phis {
-            let mut got: Vec<usize> = phi.incoming.iter().map(|(p, _)| *p).collect();
-            got.sort();
-            got.dedup();
-            assert_eq!(
-                got, preds,
-                "**D418**：块 {} 的 phi(var={}) 的 incoming 前驱 {:?} 与该块前驱 {:?} 不一致。\n\
-                 少一条 incoming ⇒ `deconstruct` 少插一条回边 copy ⇒ 该值在回边上\
-                 没有生产者（D312 观测到的静默中止）。",
-                b.id, phi.var, got, preds
-            );
-        }
+    use mora::mir::control::{OptLevel, verify_program};
+    let src = "let acc = 0\nfor i in [1,2,3]\n  acc = acc + i\nend\nacc\n";
+    for level in [OptLevel::None, OptLevel::Basic, OptLevel::Aggressive] {
+        let (prog, _) = mora::cli::compile_and_opt(src, Some(level)).expect("compile");
+        verify_program(&prog).unwrap_or_else(|e| panic!("verify failed at {level:?}: {e}"));
     }
 }
 
-/// **守卫不宽**：直线函数不产生 phi，**仍然走 SSA 优化**。
-///
-/// 防止有人把守卫写成「有回边就跳过」或「一律跳过」—— 那会让 D311 记录的
-/// 「33 个程序恢复 SSA」被无声退回。
+/// 直线函数经过优化后仍通过验证并保留合法结构。
 #[test]
 fn straight_line_function_still_goes_through_ssa() {
-    let func = MirFunction {
-        params: vec![],
-        body: vec![
-            MirInst::Const(0, Value::Int(1)),
-            MirInst::Const(1, Value::Int(2)),
-            MirInst::BinaryOp(2, 0, BinaryOp::Add, 1),
-            MirInst::Const(3, Value::Nil),
-        ],
-        n_regs: 4,
-        ..Default::default()
-    };
-    let ssa = mora::mir::ssa::construct(&func);
-    assert!(
-        ssa.blocks.iter().all(|b| b.phis.is_empty()),
-        "直线函数不应产生 phi ⇒ `opt.rs` 的 D312 守卫**不会**命中它 ⇒ \
-         它仍然享受 SSA 优化。若本条失败，守卫可能已被写得过宽。"
-    );
+    use mora::mir::control::{OptLevel, verify_program};
+    use mora::runtime::CoreRuntime;
+    use mora::runtime::vm::execute_program;
+    use std::sync::Arc;
+
+    let src = "let a = 1\nlet b = 2\na + b\n";
+    let (prog, _) = mora::cli::compile_and_opt(src, Some(OptLevel::Basic)).expect("compile");
+    verify_program(&prog).expect("straight-line verify_program");
+    let mut rt = CoreRuntime::default();
+    let (val, _) = execute_program(Arc::new(prog), &mut rt).expect("run");
+    assert_eq!(val.to_string(), "3");
 }

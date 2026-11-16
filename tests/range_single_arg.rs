@@ -50,7 +50,7 @@ fn run(src: &str, tag: &str) -> (i32, String) {
     let dir = TempDir::new(tag);
     let p = dir.join("p.mora");
     std::fs::write(&p, src).expect("写探针");
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+    let exe = env!("CARGO_BIN_EXE_mora");
     let out = Command::new(exe).arg(&p).output().expect("跑 mora");
     let _ = std::fs::remove_dir_all(&dir);
     let text = String::from_utf8_lossy(&out.stdout).into_owned()
@@ -66,6 +66,7 @@ fn run(src: &str, tag: &str) -> (i32, String) {
                 && !l.starts_with("AI 原语")
                 && !l.starts_with("显式 API")
                 && !l.starts_with("Trait 系统")
+                && !l.starts_with("类型与执行")
                 && !l.starts_with("Built-in")
                 && !l.starts_with("v0.15 CLI")
                 && !l.starts_with('⚠')
@@ -90,16 +91,15 @@ fn pr(e: &str) -> (i32, String) {
 #[test]
 fn d327_single_arg_range_means_zero_to_n() {
     for (e, want) in [
-        ("range(3)", "[0.0, 1.0, 2.0]"),
-        ("range(1)", "[0.0]"),
-        ("range(5)", "[0.0, 1.0, 2.0, 3.0, 4.0]"),
+        ("range(3)", "[0, 1, 2]"),
+        ("range(1)", "[0]"),
+        ("range(5)", "[0, 1, 2, 3, 4]"),
         ("range(0)", "[]"),
         ("range(-1)", "[]"),
         // 浮点上界向零截断（2.9 → 2），与 `as_i64` 一致
-        ("range(2.9)", "[0.0, 1.0]"),
-        // `2i` / `2n` 上界同样接受
-        ("range(3i)", "[0.0, 1.0, 2.0]"),
-        ("range(3n)", "[0.0, 1.0, 2.0]"),
+        ("range(2.9)", "[0, 1]"),
+        // `2i` 上界同样接受
+        ("range(3i)", "[0, 1, 2]"),
     ] {
         let (code, got) = pr(e);
         assert_eq!(code, 0, "`{e}` 应成功; 实得 exit={code} out={got}");
@@ -124,9 +124,9 @@ fn d327_for_loop_over_single_arg_range_actually_runs() {
     );
     assert_eq!(code, 0, "for 累加应成功; 实得 {got}");
     assert_eq!(
-        got, "10.0",
-        "`for i in range(5) {{ t = t + i }}` 之后 t 必须是 **10.0**。\n\
-         修前循环体一次都不执行、t 恒为 0.0，**退出码仍是 0、零诊断**。"
+        got, "10",
+        "`for i in range(5) {{ t = t + i }}` 之后 t 必须是 **10**。\n\
+         修前循环体一次都不执行、t 恒为 0，**退出码仍是 0、零诊断**。"
     );
 
     let (code, got) = run(
@@ -135,7 +135,7 @@ fn d327_for_loop_over_single_arg_range_actually_runs() {
     );
     assert_eq!(code, 0, "for 打印应成功; 实得 {got}");
     assert_eq!(
-        got, "0.0 | 1.0 | 2.0 | after",
+        got, "0 | 1 | 2 | after",
         "`for i in range(3) {{ print(i) }}` 必须打印 0/1/2 再打印 after; 实得 `{got}`"
     );
 
@@ -148,14 +148,14 @@ fn d327_for_loop_over_single_arg_range_actually_runs() {
 #[test]
 fn d327_multi_arg_range_unchanged() {
     for (e, want) in [
-        ("range(0, 3)", "[0.0, 1.0, 2.0]"),
-        ("range(1, 3)", "[1.0, 2.0]"),
-        ("range(0, 6, 2)", "[0.0, 2.0, 4.0]"),
-        ("range(-1, 3)", "[-1.0, 0.0, 1.0, 2.0]"),
+        ("range(0, 3)", "[0, 1, 2]"),
+        ("range(1, 3)", "[1, 2]"),
+        ("range(0, 6, 2)", "[0, 2, 4]"),
+        ("range(-1, 3)", "[-1, 0, 1, 2]"),
         ("range(3, 1)", "[]"),
-        ("range(1, 2, 3)", "[1.0]"),
+        ("range(1, 2, 3)", "[1]"),
         // 负步长（D- 轮已修）
-        ("range(3, 0, -1)", "[3.0, 2.0, 1.0]"),
+        ("range(3, 0, -1)", "[3, 2, 1]"),
         ("range(0, 3, -1)", "[]"),
         ("range(3, 3)", "[]"),
         ("range(0, 0)", "[]"),

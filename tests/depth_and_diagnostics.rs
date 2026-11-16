@@ -22,14 +22,16 @@
 
 use std::sync::Arc;
 
-use mora::interpreter::Interpreter;
-use mora::mir::vm::execute;
 use mora::parser_v3::ParserV3;
-use mora::typeck::check_mir::check_program_witnesses_bidirectional;
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::execute_program;
+use mora::typeck::check_mir::check_program_witnesses;
 
 /// 编译（不过 typeck）—— 用于断言**解析期**诊断（D25 / D27 / D30）。
 fn compile_only(src: &str) -> Result<(), String> {
-    ParserV3::compile(src).map(|_| ())
+    ParserV3::compile(src)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// 全链路：编译 + typeck + 执行。typeck 是守卫，确保断言的是
@@ -39,24 +41,19 @@ fn compile_only(src: &str) -> Result<(), String> {
 /// `e2e_helpers::assert_source_ok` 同语义。故要断言具体数值时，
 /// 源码末尾必须是一个裸表达式而非 `print(...)`。
 fn run(src: &str) -> Result<String, String> {
-    let (func, witnesses) = ParserV3::compile(src)?;
-    let errs = check_program_witnesses_bidirectional(&witnesses);
+    let (prog, witnesses) = ParserV3::compile(src).map_err(|e| e.to_string())?;
+    let errs = check_program_witnesses(&witnesses);
     if !errs.is_empty() {
         return Err(format!(
             "TYPECK-REJECT: {:?}",
             errs.iter().map(|e| e.message.clone()).collect::<Vec<_>>()
         ));
     }
-    let arc = Arc::new(func);
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    execute(
-        &arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    )
-    .map(|v| format!("{v:?}"))
+    let arc = Arc::new(prog);
+    let mut core = CoreRuntime::default();
+    execute_program(arc, &mut core)
+        .map(|(v, _)| format!("{v:?}"))
+        .map_err(|e| e.to_string())
 }
 
 /// 同 [`run`]，但在**显式大栈线程**上执行。
@@ -197,12 +194,12 @@ fn d25_moderate_nesting_still_computes_correctly() {
     // 尾表达式取嵌套括号内的字面量（不用 print —— run 返回尾表达式值）
     assert_eq!(
         run_deep(&format!("({}1{})", "(".repeat(100), ")".repeat(100))).unwrap(),
-        "Float(1.0)"
+        "Int(1)"
     );
     // 100 项 + 链 = 101
     assert_eq!(
         run_deep(&format!("1{}", "+1".repeat(100))).unwrap(),
-        "Float(101.0)"
+        "Int(101)"
     );
 }
 
@@ -215,17 +212,27 @@ fn d25_moderate_nesting_still_computes_correctly() {
 /// 静默错值（而非报错）比崩溃更危险：结果一路流进下游计算。
 #[test]
 fn d27_float_literal_out_of_range_is_an_error() {
-    // 10^309 超出 f64 max（~1.797e308）
-    let src = format!("print(1{})", "0".repeat(309));
-    let err = compile_only(&src).expect_err("超 f64 范围字面量必须报错而非静默 inf");
+    // 1e309 / 10^309.0 超出 f64 max（~1.797e308）
+    for src in [
+        "print(1e309)".to_string(),
+        format!("print(1{}.0)", "0".repeat(309)),
+    ] {
+        let err = compile_only(&src).expect_err("超 f64 范围字面量必须报错而非静默 inf");
+        assert!(
+            err.contains("out of range") && err.contains("f64"),
+            "应报 f64 字面量超范围诊断，实得: {err}"
+        );
+        assert!(
+            err.contains("std/math/bigint"),
+            "诊断应指向 std/math/bigint，实得: {err}"
+        );
+    }
+    // 无小数点大整数超过 i64 max 同样报 out of range + 指路
+    let int_src = format!("print(1{})", "0".repeat(309));
+    let int_err = compile_only(&int_src).expect_err("超 i64 整数字面量必须报错");
     assert!(
-        err.contains("out of range") && err.contains("f64"),
-        "应报字面量超范围诊断，实得: {err}"
-    );
-    // 诊断要指路：BigInt 后缀是本语言确实存在的出路
-    assert!(
-        err.contains('n') && err.contains("BigInt"),
-        "诊断应指向 BigInt 字面量，实得: {err}"
+        int_err.contains("out of range") && int_err.contains("std/math/bigint"),
+        "应报 i64 字面量超范围并指路 bigint，实得: {int_err}"
     );
 }
 
@@ -236,14 +243,18 @@ fn d27_huge_mantissa_literal_is_an_error() {
     assert!(err.contains("out of range"), "实得: {err}");
 }
 
-/// 可表示的边界值必须照常工作（10^308 仍 < f64 max）。
+/// 可表示的边界值必须照常工作（1e308 仍 < f64 max）。
 #[test]
 fn d27_in_range_large_literal_still_works() {
-    let src = format!("print(1{})", "0".repeat(308));
-    assert!(
-        compile_only(&src).is_ok(),
-        "10^308 仍在 f64 范围内，不该被拦"
-    );
+    for src in [
+        "print(1e308)".to_string(),
+        format!("print(1{}.0)", "0".repeat(308)),
+    ] {
+        assert!(
+            compile_only(&src).is_ok(),
+            "10^308 仍在 f64 范围内，不该被拦: {src}"
+        );
+    }
 }
 
 /// 下溢到 0 同样报错（Rust 对 `1e-400f64` 也是 out of range）。
@@ -254,10 +265,16 @@ fn d27_underflowing_literal_is_an_error() {
     assert!(err.contains("underflow"), "实得: {err}");
 }
 
-/// 真正的零与科学计数法的既有行为不受影响。
+/// 真正的零与科学计数法的既有行为正常支持。
 #[test]
 fn d27_zero_and_ordinary_literals_unaffected() {
-    for src in ["print(0)", "print(0.0)", "print(0e5.0e0)", "print(1.5f)"] {
+    for src in [
+        "print(0)",
+        "print(0.0)",
+        "print(1e5)",
+        "print(1.5e10)",
+        "print(1.5f)",
+    ] {
         // 注：`0e5` / `1.5e10` 这类科学计数法本语言**不支持**（词法器与
         // spec 均未定义），故此处只取确实支持的形态。
         let _ = src;
@@ -265,13 +282,6 @@ fn d27_zero_and_ordinary_literals_unaffected() {
     assert!(compile_only("print(0.0)").is_ok());
     assert!(compile_only("print(1.5f)").is_ok());
     assert!(compile_only("print(0.0 + 0.0)").is_ok());
-}
-
-/// BigInt 字面量不受影响 —— D27 正是要恢复它与普通字面量的自洽。
-#[test]
-fn d27_bigint_literal_unaffected() {
-    assert!(compile_only("print(100000000000000000000n)").is_ok());
-    assert!(compile_only("print(123456789012345678901234567890n)").is_ok());
 }
 
 // ===================================================================
@@ -319,10 +329,10 @@ fn d28_string_negative_index_is_rejected() {
 #[test]
 fn d28_positive_index_unaffected() {
     // 尾表达式取索引结果本身（run 返回尾表达式值，不是 print 的内容）
-    assert_eq!(run("let xs = [1, 2, 3]\nxs[0]").unwrap(), "Float(1.0)");
-    assert_eq!(run("let xs = [1, 2, 3]\nxs[2]").unwrap(), "Float(3.0)");
+    assert_eq!(run("let xs = [1, 2, 3]\nxs[0]").unwrap(), "Int(1)");
+    assert_eq!(run("let xs = [1, 2, 3]\nxs[2]").unwrap(), "Int(3)");
     // 浮点下标按既有约定向零截断（D3 的设计决定）
-    assert_eq!(run("let xs = [1, 2, 3]\nxs[1.9]").unwrap(), "Float(2.0)");
+    assert_eq!(run("let xs = [1, 2, 3]\nxs[1.9]").unwrap(), "Int(2)");
     assert_eq!(run("let s = \"abc\"\ns[0]").unwrap(), "Char('a')");
     assert_eq!(run("let s = \"abc\"\ns[1.9]").unwrap(), "Char('b')");
     // 正向越界信息不变
@@ -355,7 +365,7 @@ fn d29_multiline_import_does_not_swallow_next_line() {
         "let x = 1\nimport nosuchmod\nprint(x)",
     ] {
         let (_, witnesses) = ParserV3::compile(src).expect("应能编译出 import 语句");
-        let errs = check_program_witnesses_bidirectional(&witnesses);
+        let errs = check_program_witnesses(&witnesses);
         let joined = errs
             .iter()
             .map(|e| e.message.clone())
@@ -378,7 +388,7 @@ fn d29_canonical_quoted_import_still_resolves() {
     let (func, witnesses) =
         ParserV3::compile("import \"tests/fixtures/e2e/import_handle_index.mora\"\nprint(h2())")
             .expect("规范引号 import 必须能编译");
-    let errs = check_program_witnesses_bidirectional(&witnesses);
+    let errs = check_program_witnesses(&witnesses);
     assert!(errs.is_empty(), "规范 import 不应报错: {errs:?}");
     let _ = func;
 }

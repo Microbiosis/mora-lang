@@ -26,7 +26,7 @@
 //! ## 不变的
 //!
 //! - `check_union` / `join_types` 签名 / 行为完全保持
-//! - `Result<(), String>` 返回类型（保留 v0.91 错误统一计划前的现状）
+//! - 错误归类为 [`MoraError::Typeck`]（`Result<(), MoraError>`）
 //! - 4 个 `check_union_*` 测试 + 1 个 `join_types_*` 测试语义保留
 
 use crate::common::Span;

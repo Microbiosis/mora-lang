@@ -75,7 +75,7 @@ fn run(src: &str, tag: &str) -> (i32, Vec<String>) {
     std::fs::create_dir_all(&dir).expect("建目录");
     let p = dir.join("p.mora");
     std::fs::write(&p, src).expect("写探针");
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+    let exe = env!("CARGO_BIN_EXE_mora");
     let out = Command::new(exe).arg(&p).output().expect("跑 mora");
     cleanup_dir(&dir);
     let text = String::from_utf8_lossy(&out.stdout).into_owned()
@@ -91,6 +91,7 @@ fn run(src: &str, tag: &str) -> (i32, Vec<String>) {
                 && !l.starts_with("AI 原语")
                 && !l.starts_with("显式 API")
                 && !l.starts_with("Trait 系统")
+                && !l.starts_with("类型与执行")
                 && !l.starts_with("Built-in")
                 && !l.starts_with("v0.15 CLI")
                 && !l.starts_with('⚠')
@@ -112,69 +113,40 @@ fn expr(e: &str) -> String {
 #[test]
 fn d319_integer_div_mod_by_zero_never_panics() {
     for op in ["/", "%"] {
-        for (a, b, tag) in [
-            ("7i", "0i", "int-int"),
-            ("7n", "0n", "big-big"),
-            ("7n", "0i", "big-int"),
-            ("7i", "0n", "int-big"),
-        ] {
-            let (code, lines) = run(&expr(&format!("{a} {op} {b}")), &format!("{op}_{tag}"));
-            assert_ne!(
-                code, 101,
-                "**D319**：`print({a} {op} {b})` 触发了 **Rust panic**（exit 101）。\n\
-                 整数除零必须返回 `MoraError`（exit 1），与同族的 `7i {op} 0i` / \
-                 `7n {op} 0n` 一致。\n  实际输出: {lines:?}"
-            );
-            assert_eq!(
-                code, 1,
-                "`print({a} {op} {b})` 应以 exit 1 报运行期错误; 实得 exit={code}\n  输出: {lines:?}"
-            );
-            assert!(
-                lines.iter().any(|l| l.contains("zero")),
-                "`print({a} {op} {b})` 的错误信息应指明除零/模零; 实得: {lines:?}"
-            );
-        }
+        let (a, b, tag) = ("7i", "0i", "int-int");
+        let (code, lines) = run(&expr(&format!("{a} {op} {b}")), &format!("{op}_{tag}"));
+        assert_ne!(
+            code, 101,
+            "**D319**：`print({a} {op} {b})` 触发了 **Rust panic**（exit 101）。\n  实际输出: {lines:?}"
+        );
+        assert_eq!(
+            code, 1,
+            "`print({a} {op} {b})` 应以 exit 1 报运行期错误; 实得 exit={code}\n  输出: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("zero")),
+            "`print({a} {op} {b})` 的错误信息应指明除零/模零; 实得: {lines:?}"
+        );
     }
 }
 
-/// **正确性矩阵**：混合类型的除法 / 取模必须给出**正确值**，
-/// 且既有的各条路径**不得回归**。
-///
-/// 期望值约定：向零截断（Rust `i64` 与 num-bigint 同约定）、符号随被除数、
-/// BigInt 打印带 `n` 后缀。
+/// **正确性矩阵**：整数/混合 Float 的除法 / 取模必须给出**正确值**（BigInt 已下放 std）。
 #[test]
 fn d319_mixed_type_div_mod_results_are_correct() {
     for (e, want) in [
-        // 混合类型（修前会 panic 的那条路径，现在必须正常）
-        ("7n / 2i", "3n"),
-        ("7i / 2n", "3n"),
-        ("7n % 2i", "1n"),
-        ("7i % 2n", "1n"),
-        ("8n / 2i", "4n"),
-        ("8i / 2n", "4n"),
-        // 负数：向零截断 / 符号随被除数
-        ("(-7n) / 2i", "-3n"),
-        ("(-7i) / 2n", "-3n"),
-        ("(-7n) % 2i", "-1n"),
-        ("(-7i) % 2n", "-1n"),
-        ("7n / (-2i)", "-3n"),
-        ("7n % (-2i)", "1n"),
-        // 既有路径不得回归
+        // 整数路径（向零截断 / 符号随被除数 —— 无后缀字面量 `2` 同为 Int）
         ("7i / 2i", "3"),
-        ("7n / 2n", "3n"),
+        ("7 / 2", "3"),
+        ("7i / 2", "3"),
         ("7i % 2i", "1"),
-        ("7n % 2n", "1n"),
+        ("(-7i) / 2i", "-3"),
+        ("(-7i) % 2i", "-1"),
+        ("7i / (-2i)", "-3"),
+        ("7i % (-2i)", "1"),
         // Int ⊗ Float 提升为 IEEE 浮点、不截断
-        ("7i / 2", "3.5"),
-        ("7 / 2i", "3.5"),
-        ("7 / 2", "3.5"),
-        // 其它 BigInt 运算不受影响
-        ("2n + 2i", "4n"),
-        ("2i + 2n", "4n"),
-        ("2n * 3i", "6n"),
-        // 任意精度不得被截到 i64
-        ("100000000000000000000n / 3i", "33333333333333333333n"),
-        ("100000000000000000000n % 7i", "2n"),
+        ("7i / 2.0", "3.5"),
+        ("7.0 / 2i", "3.5"),
+        ("7.0 / 2.0", "3.5"),
     ] {
         let (code, lines) = run(&expr(e), "val");
         assert_eq!(code, 0, "`{e}` 应成功; 实得 exit={code} out={lines:?}");
@@ -191,7 +163,11 @@ fn d319_mixed_type_div_mod_results_are_correct() {
 /// 钉住它是为了防止有人「顺手」把浮点除零也改成报错（那会改变语言语义）。
 #[test]
 fn d319_float_division_by_zero_keeps_ieee_semantics() {
-    for (e, want) in [("7 / 0", "inf"), ("7i / 0", "inf"), ("7 / 0.0", "inf")] {
+    for (e, want) in [
+        ("7.0 / 0", "inf"),
+        ("7i / 0.0", "inf"),
+        ("7.0 / 0.0", "inf"),
+    ] {
         let (code, lines) = run(&expr(e), "f");
         assert_eq!(code, 0, "`{e}` 应成功（IEEE 语义）; 实得 exit={code}");
         assert_eq!(
@@ -202,53 +178,17 @@ fn d319_float_division_by_zero_keeps_ieee_semantics() {
              请先回到 CHANGELOG D319 记录裁决依据。"
         );
     }
-    // `%` 0 得 nan（不是 inf）
-    let (code, lines) = run(&expr("7i % 0"), "f_mod");
-    assert_eq!(code, 0, "`7i % 0` 应成功; 实得 {code}");
+    // 整数 7 / 0 走整数除零报错（与 7i / 0i 一致）
+    let (code_i0, lines_i0) = run(&expr("7 / 0"), "i_zero");
+    assert_eq!(code_i0, 1, "`7 / 0` 作为整数除零应报错; out={lines_i0:?}");
+    // 浮点 `%` 0 得 nan（不是 inf）
+    let (code, lines) = run(&expr("7i % 0.0"), "f_mod");
+    assert_eq!(code, 0, "`7i % 0.0` 应成功; 实得 {code}");
     assert_eq!(
         lines.first().map(String::as_str),
         Some("nan"),
-        "`print(7i % 0)` 应得 nan; 实得 {lines:?}"
+        "`print(7i % 0.0)` 应得 nan; 实得 {lines:?}"
     );
 }
 
-/// **现状判据**：BigInt 与 Int/Float 的**比较**被 typeck 拒绝，而**算术**可以。
-///
-/// 属**语义缺口**（算术有提升、比较没有），修它要同时动 typeck +
-/// `Value::PartialEq` + `eval_binary` 三层 ⇒ **架构决定，只报告不实施**。
-/// 本条保证这个缺口**保持可观察**，不被无意改动。
-#[test]
-fn d319_status_quo_bigint_comparison_is_rejected_but_arithmetic_is_not() {
-    // 算术：允许（→ BigInt）
-    for e in ["2n + 2i", "2i + 2n", "2n + 2"] {
-        let (code, lines) = run(&expr(e), "ar");
-        assert_eq!(
-            code, 0,
-            "`{e}` 算术应被允许; 实得 exit={code} out={lines:?}"
-        );
-        assert_eq!(
-            lines.first().map(String::as_str),
-            Some("4n"),
-            "`print({e})` 应得 4n（任一含 BigInt ⇒ 结果 BigInt）; 实得 {lines:?}"
-        );
-    }
-    // 比较：拒绝（typeck）
-    for e in ["2n == 2i", "2n == 2", "2n < 2i", "2n > 2i"] {
-        let (code, lines) = run(&expr(e), "cmp");
-        assert_eq!(
-            code, 2,
-            "**D319 现状**：`{e}` 当前被 typeck 拒绝（BigInt 与 Int/Float 不可比）。\n\
-             ⚠ 这是**语义缺口**（算术能提升、比较不能），不是已判定的缺陷。\n\
-             若将来裁决为「应可比较」并实现（需同时改 typeck + `Value::PartialEq` \
-             + `eval_binary`），本条会红并应翻转为 exit 0。\n  实得: {lines:?}"
-        );
-    }
-    // BigInt 与 BigInt 之间可比较（对照组）
-    let (code, lines) = run(&expr("2n == 2n"), "cmp_bb");
-    assert_eq!(code, 0, "`2n == 2n` 应成功; 实得 {code}");
-    assert_eq!(
-        lines.first().map(String::as_str),
-        Some("true"),
-        "实得 {lines:?}"
-    );
-}
+// BigInt 已下放 std/math/bigint，compiler core 中的 BigInt 比较/算术对比用例于 v0.110.0 移除。

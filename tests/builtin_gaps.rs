@@ -44,38 +44,28 @@
 use mora::test_support::TempFile;
 use std::sync::Arc;
 
-use mora::interpreter::Interpreter;
-use mora::mir::vm::execute;
 use mora::parser_v3::ParserV3;
-use mora::typeck::check_mir::check_program_witnesses_bidirectional;
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::execute_program;
+use mora::typeck::check_mir::check_program_witnesses;
 
 /// 跑一段 Mora 源码，返回 `Value` 的 Debug 形态或 `ERR: …`。
 ///
 /// **同时跑 typeck** —— 本文件的断言都必须是「用户真写得出来」的代码。
-/// 只用 `execute` 会绕过 typeck，于是「typeck 拒绝、运行期却支持」的写法
-/// 会被当成有效断言固化。v0.104.6 在 `numeric_tower.rs` 上实测：加上这个
-/// 守卫后 15 条测试里 **8 条当场失败**，全在断言不可达代码。
-/// 需要记录「运行期已有、typeck 未放行」的能力时用 `run_runtime_only()`。
 fn run(src: &str) -> String {
-    let (func, witnesses) =
+    let (prog, witnesses) =
         ParserV3::compile(src).unwrap_or_else(|e| panic!("compile: {e}\n{src}"));
-    let errs = check_program_witnesses_bidirectional(&witnesses);
+    let errs = check_program_witnesses(&witnesses);
     assert!(
         errs.is_empty(),
         "这段源码被 typeck 拒绝，本测试却在断言它的行为 —— 断言的是用户写不出来的代码。\n\
          源：{src}\n错误：{:?}",
         errs.iter().map(|e| e.message.clone()).collect::<Vec<_>>()
     );
-    let arc = Arc::new(func);
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    match execute(
-        &arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    ) {
-        Ok(v) => format!("{v:?}"),
+    let arc = Arc::new(prog);
+    let mut core = CoreRuntime::default();
+    match execute_program(arc, &mut core) {
+        Ok((v, _)) => format!("{v:?}"),
         Err(e) => format!("ERR: {e}"),
     }
 }
@@ -83,17 +73,11 @@ fn run(src: &str) -> String {
 /// 只跑运行期、**故意绕过 typeck** —— 专用于记录「运行期已支持、typeck 尚未
 /// 放行」的能力。**它不能证明「用户写得出来」。**
 fn run_runtime_only(src: &str) -> String {
-    let (func, _w) = ParserV3::compile(src).unwrap_or_else(|e| panic!("compile: {e}\n{src}"));
-    let arc = Arc::new(func);
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    match execute(
-        &arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    ) {
-        Ok(v) => format!("{v:?}"),
+    let (prog, _w) = ParserV3::compile(src).unwrap_or_else(|e| panic!("compile: {e}\n{src}"));
+    let arc = Arc::new(prog);
+    let mut core = CoreRuntime::default();
+    match execute_program(arc, &mut core) {
+        Ok((v, _)) => format!("{v:?}"),
         Err(e) => format!("ERR: {e}"),
     }
 }
@@ -143,8 +127,8 @@ fn d1_range_bound_from_len_is_not_silently_empty() {
     let mut failures = Vec::new();
     for (name, src) in canonical {
         let got = run(src);
-        if got != "Float(15.0)" {
-            failures.push(format!("  [{name}] want Float(15.0), got {got}"));
+        if got != "Int(15)" {
+            failures.push(format!("  [{name}] want Int(15), got {got}"));
         }
     }
     assert!(
@@ -183,12 +167,12 @@ fn d1_range_over_dict_values_and_strings() {
 
 #[test]
 fn d1_range_negative_step_works() {
-    // 修前 `while i < end` 对负步长恒假 → 静默返回空列表。
+    // Stage 3A-1：range() 元素为 Int。
     expect_all(&[
         (
             "neg step 3..0",
             "range(3, 0, -1)\n",
-            "List([Float(3.0), Float(2.0), Float(1.0)])",
+            "List([Int(3), Int(2), Int(1)])",
         ),
         ("neg step count", "len(range(3, 0, -1))\n", "Int(3)"),
         ("neg step empty", "len(range(0, 3, -1))\n", "Int(0)"),
@@ -197,19 +181,22 @@ fn d1_range_negative_step_works() {
 
 #[test]
 fn d1_range_rejects_bad_args_instead_of_silently_defaulting() {
-    // 恶劣失败模式的反面：类型不对要报错，不能悄悄换一个值。
-    expect_all(&[
-        (
-            "step 0",
-            "range(0, 5, 0)\n",
-            "ERR: range() step must not be 0 (would never terminate)",
-        ),
-        (
-            "non-numeric end",
-            "range(0, \"x\")\n",
-            "ERR: range() end must be a number, got string",
-        ),
-    ]);
+    // step 0 属于值域错误（typeck 通过，运行期拒绝）
+    expect_all(&[(
+        "step 0",
+        "range(0, 5, 0)\n",
+        "ERR: range() step must not be 0 (would never terminate)",
+    )]);
+    // Stage 3A：typeck 对非数值实参直接在静态期拒绝，运行期路径同样拒绝。
+    let (_p, w) = ParserV3::compile("range(0, \"x\")\n").expect("compile");
+    assert!(
+        !check_program_witnesses(&w).is_empty(),
+        "range(0, \"x\") 应被静态类型检查拒绝"
+    );
+    assert_eq!(
+        run_runtime_only("range(0, \"x\")\n"),
+        "ERR: range() end must be a number, got string"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -334,21 +321,23 @@ fn d4_conversion_builtins_report_bad_input() {
             "ERR: int() cannot parse string: \"abc\"",
         ),
         (
-            "int on list",
-            "int([1,2])\n",
-            "ERR: int() does not accept list",
-        ),
-        (
             "float bad string",
             "float(\"x\")\n",
             "ERR: float() cannot parse string: \"x\"",
         ),
-        (
-            "float on dict",
-            "float({a:1})\n",
-            "ERR: float() does not accept dict",
-        ),
     ]);
+    // Stage 3A：typeck 在静态期先拒掉非法容器类型，运行期亦保持清晰错误。
+    for (src, rt_want) in [
+        ("int([1,2])\n", "ERR: int() does not accept list"),
+        ("float({a:1})\n", "ERR: float() does not accept dict"),
+    ] {
+        let (_p, w) = ParserV3::compile(src).expect("compile");
+        assert!(
+            !check_program_witnesses(&w).is_empty(),
+            "{src} 应被静态类型检查拒绝"
+        );
+        assert_eq!(run_runtime_only(src), rt_want);
+    }
 }
 
 #[test]
@@ -407,7 +396,7 @@ fn canonical_sum_spelling_is_stable() {
     let by_while = run(
         "let xs=[1,2,3,4,5]\nlet s=0\nlet i=0\nwhile i < len(xs)\n  assign s = s + xs[i]\n  assign i = i + 1\nend\ns\n",
     );
-    assert_eq!(by_len, "Float(15.0)");
+    assert_eq!(by_len, "Int(15)");
     assert_eq!(by_len, by_const, "for+range 与字面量上界应一致");
     assert_eq!(by_len, by_while, "for+range 与 while+len 应一致");
 }
@@ -417,7 +406,7 @@ fn canonical_sum_spelling_is_stable() {
 // ─────────────────────────────────────────────────────────────────────
 
 /// 库内测试走 `execute`，**绕过 typeck**。而 `mora run` 会在
-/// `main.rs:409` 跑 `check_program_witnesses_bidirectional`，出错即
+/// `main.rs:409` 跑 `check_program_witnesses`，出错即
 /// `process::exit(2)`。D4 那一族（typeck 放行、运行期报 Undefined）
 /// 只有在这条路径上才完整暴露，所以必须补一条子进程 e2e。
 #[test]
@@ -439,7 +428,7 @@ fn cli_path_runs_all_four_fixes() {
 
     // 逐行精确断言，避免「只要 stdout 里有 sum= 就通过」这种弱护栏。
     let expected = [
-        "sum=15.0",   // D1：修前是 0.0
+        "sum=15",     // Stage 3A-1：[1..5] 为 Int，累加得 Int 15
         "bound=5",    // D1：len 走 Int
         "chars=6",    // D2：修前是 12（UTF-8 字节）
         "method=6",   // D2：方法形式同样 6，且与自由函数同值
@@ -535,16 +524,22 @@ fn typeck_len_return_type_matches_runtime() {
     );
 
     let (code_bad, out_bad) = cli_run_src(
-        "len_float",
-        "let xs = [1,2,3]\nlet n: Float = len(xs)\nprint(n)\n",
+        "len_string",
+        "let xs = [1,2,3]\nlet n: String = len(xs)\nprint(n)\n",
     );
     assert_eq!(
         code_bad, 2,
-        "`let n: Float = len(xs)` 与运行期的 Int 不符，typeck **应当**拒绝。\n{out_bad}"
+        "`let n: String = len(xs)` 与运行期的 Int 不符，typeck **应当**拒绝。\n{out_bad}"
     );
     assert!(
         out_bad.contains("Type error"),
         "拒绝理由应是类型不匹配。\n{out_bad}"
+    );
+    // Stage 3A-2 Int <: Float 子类型拓宽，同时 `let n: Int = 1.5` 必须被拒绝
+    let (code_narrow, out_narrow) = cli_run_src("int_from_float", "let n: Int = 1.5\nprint(n)\n");
+    assert_eq!(
+        code_narrow, 2,
+        "`Float` 不得隐式赋给 `Int` 标注。\n{out_narrow}"
     );
 }
 
@@ -603,28 +598,33 @@ fn typeck_len_method_return_type_matches_runtime() {
 fn module_prefix_called_bare_does_not_panic() {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
-    // 全部 20 个 MODULE_OBJECTS 前缀，逐个验证「不崩 + 给出指路错误」
-    let prefixes = [
-        "ai", "web", "json", "file", "memory", "agent", "document", "bus", "sandbox", "schedule",
-        "ccr", "mock", "exec", "tool", "skill", "plan", "mora", "math", "stats", "linalg",
-        "random",
-    ];
+    // 全部 7 个保留的 MODULE_OBJECTS 前缀，逐个验证：
+    // 1) 静态 typeck 明确给出 "'p' is a module, not a function" 而不 panic；
+    // 2) 运行期兜底同样安全报错而非 panic。
+    let prefixes = ["json", "file", "exec", "math", "stats", "linalg", "random"];
     let mut failures = Vec::new();
     for p in prefixes {
         let src = format!("{p}(1)\n");
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
-        let r = catch_unwind(AssertUnwindSafe(|| run(&src)));
+        let r_typeck = catch_unwind(AssertUnwindSafe(|| {
+            let (_prog, w) = ParserV3::compile(&src).expect("compile");
+            check_program_witnesses(&w)
+        }));
+        let r_rt = catch_unwind(AssertUnwindSafe(|| run_runtime_only(&src)));
         std::panic::set_hook(prev);
-        let got = match r {
-            Ok(s) => s,
-            Err(_) => {
-                failures.push(format!("  [{p}] PANIC —— 模块前缀当自由函数调会崩溃"));
-                continue;
-            }
-        };
-        if !got.contains("is a module, not a function") {
-            failures.push(format!("  [{p}] 期望指路错误，实得 {got}"));
+        match r_typeck {
+            Ok(errs)
+                if errs
+                    .iter()
+                    .any(|e| e.message.contains("is a module, not a function")) => {}
+            Ok(errs) => failures.push(format!("  [{p}] typeck 期望指路错误，实得 {errs:?}")),
+            Err(_) => failures.push(format!("  [{p}] typeck PANIC")),
+        }
+        match r_rt {
+            Ok(s) if s.contains("is a module, not a function") => {}
+            Ok(s) => failures.push(format!("  [{p}] runtime 期望指路错误，实得 {s}")),
+            Err(_) => failures.push(format!("  [{p}] runtime PANIC")),
         }
     }
     assert!(
@@ -642,7 +642,7 @@ fn module_prefix_called_bare_does_not_panic() {
 fn module_method_calls_still_work() {
     expect_all(&[
         ("math.floor", "math.floor(2.5)\n", "Float(2.0)"),
-        ("math.abs", "math.abs(-3)\n", "Float(3.0)"),
+        ("math.abs", "math.abs(-3)\n", "Int(3)"),
         ("stats.mean", "stats.mean([1,2,3])\n", "Float(2.0)"),
         ("linalg.norm", "linalg.norm([3,4])\n", "Float(5.0)"),
         ("json.parse", "json.parse(\"{}\")\n", "Dict({})"),
@@ -656,7 +656,7 @@ fn shadowed_module_name_is_still_callable() {
     expect_all(&[(
         "let math = fn(x) x * 2 end",
         "let math = fn(x) x * 2 end\nmath(21)\n",
-        "Float(42.0)",
+        "Int(42)",
     )]);
 }
 
@@ -709,7 +709,6 @@ fn methods_of_never_reports_an_unimplemented_method() {
                 ("batch", "[3,1,2].batch(2)"),
                 ("reshape", "[3,1,2].reshape(1, 3)"),
                 ("transpose", "[[1,2],[3,4]].transpose()"),
-                ("crush_json", "[3,1,2].crush_json(2)"),
             ],
         ),
         (
@@ -768,31 +767,6 @@ fn methods_of_never_reports_an_unimplemented_method() {
     );
 }
 
-/// D7：`Type::AiConfig` / `Type::HttpRequest` 的方法签名是**不可达死注册**。
-///
-/// `Value::AiConfig` 与 `Value::HttpRequest` 全仓从未被构造，`call_method`
-/// 也没有它们的分支。所以今天这不是用户可见缺陷 —— 但它是一枚**地雷**：
-/// 谁哪天补上构造入口，这些签名立刻变成「typeck 放行 → 运行期报
-/// Can only call methods on …」。
-///
-/// 这里钉住「确实拿不到这样的值」这个事实，好让补构造的人看见这条测试
-/// 失败并知道还要补 `call_method` 分支。
-#[test]
-fn ai_config_and_http_request_values_are_unconstructible() {
-    // 构造入口不存在
-    expect_all(&[(
-        "AiConfig::new()",
-        "AiConfig::new()\n",
-        "ERR: Undefined function or task: AiConfig::new",
-    )]);
-    // `with` 块把配置存进 Rust 侧的 CoreRuntime，不是 Value::AiConfig
-    assert_eq!(
-        run("with model = \"m\"\n  1\nend\n"),
-        "Nil",
-        "`with` 块不产生 AiConfig 值"
-    );
-}
-
 /// 反向对拍：typeck 为 String/Dict/List 注册的每个方法名，运行期都得有分支。
 /// 这一侧是「typeck 放行 → 运行期 Unknown method」那一族（v0.104.6 修掉的
 /// `str()` / `int()` / `float()` / `bool()` 在自由函数侧；方法侧此前干净，
@@ -835,101 +809,15 @@ fn typeck_registered_methods_all_exist_at_runtime() {
     );
 }
 
-// ─────────────────────────────────────────────────────────────────────
-// D9：ai.chat 的返回类型 —— 语言主打能力从源码层完全不可达
-// ─────────────────────────────────────────────────────────────────────
-
-/// typeck 把 `ai.chat` 声明为 `-> Type::AiResult`，而 `Value` 里**没有任何**
-/// `AiResult` 变体 —— 它是个只存在于 typeck 的幽灵类型。于是返回值没有任何
-/// 东西能消费，连 `print` 的形参类型里都没有它：
-///
-/// ```text
-/// 修前（真实 CLI `mora run`，均 exit 2）：
-///   let reply = ai.chat("hi")     Type mismatch: expected string|int|…, got ai_result
-///   print(ai.chat("hi"))          同上
-/// ```
-///
-/// 连「先赋值再打印」都过不了 —— **`ai.chat` 在源语言里任何用法都用不了**。
-/// 而 `do_ai_chat` 的每一条路径（mock / replay / cache / real / tools /
-/// agent）都返回 `Value::String`；运行期自己的记录签名也写着
-/// `"ai.chat(model: string, prompt: string) -> string"`。是 typeck 写错了。
-///
-/// 这里逐条钉住常见用法的**可编译性** —— 判据是「typeck 放行」，所以必须走
-/// 真实 CLI（库内 `execute` 绕过 typeck，见本文件上方说明）。
+/// v0.110.0 W2.6：`p"..."`（Agent Prompt 特化字面量）连同 `PromptString`/`ControlInst::Prompt` 一并退出语言内核，
+/// `p"say hi"` 不得再被词法/解析器静默放行为模板字面量。
 #[test]
-fn ai_chat_is_usable_from_source() {
-    let cases: &[(&str, &str)] = &[
-        ("直接 print", "print(ai.chat(\"hi\"))\n"),
-        ("赋值再 print", "let r = ai.chat(\"hi\")\nprint(r)\n"),
-        (
-            "字符串拼接",
-            "let r = ai.chat(\"hi\")\nprint(\"reply: \" + r)\n",
-        ),
-        ("标注 String", "let r: String = ai.chat(\"hi\")\nprint(r)\n"),
-        ("当作值返回", "ai.chat(\"hi\")\n"),
-    ];
-    let mut failures = Vec::new();
-    for (i, (name, src)) in cases.iter().enumerate() {
-        let (code, out) = cli_run_src(&format!("chat_{i}"), src);
-        if code != 0 {
-            failures.push(format!("  [{name}] exit={code}\n{out}"));
-        }
-    }
-    assert!(
-        failures.is_empty(),
-        "ai.chat 在源语言里不可用：\n{}",
-        failures.join("\n")
+fn prompt_string_syntax_is_retired() {
+    let (code, _out) = cli_run_src("retired_prompt", "let r = p\"say hi\"\nprint(r)\n");
+    assert_ne!(
+        code, 0,
+        "v0.110.0 已彻底移除 p\"...\" 语法，cli 运行应当报错退出"
     );
-}
-
-/// 顺带把整个 AI surface 扫一遍 —— 同一族的阻塞可能不止 `ai.chat` 一处。
-#[test]
-fn ai_surface_is_usable_from_source() {
-    let cases: &[(&str, &str)] = &[
-        ("p\"...\" 赋值", "let r = p\"say hi\"\nprint(r)\n"),
-        ("p\"...\" 直接 print", "print(p\"say hi\")\n"),
-        ("ai.critic", "let v = ai.critic(\"answer\")\nprint(v)\n"),
-        (
-            "ai.critic 取 verdict",
-            "let v = ai.critic(\"answer\")\nprint(v.get(\"verdict\"))\n",
-        ),
-        ("ai.tokens.input", "print(ai.tokens.input)\n"),
-        ("ai.tokens.total", "print(ai.tokens.total)\n"),
-        (
-            "with 块内 chat",
-            "with model = \"m\"\n  print(ai.chat(\"hi\"))\nend\n",
-        ),
-        ("Router::new", "let r = Router::new()\nprint(type_of(r))\n"),
-        (
-            "McpServer::new",
-            "let m = McpServer::new()\nprint(type_of(m))\n",
-        ),
-    ];
-    let mut failures = Vec::new();
-    for (i, (name, src)) in cases.iter().enumerate() {
-        let (code, out) = cli_run_src(&format!("surface_{i}"), src);
-        if code != 0 {
-            failures.push(format!("  [{name}] exit={code}\n{out}"));
-        }
-    }
-    assert!(
-        failures.is_empty(),
-        "AI surface 有写法过不了类型检查：\n{}",
-        failures.join("\n")
-    );
-}
-
-/// `ai.critic` 不只该能编译，还得真给出 spec §12.5 承诺的结构化裁决。
-#[test]
-fn ai_critic_returns_structured_verdict() {
-    let (code, out) = cli_run_src("critic_shape", "print(ai.critic(\"the answer\"))\n");
-    assert_eq!(code, 0, "ai.critic 应能跑通。\n{out}");
-    for key in ["verdict", "critique", "score"] {
-        assert!(
-            out.contains(key),
-            "裁决 dict 应含 `{key}` 字段（spec §12.5）。\n{out}"
-        );
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -957,8 +845,8 @@ fn imported_module_handle_index_works() {
         "import 进来的 handle+索引应能跑通。\nstderr:\n{stderr}"
     );
     assert!(
-        stdout.contains("20.0"),
-        "t = [10,20,30]，t[1] 应得 20.0。实际 stdout:\n{stdout}"
+        stdout.contains("\n20\n") || stdout.contains("20"),
+        "t = [10,20,30]，t[1] 应得 20。实际 stdout:\n{stdout}"
     );
     assert!(
         !format!("{stdout}{stderr}").contains("Undefined function or task: []"),
@@ -1097,7 +985,6 @@ fn numeric_methods_of_are_all_callable() {
         "abs", "sign", "floor", "ceil", "round", "sqrt", "sin", "cos", "tan", "exp", "log", "log2",
         "log10", "to_float",
     ];
-    let bigint_methods = ["abs", "sign", "to_float", "to_int"];
 
     let cases: Vec<(&str, &str, &[&str])> = vec![
         // 注意 receiver 必须是**真 Float/Int**，不能写字面量 3 —— 本语言
@@ -1105,7 +992,6 @@ fn numeric_methods_of_are_all_callable() {
         // 报的是 Float 表而不是 Int 表。
         ("Float", "1.5", &float_methods),
         ("Int", "int(\"3\")", &int_methods),
-        ("BigInt", "5n", &bigint_methods),
     ];
 
     let mut failures = Vec::new();
@@ -1194,16 +1080,21 @@ fn method_call_binds_tighter_than_unary_minus() {
 /// 这条很容易在写测试时误判（我第一轮就踩了），故显式钉住。
 #[test]
 fn methods_of_routes_by_runtime_type_not_literal_shape() {
-    // 字面量 3 是 Float
-    assert_eq!(run("type_of(3)\n"), "String(\"float\")");
-    let float_tbl = run("methods_of(3)\n");
+    // Stage 3A-1：无后缀 `3` 是 Int；`3.0` 是 Float。
+    assert_eq!(run("type_of(3)\n"), "String(\"int\")");
+    assert_eq!(run("type_of(3.0)\n"), "String(\"float\")");
+    let float_tbl = run("methods_of(3.0)\n");
     assert!(
         float_tbl.contains("\"trunc\"") && float_tbl.contains("\"to_int\""),
         "Float 表应含 trunc/to_int：{float_tbl}"
     );
     // 真 Int
     assert_eq!(run("type_of(int(\"3\"))\n"), "String(\"int\")");
-    for src in ["methods_of(int(\"3\"))", "methods_of(len([1,2,3]))"] {
+    for src in [
+        "methods_of(3)",
+        "methods_of(int(\"3\"))",
+        "methods_of(len([1,2,3]))",
+    ] {
         let tbl = run(&format!("{src}\n"));
         assert!(
             tbl.contains("\"to_float\"") && !tbl.contains("\"trunc\""),
@@ -1237,10 +1128,9 @@ fn bool_agrees_with_language_truthiness() {
         ("nil", "nil"),
         ("true", "true"),
         ("false", "false"),
-        ("int 0", "0"),
+        ("int 0", "0i"),
+        ("int 1", "1i"),
         ("float 0.0", "0.0"),
-        ("bigint 0n", "0n"),
-        ("bigint 1n", "1n"),
         ("empty string", "\"\""),
         ("nonempty string", "\"a\""),
         ("empty list", "[]"),
@@ -1248,17 +1138,14 @@ fn bool_agrees_with_language_truthiness() {
         ("empty dict", "{}"),
         ("nonempty dict", "{a: 1}"),
         ("closure", "fn(x) x end"),
-        ("Router", "Router::new()"),
-        ("McpServer", "McpServer::new()"),
-        ("agent", "agent.create(\"x\", {})"),
     ];
     let mut failures = Vec::new();
     for (name, e) in exprs {
         // if 走语言真值判断：真分支返 1.0，假分支返 0.0
         let t = run_runtime_only(&format!("if {e}\n  1\nelse\n  0\nend\n"));
         let truthy = match t.as_str() {
-            "Float(1.0)" => "true",
-            "Float(0.0)" => "false",
+            "Int(1)" | "Float(1.0)" => "true",
+            "Int(0)" | "Float(0.0)" => "false",
             other => {
                 failures.push(format!("  [{name}] if 判真返回了意外值 {other}"));
                 continue;
@@ -1388,186 +1275,13 @@ fn ambient_labels_and_method_mapping_agree() {
 /// 对需要入参的 handler 以空参调用。typeck 一直声明的是三形参
 /// `tool(name, schema, handler)` —— 契约对，运行期没兑现。
 ///
-/// 内部三元组的断言在 `src/interpreter/dispatch.rs::tests`（源码侧看不到
-/// `McpServer` 的内部结构，它没有 `json` 方法）。这里钉源码可观测的那一面。
-#[test]
-fn mcp_tool_rejects_non_schema_argument() {
-    // 非 dict / 非 JSON 字符串的 schema 应**报错**，不能静默降级成 `{}`
-    let (code, out) = cli_run_src(
-        "mcp_bad_schema",
-        "let m = McpServer::new()\nm.tool(\"t\", 1, fn(x) x end)\n",
-    );
-    assert_ne!(
-        code, 0,
-        "数字 schema 应被拒（静默变空对象会让客户端以为无参数）"
-    );
-    assert!(
-        out.contains("schema must be a dict or JSON string"),
-        "错误信息应点明 schema 的合法形态。\n{out}"
-    );
-}
-
-/// `tool()` 与 `push` / `sort` 同语义：**返回新值，接收者不变**。
-/// 这条很容易写错 —— 不接返回值会看起来像「工具没注册成功」而误判成缺陷。
-#[test]
-fn mcp_tool_returns_new_server_and_leaves_receiver_unchanged() {
-    // 显示文本只能从 stdout 拿（`print` 自身返回 Nil），故走 CLI。
-    // 库内 `run()` 返回**最后一个表达式的值**，不是 stdout。
-    let cases: &[(&str, &str, &str)] = &[
-        (
-            "原接收者不变",
-            "let m = McpServer::new()\nlet m2 = m.tool(\"t\", {a: 1}, fn(x) x end)\nprint(m)\n",
-            "<mcp_server (0 tools)>",
-        ),
-        (
-            "返回值含 1 个工具",
-            "let m = McpServer::new()\nlet m2 = m.tool(\"t\", {a: 1}, fn(x) x end)\nprint(m2)\n",
-            "<mcp_server (1 tools)>",
-        ),
-    ];
-    for (i, (name, src, want)) in cases.iter().enumerate() {
-        let (code, out) = cli_run_src(&format!("mcp_ret_{i}"), src);
-        assert_eq!(code, 0, "[{name}] 应跑通。\n{out}");
-        assert!(
-            out.contains(want),
-            "[{name}] 期望 stdout 含 `{want}`。\n{out}"
-        );
-    }
-}
-
-/// dict 与 JSON 字符串两种 schema 写法都应被接受（前者序列化成 JSON 字符串）。
-#[test]
-fn mcp_tool_accepts_dict_and_json_string_schema() {
-    for (name, schema_lit) in [
-        ("dict", "{a: 1}"),
-        ("json string", "\"{\\\"type\\\":\\\"object\\\"}\""),
-        ("nil", "nil"),
-    ] {
-        let (code, out) = cli_run_src(
-            &format!("mcp_schema_{name}"),
-            &format!(
-                "let m = McpServer::new()\nlet m2 = m.tool(\"t\", {schema_lit}, fn(x) x end)\nprint(m2)\n"
-            ),
-        );
-        assert_eq!(code, 0, "{name} schema 应被接受。\n{out}");
-        assert!(
-            out.contains("(1 tools)"),
-            "{name} schema 应注册成功。\n{out}"
-        );
-    }
-}
-
-/// `Value::methods()` 覆盖 11 个类型，其中 6 个已审（String/List/Dict/
-/// Int/Float/BigInt）。这里把剩下三个**可构造**的也钉上：
-/// `Router`（`Router::new()`）、`McpServer`（`McpServer::new()`）、
-/// `Agent`（`agent.create(name, config)`）。
-///
-/// `Conversation` / `Stream` 两个值类型全仓**无构造点**（只在
-/// `type_name` / `json` / `display` 里被模式匹配），与 `Value::AiConfig`
-/// 同类，属不可达，不在本测试范围。
-#[test]
-fn server_side_methods_of_are_all_callable() {
-    // `methods_of(x)` 作**末表达式**（不用 print 包裹）—— `run()` 取的是
-    // 最后一个表达式的值，`print` 会把它变成 Nil。
-    let router_tbl = run("let r = Router::new()\nmethods_of(r)\n");
-    for m in ["route", "listen"] {
-        assert!(
-            router_tbl.contains(&format!("\"{m}\"")),
-            "Router 表应含 `{m}`：{router_tbl}"
-        );
-    }
-    // route 真能调（listen 会起 HTTP server，不在测试里跑）
-    assert!(
-        !run("let r = Router::new()\nlet h = fn(req) \"ok\" end\nr.route(\"GET\", \"/x\", h)\n")
-            .starts_with("ERR"),
-        "Router.route 应可调"
-    );
-
-    let mcp_tbl = run("let m = McpServer::new()\nmethods_of(m)\n");
-    for m in ["tool", "serve"] {
-        assert!(
-            mcp_tbl.contains(&format!("\"{m}\"")),
-            "McpServer 表应含 `{m}`：{mcp_tbl}"
-        );
-    }
-
-    // Agent：注意是**两个**实参（名字字符串 + 配置 dict）
-    let agent = run("let a = agent.create(\"x\", {})\nmethods_of(a)\n");
-    for m in ["run", "name", "max_steps"] {
-        assert!(
-            agent.contains(&format!("\"{m}\"")),
-            "Agent 表应含 `{m}`：{agent}"
-        );
-    }
-    expect_all(&[
-        (
-            "agent.name",
-            "let a = agent.create(\"x\", {})\na.name()\n",
-            "String(\"x\")",
-        ),
-        // 注意返 Float 不是 Int —— 数值在本语言里默认是 Float
-        (
-            "agent.max_steps 默认",
-            "let a = agent.create(\"x\", {})\na.max_steps()\n",
-            "Float(10.0)",
-        ),
-    ]);
-}
-
-// ─────────────────────────────────────────────────────────────────────
-// D11：print() 拒绝 router / mcp_server —— 最基本的调试写法被挡住
-// ─────────────────────────────────────────────────────────────────────
-
-/// `print` 的形参 Union 此前只列 9 个原始类型，于是：
-///
-/// ```text
-/// let r = Router::new()     → print(r)  exit 2
-///   "expected string|int|float|bigint|bool|char|nil|list|dict, got router"
-/// let m = McpServer::new()  → print(m)  exit 2（同上，got mcp_server）
-/// ```
-///
-/// 而运行期**明明能打印** —— `call_builtin_print` 对每个实参调
-/// `Value::to_string()`，`value/display.rs` 为 Router / McpServer / Agent /
-/// Conversation / Stream / Task / Closure / Builtin 都写了专门的 Display 臂。
-/// 旁证：`str(r)` 一直好使，输出 `<router (0 routes)>`。
-///
-/// 又一次「typeck 声明窄于运行期实际能力」，与 `ai.chat` 声明 `-> AiResult`
-/// 同源。判据是**真实 CLI**（库内 `execute` 绕过 typeck）。
-#[test]
-fn print_accepts_server_and_handle_values() {
-    let cases: &[(&str, &str)] = &[
-        ("Router::new()", "print(Router::new())\n"),
-        ("router 变量", "let r = Router::new()\nprint(r)\n"),
-        ("McpServer::new()", "print(McpServer::new())\n"),
-        ("mcp 变量", "let m = McpServer::new()\nprint(m)\n"),
-        ("agent", "let a = agent.create(\"x\", {})\nprint(a)\n"),
-        (
-            "注册过工具的 mcp",
-            "let m = McpServer::new()\nlet m2 = m.tool(\"t\", {a: 1}, fn(x) x end)\nprint(m2)\n",
-        ),
-    ];
-    let mut failures = Vec::new();
-    for (i, (name, src)) in cases.iter().enumerate() {
-        let (code, out) = cli_run_src(&format!("print_val_{i}"), src);
-        if code != 0 {
-            failures.push(format!("  [{name}] exit={code}\n{out}"));
-        }
-    }
-    assert!(
-        failures.is_empty(),
-        "print 拒绝了运行期明明能打印的值：\n{}",
-        failures.join("\n")
-    );
-}
-
-/// 放宽 Union 是安全方向 —— 但仍要确认原始类型一个都没被挤掉，
-/// 且变参行为（join("\t")）保持。
+/// 确认原始类型（含 Int/Float/Bool/String）仍可打印且 `print` 保持变参行为。
 #[test]
 fn print_still_accepts_primitives_and_is_variadic() {
-    let (code, out) = cli_run_src("print_prims", "print(1, \"a\", true, 2n)\n");
+    let (code, out) = cli_run_src("print_prims", "print(1, \"a\", true, 2i, 1.5)\n");
     assert_eq!(code, 0, "原始类型应照常可打印。\n{out}");
     assert!(
-        out.contains("1.0\ta\ttrue\t2n"),
+        out.contains("1\ta\ttrue\t2\t1.5"),
         "变参应 join(\"\\t\") 且保留各类型显示形态。\n{out}"
     );
     // 容器仍可打印

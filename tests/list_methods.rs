@@ -24,18 +24,12 @@ use std::sync::Arc;
 
 /// 跑一段源码，返回顶层 body 的值（格式化后便于断言）。
 fn run(src: &str) -> String {
-    let (func, _w) = mora::parser_v3::ParserV3::compile(src)
+    let (prog, _w) = mora::parser_v3::ParserV3::compile(src)
         .unwrap_or_else(|e| panic!("compile failed for:\n{src}\n{e}"));
-    let arc = Arc::new(func);
-    let mut interp = mora::interpreter::Interpreter::new();
-    let mut env = interp.take_env();
-    match mora::mir::vm::execute(
-        &arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    ) {
-        Ok(v) => format!("{v:?}"),
+    let arc = Arc::new(prog);
+    let mut core = mora::runtime::CoreRuntime::default();
+    match mora::runtime::vm::execute_program(arc, &mut core) {
+        Ok((v, _)) => format!("{v:?}"),
         Err(e) => format!("ERR: {e}"),
     }
 }
@@ -44,40 +38,40 @@ fn run(src: &str) -> String {
 ///
 /// 期望值取自 2026-09-28 的语义 A/B 快照（改动前后 32/32 一致）。
 fn cases() -> Vec<(&'static str, &'static str, String)> {
-    let f = |n: f64| format!("Float({n:?})");
+    let i = |n: i64| format!("Int({n})");
     let l = |s: &str| format!("List([{s}])");
     let ll = |rows: &[&str]| format!("List([{}])", rows.join(", "));
 
     vec![
         // ── shape ────────────────────────────────────────────────────────
-        ("shape.empty", "let L = []\nL.shape()", l(&f(0.0))),
-        ("shape.scalar1d", "let L = [1, 2, 3]\nL.shape()", l(&f(3.0))),
+        ("shape.empty", "let L = []\nL.shape()", l(&i(0))),
+        ("shape.scalar1d", "let L = [1, 2, 3]\nL.shape()", l(&i(3))),
         (
             "shape.2d",
             "let L = [[1, 2, 3], [4, 5, 6]]\nL.shape()",
-            l(&format!("{}, {}", f(2.0), f(3.0))),
+            l(&format!("{}, {}", i(2), i(3))),
         ),
         (
             "shape.3d",
             "let L = [[[1, 2], [3, 4]]]\nL.shape()",
-            l(&format!("{}, {}, {}", f(1.0), f(2.0), f(2.0))),
+            l(&format!("{}, {}, {}", i(1), i(2), i(2))),
         ),
-        ("shape.mixed", "let L = [1, [2, 3]]\nL.shape()", l(&f(2.0))),
+        ("shape.mixed", "let L = [1, [2, 3]]\nL.shape()", l(&i(2))),
         // ── flatten ──────────────────────────────────────────────────────
         (
             "flatten.flat",
             "let L = [1, 2, 3]\nL.flatten()",
-            l("Float(1.0), Float(2.0), Float(3.0)"),
+            l("Int(1), Int(2), Int(3)"),
         ),
         (
             "flatten.2d",
             "let L = [[1, 2], [3, 4]]\nL.flatten()",
-            l("Float(1.0), Float(2.0), Float(3.0), Float(4.0)"),
+            l("Int(1), Int(2), Int(3), Int(4)"),
         ),
         (
             "flatten.3d",
             "let L = [[[1], [2]], [[3]]]\nL.flatten()",
-            l("Float(1.0), Float(2.0), Float(3.0)"),
+            l("Int(1), Int(2), Int(3)"),
         ),
         (
             "flatten.empty",
@@ -87,56 +81,41 @@ fn cases() -> Vec<(&'static str, &'static str, String)> {
         (
             "flatten.mixed",
             "let L = [1, [2, [3, 4]], 5]\nL.flatten()",
-            l("Float(1.0), Float(2.0), Float(3.0), Float(4.0), Float(5.0)"),
+            l("Int(1), Int(2), Int(3), Int(4), Int(5)"),
         ),
         // ── reshape ──────────────────────────────────────────────────────
         (
             "reshape.2x3",
             "let L = [1, 2, 3, 4, 5, 6]\nL.reshape(2, 3)",
-            ll(&[
-                &l("Float(1.0), Float(2.0), Float(3.0)"),
-                &l("Float(4.0), Float(5.0), Float(6.0)"),
-            ]),
+            ll(&[&l("Int(1), Int(2), Int(3)"), &l("Int(4), Int(5), Int(6)")]),
         ),
         (
             "reshape.3x2",
             "let L = [1, 2, 3, 4, 5, 6]\nL.reshape(3, 2)",
             ll(&[
-                &l("Float(1.0), Float(2.0)"),
-                &l("Float(3.0), Float(4.0)"),
-                &l("Float(5.0), Float(6.0)"),
+                &l("Int(1), Int(2)"),
+                &l("Int(3), Int(4)"),
+                &l("Int(5), Int(6)"),
             ]),
         ),
         // 既有行为：不足时循环重复已有前缀补齐
         (
             "reshape.pad",
             "let L = [1, 2, 3]\nL.reshape(2, 3)",
-            ll(&[
-                &l("Float(1.0), Float(2.0), Float(3.0)"),
-                &l("Float(1.0), Float(2.0), Float(3.0)"),
-            ]),
+            ll(&[&l("Int(1), Int(2), Int(3)"), &l("Int(1), Int(2), Int(3)")]),
         ),
         (
             "reshape.1x6",
             "let L = [1, 2, 3, 4, 5, 6]\nL.reshape(1, 6)",
-            ll(&[&l(
-                "Float(1.0), Float(2.0), Float(3.0), Float(4.0), Float(5.0), Float(6.0)",
-            )]),
+            ll(&[&l("Int(1), Int(2), Int(3), Int(4), Int(5), Int(6)")]),
         ),
         (
             "reshape.nested_in",
             "let L = [[1, 2], [3, 4]]\nL.reshape(4, 1)",
-            ll(&[
-                &l("Float(1.0)"),
-                &l("Float(2.0)"),
-                &l("Float(3.0)"),
-                &l("Float(4.0)"),
-            ]),
+            ll(&[&l("Int(1)"), &l("Int(2)"), &l("Int(3)"), &l("Int(4)")]),
         ),
         // v0.104.6 D153：措辞由 `reshape() requires rows argument` 统一为
         // `reshape: requires rows`（`builtins::required_num_arg` 的格式）。
-        // **行为未变** —— 两者都是「真没传参」时的诚实报错；D153 修的是
-        // 「传了合法 `Int` 却被报成没传」那个归因错误。
         (
             "reshape.noargs",
             "let L = [1, 2, 3]\nL.reshape()",
@@ -146,23 +125,23 @@ fn cases() -> Vec<(&'static str, &'static str, String)> {
         (
             "push.basic",
             "let L = [1, 2]\nL.push(3)",
-            l("Float(1.0), Float(2.0), Float(3.0)"),
+            l("Int(1), Int(2), Int(3)"),
         ),
         (
             "push.nil",
             "let L = [1, 2]\nL.push()",
-            l("Float(1.0), Float(2.0), Nil"),
+            l("Int(1), Int(2), Nil"),
         ),
-        ("push.empty", "let L = []\nL.push(1)", l("Float(1.0)")),
+        ("push.empty", "let L = []\nL.push(1)", l("Int(1)")),
         (
             "push.nested",
             "let L = [[1], [2]]\nL.push([3])",
-            ll(&[&l("Float(1.0)"), &l("Float(2.0)"), &l("Float(3.0)")]),
+            ll(&[&l("Int(1)"), &l("Int(2)"), &l("Int(3)")]),
         ),
         (
             "pop.basic",
             "let L = [1, 2, 3]\nL.pop()",
-            "Float(3.0)".to_string(),
+            "Int(3)".to_string(),
         ),
         ("pop.empty", "let L = []\nL.pop()", "Nil".to_string()),
         // ── stats 链 ─────────────────────────────────────────────────────
@@ -238,13 +217,13 @@ fn push_does_not_mutate_the_receiver() {
     // 浅层：标量元素
     assert_eq!(
         run("let L = [1, 2]\nlet M = L.push(3)\nL"),
-        "List([Float(1.0), Float(2.0)])",
+        "List([Int(1), Int(2)])",
         "push 后原列表必须保持不变（标量元素）"
     );
     // 深层：嵌套列表元素 —— 共享子结构也不得被就地改写
     assert_eq!(
         run("let L = [[1], [2]]\nlet M = L.push([3])\nL"),
-        "List([List([Float(1.0)]), List([Float(2.0)])])",
+        "List([List([Int(1)]), List([Int(2)])])",
         "push 后原列表必须保持不变（嵌套元素）"
     );
 }
@@ -254,7 +233,7 @@ fn push_does_not_mutate_the_receiver() {
 fn push_accumulation_in_loop_is_correct() {
     assert_eq!(
         run("let xs = []\nlet i = 0\nwhile i < 5\n  let xs = xs.push(i)\n  let i = i + 1\nend\nxs"),
-        "List([Float(0.0), Float(1.0), Float(2.0), Float(3.0), Float(4.0)])",
+        "List([Int(0), Int(1), Int(2), Int(3), Int(4)])",
     );
     assert_eq!(
         run(
@@ -269,7 +248,7 @@ fn push_accumulation_in_loop_is_correct() {
 fn pop_does_not_mutate_the_receiver() {
     assert_eq!(
         run("let L = [1, 2, 3]\nlet x = L.pop()\nL"),
-        "List([Float(1.0), Float(2.0), Float(3.0)])",
+        "List([Int(1), Int(2), Int(3)])",
         "pop 后原列表必须保持不变"
     );
 }
@@ -302,7 +281,7 @@ fn list_methods_undefined_quirks_are_pinned_not_enshrined() {
         (
             "shape(ragged)",
             "let L = [[1, 2], [3, 4, 5]]\nL.shape()",
-            "List([Float(2.0), Float(2.0)])",
+            "List([Int(2), Int(2)])",
         ),
     ];
 

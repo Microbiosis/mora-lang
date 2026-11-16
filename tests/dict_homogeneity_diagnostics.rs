@@ -24,7 +24,7 @@
 //!   消息说明**约束本身**、带上**键名**，span 指向**出问题的值**。
 
 use mora::parser_v3::ParserV3;
-use mora::typeck::check_mir::check_program_witnesses_bidirectional;
+use mora::typeck::check_mir::check_program_witnesses;
 
 /// 一条诊断的「消息 + 位置」。
 ///
@@ -33,7 +33,7 @@ use mora::typeck::check_mir::check_program_witnesses_bidirectional;
 /// 故这里取字段，**不**拼字符串 —— 拼了就把判据绑死在渲染格式上。
 fn typeck_errors(src: &str) -> Vec<(String, usize, usize)> {
     let (_f, wits) = ParserV3::compile(src).expect("语法应通过");
-    check_program_witnesses_bidirectional(&wits)
+    check_program_witnesses(&wits)
         .iter()
         .map(|e| (e.message.clone(), e.line, e.column))
         .collect()
@@ -59,7 +59,7 @@ fn d124_dict_heterogeneity_error_explains_the_constraint_and_names_the_key() {
         "诊断必须点名**出问题的键**（这里是 's'）: {msg}"
     );
     assert!(
-        msg.contains("Float") && msg.contains("String"),
+        msg.contains("int") && msg.contains("string"),
         "诊断应同时给出两种类型，便于自查: {msg}"
     );
     // 旧的笼统措辞不应再出现

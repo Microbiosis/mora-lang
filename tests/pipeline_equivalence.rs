@@ -62,48 +62,42 @@
 
 use std::sync::Arc;
 
-use mora::interpreter::Interpreter;
-use mora::mir::vm::execute;
-use mora::parser_v3::ParserV3;
+use mora::mir::control::{CalleeTarget, ControlInst, ControlProgram, OptLevel};
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::execute_program;
 
 /// 在给定优化档位下编译并执行，返回结果的字符串形式。
 ///
 /// 档位不变性判据用它：**优化器只能改效率，不能改语义**。
-fn run_at_opt(src: &str, level: mora::mir::ssa::OptLevel) -> String {
+fn run_at_opt(src: &str, level: OptLevel) -> String {
     match mora::cli::compile_and_opt(src, Some(level)) {
-        Ok((f, _)) => exec(f),
+        Ok((p, _)) => exec(p),
         Err(e) => format!("COMPILE-ERR: {e}"),
     }
 }
 
 /// 三个优化档位下结果是否一致。
 fn stable_across_opt_levels(src: &str) -> (bool, String, String, String) {
-    let off = run_at_opt(src, mora::mir::ssa::OptLevel::None);
-    let basic = run_at_opt(src, mora::mir::ssa::OptLevel::Basic);
-    let aggressive = run_at_opt(src, mora::mir::ssa::OptLevel::Aggressive);
+    let off = run_at_opt(src, OptLevel::None);
+    let basic = run_at_opt(src, OptLevel::Basic);
+    let aggressive = run_at_opt(src, OptLevel::Aggressive);
     let same = off == basic && basic == aggressive;
     (same, off, basic, aggressive)
 }
 
-fn exec(func: mora::mir::MirFunction) -> String {
-    let arc = Arc::new(func);
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    match execute(
-        &arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    ) {
-        Ok(v) => format!("{v:?}"),
+fn exec(prog: ControlProgram) -> String {
+    let arc = Arc::new(prog);
+    let mut core = CoreRuntime::default();
+    match execute_program(arc, &mut core) {
+        Ok((v, _)) => format!("{v:?}"),
         Err(e) => format!("ERR: {e}"),
     }
 }
 
-/// 裸路径：`ParserV3::compile`，不过 9 层管线。`import` / `eval` 走的就是它。
+/// 无优化基线路径（OptLevel::None）。
 fn run_bare(src: &str) -> String {
-    match ParserV3::compile(src) {
-        Ok((f, _)) => exec(f),
+    match mora::cli::compile_and_opt(src, Some(OptLevel::None)) {
+        Ok((p, _)) => exec(p),
         Err(e) => format!("COMPILE-ERR: {e}"),
     }
 }
@@ -111,7 +105,7 @@ fn run_bare(src: &str) -> String {
 /// 管线路径：`cli::compile_and_opt`，与 `mora run` 同构。
 fn run_pipeline(src: &str) -> String {
     match mora::cli::compile_and_opt(src, None) {
-        Ok((f, _)) => exec(f),
+        Ok((p, _)) => exec(p),
         Err(e) => format!("COMPILE-ERR: {e}"),
     }
 }
@@ -158,11 +152,11 @@ fn handle_body_index_is_stable_across_opt_levels() {
 /// 不能只验「两条一致」—— 两条一起错也会通过。所以另钉一组**绝对值**。
 #[test]
 fn handle_body_index_has_correct_absolute_value() {
-    // 合法索引：t = [10,20,30]，t[1] = 20.0
-    assert_eq!(run_pipeline(HANDLE_OK), "Float(20.0)", "管线路径应得 20.0");
+    // 合法索引：t = [10,20,30]，t[1] = 20
+    assert_eq!(run_pipeline(HANDLE_OK), "Int(20)", "管线路径应得 20");
     assert_eq!(
         run_bare(HANDLE_OK),
-        "Float(20.0)",
+        "Int(20)",
         "裸路径（import/eval 走的）此前报 Undefined function or task: []"
     );
     // 越界：真实错误信息，不是「调用一个不存在的函数」
@@ -185,7 +179,8 @@ fn handle_body_index_has_correct_absolute_value() {
 fn witness_index_encoding_is_decoded_back_to_index_instruction() {
     use mora::mir::witness::{WitnessCallee, WitnessKind};
 
-    let (func, witnesses) = ParserV3::compile("let t = [1,2]\nt[0]\n").expect("compile");
+    let (prog, witnesses) =
+        mora::cli::compile_and_opt("let t = [1,2]\nt[0]\n", None).expect("compile");
 
     // witness 侧：确实是 Call("[]") 编码（有意为之）
     fn has_index_encoding(w: &mora::mir::witness::MirWitness) -> bool {
@@ -202,20 +197,29 @@ fn witness_index_encoding_is_decoded_back_to_index_instruction() {
          若不再如此说明编码变了，本测试需重新审视"
     );
 
-    // 但 lower 之后不得残留 Call("[]")，必须是 Index
-    let has_call_bracket = func
-        .body
+    // 但 lower 之后不得残留 Call("[]")，必须是 ControlInst::Index
+    let insts: Vec<&ControlInst> = prog
+        .functions
         .iter()
-        .any(|i| matches!(i, mora::mir::MirInst::Call(_, n, _) if n == "[]"));
+        .flat_map(|f| f.blocks.iter())
+        .flat_map(|b| b.insts.iter())
+        .collect();
+    let has_call_bracket = insts.iter().any(|i| {
+        matches!(
+            i,
+            ControlInst::Call {
+                target: CalleeTarget::DynGlobal(sym),
+                ..
+            } if prog.symbols.resolve(*sym) == "[]"
+        )
+    });
     assert!(
         !has_call_bracket,
-        "lower 后不应残留 Call(\"[]\") —— 索引必须解码成 MirInst::Index"
+        "lower 后不应残留 Call(\"[]\") —— 索引必须解码成 ControlInst::Index"
     );
     assert!(
-        func.body
-            .iter()
-            .any(|i| matches!(i, mora::mir::MirInst::Index(..))),
-        "顶层索引应产出 MirInst::Index"
+        insts.iter().any(|i| matches!(i, ControlInst::Index(..))),
+        "顶层索引应产出 ControlInst::Index"
     );
 }
 
@@ -278,7 +282,6 @@ fn sweep_cases() -> Vec<(&'static str, &'static str)> {
         ("lit str", "\"a\"\n"),
         ("lit bool", "true\n"),
         ("lit nil", "nil\n"),
-        ("lit bigint", "999n\n"),
         ("lit list", "[1,2,3]\n"),
         ("lit char", "'x'\n"),
         // ── 算术 ───────────────────────────────────────────────
@@ -398,7 +401,6 @@ fn sweep_cases() -> Vec<(&'static str, &'static str)> {
             "handler 内索引",
             "let v = 0.0\nlet t = [10,20]\nhandle random_random {\n  v = random.random()\n} {\n  t[1]\n}\nv\n",
         ),
-        ("with 块", "with model = \"m\"\n  1.0\nend\n"),
         // ── 杂项 ───────────────────────────────────────────────
         ("let 多绑定", "let a = 1\nlet b = 2\na + b\n"),
         ("assign 写变量", "let a = 1\nassign a = 5\na\n"),
@@ -510,7 +512,6 @@ fn path_agreement_cases() -> Vec<(&'static str, &'static str)> {
         ("if/else", "let c = 1\nif c == 1\n  1.0\nelse\n  2.0\nend\n"),
         ("task", "task t()\n  1\nend\n"),
         ("match", "let v = 1\nmatch v with\n  1 -> \"one\"\nend\n"),
-        ("with", "with a = 1\n  a\nend\n"),
         (
             "handle",
             "let x = 0.0\nhandle random_random {\n  x = random.random()\n} {\n  0.5\n}\nx\n",
@@ -519,13 +520,10 @@ fn path_agreement_cases() -> Vec<(&'static str, &'static str)> {
             "perform",
             "let v = 0.0\nhandle E {\n  v = perform E(\"a\")\n} {\n  __arg0\n}\nv\n",
         ),
-        ("observe", "observe trace do\n  1\nend\n"),
         ("worker", "worker w\n  1\nend\n"),
         ("transaction", "transaction\n  1\nend\n"),
         ("parallel", "parallel\n  1\nend\n"),
         ("macro", "macro m(x)\n  x\nend\n"),
-        ("TEA model", "model M\n  count: Int\nend\n"),
-        ("TEA app", "app tea_app\n  1\nend\n"),
         ("闭包", "let g = fn(x) x end\ng(1)\n"),
         ("dict", "let d = {a: 1}\nd[\"a\"]\n"),
         ("字符串方法", "\"a,b\".split(\",\")\n"),
@@ -533,16 +531,11 @@ fn path_agreement_cases() -> Vec<(&'static str, &'static str)> {
         ("int() 转换", "int(\"42\")\n"),
         ("bool() 转换", "bool(1)\n"),
         ("char 字面量", "'a'\n"),
-        ("bigint", "999n\n"),
         ("pipe", "[1,2] |> len()\n"),
         ("quasiquote", "`(1)\n"),
         ("eval", "eval(\"1\")\n"),
         ("quote", "quote(1)\n"),
         ("嵌套闭包", "let o = fn(a) fn(b) a + b end end\no(1)(2)\n"),
-        ("Router", "let r = Router::new()\nprint(r)\n"),
-        ("McpServer", "let m = McpServer::new()\nprint(m)\n"),
-        ("agent", "let a = agent.create(\"x\", {})\nprint(a)\n"),
-        ("succeed", "succeed()\n"),
         // 应当两路**一致拒绝**的：类型错误
         ("类型错误 String=int", "let a: String = 1\na\n"),
         ("类型错误 Bool=float", "let a: Bool = 1.5\na\n"),
@@ -552,8 +545,8 @@ fn path_agreement_cases() -> Vec<(&'static str, &'static str)> {
 }
 
 fn accept_check_path(src: &str) -> Result<usize, String> {
-    let (_f, ws) = mora::parser_v3::ParserV3::compile(src)?;
-    let errs = mora::typeck::check_mir::check_program_witnesses_bidirectional(&ws);
+    let (_f, ws) = mora::parser_v3::ParserV3::compile(src).map_err(|e| e.to_string())?;
+    let errs = mora::typeck::check_mir::check_program_witnesses(&ws);
     if errs.is_empty() {
         Ok(ws.len())
     } else {
@@ -572,18 +565,14 @@ fn accept_check_path(src: &str) -> Result<usize, String> {
 ///
 /// 期望集合取自 D474 退役差分时的**实测基线**（`mora --check` 路径）。
 /// ⚠ 「拒绝」的那些**不是** bug —— 它们是当前 typeck 的**已知边界**
-/// （如 `with` 块、`perform` 裸用、类型标注 let、TEA app、嵌套闭包、
+/// （如 `perform` 裸用、类型标注 let、嵌套闭包、
 /// 显式类型错误、未实现的 `?` 运算符）。若某条被改成「接受」，
 /// 本测试会要求**同步更新**这份清单 —— 那正是要发生的事。
 #[test]
 fn typeck_verdicts_match_the_pinned_expectation() {
     /// 应当**被拒绝**的构造名（其余全部应当被接受）。
     const REJECTED: &[&str] = &[
-        "带类型标注",
-        "with",
         "perform",
-        "TEA app",
-        "嵌套闭包",
         "类型错误 String=int",
         "类型错误 Bool=float",
         "expr question",

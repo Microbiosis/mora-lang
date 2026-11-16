@@ -47,11 +47,11 @@
 //! 即运行期**不支持部分应用**，类型层也不该放行。部分应用在本语言里有
 //! **显式**写法（`curry(f, n)`，D148 钉过），不靠少传实参隐式获得。
 
-use mora::typeck::check_mir::check_program_witnesses_bidirectional;
+use mora::typeck::check_mir::check_program_witnesses;
 
 fn typeck(src: &str) -> Result<Vec<String>, String> {
     let (_f, w) = mora::cli::compile_and_opt(src, None).map_err(|e| format!("COMPILE: {e}"))?;
-    let errs = check_program_witnesses_bidirectional(&w);
+    let errs = check_program_witnesses(&w);
     if errs.is_empty() {
         Ok(vec![])
     } else {

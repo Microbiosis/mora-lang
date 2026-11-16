@@ -109,7 +109,7 @@ fn run(src: &str, tag: &str) -> (i32, String) {
     let dir = TempDir::new(tag);
     let p = dir.join("p.mora");
     std::fs::write(&p, src).expect("写探针");
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+    let exe = env!("CARGO_BIN_EXE_mora");
     let out = Command::new(exe).arg(&p).output().expect("跑 mora");
     let _ = std::fs::remove_dir_all(&dir);
     let text = String::from_utf8_lossy(&out.stdout).into_owned()
@@ -125,6 +125,7 @@ fn run(src: &str, tag: &str) -> (i32, String) {
                 && !l.starts_with("AI 原语")
                 && !l.starts_with("显式 API")
                 && !l.starts_with("Trait 系统")
+                && !l.starts_with("类型与执行")
                 && !l.starts_with("Built-in")
                 && !l.starts_with("v0.15 CLI")
                 && !l.starts_with('⚠')
@@ -229,9 +230,8 @@ fn d329_non_numeric_elements_error_per_method() {
         ("[\"a\",\"b\"].var()", "stats.var"),
         ("[\"a\",\"b\"].min()", "stats.min"),
         ("[\"a\",\"b\"].max()", "stats.max"),
-        // 嵌套 list 与 BigInt 同样被拒
+        // 嵌套 list 同样被拒
         ("[[1],[2]].sum()", "stats.sum"),
-        ("stats.sum([1n,2n])", "stats.sum"),
     ] {
         let (c, o) = ev(e);
         assert_eq!(c, 1, "`{e}` 应干净报错（exit 1）; 实得 exit={c} out={o}");
@@ -321,7 +321,7 @@ fn d329_quantile_corr_cov_boundaries() {
 /// 钉住上界常量不变，防止有人「顺手收紧」到破坏 1e6 的合法用法。
 #[test]
 fn d329_histogram_max_bins_constant_unchanged() {
-    let src = include_str!("../src/interpreter/builtins/stats.rs");
+    let src = include_str!("../src/runtime/builtins/stats.rs");
     assert!(
         src.contains("const HISTOGRAM_MAX_BINS: usize = 1_000_000;"),
         "HISTOGRAM_MAX_BINS 应仍为 1_000_000（D284 判定为判断题，改动需走 CHANGELOG）"

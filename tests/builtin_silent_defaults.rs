@@ -38,25 +38,25 @@
 
 use std::sync::Arc;
 
-use mora::interpreter::Interpreter;
-use mora::mir::effect::Effects;
-use mora::mir::vm::execute;
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::execute_program;
 use mora::value::Value;
 
 fn run(src: &str) -> Result<Value, String> {
-    let (func, witnesses) =
+    let (prog, witnesses) =
         mora::cli::compile_and_opt(src, None).map_err(|e| format!("COMPILE: {e}"))?;
-    let errs = mora::typeck::check_mir::check_program_witnesses_bidirectional(&witnesses);
+    let errs = mora::typeck::check_mir::check_program_witnesses(&witnesses);
     if !errs.is_empty() {
         return Err(format!(
             "TYPECK: {:?}",
             errs.iter().map(|e| e.message.clone()).collect::<Vec<_>>()
         ));
     }
-    let arc = Arc::new(func);
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    execute(&arc, &mut interp, &mut env, &mut Effects::new())
+    let arc = Arc::new(prog);
+    let mut core = CoreRuntime::default();
+    execute_program(arc, &mut core)
+        .map(|(v, _)| v)
+        .map_err(|e| e.to_string())
 }
 
 fn debug_of(src: &str) -> String {
@@ -96,64 +96,10 @@ fn macroexpand_arity_mismatch_is_rejected() {
 fn macroexpand_with_correct_arity_still_works() {
     assert_eq!(
         debug_of(&format!("{MACRO_M1}macroexpand(\"m1\", [7, 8])")),
-        "Float(15.0)"
+        "Int(15)"
     );
     assert_eq!(
         debug_of(&format!("{MACRO_M1}macroexpand(\"m1\", [0, 0])")),
-        "Float(0.0)"
+        "Int(0)"
     );
-}
-
-// ===================================================================
-// D51
-// ===================================================================
-
-/// 缺 value 必须报错 —— 修前静默把 `Nil` 存进去。
-///
-/// ⚠ v0.104.6 D75：`memory` 补上模块签名后，这个错误**提前到了编译期** ——
-/// `memory.store` 声明「至少 2 参」，于是 typeck 先报
-/// `Expected 2 arguments, got 1`，运行期那条 `requires a value` 的
-/// `ok_or` 不再是这条路径的第一现场。
-///
-/// **这是修复强度提升，不是回退**：D51 的缺陷（静默存 Nil）依然不存在，
-/// 且现在在更早的阶段、用更明确的措辞被拦下。运行期的 `ok_or` 保留作
-/// 纵深防御（任何绕过 typeck 的动态路径仍会命中）。
-///
-/// 故断言放宽为「两条合法诊断之一」：typeck 的元数错 或 运行期的
-/// `requires a value`。
-#[test]
-fn memory_store_without_value_is_rejected() {
-    match run("memory.store(\"k1\")\n") {
-        Ok(v) => panic!("缺 value 必须报错（修前静默存 Nil），实得 Ok({v:?})"),
-        Err(e) => assert!(
-            e.contains("requires a value") || e.contains("Expected 2 arguments"),
-            "缺 value 必须报错：或由 typeck 拦下（元数错），或由运行期指出缺的是 value \
-             （与 key 那一侧的措辞区分），实得: {e}"
-        ),
-    }
-}
-
-/// 缺 key 也必须报错（该分支修前就是对的，此处钉住防回退）。
-#[test]
-fn memory_store_without_key_is_rejected() {
-    if let Ok(v) = run("memory.store()\n") {
-        panic!("缺 key 必须报错，实得 Ok({v:?})");
-    }
-}
-
-/// 正常存取必须照常工作。
-#[test]
-fn memory_store_and_recall_roundtrip() {
-    // tail 值是 recall 的结果
-    match run("memory.store(\"k2\", 42)\nmemory.recall(\"k2\")\n") {
-        Ok(Value::Float(f)) => assert_eq!(f, 42.0),
-        Ok(other) => panic!("期望 Float(42.0)，实得 {other:?}"),
-        Err(e) => panic!("正常存取不该报错，实得: {e}"),
-    }
-    // 存字符串也应原样取回
-    match run("memory.store(\"k3\", \"hello\")\nmemory.recall(\"k3\")\n") {
-        Ok(Value::String(s)) => assert_eq!(s, "hello"),
-        Ok(other) => panic!("期望 String(\"hello\")，实得 {other:?}"),
-        Err(e) => panic!("正常存取不该报错，实得: {e}"),
-    }
 }

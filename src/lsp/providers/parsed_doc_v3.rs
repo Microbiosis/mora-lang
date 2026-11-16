@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 use crate::lsp::json::Value as JsonValue;
 use crate::lsp::server::DocumentState;
-use crate::mir::witness::{MirWitness, WitnessKind, WitnessOrchestrateKind};
+use crate::mir::witness::{MirWitness, WitnessKind};
 
 ///  Look up and parse MirWitness list for `uri`.
 ///  Returns `None` when the document has not been opened yet or parse fails.
@@ -65,28 +65,6 @@ pub fn pos_of(line: Option<&JsonValue>, ch: Option<&JsonValue>) -> (usize, usize
 fn walk_witness_kind<F: FnMut(&MirWitness)>(kind: &WitnessKind, visit: &mut F) {
     match kind {
         WitnessKind::Literal(_) | WitnessKind::Variable(_) => {}
-        // v0.83: TEA definitions — no nested witnesses to walk
-        WitnessKind::ModelDef { .. }
-        | WitnessKind::MsgDef { .. }
-        | WitnessKind::UpdateDef { .. }
-        | WitnessKind::AppDef { .. } => {}
-        // v0.102: 声明式范式 — 遍历类型推断镜像（hover/补全可见）
-        WitnessKind::RelDef { clause_wits, .. } => {
-            for cw in clause_wits {
-                for h in &cw.head {
-                    walk_witness(h, visit);
-                }
-                walk_witness(&cw.body, visit);
-            }
-        }
-        WitnessKind::Solve { goal, .. } => walk_witness(goal, visit),
-        // v0.103: section 声明 — 遍历 body
-        WitnessKind::PromptSection { body, .. } | WitnessKind::DocumentSection { body, .. } => {
-            walk_witness(body, visit)
-        }
-        WitnessKind::Observe { body, .. } | WitnessKind::Span { body, .. } => {
-            walk_witness(body, visit)
-        }
         WitnessKind::Parallel { body } => walk_witness(body, visit),
         // v0.104.6 D472：4 类新构造 —— 遍历其子 witness，
         // 否则 hover/补全看不到 worker 体 / 事务补偿段 / eval 的 given 与 expects。
@@ -110,6 +88,46 @@ fn walk_witness_kind<F: FnMut(&MirWitness)>(kind: &WitnessKind, visit: &mut F) {
             walk_witness(right, visit);
         }
         WitnessKind::Commit | WitnessKind::Rollback => {}
+        WitnessKind::Spawn { target } => match target {
+            crate::mir::witness::WitnessSpawnTarget::Call { args, .. } => {
+                for arg in args {
+                    walk_witness(arg, visit);
+                }
+            }
+            crate::mir::witness::WitnessSpawnTarget::MethodCall { receiver, args, .. } => {
+                walk_witness(receiver, visit);
+                for arg in args {
+                    walk_witness(arg, visit);
+                }
+            }
+            crate::mir::witness::WitnessSpawnTarget::Expr(e) => walk_witness(e, visit),
+        },
+        WitnessKind::Select { arms } => {
+            for arm in arms {
+                match arm {
+                    crate::mir::witness::WitnessSelectArm::Recv { channel, body, .. } => {
+                        walk_witness(channel, visit);
+                        walk_witness(body, visit);
+                    }
+                    crate::mir::witness::WitnessSelectArm::Send {
+                        channel,
+                        value,
+                        body,
+                    } => {
+                        walk_witness(channel, visit);
+                        walk_witness(value, visit);
+                        walk_witness(body, visit);
+                    }
+                    crate::mir::witness::WitnessSelectArm::Timeout { ms, body } => {
+                        walk_witness(ms, visit);
+                        walk_witness(body, visit);
+                    }
+                    crate::mir::witness::WitnessSelectArm::Default { body } => {
+                        walk_witness(body, visit);
+                    }
+                }
+            }
+        }
         WitnessKind::Export { decl, .. } => walk_witness(decl, visit),
         WitnessKind::Binary { left, right, .. } => {
             walk_witness(left, visit);
@@ -152,11 +170,6 @@ fn walk_witness_kind<F: FnMut(&MirWitness)>(kind: &WitnessKind, visit: &mut F) {
             }
         }
         WitnessKind::DynTrait { expr, .. } => walk_witness(expr, visit),
-        WitnessKind::Prompt { parts } => {
-            for part in parts {
-                walk_witness(part, visit);
-            }
-        }
         WitnessKind::LetBinding {
             value, init_body, ..
         } => {
@@ -164,7 +177,6 @@ fn walk_witness_kind<F: FnMut(&MirWitness)>(kind: &WitnessKind, visit: &mut F) {
             walk_witness(init_body, visit);
         }
         WitnessKind::Assign { value, .. } => walk_witness(value, visit),
-        WitnessKind::Orchestrate { kind, .. } => walk_witness_orchestrate(kind, visit),
         WitnessKind::Loop { iterable, body, .. } => {
             walk_witness(iterable, visit);
             walk_witness(body, visit);
@@ -201,73 +213,10 @@ fn walk_witness_kind<F: FnMut(&MirWitness)>(kind: &WitnessKind, visit: &mut F) {
         | WitnessKind::Sequence(_)
         | WitnessKind::Perform { .. }
         | WitnessKind::Handle { .. } => {}
-        // v0.85: with 块 — 遍历绑定值与 body
-        WitnessKind::WithConfig { bindings, body } => {
-            for (_, v) in bindings {
-                walk_witness(v, visit);
-            }
-            walk_witness(body, visit);
-        }
         // v0.88: Quasiquote — 遍历各段（Quote/Unquote/UnquoteSplice）
         WitnessKind::Quasiquote { segments } => {
             for seg in segments {
                 walk_witness(seg, visit);
-            }
-        }
-    }
-}
-
-fn walk_witness_orchestrate(kind: &WitnessOrchestrateKind, visit: &mut dyn FnMut(&MirWitness)) {
-    match kind {
-        WitnessOrchestrateKind::Sequential { agents }
-        | WitnessOrchestrateKind::Graph { agents, .. }
-        | WitnessOrchestrateKind::Pregel { agents, .. } => {
-            for a in agents {
-                visit(&a.task_expr);
-                if let Some(v) = &a.verify_expr {
-                    visit(v);
-                }
-                if let Some(cfg) = &a.with_config {
-                    for e in cfg.values() {
-                        visit(e);
-                    }
-                }
-            }
-        }
-        WitnessOrchestrateKind::Loop {
-            agents, exit_when, ..
-        } => {
-            for agent in agents {
-                visit(&agent.task_expr);
-                if let Some(v) = &agent.verify_expr {
-                    visit(v);
-                }
-                if let Some(cfg) = &agent.with_config {
-                    for e in cfg.values() {
-                        visit(e);
-                    }
-                }
-            }
-            if let Some(e) = exit_when {
-                visit(e);
-            }
-        }
-        // v0.75.84: MoA — prompt 表达式参与 walk（LSP 语义/折叠）。
-        WitnessOrchestrateKind::Moa { prompt, .. } => {
-            visit(prompt);
-        }
-        // v0.75.85: MoE — router/prompt/专家定义参与 walk（LSP 语义/折叠）。
-        // v0.104.6 D270：experts 现为 `WitnessMoeExpert`，只 walk 其 `def`。
-        WitnessOrchestrateKind::Moe {
-            experts,
-            router,
-            prompt,
-            ..
-        } => {
-            visit(router);
-            visit(prompt);
-            for e in experts {
-                visit(&e.def);
             }
         }
     }
@@ -406,8 +355,8 @@ pub(super) fn make_completion(label: &str, kind: f64, detail: Option<&str>) -> J
     JsonValue::Object(m)
 }
 
-/// 在某 offset 取一个标识符（变量名）
-pub(super) fn ident_at_offset(text: &str, offset: usize) -> Option<String> {
+/// Resolve `offset` to `(ident, ident_start_col_1based)` if the cursor touches an identifier.
+pub(super) fn ident_with_col_at_offset(text: &str, offset: usize) -> Option<(String, usize)> {
     let bytes = text.as_bytes();
     if offset > bytes.len() {
         return None;
@@ -433,7 +382,23 @@ pub(super) fn ident_at_offset(text: &str, offset: usize) -> Option<String> {
     if start == end {
         return None;
     }
-    std::str::from_utf8(&bytes[start..end])
-        .ok()
-        .map(|s| s.to_string())
+    let ident = std::str::from_utf8(&bytes[start..end]).ok()?.to_string();
+    let line_start = text[..start].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let col_1based = text[line_start..start].chars().count() + 1;
+    Some((ident, col_1based))
+}
+
+/// 在某 offset 取一个标识符（变量名）
+pub(super) fn ident_at_offset(text: &str, offset: usize) -> Option<String> {
+    ident_with_col_at_offset(text, offset).map(|(ident, _)| ident)
+}
+
+/// Format a resolved HM type for LSP hover/completion, returning `None` when unresolved.
+pub(super) fn format_hm_type(ty: &crate::typeck::Type) -> Option<String> {
+    use crate::typeck::{Type, TypeVarId};
+    match ty {
+        Type::Error | Type::Unknown | Type::TypeVar(TypeVarId::Meta(_)) => None,
+        Type::ForAll(vars, inner) if vars.is_empty() => format_hm_type(inner),
+        other => Some(other.name()),
+    }
 }

@@ -96,7 +96,7 @@ impl Server {
         if let Some(id) = id {
             match self.handle_request(&method, params) {
                 Ok(result) => self.send_response(id, Some(result), None)?,
-                Err(err_msg) => self.send_response(id, None, Some(err_msg))?,
+                Err(err) => self.send_response(id, None, Some(&err))?,
             }
         }
         Ok(())
@@ -187,7 +187,7 @@ impl Server {
         Ok(())
     }
 
-    fn handle_request(&mut self, method: &str, params: Value) -> Result<Value, String> {
+    fn handle_request(&mut self, method: &str, params: Value) -> crate::error::MoraResult<Value> {
         match method {
             "initialize" => Ok(self.handle_initialize(params)),
             "shutdown" => {
@@ -204,7 +204,10 @@ impl Server {
             "textDocument/rename" => self.handle_rename(params),
             "textDocument/semanticTokens/full" => self.handle_semantic_tokens(params),
             "textDocument/foldingRange" => self.handle_folding_range(params),
-            _ => Err(format!("method not supported: {}", method)),
+            _ => Err(crate::error::MoraError::Runtime(format!(
+                "method not supported: {}",
+                method
+            ))),
         }
     }
 
@@ -299,47 +302,47 @@ impl Server {
     // ============================================================
     // 各 LSP method 的占位实现 — 真正逻辑在 providers 模块
     // ============================================================
-    fn handle_hover(&self, params: Value) -> Result<Value, String> {
+    fn handle_hover(&self, params: Value) -> crate::error::MoraResult<Value> {
         let docs = lock_or_recover(&self.docs, "lsp_docs");
         super::providers::hover_v3(&docs, &params)
     }
 
-    fn handle_completion(&self, params: Value) -> Result<Value, String> {
+    fn handle_completion(&self, params: Value) -> crate::error::MoraResult<Value> {
         let docs = lock_or_recover(&self.docs, "lsp_docs");
         Ok(super::providers::completion_v3(&docs, &params))
     }
 
-    fn handle_definition(&self, params: Value) -> Result<Value, String> {
+    fn handle_definition(&self, params: Value) -> crate::error::MoraResult<Value> {
         let docs = lock_or_recover(&self.docs, "lsp_docs");
         Ok(super::providers::definition_v3(&docs, &params))
     }
 
-    fn handle_references(&self, params: Value) -> Result<Value, String> {
+    fn handle_references(&self, params: Value) -> crate::error::MoraResult<Value> {
         let docs = lock_or_recover(&self.docs, "lsp_docs");
         Ok(super::providers::references_v3(&docs, &params))
     }
 
-    fn handle_document_symbol(&self, params: Value) -> Result<Value, String> {
+    fn handle_document_symbol(&self, params: Value) -> crate::error::MoraResult<Value> {
         let docs = lock_or_recover(&self.docs, "lsp_docs");
         Ok(super::providers::document_symbol_v3(&docs, &params))
     }
 
-    fn handle_formatting(&self, params: Value, range: bool) -> Result<Value, String> {
+    fn handle_formatting(&self, params: Value, range: bool) -> crate::error::MoraResult<Value> {
         let docs = lock_or_recover(&self.docs, "lsp_docs");
         Ok(super::providers::formatting(&docs, &params, range))
     }
 
-    fn handle_rename(&self, params: Value) -> Result<Value, String> {
+    fn handle_rename(&self, params: Value) -> crate::error::MoraResult<Value> {
         let docs = lock_or_recover(&self.docs, "lsp_docs");
         Ok(super::providers::rename_v3(&docs, &params))
     }
 
-    fn handle_semantic_tokens(&self, params: Value) -> Result<Value, String> {
+    fn handle_semantic_tokens(&self, params: Value) -> crate::error::MoraResult<Value> {
         let docs = lock_or_recover(&self.docs, "lsp_docs");
         Ok(super::providers::semantic_tokens_v3(&docs, &params))
     }
 
-    fn handle_folding_range(&self, params: Value) -> Result<Value, String> {
+    fn handle_folding_range(&self, params: Value) -> crate::error::MoraResult<Value> {
         let docs = lock_or_recover(&self.docs, "lsp_docs");
         Ok(super::providers::folding_range_v3(&docs, &params))
     }
@@ -378,20 +381,11 @@ impl Server {
     }
 
     fn check_diagnostics(&self, text: &str) -> Vec<Diagnostic> {
-        // v0.75.40: 单遍编译（compile 直接产出 witness），typeck 直接消费
-        let (_, witnesses) = match crate::parser_v3::ParserV3::compile(text) {
-            Ok(pair) => pair,
-            // v0.104.6 D101：此前 `Err(_) => return Vec::new()` —— **语法错误
-            // 产生零诊断**。实测 `let = = =` 在 `mora run` 下报
-            // 「Parse error: Expected variable name after 'let' at line 1」，
-            // 而 LSP 推送 `diagnostics: []`，即**告诉用户「代码没问题」**。
-            // 语法错误是语言服务器最基本的能力，这一吞让整条诊断链在此处失效。
-            //
-            // 改为把 parse 错误本身作为一条 Error 诊断推出。行号从消息里的
-            // `at line N` 提取（1-based → 0-based）；提取不到时落在第 0 行。
-            Err(e) => return vec![Self::parse_error_diagnostic(&e)],
+        let witnesses = match crate::parser_v3::ParserV3::parse_witnesses(text) {
+            Ok(w) => w,
+            Err(e) => return vec![Self::parse_error_diagnostic(e.message())],
         };
-        let errs = crate::typeck::check_mir::check_program_witnesses_bidirectional(&witnesses);
+        let errs = crate::typeck::check_mir::check_program_witnesses(&witnesses);
         errs.into_iter()
             .map(|e| {
                 // v0.05: line/column 都是 1-based (typeck)，LSP 是 0-based
@@ -491,7 +485,7 @@ impl Server {
         &self,
         id: Value,
         result: Option<Value>,
-        err: Option<String>,
+        err: Option<&crate::error::MoraError>,
     ) -> io::Result<()> {
         let mut msg = std::collections::BTreeMap::new();
         msg.insert("jsonrpc".to_string(), Value::String_("2.0".to_string()));
@@ -503,7 +497,10 @@ impl Server {
             (None, Some(e)) => {
                 let mut err_obj = std::collections::BTreeMap::new();
                 err_obj.insert("code".to_string(), Value::Number(-32603.0));
-                err_obj.insert("message".to_string(), Value::String_(e));
+                err_obj.insert(
+                    "message".to_string(),
+                    Value::String_(e.message().to_string()),
+                );
                 msg.insert("error".to_string(), Value::Object(err_obj));
             }
             _ => {

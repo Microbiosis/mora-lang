@@ -79,7 +79,7 @@ fn run(src: &str, tag: &str) -> (i32, String) {
     std::fs::create_dir_all(&dir).expect("建目录");
     let p = dir.join("p.mora");
     std::fs::write(&p, src).expect("写探针");
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+    let exe = env!("CARGO_BIN_EXE_mora");
     let out = Command::new(exe).arg(&p).output().expect("跑 mora");
     cleanup_dir(&dir);
     let text = String::from_utf8_lossy(&out.stdout).into_owned()
@@ -95,6 +95,7 @@ fn run(src: &str, tag: &str) -> (i32, String) {
                 && !l.starts_with("AI 原语")
                 && !l.starts_with("显式 API")
                 && !l.starts_with("Trait 系统")
+                && !l.starts_with("类型与执行")
                 && !l.starts_with("Built-in")
                 && !l.starts_with("v0.15 CLI")
                 && !l.starts_with('⚠')
@@ -118,9 +119,9 @@ fn print_of(e: &str) -> (i32, String) {
 fn d320_index_matrix_behaviour_is_pinned() {
     // ── List：正常取值 ──
     for (e, want) in [
-        ("([10,20,30])[0]", "10.0"),
-        ("([10,20,30])[2]", "30.0"),
-        ("[1,2,3][len([1,2,3]) - 1]", "3.0"),
+        ("([10,20,30])[0]", "10"),
+        ("([10,20,30])[2]", "30"),
+        ("[1,2,3][len([1,2,3]) - 1]", "3"),
     ] {
         let (code, got) = print_of(e);
         assert_eq!(code, 0, "`{e}` 应成功; exit={code} out={got}");
@@ -149,9 +150,9 @@ fn d320_index_matrix_behaviour_is_pinned() {
     // ⚠ 改这一格前先读 `tests/depth_and_diagnostics.rs::d28_positive_index_unaffected`
     //   的注释：「浮点下标按既有约定向零截断（D3 的设计决定）」。
     for (e, want) in [
-        ("([10,20,30])[1.0]", "20.0"),
-        ("([10,20,30])[1.5]", "20.0"),
-        ("([10,20,30])[2.9]", "30.0"),
+        ("([10,20,30])[1.0]", "20"),
+        ("([10,20,30])[1.5]", "20"),
+        ("([10,20,30])[2.9]", "30"),
     ] {
         let (code, got) = print_of(e);
         assert_eq!(
@@ -233,5 +234,5 @@ fn d320_index_assign_is_syntax_error_but_mir_handler_still_exists() {
         &mut mora::value::Value,
         &mora::value::Value,
         &mora::value::Value,
-    ) -> Result<(), String> = mora::mir::vm::index_assign_value;
+    ) -> mora::error::MoraResult<()> = mora::runtime::vm::index_assign_value;
 }

@@ -44,7 +44,7 @@ fn run(src: &str, tag: &str) -> (i32, String) {
     let dir = TempDir::new(tag);
     let p = dir.join("p.mora");
     std::fs::write(&p, src).expect("写探针");
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+    let exe = env!("CARGO_BIN_EXE_mora");
     let out = Command::new(exe).arg(&p).output().expect("跑 mora");
     let _ = std::fs::remove_dir_all(&dir);
     let text = String::from_utf8_lossy(&out.stdout).into_owned()
@@ -60,6 +60,7 @@ fn run(src: &str, tag: &str) -> (i32, String) {
                 && !l.starts_with("AI 原语")
                 && !l.starts_with("显式 API")
                 && !l.starts_with("Trait 系统")
+                && !l.starts_with("类型与执行")
                 && !l.starts_with("Built-in")
                 && !l.starts_with("v0.15 CLI")
                 && !l.starts_with('⚠')
@@ -123,8 +124,8 @@ fn d325_reshape_preserves_element_sum() {
     );
     assert_eq!(code, 0, "恰好整除时应成功; 实得 {got}");
     assert_eq!(
-        got, "10.0",
-        "reshape(2,2) 之后元素和必须仍是 10.0（数据未被改动）"
+        got, "10",
+        "reshape(2,2) 之后元素和必须仍是 10（数据未被改动）"
     );
 }
 
@@ -132,18 +133,12 @@ fn d325_reshape_preserves_element_sum() {
 #[test]
 fn d325_reshape_padding_and_exact_shapes_unchanged() {
     for (e, want) in [
-        ("[1,2,3,4].reshape(2,2)", "[[1.0, 2.0], [3.0, 4.0]]"),
-        ("[1,2,3,4].reshape(1,4)", "[[1.0, 2.0, 3.0, 4.0]]"),
-        ("[1,2,3,4].reshape(4,1)", "[[1.0], [2.0], [3.0], [4.0]]"),
+        ("[1,2,3,4].reshape(2,2)", "[[1, 2], [3, 4]]"),
+        ("[1,2,3,4].reshape(1,4)", "[[1, 2, 3, 4]]"),
+        ("[1,2,3,4].reshape(4,1)", "[[1], [2], [3], [4]]"),
         // 填充：**循环重复**已有前缀（learning-plan.md:166 记的「既有行为」）
-        (
-            "[1,2,3,4].reshape(2,3)",
-            "[[1.0, 2.0, 3.0], [4.0, 1.0, 2.0]]",
-        ),
-        (
-            "[1,2,3,4].reshape(3,2)",
-            "[[1.0, 2.0], [3.0, 4.0], [1.0, 2.0]]",
-        ),
+        ("[1,2,3,4].reshape(2,3)", "[[1, 2, 3], [4, 1, 2]]"),
+        ("[1,2,3,4].reshape(3,2)", "[[1, 2], [3, 4], [1, 2]]"),
     ] {
         let (code, got) = sh(e);
         assert_eq!(code, 0, "`{e}` 应成功; 实得 exit={code} out={got}");

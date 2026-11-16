@@ -1,18 +1,22 @@
 //! v0.75.39: ParserV3::compile 管线验证测试。
 //!
-//! 验证 compile 产出的 MirFunction 具有正确的结构（body 非空、n_regs 合理）。
+//! 验证 compile 产出的 ControlProgram 具有正确的结构（entry 块非空、verify_program 通过）。
 //! 旧 parse→lower 路径已删除（AGENTS.md §6 禁止兼容桥）。
 
 use mora::parser_v3::ParserV3;
 
-/// 验证 compile 产出的 MirFunction 结构正确。
+/// 验证 compile 产出的 ControlProgram 结构正确。
 fn assert_compile_valid(source: &str) {
-    let (func, witnesses) = ParserV3::compile(source).expect("compile should succeed");
+    let (prog, witnesses) = ParserV3::compile(source).expect("compile should succeed");
     assert!(
-        !func.body.is_empty(),
-        "compile 产出的 MirFunction body 不应为空\nsource: {source}"
+        mora::mir::control::verify_program(&prog).is_ok(),
+        "compile 产出的 ControlProgram 必须通过 SSA 校验\nsource: {source}"
     );
-    // n_regs 可能为 0（task 定义的顶层寄存器空间为空，嵌套 body 有独立空间）
+    let entry_fn = prog.func(prog.entry);
+    assert!(
+        !entry_fn.blocks.is_empty(),
+        "compile 产出的 ControlProgram entry 函数不应为空\nsource: {source}"
+    );
     assert!(
         !witnesses.is_empty(),
         "compile 产出的 witnesses 不应为空\nsource: {source}"
@@ -49,21 +53,18 @@ fn compile_valid_call_and_closure() {
 }
 
 #[test]
-fn compile_valid_orchestrate() {
-    assert_compile_valid(
-        "orchestrate sequential input -> result\n  agent a => \"hello\"\nend\nprint(result)",
-    );
-}
-
-#[test]
 fn compile_valid_match() {
     assert_compile_valid("match 42 {\n  _ => \"default\"\n}");
 }
 
 #[test]
-fn compile_valid_prompt() {
-    assert_compile_valid("print(p\"hello {name}\")");
-    assert_compile_valid("let msg = p\"score: {n} points\"\nprint(msg)");
+fn compile_rejects_retired_prompt_and_accepts_string_concat() {
+    assert!(
+        ParserV3::compile("print(p\"hello {name}\")").is_err(),
+        "v0.110.0 W2.6 retired p\"...\" literals from parser"
+    );
+    assert_compile_valid("let name = \"world\"\nprint(\"hello \" + name)");
+    assert_compile_valid("let n = 10\nlet msg = \"score: \" + str(n) + \" points\"\nprint(msg)");
 }
 
 #[test]

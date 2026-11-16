@@ -51,7 +51,7 @@ fn ev(body: &str) -> (i32, String) {
     std::fs::write(&p, body).expect("写探针");
     let home = dir.join("home");
     std::fs::create_dir_all(&home).expect("建 home");
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+    let exe = env!("CARGO_BIN_EXE_mora");
     let out = Command::new(exe)
         .arg(&p)
         .env("HOME", &home)
@@ -73,6 +73,7 @@ fn ev(body: &str) -> (i32, String) {
                 && !l.starts_with("AI 原语")
                 && !l.starts_with("显式 API")
                 && !l.starts_with("Trait 系统")
+                && !l.starts_with("类型与执行")
                 && !l.starts_with("Built-in")
                 && !l.starts_with("v0.15 CLI")
                 && !l.starts_with('⚠')
@@ -93,14 +94,14 @@ fn is_bare_path_line(line: &&str, path: &str) -> bool {
 fn d361_harness_collects_print_output() {
     let (code, got) = ev("print(1)\n");
     assert_eq!(code, 0, "探针应正常退出; 实得 exit={code} out=[{got}]");
-    assert_eq!(got.trim(), "1.0", "采集器失效（本文件全部断言依赖它）");
+    assert_eq!(got.trim(), "1", "采集器失效（本文件全部断言依赖它）");
 }
 
 /// **列表索引**：正常、浮点截断、越界、负数。
 #[test]
 fn d361_list_index_matrix() {
     let setup = "let xs = [10, 20, 30]\n";
-    for (expr, expected) in [("xs[0]", "10.0"), ("xs[1.0]", "20.0"), ("xs[2]", "30.0")] {
+    for (expr, expected) in [("xs[0]", "10"), ("xs[1.0]", "20"), ("xs[2]", "30")] {
         let (code, got) = ev(&format!("{setup}print({expr})\n"));
         assert_eq!(code, 0, "`{expr}` 应正常; 实得 exit={code} out={got}");
         assert_eq!(got.trim(), expected, "`{expr}` 的值不对; 实得: {got}");
@@ -108,7 +109,7 @@ fn d361_list_index_matrix() {
     // `checked_index` 对浮点**截断**（不报错）—— 这是既有设计
     assert_eq!(
         ev(&format!("{setup}print(xs[2.7])\n")).1.trim(),
-        "30.0",
+        "30",
         "浮点索引应截断取整（D246 已钉 value_as_usize 的截断为设计）"
     );
     // 越界与负数必须报错
@@ -155,7 +156,7 @@ fn d361_string_index_is_char_based() {
 fn d361_dict_index_missing_returns_nil() {
     let (code, got) = ev("let m = {\"a\": 1}\nprint(m[\"a\"])\n");
     assert_eq!(code, 0, "应正常; 实得 exit={code} out={got}");
-    assert_eq!(got.trim(), "1.0", "命中键应返回值");
+    assert_eq!(got.trim(), "1", "命中键应返回值");
 
     let (code, got) = ev("let m = {\"a\": 1}\nprint(m[\"zzz\"])\n");
     assert_eq!(
@@ -241,10 +242,15 @@ fn d361_index_assign_defined_in_mir_but_never_built_by_parser() {
          本文件「未接通」的结论需重新评估（parser 命中 {parser_hits} 处）"
     );
 
-    // 但 MIR 层确实在传递它（否则就不是「死代码」而是「没实现」）
-    let lower = std::fs::read_to_string(format!("{root}/mir/lower.rs")).expect("读 lower.rs");
+    // 但控制 IR 管线确实在传递它（否则就不是「死代码」而是「没实现」）
+    let control_ir =
+        std::fs::read_to_string(format!("{root}/mir/control/ir.rs")).expect("读 control/ir.rs");
+    let control_lower = std::fs::read_to_string(format!("{root}/mir/control/lower.rs"))
+        .expect("读 control/lower.rs");
     assert!(
-        lower.contains("WitnessKind::IndexAssign") && lower.contains("MirInst::IndexAssign"),
-        "MIR 层应在传递 IndexAssign（这正是它属于「完整基础设施 + 零入口」的原因）"
+        control_lower.contains("WitnessKind::IndexAssign")
+            && control_lower.contains("ControlInst::IndexAssign")
+            && control_ir.contains("IndexAssign("),
+        "Control IR 管线应在传递 IndexAssign（这正是它属于「完整基础设施 + 零入口」的原因）"
     );
 }

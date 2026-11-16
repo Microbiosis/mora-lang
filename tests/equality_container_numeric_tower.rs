@@ -49,7 +49,7 @@ use mora::value::Value;
 use mora::value::list::List;
 
 fn run_fixture(name: &str) -> (i32, String) {
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+    let exe = env!("CARGO_BIN_EXE_mora");
     let script = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/e2e")
         .join(name);

@@ -56,7 +56,7 @@ fn ev(body: &str) -> (i32, String) {
     std::fs::write(&p, body).expect("写探针");
     let home = dir.join("home");
     std::fs::create_dir_all(&home).expect("建 home");
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+    let exe = env!("CARGO_BIN_EXE_mora");
     let out = Command::new(exe)
         .arg(&p)
         .env("HOME", &home)
@@ -78,6 +78,7 @@ fn ev(body: &str) -> (i32, String) {
                 && !l.starts_with("AI 原语")
                 && !l.starts_with("显式 API")
                 && !l.starts_with("Trait 系统")
+                && !l.starts_with("类型与执行")
                 && !l.starts_with("Built-in")
                 && !l.starts_with("v0.15 CLI")
                 && !l.contains("不兼容 v0.03")
@@ -98,7 +99,7 @@ fn is_bare_path_line(line: &&str, path: &str) -> bool {
 fn d363_harness_collects_print_output() {
     let (code, got) = ev("print(1)\n");
     assert_eq!(code, 0, "探针应正常退出; 实得 exit={code} out=[{got}]");
-    assert_eq!(got.trim(), "1.0", "采集器失效（本文件全部断言依赖它）");
+    assert_eq!(got.trim(), "1", "采集器失效（本文件全部断言依赖它）");
 }
 
 /// **主断言 1**：**无 handler 的 `perform` 必须在编译期被拦下**。

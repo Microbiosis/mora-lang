@@ -72,17 +72,17 @@ fn switch_threading_handles_forking_control_flow() {
         (
             "if/else as value",
             "let c = 2\nlet x = if c == 1 then 5 else 7 end\nprint(x)\n",
-            "7.0\n",
+            "7\n",
         ),
         (
             "for + break",
             "let n = 0\nfor x in [1, 2, 3, 4, 5]\n  if x == 3 then\n    break\n  end\n  assign n = n + 1\nend\nprint(n)\n",
-            "2.0\n",
+            "2\n",
         ),
         (
             "while + continue",
             "let n = 0\nlet k = 0i\nwhile k < 6i\n  if k == 2i then\n    assign k = k + 1i\n    continue\n  end\n  assign n = n + 1\n  assign k = k + 1i\nend\nprint(n)\n",
-            "5.0\n",
+            "5\n",
         ),
         (
             "handler",
@@ -92,7 +92,7 @@ fn switch_threading_handles_forking_control_flow() {
         (
             "closure call",
             "let add = fn(a, b) a + b end\nprint(add(2, 3))\n",
-            "5.0\n",
+            "5\n",
         ),
     ] {
         // v0.104.6 D475：要的是**文件** ⇒ TempFile。

@@ -5,32 +5,21 @@
 //!（witness→FCFG→lower_fcfg→apply_rules），红时回落 emit.rs 直出。
 //! 本测试走完整生产路径（compile_and_opt → execute）断言执行结果。
 
-use mora::interpreter::Interpreter;
-use mora::mir::vm::{execute, run_main_task};
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::{execute_program, run_main_task};
 use mora::value::Value;
 use std::sync::Arc;
 
-/// 生产路径执行：compile_and_opt → execute + run_main_task。
+/// 生产路径执行：compile_and_opt → execute_program + run_main_task。
 fn run_production(source: &str) -> Value {
-    let (func, _witnesses) =
+    let (prog, _witnesses) =
         mora::cli::compile_and_opt(source, None).expect("compile_and_opt failed");
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    let func_arc = Arc::new(func);
-    let last = execute(
-        &func_arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    )
-    .unwrap_or_else(|e| panic!("execute failed: {}", e));
-    run_main_task(
-        &func_arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    )
-    .unwrap_or_else(|e| panic!("run_main_task failed: {}", e));
+    let mut core = CoreRuntime::default();
+    let prog_arc = Arc::new(prog);
+    let (last, globals) = execute_program(prog_arc.clone(), &mut core)
+        .unwrap_or_else(|e| panic!("execute failed: {}", e));
+    let _ = run_main_task(prog_arc, globals, &mut core)
+        .unwrap_or_else(|e| panic!("run_main_task failed: {}", e));
     last
 }
 
@@ -137,32 +126,21 @@ fn switch_chained_method_calls() {
 
 #[test]
 fn switch_while_break() {
-    use mora::cli::compile_and_opt;
-    use mora::interpreter::Interpreter;
-    use mora::mir::vm::{execute, run_main_task};
-    use std::sync::Arc;
     let source = std::fs::read_to_string("tests/fixtures/e2e/loop_break.mora").unwrap();
-    let (func, _) = compile_and_opt(&source, None).expect("compile_and_opt failed");
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    let arc = Arc::new(func);
-    let _ = execute(
-        &arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    )
-    .unwrap();
-    let _ = run_main_task(
-        &arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    );
-    // 通过 env state 验证：break 触发则 total=10，未触发则=55
-    let total = env.get("total").unwrap_or(mora::value::Value::Nil);
+    let (prog, _) = mora::cli::compile_and_opt(&source, None).expect("compile_and_opt failed");
+    let mut core = CoreRuntime::default();
+    let arc = Arc::new(prog);
+    let (_, globals) = execute_program(arc.clone(), &mut core).unwrap();
+    let _ = run_main_task(arc.clone(), globals.clone(), &mut core);
+    // 通过 globals 验证：break 触发则 total=10，未触发则=55
+    let total = arc
+        .globals
+        .iter()
+        .position(|g| g.name == "total")
+        .map(|i| globals[i].lock().0.clone())
+        .unwrap_or(Value::Nil);
     assert!(
-        matches!(total, mora::value::Value::Int(10)),
+        matches!(total, Value::Int(10)),
         "while break: total should be 10 (break at i=5), got {:?}",
         total
     );
@@ -170,34 +148,17 @@ fn switch_while_break() {
 
 #[test]
 fn switch_while_continue() {
-    // v0.103: continue 值传递已修复（DAG 的 Sequence 缝合不再跨块 +
-    // Data 边不再充当激活通道）—— 断言精确累加值。
     // 1+2+4+5 = 12（i==3 时 continue，跳过 3）
-    use mora::cli::compile_and_opt;
-    use mora::interpreter::Interpreter;
-    use mora::mir::vm::{execute, run_main_task};
-    use std::sync::Arc;
     let source = "let total = 0i\nlet i = 0i\nwhile i < 5i\n  i = i + 1i\n  if i == 3i\n    continue\n  end\n  total = total + i\nend\ntotal";
-    let (func, _) = compile_and_opt(source, None).expect("compile_and_opt failed");
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    let arc = Arc::new(func);
-    let last = execute(
-        &arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    )
-    .expect("while_continue execute failed");
-    let _ = run_main_task(
-        &arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    );
+    let (prog, _) = mora::cli::compile_and_opt(source, None).expect("compile_and_opt failed");
+    let mut core = CoreRuntime::default();
+    let arc = Arc::new(prog);
+    let (last, globals) =
+        execute_program(arc.clone(), &mut core).expect("while_continue execute failed");
+    let _ = run_main_task(arc, globals, &mut core);
     let got = match last {
-        mora::value::Value::Int(n) => n as f64,
-        mora::value::Value::Float(n) => n,
+        Value::Int(n) => n as f64,
+        Value::Float(n) => n,
         other => panic!("期望数值结果，得到 {:?}", other),
     };
     assert_eq!(got, 12.0, "continue 跳过 i==3 后累加应为 12");
@@ -205,34 +166,16 @@ fn switch_while_continue() {
 
 #[test]
 fn switch_for_break() {
-    // v0.103: for 循环值传递已修复（CSE 不再重命名环携带寄存器；
-    // fcfg_lower 的 For 退出条件用 JumpIf）—— 断言精确累加值。
     // 1+2+3+4+5 = 15
-    use mora::cli::compile_and_opt;
-    use mora::interpreter::Interpreter;
-    use mora::mir::vm::{execute, run_main_task};
-    use std::sync::Arc;
     let source = "let total = 0i\nfor i in [1i, 2i, 3i, 4i, 5i]\n  total = total + i\nend\ntotal";
-    let (func, _) = compile_and_opt(source, None).expect("compile_and_opt failed");
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    let arc = Arc::new(func);
-    let last = execute(
-        &arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    )
-    .expect("for sum execute failed");
-    let _ = run_main_task(
-        &arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    );
+    let (prog, _) = mora::cli::compile_and_opt(source, None).expect("compile_and_opt failed");
+    let mut core = CoreRuntime::default();
+    let arc = Arc::new(prog);
+    let (last, globals) = execute_program(arc.clone(), &mut core).expect("for sum execute failed");
+    let _ = run_main_task(arc, globals, &mut core);
     let got = match last {
-        mora::value::Value::Int(n) => n as f64,
-        mora::value::Value::Float(n) => n,
+        Value::Int(n) => n as f64,
+        Value::Float(n) => n,
         other => panic!("期望数值结果，得到 {:?}", other),
     };
     assert_eq!(got, 15.0, "for 循环 1..5 累加应为 15");

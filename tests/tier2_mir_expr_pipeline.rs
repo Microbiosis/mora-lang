@@ -1,36 +1,35 @@
-//! Tier 2: ParserV3 pipeline integration tests
+//! Tier 2: ParserV3 + Control SSA pipeline integration tests
 //!
-//! 验证完整的 V3 管线：`ParserV3::compile → check_program_witnesses_bidirectional → execute`
+//! 验证完整的 V3 管线：`ParserV3::compile → check_program_witnesses → runtime::vm::{execute_program, run_main_task}`
 
-use mora::interpreter::Interpreter;
-use mora::mir::vm::{execute, run_main_task};
-use mora::mir::{MirFunction, MirInst};
+use std::sync::Arc;
+
+use mora::mir::control::{ControlConst, ControlInst, ControlProgram};
 use mora::parser_v3::ParserV3;
-use mora::typeck::check_mir::check_program_witnesses_bidirectional;
-use mora::value::Value;
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::{execute_program, run_main_task};
+use mora::typeck::check_mir::check_program_witnesses;
 
-fn compile_v3(source: &str) -> MirFunction {
+fn compile_v3(source: &str) -> ControlProgram {
     ParserV3::compile(source).expect("compile should succeed").0
 }
 
-fn run_v3_pipeline(source: &str) -> Result<(), String> {
-    let (func, witnesses) = ParserV3::compile(source)?;
-    let _type_errors = check_program_witnesses_bidirectional(&witnesses);
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    let func_arc = std::sync::Arc::new(func);
-    execute(
-        &func_arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    )?;
-    run_main_task(
-        &func_arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    )
+fn entry_insts(prog: &ControlProgram) -> Vec<&ControlInst> {
+    prog.func(prog.entry)
+        .blocks
+        .iter()
+        .flat_map(|b| b.insts.iter())
+        .collect()
+}
+
+fn run_v3_pipeline(source: &str) -> mora::error::MoraResult<()> {
+    let (prog, witnesses) = ParserV3::compile(source)?;
+    let _type_errors = check_program_witnesses(&witnesses);
+    let mut core = CoreRuntime::default();
+    let prog_arc = Arc::new(prog);
+    let (_, globals) = execute_program(prog_arc.clone(), &mut core)?;
+    let _ = run_main_task(prog_arc, globals, &mut core)?;
+    Ok(())
 }
 
 // ===================================================================
@@ -39,125 +38,123 @@ fn run_v3_pipeline(source: &str) -> Result<(), String> {
 
 #[test]
 fn v3_parse_literal_expression() {
-    let func = compile_v3("42");
+    let prog = compile_v3("42");
     assert!(
-        func.body
-            .iter()
-            .any(|inst| matches!(inst, MirInst::Const(_, _)))
+        entry_insts(&prog)
+            .into_iter()
+            .any(|inst| matches!(inst, ControlInst::Const(_, _)))
     );
 }
 
 #[test]
 fn v3_parse_string_expression() {
-    let func = compile_v3(r#""hello""#);
+    let prog = compile_v3(r#""hello""#);
     assert!(
-        func.body
-            .iter()
-            .any(|inst| matches!(inst, MirInst::Const(_, _)))
+        entry_insts(&prog)
+            .into_iter()
+            .any(|inst| matches!(inst, ControlInst::Const(_, _)))
     );
 }
 
 #[test]
 fn v3_parse_variable_reference() {
-    let func = compile_v3("let x = 1\nx");
-    assert!(
-        func.body
-            .iter()
-            .any(|inst| matches!(inst, MirInst::Var(_, _)))
-    );
+    let prog = compile_v3("let x = 1\nx");
+    assert!(entry_insts(&prog).into_iter().any(|inst| matches!(
+        inst,
+        ControlInst::LoadGlobal(_, _) | ControlInst::LoadLocal(_, _)
+    )));
 }
 
 #[test]
 fn v3_parse_binary_expression() {
-    let func = compile_v3("1 + 2");
+    let prog = compile_v3("1 + 2");
     assert!(
-        func.body
-            .iter()
-            .any(|inst| matches!(inst, MirInst::Const(_, _)))
+        entry_insts(&prog)
+            .into_iter()
+            .any(|inst| matches!(inst, ControlInst::Const(_, _)))
     );
 }
 
 #[test]
 fn v3_parse_list_literal() {
-    let func = compile_v3("[1, 2, 3]");
+    let prog = compile_v3("[1, 2, 3]");
     assert!(
-        func.body
-            .iter()
-            .any(|inst| matches!(inst, MirInst::ListLit(_, _)))
+        entry_insts(&prog)
+            .into_iter()
+            .any(|inst| matches!(inst, ControlInst::ListLit(_, _)))
     );
 }
 
 #[test]
 fn v3_parse_dict_literal() {
-    let func = compile_v3(r#"{key: "value"}"#);
+    let prog = compile_v3(r#"{key: "value"}"#);
     assert!(
-        func.body
-            .iter()
-            .any(|inst| matches!(inst, MirInst::DictLit(_, _)))
+        entry_insts(&prog)
+            .into_iter()
+            .any(|inst| matches!(inst, ControlInst::DictLit(_, _)))
     );
 }
 
 // ===================================================================
-// 2. Lowering 单元测试 — 验证 MirExpr → MirInst 转换
+// 2. Lowering 单元测试 — 验证 MirWitness → ControlProgram 转换
 // ===================================================================
 
 #[test]
 fn v3_lower_literal_produces_const() {
-    let func = compile_v3("42");
-    assert_eq!(func.body.len(), 1);
+    let prog = compile_v3("42");
+    let insts = entry_insts(&prog);
+    assert!(!insts.is_empty());
     assert!(
-        func.body
-            .iter()
-            .any(|inst| matches!(inst, MirInst::Const(_, Value::Float(42.0))))
+        insts
+            .into_iter()
+            .any(|inst| matches!(inst, ControlInst::Const(_, ControlConst::Int(42))))
     );
 }
 
 #[test]
 fn v3_lower_binary_produces_binary_op() {
-    let func = compile_v3("let a = 1\nlet b = 2\na + b");
-    assert!(func.body.iter().any(|inst| matches!(
+    let prog = compile_v3("let a = 1\nlet b = 2\na + b");
+    assert!(entry_insts(&prog).into_iter().any(|inst| matches!(
         inst,
-        MirInst::BinaryOp(_, _, mora::common::BinaryOp::Add, _)
+        ControlInst::Binary(_, _, mora::common::BinaryOp::Add, _)
     )));
 }
 
 #[test]
 fn v3_lower_let_binding_produces_define() {
-    let func = compile_v3("let x = 42");
-    assert!(
-        func.body
-            .iter()
-            .any(|inst| matches!(inst, MirInst::Define(_, _)))
-    );
+    let prog = compile_v3("let x = 42");
+    assert!(entry_insts(&prog).into_iter().any(|inst| matches!(
+        inst,
+        ControlInst::StoreGlobal(_, _) | ControlInst::StoreLocal(_, _)
+    )));
 }
 
 #[test]
 fn v3_lower_variable_reference_produces_var() {
-    let func = compile_v3("let x = 42\nx");
-    assert!(
-        func.body
-            .iter()
-            .any(|inst| matches!(inst, MirInst::Var(_, _)))
-    );
+    let prog = compile_v3("let x = 42\nx");
+    assert!(entry_insts(&prog).into_iter().any(|inst| matches!(
+        inst,
+        ControlInst::LoadGlobal(_, _) | ControlInst::LoadLocal(_, _)
+    )));
 }
 
 #[test]
 fn v3_lower_list_literal_produces_list_lit() {
-    let func = compile_v3("[1, 2]");
+    let prog = compile_v3("[1, 2]");
     assert!(
-        func.body
-            .iter()
-            .any(|inst| matches!(inst, MirInst::ListLit(_, _)))
+        entry_insts(&prog)
+            .into_iter()
+            .any(|inst| matches!(inst, ControlInst::ListLit(_, _)))
     );
 }
 
 #[test]
 fn v3_lower_dict_literal_produces_dict_lit() {
-    let func = compile_v3(r#"{a: 1}"#);
+    let prog = compile_v3(r#"{a: 1}"#);
     assert!(
-        func.body
-            .iter()
-            .any(|inst| matches!(inst, MirInst::DictLit(_, _)))
+        entry_insts(&prog)
+            .into_iter()
+            .any(|inst| matches!(inst, ControlInst::DictLit(_, _)))
     );
 }
 
@@ -167,10 +164,10 @@ fn v3_lower_dict_literal_produces_dict_lit() {
 
 #[test]
 fn v3_typecheck_then_lower_succeeds() {
-    let (func, witnesses) = ParserV3::compile("let x = 42").expect("compile should succeed");
-    let _errors = check_program_witnesses_bidirectional(&witnesses);
+    let (prog, witnesses) = ParserV3::compile("let x = 42").expect("compile should succeed");
+    let _errors = check_program_witnesses(&witnesses);
     assert!(
-        !func.body.is_empty(),
+        !entry_insts(&prog).is_empty(),
         "lowered function should have instructions"
     );
 }
@@ -258,7 +255,7 @@ fn v3_pipeline_closure_runs() {
 #[test]
 fn v3_typecheck_unbound_variable() {
     let (_func, witnesses) = ParserV3::compile("let x = missing").expect("compile should succeed");
-    let errs = check_program_witnesses_bidirectional(&witnesses);
+    let errs = check_program_witnesses(&witnesses);
     assert!(!errs.is_empty(), "unbound variable should produce error");
 }
 
@@ -266,7 +263,7 @@ fn v3_typecheck_unbound_variable() {
 fn v3_typecheck_clean_program() {
     let (_func, witnesses) =
         ParserV3::compile("let x = 1 + 2\nprint(x)").expect("compile should succeed");
-    let errs = check_program_witnesses_bidirectional(&witnesses);
+    let errs = check_program_witnesses(&witnesses);
     assert!(errs.is_empty(), "clean program should have no errors");
 }
 

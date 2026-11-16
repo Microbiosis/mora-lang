@@ -24,23 +24,18 @@
 //! 6 种形态 × **正反两条路径**。原始 E1 只在 then 侧饿死、else 侧本就好
 //! —— 两条路径**不对称**，只测一条会得到「没问题」的错误结论。
 
-use mora::interpreter::Interpreter;
 use mora::parser_v3::ParserV3;
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::execute_program;
 use std::sync::Arc;
 
 /// 跑一段源码，返回顶层 body 的值（格式化后断言）。
 fn run(source: &str) -> String {
-    let (func, _w) = ParserV3::compile(source).unwrap_or_else(|e| panic!("compile: {e}"));
-    let arc = Arc::new(func);
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    match mora::mir::vm::execute(
-        &arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    ) {
-        Ok(v) => format!("{v:?}"),
+    let (prog, _w) = ParserV3::compile(source).unwrap_or_else(|e| panic!("compile: {e}"));
+    let arc = Arc::new(prog);
+    let mut core = CoreRuntime::default();
+    match execute_program(arc, &mut core) {
+        Ok((v, _)) => format!("{v:?}"),
         Err(e) => format!("ERR: {e}"),
     }
 }
@@ -59,7 +54,7 @@ fn e1_if_as_value_tail_on_then_path() {
     assert_val(
         "A1",
         "let c = 1\nlet x = if c == 1 then 5 else 7 end\nx + 1\n",
-        "Float(6.0)",
+        "Int(6)",
     );
 }
 
@@ -69,7 +64,7 @@ fn e1_if_as_value_tail_on_else_path() {
     assert_val(
         "A2",
         "let c = 2\nlet x = if c == 1 then 5 else 7 end\nx + 1\n",
-        "Float(8.0)",
+        "Int(8)",
     );
 }
 
@@ -80,7 +75,7 @@ fn e1_block_if_else_tail_on_then_path() {
     assert_val(
         "A3",
         "let c = 1\nlet x = 0\nif c == 1 then\n  x = 5\nelse\n  x = 7\nend\nx + 1\n",
-        "Float(6.0)",
+        "Int(6)",
     );
 }
 
@@ -89,7 +84,7 @@ fn e1_block_if_else_tail_on_else_path() {
     assert_val(
         "A4",
         "let c = 2\nlet x = 0\nif c == 1 then\n  x = 5\nelse\n  x = 7\nend\nx + 1\n",
-        "Float(8.0)",
+        "Int(8)",
     );
 }
 
@@ -101,7 +96,7 @@ fn e1_bare_if_tail_on_then_path() {
     assert_val(
         "A5",
         "let c = 1\nlet n = 0\nif c == 1 then\n  let n = 7\nend\nn + 1\n",
-        "Float(8.0)",
+        "Int(8)",
     );
 }
 
@@ -115,7 +110,7 @@ fn e1_bare_if_tail_on_else_path() {
     assert_val(
         "A6",
         "let c = 2\nlet n = 0\nif c == 1 then\n  let n = 7\nend\nn + 1\n",
-        "Float(1.0)",
+        "Int(1)",
     );
 }
 
@@ -127,7 +122,7 @@ fn e1_nested_if_join_points() {
     assert_val(
         "A7",
         "let a = 1\nlet b = 2\nlet n = 0\nif a == 1 then\n  if b == 2 then\n    let n = 5\n  else\n    let n = 6\n  end\nend\nn + 1\n",
-        "Float(6.0)",
+        "Int(6)",
     );
 }
 
@@ -137,7 +132,7 @@ fn e1_if_else_if_chain() {
     assert_val(
         "A8",
         "let x = 5\nlet n = 0\nif x > 9 then\n  let n = 1\nelse if x > 4 then\n  let n = 2\nelse\n  let n = 3\nend\nn * 10\n",
-        "Float(20.0)",
+        "Int(20)",
     );
 }
 
@@ -150,7 +145,7 @@ fn e1_for_loop_join_after_backedge() {
     assert_val(
         "B2",
         "let s = 0\nfor v in [10, 20, 30]\n  let s = s + 1\nend\ns\n",
-        "Float(3.0)",
+        "Int(3)",
     );
 }
 
@@ -160,7 +155,7 @@ fn e1_while_continue_then_tail() {
     assert_val(
         "B8",
         "let i = 0\nlet s = 0\nwhile i < 8\n  let i = i + 1\n  if i == 3 then\n    continue\n  end\n  if i == 7 then\n    break\n  end\n  let s = s + i\nend\ns\n",
-        "Float(18.0)",
+        "Int(18)",
     );
 }
 
@@ -170,23 +165,19 @@ fn e1_loop_if_assign_composite() {
     assert_val(
         "E1",
         "let t = 0\nfor i in [1, 2, 3, 4, 5]\n  if i % 2 == 0 then\n    let t = t + i\n  else\n    let t = t + 1\n  end\nend\nt\n",
-        "Float(9.0)",
+        "Int(9)",
     );
 }
 
 // ── 形态 6：`str()` 的运行期实现 ────────────────────────────────────────
 
-/// `str()` 在 typeck 有签名（`src/typeck/hm/builtin.rs`）却曾无运行期实现。
-/// 它之所以长期隐身，正是因为唯一用到它的那行被 E1 饿死了。
-/// 本用例无任何控制流，可独立复现该缺口。
-///
-/// 注：Mora 的字面量 `45` 是 `Float`，故 `str(45)` 是 `"45.0"` 而非 `"45"`。
+/// Stage 3A-1：无后缀 `45` / `7` 为 `Int`，故 `str(45)` 得 `"45"`、`str(7)` 得 `"7"`。
 #[test]
 fn str_builtin_exists_at_runtime() {
-    assert_val("D0", "str(45)\n", "String(\"45.0\")");
+    assert_val("D0", "str(45)\n", "String(\"45\")");
 }
 
 #[test]
 fn str_builtin_concatenates_with_string() {
-    assert_val("D1", "let n = 7\n\"n=\" + str(n)\n", "String(\"n=7.0\")");
+    assert_val("D1", "let n = 7\n\"n=\" + str(n)\n", "String(\"n=7\")");
 }

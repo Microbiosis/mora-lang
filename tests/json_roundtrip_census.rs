@@ -23,7 +23,7 @@ fn lst(v: Vec<Value>) -> Value {
 }
 
 /// 单个字符串的往返：写 → 读，返回读回的值或错误描述。
-fn rt_string(s: &str) -> Result<Value, String> {
+fn rt_string(s: &str) -> mora::error::MoraResult<Value> {
     let json = value_to_json(&Value::String(s.to_string()));
     json_to_value(&json)
 }

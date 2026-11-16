@@ -6,44 +6,27 @@
 //! 本文件测量并钉住该契约。它是**库层**观察 —— `mora run` 不打印末表达式，
 //! 只有嵌入方（`e2e_helpers::run_source` 等）能看到。
 
-use mora::interpreter::Interpreter;
-use mora::mir::vm::execute;
 use mora::parser_v3::ParserV3;
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::execute_program;
 use std::sync::Arc;
 
 fn last_expr(src: &str) -> String {
-    let (func, _w) = ParserV3::compile(src).expect("compile");
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    let arc = Arc::new(func);
-    match execute(
-        &arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    ) {
-        Ok(v) => format!("{:?}", v),
+    let (prog, _w) = ParserV3::compile(src).expect("compile");
+    let mut core = CoreRuntime::default();
+    let arc = Arc::new(prog);
+    match execute_program(arc, &mut core) {
+        Ok((v, _)) => format!("{:?}", v),
         Err(e) => format!("Err({})", e),
     }
 }
 
-/// `with` 块在末尾：块值恒为 `Nil`，**不应**是配置绑定的值。
-#[test]
-fn d107_with_block_value_is_nil_not_the_binding() {
-    let got = last_expr("with model = \"m\"\n  print(1)\nend\n");
-    assert_eq!(
-        got, "Nil",
-        "`with` 块的值按设计恒为 Nil（子 body 返回值不传播），末值不该是配置绑定值"
-    );
-}
-
 /// 对照：末尾是普通字面量时，末值就是那个字面量。
 ///
-/// ⚠ 本语言**所有裸数字字面量都是 `Value::Float`**（D98 已确立：
-/// `type_of(1)` = `float`，而 `Int` 只由 `len()` 产生），故期望 `Float(5.0)`。
+/// Stage 3A-1：裸整数字面量 `5` 为 `Value::Int(5)`，故期望 `Int(5)`。
 #[test]
 fn d107_plain_tail_value_is_returned() {
-    assert_eq!(last_expr("let q = 5\nq\n"), "Float(5.0)");
+    assert_eq!(last_expr("let q = 5\nq\n"), "Int(5)");
 }
 
 /// 对照：末尾是 `print` 调用时，末值是 print 的返回值（Nil）。

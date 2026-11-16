@@ -30,10 +30,9 @@
 //!
 //! **排列穷举不变式**（D241 同款）+ **真实 Mora 源码**端到端。
 
-use mora::interpreter::Interpreter;
-use mora::mir::effect::Effects;
-use mora::mir::vm::execute;
 use mora::parser_v3::ParserV3;
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::execute_program;
 use std::sync::Arc;
 
 /// 穷举 n 个 f64 的全部排列
@@ -100,12 +99,11 @@ fn d242_partial_cmp_plus_equal_is_the_broken_form() {
 }
 
 fn run(source: &str) -> String {
-    let (func, _w) = ParserV3::compile(source).expect("compile");
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    let arc = Arc::new(func);
-    match execute(&arc, &mut interp, &mut env, &mut Effects::new()) {
-        Ok(v) => format!("{v:?}"),
+    let (prog, _w) = ParserV3::compile(source).expect("compile");
+    let mut core = CoreRuntime::default();
+    let arc = Arc::new(prog);
+    match execute_program(arc, &mut core) {
+        Ok((v, _)) => format!("{v:?}"),
         Err(e) => format!("ERR:{e}"),
     }
 }

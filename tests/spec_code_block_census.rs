@@ -77,7 +77,8 @@ fn d110_census_of_spec_mora_blocks() {
         match ParserV3::compile(src) {
             Ok(_) => {}
             Err(e) => {
-                let first = e.lines().next().unwrap_or("").to_string();
+                let msg = e.to_string();
+                let first = msg.lines().next().unwrap_or("").to_string();
                 bad.push(format!("spec 行 {line}: {first}"));
                 eprintln!(
                     "  spec:{line} 不可解析 — {first}\n    |{}|",
@@ -186,11 +187,11 @@ fn d110_result_generic_annotation_is_rejected_not_silently_dropped() {
          若本测试失败，说明静默丢弃又回来了（D111 回归）"
     );
 
-    // `update` 的返回标注是同一个坑（D111 一并修）
-    let r2 = ParserV3::compile("update(msg, model): result<number, string>\n  model\nend\n");
+    // 泛型 return 标注仍必须明确报错，不得被静默丢弃（D111）
+    let r2 = ParserV3::compile("task f(x): result<number, string>\n  return x\nend\n");
     assert!(
         r2.is_err(),
-        "`update` 的返回标注同样必须报错（不得静默丢弃）"
+        "`task` 返回泛型标注同样必须报错（不得静默丢弃）"
     );
 
     // 对照：受支持的泛型标注照常可用
@@ -204,7 +205,7 @@ fn d110_result_generic_annotation_is_rejected_not_silently_dropped() {
 fn d110_supported_annotations_are_enforced() {
     let err_count = |src: &str| {
         let (_, wits) = ParserV3::compile(src).expect("语法应通过");
-        mora::typeck::check_mir::check_program_witnesses_bidirectional(&wits).len()
+        mora::typeck::check_mir::check_program_witnesses(&wits).len()
     };
     assert!(
         err_count("let r: string = 1\nprint(r)\n") > 0,
@@ -246,40 +247,23 @@ fn d110_let_destructuring_is_not_supported() {
     );
 }
 
-/// **D116**：spec §11.1 曾把 `budget` / `per_call` 列在「**支持的配置键**」下，
-/// 但实现对这两个键**明确报错**（D39 的消息原文即
-/// 「promised by spec §11.1 but not implemented yet」）。spec 侧已更正。
+/// v0.110.0 同步：`with` 块、`ai.chat`、`Router::new()`、`McpServer::new()` 与
+/// TEA 声明已在 Wave 1 移除，spec 中不得继续宣传为内置核心特性。
 #[test]
-fn d116_spec_does_not_claim_unimplemented_budget_keys() {
+fn v0110_spec_removes_with_block_and_removed_builtins() {
     let text = std::fs::read_to_string("docs/mora-spec.md").expect("读 docs/mora-spec.md");
-
-    // 找到 §11.1 的「支持的配置键」列表
-    let start = text
-        .find("支持的配置键")
-        .unwrap_or_else(|| panic!("spec 里找不到「支持的配置键」"));
-    let list = &text[start..start + 600];
-
-    for key in ["budget", "per_call"] {
-        let in_supported = list
-            .lines()
-            .take_while(|l| !l.trim_start().starts_with("**"))
-            .any(|l| l.trim_start().starts_with(&format!("- `{key}`")));
+    for removed in [
+        "with model =",
+        "with budget =",
+        "with mock_llm =",
+        "Router::new()",
+        "McpServer::new()",
+    ] {
         assert!(
-            !in_supported,
-            "`{key}` 未被实现，写它会报错 —— 不得列在「支持的配置键」下"
+            !text.contains(removed),
+            "v0.110.0 已移除 `{removed}`，spec 不应继续出现该承诺"
         );
     }
-    assert!(
-        list.contains("承诺但未实现"),
-        "§11.1 应显式标注 `budget` / `per_call` 为「承诺但未实现」"
-    );
-    // 对照：`mock_llm` / `model` 等确实被支持（D91 已修好 mock_llm）
-    assert!(
-        list.lines()
-            .take(8)
-            .any(|l| l.trim_start().starts_with("- `mock_llm`")),
-        "对照失败：`mock_llm` 确实受支持（D91），应留在「支持的配置键」下"
-    );
 }
 
 /// **D163 已翻转**：`params` 此前被 `task_stmt` / `macro_stmt` / `closure` 引用
@@ -414,19 +398,19 @@ fn d118_omitted_end_closure_works_and_does_not_swallow_statements() {
     // 对照组 1：`fn(x) x + 1` 闭包**返回值**正确（捕获参数 x）
     assert_eq!(
         execute_last_value("let f = fn(x) x + 1\nf(2)\n"),
-        "Float(3.0)",
+        "Int(3)",
         "`fn(params) expr` 必须返回 expr 的值"
     );
     // 对照组 2：显式 `end` 的 `return` 形式不受影响（`return` 不是表达式）
     assert_eq!(
         execute_last_value("let f = fn() return 1 end\nf()\n"),
-        "Float(1.0)",
+        "Int(1)",
         "`return` 形式必须照旧工作（它不在 emit_expr_w 里，靠本测试防回归）"
     );
     // 对照组 3：换行多语句闭包**不能**被降成「只执行第一条」
     assert_eq!(
         execute_last_value("let f = fn()\n  let a = 2\n  a + 40\nend\nf()\n"),
-        "Float(42.0)",
+        "Int(42)",
         "换行块闭包仍是多语句；只看「首 token 是 Identifier」会把它误降成单表达式"
     );
     // 对照组 4：作函数实参（`)` 终止）与行尾（EOF 终止）两种省略式都可用
@@ -441,7 +425,7 @@ fn d118_omitted_end_closure_works_and_does_not_swallow_statements() {
     //   这里补上执行层的钉子。
     assert_eq!(
         execute_last_value("let g = fn(a) a + 1\ng(1)\n"),
-        "Float(2.0)",
+        "Int(2)",
         "省略 end 的闭包必须真能求值"
     );
 }
@@ -458,12 +442,8 @@ fn d118_closures_capture_lexical_values() {
     ParserV3::compile(spec_6_1).expect("spec §6.1 的闭包示例必须可解析");
 
     // 执行层：闭包捕获的是**运行时值**（10 + 20 = 30），不是 0 也不是编译期常量。
-    // ⚠ 本语言所有裸数字字面量都是 `Value::Float`（D98：`type_of(1)` = `float`）。
     let got = execute_last_value(spec_6_1);
-    assert_eq!(
-        got, "Float(30.0)",
-        "闭包应捕获外层 x=10 与参数 y=20 求得 30"
-    );
+    assert_eq!(got, "Int(30)", "闭包应捕获外层 x=10 与参数 y=20 求得 30");
 }
 
 /// D118：§16.4 JSON 示例里 `json.parse('…')` 的**单引号**会被当成 char 字面量。
@@ -488,21 +468,15 @@ fn d118_json_needs_double_quotes_not_single() {
 
 /// 跑一段 Mora 并返回**末表达式**的运行时值（库层观察，`mora run` 不打印它）。
 fn execute_last_value(src: &str) -> String {
-    use mora::interpreter::Interpreter;
-    use mora::mir::vm::execute;
+    use mora::runtime::CoreRuntime;
+    use mora::runtime::vm::execute_program;
     use std::sync::Arc;
 
-    let (func, _w) = ParserV3::compile(src).expect("compile");
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    let arc = Arc::new(func);
-    match execute(
-        &arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    ) {
-        Ok(v) => format!("{v:?}"),
+    let (prog, _w) = ParserV3::compile(src).expect("compile");
+    let mut core = CoreRuntime::default();
+    let arc = Arc::new(prog);
+    match execute_program(arc, &mut core) {
+        Ok((v, _)) => format!("{v:?}"),
         Err(e) => format!("Err({e})"),
     }
 }

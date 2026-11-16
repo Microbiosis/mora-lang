@@ -74,7 +74,7 @@ fn run(src: &str, tag: &str) -> (i32, String) {
     let dir = TempDir::new(tag);
     let p = dir.join("p.mora");
     std::fs::write(&p, src).expect("写探针");
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+    let exe = env!("CARGO_BIN_EXE_mora");
     let out = Command::new(exe).arg(&p).output().expect("跑 mora");
     let _ = std::fs::remove_dir_all(&dir);
     let text = String::from_utf8_lossy(&out.stdout).into_owned()
@@ -90,6 +90,7 @@ fn run(src: &str, tag: &str) -> (i32, String) {
                 && !l.starts_with("AI 原语")
                 && !l.starts_with("显式 API")
                 && !l.starts_with("Trait 系统")
+                && !l.starts_with("类型与执行")
                 && !l.starts_with("Built-in")
                 && !l.starts_with("v0.15 CLI")
                 && !l.starts_with('⚠')
@@ -197,20 +198,16 @@ fn d329_explicit_integer_zero_bins_still_returns_empty_list() {
 /// 而不是留给下一个人凭直觉决定。
 #[test]
 fn d329_other_value_as_usize_callers_still_truncate() {
-    for (e, what) in [
-        ("crush_json([1,2,3,4,5], 2.5)", "crush_json 的 max"),
-        (
-            "exec.parallel([\"echo a\"], 2.5)",
-            "exec.parallel 的 max_concurrent",
-        ),
-    ] {
-        let (code, got) = ev(e);
-        assert_eq!(
-            code, 0,
-            "{what} 不属本条范围：仍应按 D246 收口向零截断（exit 0）; \
-             实得 exit={code} out={got}\n\
-             若此处变红，说明有人把 `value_as_usize` 收口整体改成拒绝小数了 —— \
-             那是 6 个调用点的**产品契约决定**，不该由某一条缺陷顺带做掉"
-        );
-    }
+    let (e, what) = (
+        "exec.parallel([\"echo a\"], 2.5)",
+        "exec.parallel 的 max_concurrent",
+    );
+    let (code, got) = ev(e);
+    assert_eq!(
+        code, 0,
+        "{what} 不属本条范围：仍应按 D246 收口向零截断（exit 0）; \
+         实得 exit={code} out={got}\n\
+         若此处变红，说明有人把 `value_as_usize` 收口整体改成拒绝小数了 —— \
+         那是 6 个调用点的**产品契约决定**，不该由某一条缺陷顺带做掉"
+    );
 }

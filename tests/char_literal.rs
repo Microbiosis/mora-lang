@@ -30,34 +30,28 @@
 
 use std::sync::Arc;
 
-use mora::interpreter::Interpreter;
-use mora::mir::vm::execute;
 use mora::parser_v3::ParserV3;
-use mora::typeck::check_mir::check_program_witnesses_bidirectional;
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::execute_program;
+use mora::typeck::check_mir::check_program_witnesses;
 
 fn run(src: &str) -> String {
     // typeck 守卫：断言必须是「用户真写得出来」的代码（见 builtin_gaps.rs 同款说明）
-    let (func, witnesses) = match ParserV3::compile(src) {
+    let (prog, witnesses) = match ParserV3::compile(src) {
         Ok(v) => v,
         Err(e) => return format!("COMPILE-ERR: {e}"),
     };
-    let errs = check_program_witnesses_bidirectional(&witnesses);
+    let errs = check_program_witnesses(&witnesses);
     if !errs.is_empty() {
         return format!(
             "TYPECK-REJECT: {:?}",
             errs.iter().map(|e| e.message.clone()).collect::<Vec<_>>()
         );
     }
-    let arc = Arc::new(func);
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    match execute(
-        &arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    ) {
-        Ok(v) => format!("{v:?}"),
+    let arc = Arc::new(prog);
+    let mut core = CoreRuntime::default();
+    match execute_program(arc, &mut core) {
+        Ok((v, _)) => format!("{v:?}"),
         Err(e) => format!("ERR: {e}"),
     }
 }
@@ -68,18 +62,12 @@ fn expect_runtime_only(cases: &[(&str, &str, &str)]) {
     let mut failures = Vec::new();
     for (name, src, want) in cases {
         let got = {
-            let (func, _w) = ParserV3::compile(&format!("{src}\n"))
+            let (prog, _w) = ParserV3::compile(&format!("{src}\n"))
                 .unwrap_or_else(|e| panic!("compile: {e}\n{src}"));
-            let arc = Arc::new(func);
-            let mut interp = Interpreter::new();
-            let mut env = interp.take_env();
-            match execute(
-                &arc,
-                &mut interp,
-                &mut env,
-                &mut mora::mir::effect::Effects::new(),
-            ) {
-                Ok(v) => format!("{v:?}"),
+            let arc = Arc::new(prog);
+            let mut core = CoreRuntime::default();
+            match execute_program(arc, &mut core) {
+                Ok((v, _)) => format!("{v:?}"),
                 Err(e) => format!("ERR: {e}"),
             }
         };
@@ -132,17 +120,11 @@ fn char_literal_goes_through_both_compile_paths() {
     let src = "let c = 'x'\nc\n";
     let bare = run(src);
     let pipe = match mora::cli::compile_and_opt(src, None) {
-        Ok((f, _)) => {
-            let arc = Arc::new(f);
-            let mut interp = Interpreter::new();
-            let mut env = interp.take_env();
-            match execute(
-                &arc,
-                &mut interp,
-                &mut env,
-                &mut mora::mir::effect::Effects::new(),
-            ) {
-                Ok(v) => format!("{v:?}"),
+        Ok((p, _)) => {
+            let arc = Arc::new(p);
+            let mut core = CoreRuntime::default();
+            match execute_program(arc, &mut core) {
+                Ok((v, _)) => format!("{v:?}"),
                 Err(e) => format!("ERR: {e}"),
             }
         }
@@ -213,11 +195,6 @@ fn equality_functions_do_not_diverge() {
         ("int", v(Value::Int(3)), v(Value::Int(3))),
         ("int 异值", v(Value::Int(3)), v(Value::Int(4))),
         ("float", v(Value::Float(3.5)), v(Value::Float(3.5))),
-        (
-            "bigint",
-            v(Value::BigInt(7.into())),
-            v(Value::BigInt(7.into())),
-        ),
         (
             "string",
             v(Value::String("a".into())),

@@ -26,7 +26,6 @@
 //! ⇒ 教训：收口的**位置**和收口本身一样重要。放在只有一部分调用方能到达的
 //! 地方，等于没有收口 —— 它只会挡住「已经看见它」的那部分调用方。
 
-use mora::compress::json::value_as_f64 as compress_value_as_f64;
 use mora::flow::{value_as_f64, value_as_usize};
 use mora::value::Value;
 
@@ -58,14 +57,6 @@ fn d246_value_as_usize_rejects_negative_and_non_finite() {
     assert_eq!(value_as_usize(&Value::Float(f64::NAN)), None);
     assert_eq!(value_as_usize(&Value::Float(f64::INFINITY)), None);
     assert_eq!(value_as_usize(&Value::String("5".into())), None);
-}
-
-/// ③ `compress::json::value_as_f64` 仍转发到同一实现（D231 的公开路径不变）。
-#[test]
-fn d246_compress_path_still_works() {
-    assert_eq!(compress_value_as_f64(&Value::Int(42)), Some(42.0));
-    assert_eq!(compress_value_as_f64(&Value::Float(4.5)), Some(4.5));
-    assert_eq!(compress_value_as_f64(&Value::Nil), None);
 }
 
 /// ④ 对照组：钉住「整数 JSON 数字 → `Value::Int`」这条**前提**。

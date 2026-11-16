@@ -59,7 +59,7 @@ impl WorkDir {
             format!("Content-Length: {}\r\n\r\n{}", json.len(), json)
         }
         fn esc(s: &str) -> String {
-            s.replace('\\', "\\\\").replace('"', "\\\"")
+            mora::flow::escape_json_string(s)
         }
         let uri = format!("file:///tmp/{tag}.mora");
         let input = self.0.join(format!("{tag}.bin"));

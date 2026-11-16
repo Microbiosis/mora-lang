@@ -1,5 +1,5 @@
 //! v0.77: E2E test harness — 镜像 main.rs::run_file 的完整调用栈：
-//!   cli::compile_and_opt → typeck::check_program_witnesses_bidirectional
+//!   cli::compile_and_opt → typeck::check_program_witnesses
 //!   → mir::vm::execute → mir::vm::run_main_task
 //!
 //! 与 parser_v2_integration.rs 那种依赖 cwd 的 read_to_string 不同，
@@ -17,9 +17,9 @@
 
 #![allow(dead_code)]
 
-use mora::interpreter::Interpreter;
-use mora::mir::vm::{execute, run_main_task};
-use mora::typeck::{TypeError, check_mir::check_program_witnesses_bidirectional, format_error};
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::{execute_program, run_main_task};
+use mora::typeck::{TypeError, check_mir::check_program_witnesses, format_error};
 use mora::value::Value;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -73,33 +73,22 @@ pub fn run_e2e(name: &str) -> E2eResult {
 pub fn run_source(source: &str) -> E2eResult {
     let (func, witnesses) = match mora::parser_v3::ParserV3::compile(source) {
         Ok(f) => f,
-        Err(e) => return E2eResult::CompileError(e),
+        Err(e) => return E2eResult::CompileError(e.to_string()),
     };
 
-    let type_errs = check_program_witnesses_bidirectional(&witnesses);
+    let type_errs = check_program_witnesses(&witnesses);
     if !type_errs.is_empty() {
         return E2eResult::TypeErrors(type_errs);
     }
 
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    let func_arc = Arc::new(func);
+    let mut core = CoreRuntime::default();
+    let prog_arc = Arc::new(func);
 
-    let last_expr = match execute(
-        &func_arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    ) {
+    let (last_expr, globals) = match execute_program(Arc::clone(&prog_arc), &mut core) {
         Ok(v) => v,
         Err(e) => return E2eResult::CompileError(format!("execute: {}", e)),
     };
-    if let Err(e) = run_main_task(
-        &func_arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    ) {
+    if let Err(e) = run_main_task(prog_arc, globals, &mut core) {
         return E2eResult::CompileError(format!("run_main_task: {}", e));
     }
 

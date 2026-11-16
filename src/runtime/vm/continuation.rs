@@ -1,0 +1,458 @@
+//! Heap-allocated stackful VM frames, upvalues, module globals, and delimited continuations.
+//!
+//! All types are `Send + Sync` so `Value` (including `Closure`, `Task`, `Macro`, and
+//! `Continuation`) can safely cross thread boundaries for `parallel` worker scopes and
+//! future coroutine schedulers (Wave 2 — Stage W2.3 / W2.4).
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+
+use crate::error::{MoraError, MoraResult};
+use crate::mir::control::{
+    BlockId, CaptureSource, ControlFunction, ControlProgram, FnId, FunctionKind, LocalSlot,
+    ParallelSegment, UpvalueSlot, VReg,
+};
+use crate::value::{Environment, Value};
+
+/// Shared cell holding a module-top static global binding `(value, is_exported)`.
+pub type GlobalCell = Arc<Mutex<(Value, bool)>>;
+
+/// Per-module global slot storage vector.
+pub type ModuleGlobals = Arc<Vec<GlobalCell>>;
+
+/// Interior-mutable heap cell backing locals captured by closures and mutated across boundaries.
+pub type UpvalueCell = Arc<Mutex<Value>>;
+
+/// Lexical upvalue entry stored in a `Closure` or `ScriptFrame`.
+#[derive(Debug, Clone)]
+pub enum UpvalueValue {
+    /// Immutable capture-by-value copy.
+    Const(Value),
+    /// Shared mutable cell visible across enclosing frame and inner closures.
+    Cell(UpvalueCell),
+}
+
+impl UpvalueValue {
+    /// Read the current value stored in this upvalue.
+    pub fn get(&self) -> Value {
+        match self {
+            Self::Const(v) => v.clone(),
+            Self::Cell(cell) => cell.lock().clone(),
+        }
+    }
+
+    /// Update a mutable shared upvalue cell.
+    pub fn set(&self, val: Value) -> MoraResult<()> {
+        match self {
+            Self::Cell(cell) => {
+                *cell.lock() = val;
+                Ok(())
+            }
+            Self::Const(_) => Err(MoraError::Runtime(
+                "cannot mutate immutable captured upvalue".to_string(),
+            )),
+        }
+    }
+
+    /// Stable pointer key for shared cell deduplication / worker isolation.
+    pub fn cell_key(&self) -> Option<usize> {
+        match self {
+            Self::Cell(cell) => Some(Arc::as_ptr(cell) as usize),
+            Self::Const(_) => None,
+        }
+    }
+}
+
+/// Per-frame local variable slot storage.
+#[derive(Debug, Clone)]
+pub enum LocalCell {
+    /// Direct frame-local slot; cloned independently across multi-shot continuations.
+    Val(Value),
+    /// Boxed heap cell shared with inner closures capturing this local.
+    Shared(UpvalueCell),
+}
+
+impl LocalCell {
+    /// Read the current value stored in this local slot.
+    pub fn get(&self) -> Value {
+        match self {
+            Self::Val(v) => v.clone(),
+            Self::Shared(cell) => cell.lock().clone(),
+        }
+    }
+
+    /// Write a new value into this local slot, preserving shared cell identity.
+    pub fn set(&mut self, val: Value) {
+        match self {
+            Self::Val(v) => *v = val,
+            Self::Shared(cell) => *cell.lock() = val,
+        }
+    }
+
+    /// Capture this local slot for an inner closure according to `shared`.
+    pub fn capture(&self, shared: bool) -> UpvalueValue {
+        match (self, shared) {
+            (Self::Shared(cell), true) => UpvalueValue::Cell(Arc::clone(cell)),
+            (Self::Shared(cell), false) => UpvalueValue::Const(cell.lock().clone()),
+            (Self::Val(v), false) => UpvalueValue::Const(v.clone()),
+            (Self::Val(v), true) => UpvalueValue::Cell(Arc::new(Mutex::new(v.clone()))),
+        }
+    }
+}
+
+/// Heap-allocated call frame executing a compiled [`ControlFunction`].
+#[derive(Debug, Clone)]
+pub struct ScriptFrame {
+    pub program: Arc<ControlProgram>,
+    pub func_id: FnId,
+    pub globals: ModuleGlobals,
+    pub upvalues: Arc<Vec<UpvalueValue>>,
+    pub locals: Vec<LocalCell>,
+    pub regs: Vec<Value>,
+    pub block_id: BlockId,
+    pub pc: usize,
+    pub resume_dst: Option<VReg>,
+}
+
+impl ScriptFrame {
+    /// Borrow the active [`ControlFunction`] descriptor from `self.program`.
+    #[inline]
+    pub fn func(&self) -> &ControlFunction {
+        self.program.func(self.func_id)
+    }
+
+    /// Deliver `reply` when control returns to this frame from a callee or resumed continuation.
+    pub fn receive_reply(&mut self, reply: Value) {
+        if let Some(dst) = self.resume_dst.take() {
+            self.regs[dst.0 as usize] = reply;
+            return;
+        }
+        let block = &self.func().blocks[self.block_id.0 as usize];
+        if self.pc == 0
+            && let Some(&param_reg) = block.params.first()
+        {
+            self.regs[param_reg.0 as usize] = reply;
+        }
+    }
+}
+
+/// Deep algebraic-effect barrier installed by `ControlInst::Handle`.
+#[derive(Debug, Clone)]
+pub struct HandleBarrierState {
+    pub effect_name: String,
+    pub handler_program: Arc<ControlProgram>,
+    pub handler_fn: FnId,
+    pub handler_globals: ModuleGlobals,
+    pub handler_upvalues: Arc<Vec<UpvalueValue>>,
+    pub auto_resume: bool,
+}
+
+/// Iterative state machine frames for higher-order builtins and collection methods.
+#[derive(Debug, Clone)]
+pub enum CombinatorFrame {
+    /// Left-to-right `compose(f1, f2, ...)` invocation.
+    Compose { funcs: Vec<Value>, next_idx: usize },
+    /// `list.map(f)` accumulation state.
+    ListMap {
+        func: Value,
+        items: Vec<Value>,
+        idx: usize,
+        results: Vec<Value>,
+    },
+    /// `list.filter(pred)` accumulation state.
+    ListFilter {
+        pred: Value,
+        items: Vec<Value>,
+        idx: usize,
+        results: Vec<Value>,
+    },
+    /// `list.reduce(fn, init)` folding state.
+    ListReduce {
+        func: Value,
+        items: Vec<Value>,
+        idx: usize,
+    },
+    /// `into(list, transform)` flat-collect state.
+    Into {
+        transform: Value,
+        items: Vec<Value>,
+        idx: usize,
+        results: Vec<Value>,
+    },
+    /// `swap(atom, f)` writeback awaiting `f(old)` return value.
+    Swap { atom: Arc<Mutex<Value>> },
+}
+
+/// Snapshot & compensation state for `ControlInst::Transaction`.
+#[derive(Debug, Clone)]
+pub struct TransactionState {
+    pub saved_env: Environment,
+    pub saved_globals_vals: Vec<(Value, bool)>,
+    pub target_globals: ModuleGlobals,
+    pub comp_program: Arc<ControlProgram>,
+    pub comp_fn: FnId,
+    pub comp_upvalues: Arc<Vec<UpvalueValue>>,
+    pub in_compensation: bool,
+}
+
+/// Continuation frame driving mixed `worker` batches and sequential statements in `parallel`.
+#[derive(Debug, Clone)]
+pub struct ParallelFrame {
+    pub program: Arc<ControlProgram>,
+    pub globals: ModuleGlobals,
+    pub parent_upvalues: Arc<Vec<UpvalueValue>>,
+    pub parent_locals: Vec<LocalCell>,
+    pub segments: Vec<ParallelSegment>,
+    pub next_idx: usize,
+    pub last_val: Value,
+}
+
+/// Polymorphic execution frame on the VM's explicit heap call stack.
+#[derive(Debug, Clone)]
+pub enum CallFrame {
+    /// Executing a compiled SSA `ControlFunction`.
+    Script(Box<ScriptFrame>),
+    /// Active algebraic effect handler boundary (`handle E { ... } { ... }`).
+    HandleBarrier(HandleBarrierState),
+    /// Automatic continuation resumption when a handler body omits `resume`.
+    AutoResume(Arc<CapturedContinuation>),
+    /// Higher-order combinator loop (`map`, `filter`, `reduce`, `compose`, `into`, `swap`).
+    Combinator(CombinatorFrame),
+    /// ACID transaction checkpoint wrapping body execution and compensation fallback.
+    Transaction(TransactionState),
+    /// Import boundary preserving caller environment while publishing only exports.
+    ImportFinalize {
+        saved_env: Environment,
+        child_program: Arc<ControlProgram>,
+        child_globals: ModuleGlobals,
+    },
+    /// Dynamic `eval(...)` boundary restoring outer `Environment` after sub-program exit.
+    EvalRestore { saved_env: Environment },
+    /// Parallel block driver executing worker batches and sequential slices.
+    Parallel(ParallelFrame),
+    /// Wraps propagated errors with a diagnostic prefix (e.g. macro invocation errors).
+    ErrorContext { prefix: String },
+}
+
+/// Multi-shot delimited continuation captured up to the matching [`HandleBarrierState`].
+#[derive(Debug, Clone)]
+pub struct CapturedContinuation {
+    pub effect_name: String,
+    pub barrier: HandleBarrierState,
+    /// Captured frames ordered bottom-to-top above the barrier.
+    pub frames: Vec<CallFrame>,
+}
+
+/// Initialize module global cells from `prog.globals`.
+pub fn init_globals(prog: &ControlProgram) -> ModuleGlobals {
+    let cells = prog
+        .globals
+        .iter()
+        .map(|meta| Arc::new(Mutex::new((Value::Nil, meta.exported))))
+        .collect();
+    Arc::new(cells)
+}
+
+/// Snapshot all module globals as `(value, is_exported)` tuples.
+pub fn snapshot_globals(globals: &ModuleGlobals) -> Vec<(Value, bool)> {
+    globals.iter().map(|cell| cell.lock().clone()).collect()
+}
+
+/// Restore module globals from a previous [`snapshot_globals`] slice.
+pub fn restore_globals(globals: &ModuleGlobals, snap: &[(Value, bool)]) {
+    for (cell, saved) in globals.iter().zip(snap.iter()) {
+        *cell.lock() = saved.clone();
+    }
+}
+
+/// Clone module globals into isolated mutex cells for concurrent worker execution.
+pub fn clone_isolated_globals(snap: &[(Value, bool)]) -> ModuleGlobals {
+    Arc::new(
+        snap.iter()
+            .map(|entry| Arc::new(Mutex::new(entry.clone())))
+            .collect(),
+    )
+}
+
+/// Resolve closure/sub-function `CaptureSource` descriptors from the active parent frame.
+pub fn resolve_captures(
+    captures: &[CaptureSource],
+    parent_locals: &[LocalCell],
+    parent_upvalues: &[UpvalueValue],
+    child_func: &ControlFunction,
+) -> Vec<UpvalueValue> {
+    captures
+        .iter()
+        .enumerate()
+        .map(|(idx, src)| {
+            let want_shared = child_func
+                .upvalues
+                .get(idx)
+                .map(|d| d.shared)
+                .unwrap_or(false);
+            match src {
+                CaptureSource::ParentLocal(LocalSlot(s)) => {
+                    parent_locals[*s as usize].capture(want_shared)
+                }
+                CaptureSource::ParentUpvalue(UpvalueSlot(u)) => match &parent_upvalues[*u as usize]
+                {
+                    UpvalueValue::Cell(c) if want_shared => UpvalueValue::Cell(Arc::clone(c)),
+                    UpvalueValue::Cell(c) => UpvalueValue::Const(c.lock().clone()),
+                    UpvalueValue::Const(v) if want_shared => {
+                        UpvalueValue::Cell(Arc::new(Mutex::new(v.clone())))
+                    }
+                    UpvalueValue::Const(v) => UpvalueValue::Const(v.clone()),
+                },
+            }
+        })
+        .collect()
+}
+
+/// Clone worker upvalue slices while isolating shared mutable cells per concurrent worker.
+pub fn clone_worker_upvalues(
+    upvalues: &[UpvalueValue],
+    child_func: &ControlFunction,
+    cell_map: &mut HashMap<usize, UpvalueCell>,
+) -> Vec<UpvalueValue> {
+    upvalues
+        .iter()
+        .enumerate()
+        .map(|(idx, uv)| match uv {
+            UpvalueValue::Const(v) => UpvalueValue::Const(v.clone()),
+            UpvalueValue::Cell(cell) => {
+                let ptr = Arc::as_ptr(cell) as usize;
+                let isolated = cell_map
+                    .entry(ptr)
+                    .or_insert_with(|| Arc::new(Mutex::new(cell.lock().clone())));
+                let want_shared = child_func
+                    .upvalues
+                    .get(idx)
+                    .map(|d| d.shared)
+                    .unwrap_or(true);
+                if want_shared {
+                    UpvalueValue::Cell(Arc::clone(isolated))
+                } else {
+                    UpvalueValue::Const(isolated.lock().clone())
+                }
+            }
+        })
+        .collect()
+}
+
+/// Construct a new [`ScriptFrame`] for calling `func_id`, verifying arity for Tasks/Closures/Macros.
+pub fn materialize_frame(
+    program: Arc<ControlProgram>,
+    func_id: FnId,
+    globals: ModuleGlobals,
+    upvalues: Arc<Vec<UpvalueValue>>,
+    args: &[Value],
+) -> MoraResult<ScriptFrame> {
+    let (locals, regs, block_id) = {
+        let func = program.func(func_id);
+        match func.kind {
+            FunctionKind::Task => {
+                if args.len() != func.params.len() {
+                    return Err(MoraError::Runtime(format!(
+                        "task expects {} args, got {}",
+                        func.params.len(),
+                        args.len()
+                    )));
+                }
+            }
+            FunctionKind::Closure => {
+                if args.len() != func.params.len() {
+                    return Err(MoraError::Runtime(format!(
+                        "closure expects {} args, got {}",
+                        func.params.len(),
+                        args.len()
+                    )));
+                }
+            }
+            FunctionKind::Macro => {
+                if args.len() != func.params.len() {
+                    let mname = func
+                        .name
+                        .map(|s| program.symbols.resolve(s))
+                        .unwrap_or("<macro>");
+                    return Err(MoraError::Runtime(format!(
+                        "macro '{}' expects {} args, got {}",
+                        mname,
+                        func.params.len(),
+                        args.len()
+                    )));
+                }
+            }
+            FunctionKind::Main
+            | FunctionKind::HandleBody
+            | FunctionKind::HandleHandler
+            | FunctionKind::TransactionBody
+            | FunctionKind::TransactionComp
+            | FunctionKind::Worker
+            | FunctionKind::ParallelSeq
+            | FunctionKind::SelectArm => {}
+        }
+
+        let n_locals = func.n_locals as usize;
+        let mut locals = Vec::with_capacity(n_locals);
+        for slot_idx in 0..n_locals {
+            if func.shared_locals.get(slot_idx).copied().unwrap_or(false) {
+                locals.push(LocalCell::Shared(Arc::new(Mutex::new(Value::Nil))));
+            } else {
+                locals.push(LocalCell::Val(Value::Nil));
+            }
+        }
+
+        for (slot_idx, val) in args.iter().enumerate() {
+            if slot_idx < locals.len() {
+                locals[slot_idx].set(val.clone());
+            }
+        }
+
+        let regs = vec![Value::Nil; func.n_regs as usize];
+        (locals, regs, func.entry)
+    };
+
+    Ok(ScriptFrame {
+        program,
+        func_id,
+        globals,
+        upvalues,
+        locals,
+        regs,
+        block_id,
+        pc: 0,
+        resume_dst: None,
+    })
+}
+
+/// Bind `perform` arguments and captured [`CapturedContinuation`] into a `HandleHandler` frame.
+pub fn materialize_handler_frame(
+    barrier: &HandleBarrierState,
+    perform_args: &[Value],
+    cont: Arc<CapturedContinuation>,
+) -> MoraResult<ScriptFrame> {
+    let mut frame = materialize_frame(
+        Arc::clone(&barrier.handler_program),
+        barrier.handler_fn,
+        Arc::clone(&barrier.handler_globals),
+        Arc::clone(&barrier.handler_upvalues),
+        &[],
+    )?;
+    let func = frame.func().clone();
+    for (idx, maybe_slot) in func.handler_arg_slots.iter().enumerate() {
+        if let Some(LocalSlot(s)) = maybe_slot
+            && (*s as usize) < frame.locals.len()
+        {
+            let val = perform_args.get(idx).cloned().unwrap_or(Value::Nil);
+            frame.locals[*s as usize].set(val);
+        }
+    }
+    if let Some(LocalSlot(k_slot)) = func.handler_k_slot
+        && (k_slot as usize) < frame.locals.len()
+    {
+        frame.locals[k_slot as usize].set(Value::Continuation(cont));
+    }
+    Ok(frame)
+}

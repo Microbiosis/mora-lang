@@ -41,7 +41,7 @@ fn run(src: &str, tag: &str, opt: bool) -> Vec<String> {
     let dir = TempDir::new(tag);
     let p = dir.join("p.mora");
     std::fs::write(&p, src).expect("写探针");
-    let exe = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+    let exe = env!("CARGO_BIN_EXE_mora");
     let mut c = Command::new(exe);
     if opt {
         c.arg("--opt=1");
@@ -59,6 +59,7 @@ fn run(src: &str, tag: &str, opt: bool) -> Vec<String> {
                 && !l.contains("AI 原语")
                 && !l.contains("显式 API")
                 && !l.contains("Trait 系统")
+                && !l.contains("类型与执行")
                 && !l.contains("Built-in")
                 && !l.contains("v0.15 CLI")
                 && !l.contains("不兼容 v0.03")
@@ -151,7 +152,7 @@ fn for_loop_is_fine_at_the_default_level() {
     let got = run("for i in [1, 2, 3]\n  print(i)\nend\n", "for", false);
     assert_eq!(
         got,
-        vec!["1.0", "2.0", "3.0"],
+        vec!["1", "2", "3"],
         "默认档的 for 循环必须正确; 实得 {got:?}"
     );
 }

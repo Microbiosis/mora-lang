@@ -63,16 +63,16 @@ fn d278_quasiquote_splice_renders_expected_text() {
     );
 
     // fixture 的 5 行输出依次是：
-    //   30.0               ← eval(`10+20)
-    //   15.0               ← eval(`10+,x)   = 10+5（普通 unquote 经求值）
+    //   30                 ← eval(`10+20)
+    //   15                 ← eval(`10+,x)   = 10+5（普通 unquote 经求值）
     //   code:1, 2, 3       ← `` `,,items ``  ← 本条要保护的那一行
     //   code:hello world   ← 纯引号
-    //   30.0               ← eval(`(10+20))
+    //   30                 ← eval(`(10+20))
     assert!(
         out.contains("code:1, 2, 3")
             && out.contains("code:hello world")
-            && out.contains("15.0")
-            && out.contains("30.0"),
+            && out.contains("15")
+            && out.contains("30"),
         "quasiquote 的四种形态（纯引号 / unquote / splice / 带括号）都应照常工作。\n\
          实际输出：{out}"
     );

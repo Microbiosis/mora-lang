@@ -33,19 +33,19 @@
 //! 「本就正确 · 作样板」。**那是错的** —— 那次只审了**负数**一侧，
 //! 没审**类型**一侧：两者都只匹配 `Float`，`Int` 实参同样被拒。
 
-use mora::interpreter::Interpreter;
-use mora::mir::effect::Effects;
-use mora::mir::vm::execute;
 use mora::parser_v3::ParserV3;
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::execute_program;
 use mora::test_support::TempDir;
 use std::sync::Arc;
 
 fn run(src: &str) -> Result<String, String> {
-    let (func, _w) = ParserV3::compile(src).map_err(|e| format!("COMPILE: {e}"))?;
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    let arc = Arc::new(func);
-    execute(&arc, &mut interp, &mut env, &mut Effects::new()).map(|v| format!("{v}"))
+    let (prog, _w) = ParserV3::compile(src).map_err(|e| format!("COMPILE: {e}"))?;
+    let mut core = CoreRuntime::default();
+    let arc = Arc::new(prog);
+    execute_program(arc, &mut core)
+        .map(|(v, _)| format!("{v}"))
+        .map_err(|e| e.to_string())
 }
 
 /// D153 主判据 ①：`list.get` 的 `Int` 索引必须**指向那个元素**，不是静默取第 0 个。
@@ -54,8 +54,8 @@ fn d153_list_get_honours_int_index() {
     let out = run("let xs = [10, 20, 30]\nlet i = len([9, 9])\nxs.get(i)\n")
         .unwrap_or_else(|e| panic!("Int 索引不应报错: {e}"));
     assert_eq!(
-        out, "30.0",
-        "`xs.get(len([9,9]))` 应得 xs[2]=30.0（修复前静默得 10.0）"
+        out, "30",
+        "`xs.get(len([9,9]))` 应得 xs[2]=30（修复前静默得 10）"
     );
 }
 
@@ -76,12 +76,9 @@ fn d153_list_get_out_of_bounds_int_index_errors() {
 #[test]
 fn d153_list_methods_accept_int_counts() {
     let cases = [
-        ("xs.take(i)", "[1.0, 2.0]"),
-        ("xs.drop(i)", "[3.0, 4.0, 5.0, 6.0, 7.0, 8.0]"),
-        (
-            "xs.batch(i)",
-            "[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]",
-        ),
+        ("xs.take(i)", "[1, 2]"),
+        ("xs.drop(i)", "[3, 4, 5, 6, 7, 8]"),
+        ("xs.batch(i)", "[[1, 2], [3, 4], [5, 6], [7, 8]]"),
     ];
     for (call, want) in cases {
         let out = run(&format!(
@@ -94,7 +91,7 @@ fn d153_list_methods_accept_int_counts() {
     let w = run("let xs = [1, 2, 3, 4]\nlet s = len([1, 1])\nxs.window(s)\n")
         .unwrap_or_else(|e| panic!("[window] Int 实参不应报错: {e}"));
     assert_eq!(
-        w, "[[1.0, 2.0], [2.0, 3.0], [3.0, 4.0]]",
+        w, "[[1, 2], [2, 3], [3, 4]]",
         "[window] Int 实参必须与 Float 等价"
     );
 
@@ -104,21 +101,14 @@ fn d153_list_methods_accept_int_counts() {
          g.reshape(a, b)\n")
     .unwrap_or_else(|e| panic!("[reshape] Int 实参不应报错: {e}"));
     assert_eq!(
-        r, "[[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]]",
+        r, "[[1, 2, 3, 4], [5, 6, 7, 8]]",
         "[reshape] 两个 Int 实参都必须与 Float 等价"
     );
 }
 
-/// D153 主判据 ④：D148 普查表里被误判为「本就正确」的 `crush_json` / `tail` 必须认 `Int`。
+/// D153 主判据 ④：`tail` 必须认 `Int`（`crush_json` 已在 v0.110.0 移除）。
 #[test]
 fn d153_crush_json_and_tail_accept_int_max() {
-    let c = run("let xs = [1, 2, 3, 4, 5, 6, 7, 8]\nlet n = len([1, 1])\nxs.crush_json(n)\n")
-        .unwrap_or_else(|e| panic!("crush_json 的 Int max 不应报错: {e}"));
-    assert!(
-        c.contains("items=2"),
-        "crush_json 的 Int max 必须与 Float 等价（items=2）; 实得: {c}"
-    );
-
     let dir = TempDir::new("mora_d153_tail");
     let f = dir.join("t.txt");
     std::fs::write(&f, "l1\nl2\nl3\nl4\n").expect("写文件");
@@ -156,7 +146,6 @@ fn d153_wrong_type_reports_type_error_not_missing_argument() {
         ("[1,2,3].window(\"two\")", "size"),
         ("[1,2,3].batch(\"two\")", "size"),
         ("[1,2,3].get(\"two\")", "index"),
-        ("[1,2,3].crush_json(\"two\")", "max"),
     ] {
         let e = run(&format!("{call}\n")).expect_err(&format!("{call} 传字符串应报错"));
         assert!(
@@ -178,18 +167,12 @@ fn d153_wrong_type_reports_type_error_not_missing_argument() {
 #[test]
 fn d153_float_paths_unchanged() {
     for (src, want) in [
-        ("let xs = [10, 20, 30]\nxs.get(2)\n", "30.0"),
-        (
-            "let xs = [1, 2, 3, 4, 5, 6, 7, 8]\nxs.take(2)\n",
-            "[1.0, 2.0]",
-        ),
-        (
-            "let xs = [1, 2, 3, 4, 5, 6, 7, 8]\nxs.drop(6)\n",
-            "[7.0, 8.0]",
-        ),
+        ("let xs = [10, 20, 30]\nxs.get(2)\n", "30"),
+        ("let xs = [1, 2, 3, 4, 5, 6, 7, 8]\nxs.take(2)\n", "[1, 2]"),
+        ("let xs = [1, 2, 3, 4, 5, 6, 7, 8]\nxs.drop(6)\n", "[7, 8]"),
         (
             "let xs = [1, 2, 3, 4]\nxs.window(2)\n",
-            "[[1.0, 2.0], [2.0, 3.0], [3.0, 4.0]]",
+            "[[1, 2], [2, 3], [3, 4]]",
         ),
     ] {
         let out = run(src).unwrap_or_else(|e| panic!("[{src}] 不应报错: {e}"));
@@ -210,7 +193,6 @@ fn d153_negative_guards_still_hold() {
         "[1, 2, 3].take(-1)\n",
         "[1, 2, 3].drop(-1)\n",
         "[1, 2, 3].get(-1)\n",
-        "[1, 2, 3].crush_json(-1)\n",
     ] {
         let e = run(src).expect_err(&format!("{src} 负数必须报错"));
         assert!(
@@ -250,7 +232,7 @@ fn d153_already_correct_siblings_not_regressed() {
 /// 本文件其余判据用 `ParserV3::compile` + `execute` 绕过 typeck；
 /// 而 `mora <file>` / `mora --check` **会**先跑 typeck，在那里错类型实参
 /// 一条都到不了运行期。本条用 `cli::compile_and_opt` +
-/// `check_program_witnesses_bidirectional` 复现真实链路。
+/// `check_program_witnesses` 复现真实链路。
 ///
 /// 它的存在理由是**让 D153 的 ⑤ 不再自欺**：那条断言的运行期消息，
 /// 用户在 CLI 上永远看不到。
@@ -258,7 +240,7 @@ fn d153_already_correct_siblings_not_regressed() {
 fn d154_cli_rejects_wrong_typed_arg_before_runtime() {
     let typeck = |src: &str| -> Result<(), String> {
         let (_f, w) = mora::cli::compile_and_opt(src, None).map_err(|e| format!("COMPILE: {e}"))?;
-        let errs = mora::typeck::check_mir::check_program_witnesses_bidirectional(&w);
+        let errs = mora::typeck::check_mir::check_program_witnesses(&w);
         if errs.is_empty() {
             Ok(())
         } else {

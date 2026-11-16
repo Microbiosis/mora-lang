@@ -26,13 +26,12 @@
 //! ⇒ 「下限过紧」在本仓是**孤例**，不是系统性缺口。但 D81 的判据**结构上**
 //! 覆盖不到这一侧（见下），所以本条把这条全称核对补上。
 
-use mora::interpreter::Interpreter;
+use mora::runtime::CoreRuntime;
+use mora::runtime::builtins::linalg::call_linalg_method;
+use mora::runtime::builtins::math::call_math_method;
+use mora::runtime::builtins::stats::call_stats_method;
+use mora::runtime::builtins::{call_exec_method, call_file_method};
 use mora::value::Value;
-
-// 三个是**自由函数**（不挂在 `Interpreter` 上）
-use mora::interpreter::builtins::linalg::call_linalg_method;
-use mora::interpreter::builtins::math::call_math_method;
-use mora::interpreter::builtins::stats::call_stats_method;
 
 fn s(x: &str) -> Value {
     Value::String(x.to_string())
@@ -52,7 +51,7 @@ fn l(xs: Vec<Value>) -> Value {
 /// 只断言 `is_err()` 会被「类型不对」之类的其它错误蒙对（D336 教训）。
 #[test]
 fn d338_every_min_arity_ge2_method_rejects_one_fewer_arg_at_runtime() {
-    let mut interp = Interpreter::new();
+    let mut core = CoreRuntime::default();
 
     // (人类可读标签, min_arity, 少传一个时的实参, 期望错误里的数字)
     let cases: Vec<(&str, usize, Vec<Value>, &str)> = vec![
@@ -84,39 +83,12 @@ fn d338_every_min_arity_ge2_method_rejects_one_fewer_arg_at_runtime() {
         ("linalg.matmul", 2, vec![l(vec![l(vec![f(1.0)])])], "2"),
         ("linalg.cross", 2, vec![l(vec![f(1.0)])], "2"),
         ("linalg.dot", 2, vec![l(vec![f(1.0)])], "2"),
-        // ── mora ──
-        ("mora.refine", 2, vec![s("a.mora")], "2"),
-        // ── mock ──
-        ("mock.register", 2, vec![s("n")], "handler"),
-        // ── plan ──
-        ("plan.create", 2, vec![s("p")], "2"),
-        ("plan.update", 2, vec![s("p")], "2"),
-        ("plan.remove", 2, vec![s("p")], "2"),
-        ("plan.add", 3, vec![s("p"), s("id")], "3"),
-        // ── tea ──
-        ("tea.dispatch", 2, vec![s("app")], "2"),
-        ("tea.update", 2, vec![s("app")], "2"),
-        // ── sandbox ──
-        ("sandbox.check_call", 2, vec![f(1.0)], "2"),
-        ("sandbox.audit_emit", 2, vec![s("actor")], "2"),
-        // ── memory ──
-        ("memory.store", 2, vec![s("k")], "value"),
-        ("memory.remember", 2, vec![s("cat")], "2"),
-        // ── schedule ──
-        ("schedule.add", 3, vec![s("n"), s("every")], "3"),
-        // ── tool（注册名是 `tool`，不是枚举变体名 `toolplane`）──
-        ("tool.register", 4, vec![s("p"), s("t"), s("d")], "4"),
-        ("tool.unregister", 2, vec![s("p")], "2"),
         // ── file：5 个双参入口（D334 刚补过 sandbox 守卫的那族）──
-        // 它们的 `min_arity = 2`（path + 第二实参）**正确** ——
-        // D334 修的是**守卫缺失**，不是元数；两者正交。
         ("file.write_text", 2, vec![s("p")], "content"),
         ("file.append_text", 2, vec![s("p")], "content"),
         ("file.write_bytes", 2, vec![s("p")], "hex"),
         ("file.rename", 2, vec![s("from")], "to"),
         ("file.copy", 2, vec![s("from")], "to"),
-        // ── skill ──
-        ("skill.install", 2, vec![s("n")], "2"),
     ];
 
     let mut checked = 0usize;
@@ -126,25 +98,17 @@ fn d338_every_min_arity_ge2_method_rejects_one_fewer_arg_at_runtime() {
             "math" => call_math_method(method, few).err(),
             "stats" => call_stats_method(method, few).err(),
             "linalg" => call_linalg_method(method, few).err(),
-            "mora" => interp.call_mora_method(method, few).err(),
-            "mock" => interp.call_mock_method(method, few).err(),
-            "plan" => interp.call_plan_method(method, few).err(),
-            "tea" => interp.call_tea_method(method, few).err(),
-            "sandbox" => interp.call_sandbox_method(method, few).err(),
-            "memory" => interp.call_memory_method(method, few).err(),
-            "schedule" => interp.call_schedule_method(method, few).err(),
-            // `tool` 的注册名对应 `BuiltinKind::Toolplane`（D74 已修「用变体名建表」）
-            "tool" => interp.call_toolplane_method(method, few).err(),
-            "skill" => interp.call_skill_method(method, few).err(),
-            "file" => interp.call_file_method(method, few).err(),
+            "file" => call_file_method(&mut core, method, few).err(),
             other => panic!("未覆盖的模块 `{other}` —— 补上它的 dispatcher"),
         };
-        let err = err.unwrap_or_else(|| {
-            panic!(
-                "[{label}] 少传一个实参（min_arity={min_arity}）**运行期竟然成功了**\n\
-                 ⇒ `MethodGroup.min_arity` 过紧，与运行期契约分叉 —— 同 D337 的 `exec.parallel`。"
-            )
-        });
+        let err = err
+            .unwrap_or_else(|| {
+                panic!(
+                    "[{label}] 少传一个实参（min_arity={min_arity}）**运行期竟然成功了**\n\
+                     ⇒ `MethodGroup.min_arity` 过紧，与运行期契约分叉 —— 同 D337 的 `exec.parallel`。"
+                )
+            })
+            .to_string();
         // 只钉「被挡住了 + 消息提到了本模块或本方法」——
         // **不钉措辞**：各模块的「缺参数」诊断本就千差万别
         // （`math` 全部走共用的 `math: numeric argument required`，**连方法名都没有**；
@@ -165,12 +129,10 @@ fn d338_every_min_arity_ge2_method_rejects_one_fewer_arg_at_runtime() {
         checked += 1;
     }
     assert_eq!(
-        checked, 29,
-        "本条只核对了 {checked} 个方法 —— 与 `dispatch.rs` 里 `min_arity >= 2` 的 \
-         **29 个**（含 5 个 `file.*`）不符。\n\
-         ⚠ 「全称判据静默漏掉几个」比红更危险。新增方法时**必须**在此表加一行。\n\
-         （计数用 `extract` 式全局扫描核对，不依赖 `const` 表的 arm 边界 ——\n\
-          按行扫描会漏掉跨行的 `MethodGroup::new` 调用。）"
+        checked, 13,
+        "本条只核对了 {checked} 个方法 —— 与 `dispatch.rs` 里保留模块的 `min_arity >= 2` \
+         （13 个，含 5 个 `file.*`）不符。\n\
+         ⚠ 「全称判据静默漏掉几个」比红更危险。新增方法时**必须**在此表加一行。"
     );
 }
 
@@ -180,20 +142,23 @@ fn d338_every_min_arity_ge2_method_rejects_one_fewer_arg_at_runtime() {
 /// `exec.parallel` 少传实参会**成功**（它本来就只需要 1 个）。
 #[test]
 fn d338_exec_parallel_min_arity_is_one_after_d337_fix() {
-    let interp = Interpreter::new();
+    let mut core = CoreRuntime::default();
     // 单参（缺 cmds）必须报错 —— 但那是因为**一个都不给**
-    let err = interp
-        .call_exec_method("parallel", &[])
-        .expect_err("一个实参都不给必须报错");
+    let err = call_exec_method(&mut core, "parallel", &[])
+        .expect_err("一个实参都不给必须报错")
+        .to_string();
     assert!(
         err.contains("at least 1 arg"),
         "`exec.parallel()` 无参应报「at least 1 arg」; 实际: {err}"
     );
 
     // 三个实参仍放行（**上限**侧，D81 的契约）
-    let r = interp
-        .call_exec_method("parallel", &[l(vec![s("echo a")]), f(1.0), Value::Nil])
-        .expect("三参应放行");
+    let r = call_exec_method(
+        &mut core,
+        "parallel",
+        &[l(vec![s("echo a")]), f(1.0), Value::Nil],
+    )
+    .expect("三参应放行");
     assert!(matches!(r, Value::List(_)), "应返回 List");
 }
 
@@ -202,15 +167,19 @@ fn d338_exec_parallel_min_arity_is_one_after_d337_fix() {
 /// 这条是主断言的**镜像** —— 防止有人把「放宽下限」误当成「不检查下限」。
 #[test]
 fn d338_min_arity_1_methods_also_reject_zero_args() {
-    let interp = Interpreter::new();
+    let mut core = CoreRuntime::default();
     for (label, err) in [
         ("math.sqrt", call_math_method("sqrt", &[]).err()),
         ("stats.mean", call_stats_method("mean", &[]).err()),
         ("linalg.norm", call_linalg_method("norm", &[]).err()),
-        ("ccr.marker", interp.call_ccr_method("marker", &[]).err()),
-        ("file.exists", interp.call_file_method("exists", &[]).err()),
+        (
+            "file.exists",
+            call_file_method(&mut core, "exists", &[]).err(),
+        ),
     ] {
-        let err = err.unwrap_or_else(|| panic!("[{label}] 零实参应报错（min_arity=1）"));
+        let err = err
+            .unwrap_or_else(|| panic!("[{label}] 零实参应报错（min_arity=1）"))
+            .to_string();
         let (module, method) = label.split_once('.').expect("标签应形如 module.method");
         assert!(
             err.contains(method) || err.contains(module),

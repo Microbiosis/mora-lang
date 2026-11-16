@@ -11,13 +11,13 @@
 //! 4. 泛型容器（`list<T>`）可用；
 //! 5. 作用域严格：泛型名不泄漏；首字母重复报错；裸参零回归。
 
-use mora::typeck::check_mir::check_program_witnesses_bidirectional;
+use mora::typeck::check_mir::check_program_witnesses;
 
 /// 编译 + typecheck，返回类型错误数（解析失败会 panic，便于定位）。
 fn type_errors(src: &str) -> usize {
     let (_, witnesses) = mora::parser_v3::ParserV3::compile(src)
         .unwrap_or_else(|e| panic!("应能解析（{src:?}）: {e}"));
-    check_program_witnesses_bidirectional(&witnesses).len()
+    check_program_witnesses(&witnesses).len()
 }
 
 /// 泛型函数可声明，且**按调用点各自单形化**：不同类型实参都通过。
@@ -75,13 +75,14 @@ fn generic_param_does_not_leak() {
     );
 }
 
-/// 类型参数首字母重复时报错（`Type::TypeVar` 是单 char，重复会静默合并）。
+/// Stage 3A-2 起 TypeVarId::Rigid(String) 支持多字符类型参数名，首字母相同的
+/// `<TT, Tx>` 不再碰撞、应正常通过。
 #[test]
 fn duplicate_type_param_first_char_errors() {
-    assert!(
-        mora::parser_v3::ParserV3::compile("task bad<TT, Tx>(a: TT)\n  return a\nend\nprint(1)\n")
-            .is_err(),
-        "两个类型参数首字母相同必须报错，不得静默合并成同一个类型变量"
+    assert_eq!(
+        type_errors("task ok<TT, Tx>(a: TT, b: Tx)\n  return a\nend\nprint(ok(1, \"s\"))\n"),
+        0,
+        "多字符类型参数名 <TT, Tx> 应保持独立且正常通过"
     );
 }
 

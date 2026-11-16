@@ -235,7 +235,7 @@ fn d196_nested_blocks_indent_per_level() {
 #[test]
 fn d196_formatting_preserves_program_behavior() {
     let dir = temp_dir();
-    let mora = concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/mora.exe");
+    let mora = env!("CARGO_BIN_EXE_mora");
     let src =
         "for i in [1,2]\n  for j in [3,4]\n    print(i * j)\n  end\n  print(i)\nend\nprint(0)\n";
     let f = format_source("c2", src);
@@ -265,6 +265,7 @@ fn d196_formatting_preserves_program_behavior() {
                     && !t.starts_with("AI 原语")
                     && !t.starts_with("显式 API")
                     && !t.starts_with("Trait 系统")
+                    && !t.starts_with("类型与执行")
                     && !t.starts_with("Built-in")
                     && !t.starts_with("v0.15 CLI")
                     && !t.starts_with('⚠')

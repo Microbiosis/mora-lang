@@ -1,8 +1,8 @@
-//! v0.104.6 D468：精确 i64 数值域。
+//! v0.104.6 D468：精确 i64 数值域（v0.110.0 起 `BigInt` 已下沉至独立标准库 `std/math/bigint`）。
 //!
 //! ## 为什么单独成域
 //!
-//! Mora 的数值塔有三个域：`Int`(i64) / `Float`(f64) / `BigInt`(任意精度)。
+//! Mora 核心数值塔有两个内建域：`Int`(i64) / `Float`(f64)（任意精度大整数见 `std/math/bigint`）。
 //! **每个域必须自己拥有自己的算术实现** —— 共享一条 f64 通道会让 `Int`
 //! 静默丢精度（f64 只有 53 位尾数，装不下 i64 的全部取值）。
 //!
@@ -40,7 +40,7 @@ use crate::error::MoraError;
 pub fn overflow(op: &BinaryOp, a: i64, b: i64) -> MoraError {
     MoraError::Other(format!(
         "integer overflow in {op:?}: {a} {op:?} {b}（超出 i64 范围）。\n\
-         提示：值超出 i64 范围时，请使用 bigint 字面量（如 `123n`）。"
+         建议：需要超出该范围的任意精度整数运算时，请使用 `std/math/bigint` 标准库。"
     ))
 }
 
@@ -57,10 +57,23 @@ pub fn arith(op: &BinaryOp, a: i64, b: i64) -> Result<i64, MoraError> {
         BinaryOp::Mul => a.checked_mul(b).ok_or_else(|| overflow(op, a, b)),
         BinaryOp::Div => div(a, b),
         BinaryOp::Mod => rem(a, b),
+        BinaryOp::Pow => pow(a, b),
         _ => Err(MoraError::Other(format!(
             "unsupported integer operation: {op:?}"
         ))),
     }
+}
+
+/// Exact integer exponentiation (`a ** b`) for non-negative exponents.
+pub fn pow(a: i64, b: i64) -> Result<i64, MoraError> {
+    if b < 0 {
+        return Err(MoraError::Runtime(format!(
+            "negative integer exponent `{b}` is invalid for int ** int; use a float base (e.g. `2.0 ** {b}`)"
+        )));
+    }
+    let exp = u32::try_from(b).map_err(|_| overflow(&BinaryOp::Pow, a, b))?;
+    a.checked_pow(exp)
+        .ok_or_else(|| overflow(&BinaryOp::Pow, a, b))
 }
 
 /// 精确整数除法：向零截断，除零报错，`i64::MIN / -1` 溢出报错。

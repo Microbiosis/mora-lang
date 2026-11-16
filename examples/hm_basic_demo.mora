@@ -116,10 +116,10 @@ print("simple_dict =", simple_dict)
 print("int_dict =", int_dict)
 
 -- ===================================================================
--- Example 8: String Interpolation
+-- Example 8: String Concatenation & Formatting
 -- ===================================================================
 
-print(p"x is {x}, sum is {sum}, and add_one(42) is {result1}")
+print("x is " + str(x) + ", sum is " + str(sum) + ", and add_one(42) is " + str(result1))
 
 -- ===================================================================
 -- Verification

@@ -42,69 +42,44 @@
 
 use std::sync::Arc;
 
-use mora::interpreter::Interpreter;
-use mora::mir::vm::execute;
 use mora::parser_v3::ParserV3;
-use mora::typeck::check_mir::check_program_witnesses_bidirectional;
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::execute_program;
+use mora::typeck::check_mir::check_program_witnesses;
 
 /// 跑一段源码，返回 `Value` 的 Debug 形态。
 ///
 /// **同时跑 typeck** —— 本文件里所有断言都必须是「用户真写得出来」的代码。
-/// 只用 `execute` 会绕过 typeck，于是「typeck 拒绝、运行期却支持」的写法
-/// （D23 的字符串隐式拼接就是这类）会被当成有效断言固化下来。这里让
-/// typeck 不通过就直接 panic，使这类断言当场暴露。
 fn run(src: &str) -> String {
-    let (func, witnesses) = match ParserV3::compile(src) {
+    let (prog, witnesses) = match ParserV3::compile(src) {
         Ok(v) => v,
         Err(e) => panic!("compile failed: {e}\n--- src ---\n{src}"),
     };
-    let errs = check_program_witnesses_bidirectional(&witnesses);
+    let errs = check_program_witnesses(&witnesses);
     assert!(
         errs.is_empty(),
         "这段源码被 typeck 拒绝，本测试却在断言它的行为 —— 断言的是用户写不出来的代码。\n\
          源：{src}\n错误：{:?}",
         errs.iter().map(|e| e.message.clone()).collect::<Vec<_>>()
     );
-    let arc = Arc::new(func);
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    match execute(
-        &arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    ) {
-        Ok(v) => format!("{v:?}"),
+    let arc = Arc::new(prog);
+    let mut core = CoreRuntime::default();
+    match execute_program(arc, &mut core) {
+        Ok((v, _)) => format!("{v:?}"),
         Err(e) => format!("ERR: {e}"),
     }
 }
 
 /// 只跑运行期、**故意绕过 typeck**。
-///
-/// 专用于记录「运行期已支持、但 typeck 尚未放行」的能力：
-///
-/// - `BigInt ⊂ Float` 的数值塔在 typeck 里没打通（D20 只修了运行期那一半）；
-/// - `String + <非字符串>` 运行期支持、typeck 拒绝（D23，规范本身空白）；
-/// - 广播里无意义的元素对（`Bool + Float`）运行期落 `Nil`。
-///
-/// **这些断言不能证明「用户写得出来」** —— 能写出来的部分由上面那个带
-/// typeck 守卫的 `run()` 覆盖。两者分开，是为了不把「运行期已具备」与
-/// 「用户可使用」这两件事混为一谈。
 fn run_runtime_only(src: &str) -> String {
-    let (func, _w) = match ParserV3::compile(src) {
+    let (prog, _w) = match ParserV3::compile(src) {
         Ok(v) => v,
         Err(e) => return format!("COMPILE-ERR: {e}"),
     };
-    let arc = Arc::new(func);
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    match execute(
-        &arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    ) {
-        Ok(v) => format!("{v:?}"),
+    let arc = Arc::new(prog);
+    let mut core = CoreRuntime::default();
+    match execute_program(arc, &mut core) {
+        Ok((v, _)) => format!("{v:?}"),
         Err(e) => format!("ERR: {e}"),
     }
 }
@@ -157,9 +132,6 @@ fn integer_division_truncates_toward_zero() {
         ("-5/2", "int(\"-5\") / int(\"2\")", "Int(-2)"),
         ("-7/2", "int(\"-7\") / int(\"2\")", "Int(-3)"),
         ("5/-2", "int(\"5\") / int(\"-2\")", "Int(-2)"),
-        // BigInt 与 Int 此前对同一组数给出不同答案（round vs as i64 截断）
-        ("7n/2n", "7n / 2n", "BigInt(3)"),
-        ("5n/2n", "5n / 2n", "BigInt(2)"),
     ]);
 }
 
@@ -175,8 +147,6 @@ fn integer_division_and_modulo_by_zero_error_out() {
         ("int -1/0", "int(\"-1\") / int(\"0\")"),
         ("int 5%0", "int(\"5\") % int(\"0\")"),
         ("int 0%0", "int(\"0\") % int(\"0\")"),
-        ("bigint 1n/0n", "1n / 0n"),
-        ("bigint 1n%0n", "1n % 0n"),
     ];
     let mut failures = Vec::new();
     for (name, src) in cases {
@@ -206,41 +176,14 @@ fn float_division_keeps_ieee_semantics() {
     ]);
 }
 
-/// BigInt 必须能与 Int / Float 互比 —— 此前算术支持、比较不支持，
-/// 出现「顺序比较报错、等值比较说不等」的自相矛盾。
-#[test]
-fn bigint_compares_with_int_and_float() {
-    // ⚠ 运行期已正确，但 typeck 仍未放行 `BigInt ⊂ Float`（D20 只修了运行期）
-    expect_runtime_only(&[
-        ("4n == 4.0", "4n == 4.0", "Bool(true)"),
-        ("4.0 == 4n", "4.0 == 4n", "Bool(true)"),
-        ("4n != 4.5", "4n != 4.5", "Bool(true)"),
-        ("4n < 4.5", "4n < 4.5", "Bool(true)"),
-        ("4n > 3.5", "4n > 3.5", "Bool(true)"),
-        ("4n <= 4.0", "4n <= 4.0", "Bool(true)"),
-        ("4n >= 4.0", "4n >= 4.0", "Bool(true)"),
-        ("int(4)==4n", "int(\"4\") == 4n", "Bool(true)"),
-        ("4n == int(4)", "4n == int(\"4\")", "Bool(true)"),
-        ("4n < int(5)", "4n < int(\"5\")", "Bool(true)"),
-        ("对照 4n==4n", "4n == 4n", "Bool(true)"),
-        ("对照 4n==5n", "4n == 5n", "Bool(false)"),
-    ]);
-}
-
 /// `==` 与 `<=` 不得自相矛盾。`values_equal` 与 `numeric_cmp` 是两个函数，
 /// 修一个漏一个就会出现「`a <= b` 真但 `a == b` 假」的裂缝。
 #[test]
 fn equality_and_ordering_never_contradict() {
-    // ⚠ 同上：typeck 尚未放行 BigInt ⊗ Float，故只在运行期层面查自洽性
     let mut failures = Vec::new();
     for (label, big, small) in [
-        ("4n vs 4.5", "4n", "4.5"),
-        ("4n vs 4.0", "4n", "4.0"),
-        ("4n vs 3.5", "4n", "3.5"),
         ("int(4) vs 4.0", "int(\"4\")", "4.0"),
         ("int(3) vs 4.0", "int(\"3\")", "4.0"),
-        ("4n vs int(4)", "4n", "int(\"4\")"),
-        ("4n vs int(5)", "4n", "int(\"5\")"),
     ] {
         let eq = run_runtime_only(&format!("({big}) == ({small})\n")) == "Bool(true)";
         let le = run_runtime_only(&format!("({big}) <= ({small})\n")) == "Bool(true)";
@@ -259,73 +202,14 @@ fn equality_and_ordering_never_contradict() {
     );
 }
 
-/// D21：BigInt 承诺**任意精度**（spec EBNF `BIGINT = digits "n"  -- v0.91:
-/// 任意精度整数`），超过 i64 范围也必须精确。
-///
-/// 此前 `numeric_op` 的 BigInt 臂一律 `BigInt::from(f64_result as i64)`，
-/// 而 `f64 as i64` 是**饱和转换**，于是：
-///
-/// ```text
-/// 修前： 10^20 * 2n  → BigInt(i64::MAX)   应为 200000000000000000000
-///       10^20 - 1n  → BigInt(i64::MAX)   应为 99999999999999999999
-/// ```
-///
-/// 而 `BinaryOp::Add` **另有**一条原生 BigInt 分支，所以 `10^20 + 1n` 是对的 ——
-/// 同一族里 Add 精确、Sub/Mul 饱和。（D19 已把 Div/Mod 也改成原生。）
-#[test]
-fn bigint_arithmetic_is_truly_arbitrary_precision() {
-    expect(&[
-        // 超过 i64::MAX（9223372036854775807）
-        (
-            "10^20 + 1n",
-            "100000000000000000000n + 1n",
-            "BigInt(100000000000000000001)",
-        ),
-        (
-            "10^20 - 1n",
-            "100000000000000000000n - 1n",
-            "BigInt(99999999999999999999)",
-        ),
-        (
-            "10^20 * 2n",
-            "100000000000000000000n * 2n",
-            "BigInt(200000000000000000000)",
-        ),
-        (
-            "10^20 / 4n",
-            "100000000000000000000n / 4n",
-            "BigInt(25000000000000000000)",
-        ),
-        // 超过 2^53 —— f64 在此之上会丢精度
-        (
-            "(2^53+1) + 1n",
-            "9007199254740993n + 1n",
-            "BigInt(9007199254740994)",
-        ),
-        // 恰好越过 i64 边界
-        (
-            "i64::MAX + 1n",
-            "9223372036854775807n + 1n",
-            "BigInt(9223372036854775808)",
-        ),
-        // 小值不得回归
-        ("2n + 3n", "2n + 3n", "BigInt(5)"),
-        ("2n * 3n", "2n * 3n", "BigInt(6)"),
-    ]);
-}
-
 /// 常量折叠与运行期求值必须同值 —— 否则同一个表达式**因优化与否得到不同答案**。
-/// （本条最初是为验证「折叠走原生、运行期走 f64」的猜测而写；实测折叠与运行期
-/// 一致，但这条不变式本身值得保留：它正是 D19 让 JIT 差分测试失败的那类检查。）
 #[test]
 fn constant_folding_and_runtime_evaluation_agree() {
     let cases = [
-        ("10^20 + 1n", "100000000000000000000n", "+", "1n"),
-        ("10^20 - 1n", "100000000000000000000n", "-", "1n"),
-        ("10^20 * 2n", "100000000000000000000n", "*", "2n"),
-        ("2^70 / 2n", "1180591620717411303424n", "/", "2n"),
-        ("小值 5n + 3n", "5n", "+", "3n"),
-        ("小值 5n * 3n", "5n", "*", "3n"),
+        ("小值 5i + 3i", "5i", "+", "3i"),
+        ("小值 5i * 3i", "5i", "*", "3i"),
+        ("整数除 7i / 2i", "7i", "/", "2i"),
+        ("浮点 5.0 + 3.0", "5.0", "+", "3.0"),
     ];
     let mut failures = Vec::new();
     for (label, a, op, b) in cases {
@@ -379,36 +263,13 @@ fn list_broadcast_accepts_all_numeric_scalars() {
             "1.5 + [1,2]",
             "List([Float(2.5), Float(3.5)])",
         ),
-        (
-            "list + int",
-            "[1,2] + int(\"1\")",
-            "List([Float(2.0), Float(3.0)])",
-        ),
-        (
-            "int + list",
-            "int(\"1\") + [1,2]",
-            "List([Float(2.0), Float(3.0)])",
-        ),
-        // v0.104.6 D198：**行为变更**（此前是 `List([Float(2.0), Float(3.0)])`）。
-        //
-        // 旧实现把 `1n` 这个 BigInt **静默降级**成 Float —— 因为另一个操作数
-        // （列表元素 `1.0`）是 float，就走「BigInt 转 f64 再算」的路径。
-        // `value.rs` 写明的推广规则是「**任一含 BigInt 时结果为 BigInt**
-        // （最小惊讶）」，而实现与文档**相反**；D198 修的正是这一点。
-        // 故此处期望翻转为 BigInt 元素。
-        //
-        // ⚠ 这是**用户可见的行为变更**：依赖旧行为（大整数列表运算得到
-        // Float 元素）的代码需要复查。已在 CHANGELOG D198 显式记录。
-        (
-            "list + bigint",
-            "[1,2] + 1n",
-            "List([BigInt(2), BigInt(3)])",
-        ),
+        ("list + int", "[1,2] + int(\"1\")", "List([Int(2), Int(3)])"),
+        ("int + list", "int(\"1\") + [1,2]", "List([Int(2), Int(3)])"),
         // 关键回归：len() 返 Int，最自然的写法必须能用
         (
             "list + len()",
             "let xs = [9, 9]\n[1,2] + len(xs)",
-            "List([Float(3.0), Float(4.0)])",
+            "List([Int(3), Int(4)])",
         ),
     ]);
 }
@@ -419,14 +280,7 @@ fn list_broadcast_accepts_all_numeric_scalars() {
 /// 臂的既有约定一致（其注释就写着「不支持加法的元素对 → Nil」），不算缺陷。
 #[test]
 fn list_broadcast_preserves_element_types() {
-    // ⚠ 元素含 Int/BigInt 的几组仍被 typeck 拒（BigInt 塔未打通），故走运行期
     expect_runtime_only(&[
-        // BigInt 元素（修前 → [Nil, Nil]）
-        (
-            "bigint 元素",
-            "[1n, 2n] + 1n",
-            "List([BigInt(2), BigInt(3)])",
-        ),
         // Int 元素（修前 → [Nil, Nil]）
         (
             "int 元素",
@@ -487,46 +341,22 @@ fn undefined_element_pairs_still_become_nil() {
 fn list_broadcast_works_for_sub_mul_div_mod_too() {
     expect_runtime_only(&[
         // 标量侧覆盖 Int
-        (
-            "list - int",
-            "[5,6] - int(\"1\")",
-            "List([Float(4.0), Float(5.0)])",
-        ),
+        ("list - int", "[5,6] - int(\"1\")", "List([Int(4), Int(5)])"),
         (
             "int - list",
             "int(\"10\") - [1,2]",
-            "List([Float(9.0), Float(8.0)])",
+            "List([Int(9), Int(8)])",
         ),
         (
             "list * int",
             "[5,6] * int(\"2\")",
-            "List([Float(10.0), Float(12.0)])",
+            "List([Int(10), Int(12)])",
         ),
-        // 元素侧覆盖 BigInt / Int
-        (
-            "bigint 元素 - float",
-            "[10n,20n] - 1.0",
-            // v0.104.6 **D472 追正**：原期望 `List([Float(9.0), Float(19.0)])`，
-            // 实得 `List([BigInt(9), BigInt(19)])`。
-            //
-            // 旧期望编码的是 **D468 统一数值塔之前**的行为：当时 `Sub` 走
-            // f64 round-trip（10n − 1.0 = 9.0，Float），而 `Add` 走提升
-            // （100.0 + 100n = 200n，BigInt）—— 同一组操作数因**运算符**不同
-            // 而结果类型不同。D468 统一后：整数值 float 提升为 BigInt，
-            // 故 `10n - 1.0` ≡ `10n - 1n` = **BigInt(9)**。
-            //
-            // ⇒ 与 `mixed_float_bigint_precision.rs` 的 `3 + 1n` → `4n` 一致。
-            "List([BigInt(9), BigInt(19)])",
-        ),
+        // Int 元素（D153）
         (
             "int 元素 * int",
             "[int(\"2\"), int(\"3\")] * int(\"3\")",
             "List([Int(6), Int(9)])",
-        ),
-        (
-            "list-op-list bigint",
-            "[10n,20n] - [1n,2n]",
-            "List([BigInt(9), BigInt(18)])",
         ),
     ]);
 }
@@ -587,22 +417,22 @@ fn list_broadcast_is_accepted_by_typeck() {
         (
             "spec [1,2,3] * 2",
             "[1, 2, 3] * 2",
-            "List([Float(2.0), Float(4.0), Float(6.0)])",
+            "List([Int(2), Int(4), Int(6)])",
         ),
         (
             "spec 1 + [10,20,30]",
             "1 + [10, 20, 30]",
-            "List([Float(11.0), Float(21.0), Float(31.0)])",
+            "List([Int(11), Int(21), Int(31)])",
         ),
         (
             "spec [1,2,3] + [10,20,30]",
             "[1, 2, 3] + [10, 20, 30]",
-            "List([Float(11.0), Float(22.0), Float(33.0)])",
+            "List([Int(11), Int(22), Int(33)])",
         ),
         (
             "spec [10,20,30] - [1,2,3]",
             "[10, 20, 30] - [1, 2, 3]",
-            "List([Float(9.0), Float(18.0), Float(27.0)])",
+            "List([Int(9), Int(18), Int(27)])",
         ),
         // spec 说支持 `+ - * / %` 五个操作符
         ("div", "[10, 20] / 2.0", "List([Float(5.0), Float(10.0)])"),
@@ -613,10 +443,10 @@ fn list_broadcast_is_accepted_by_typeck() {
         (
             "scalar 侧是 len()",
             "let xs = [9, 9]\n[1, 2] + len(xs)",
-            "List([Float(3.0), Float(4.0)])",
+            "List([Int(3), Int(4)])",
         ),
         // 结果可继续参与其它运算
-        ("结果用于索引", "let a = [10, 20] * 2\na[1]", "Float(40.0)"),
+        ("结果用于索引", "let a = [10, 20] * 2\na[1]", "Int(40)"),
     ]);
 }
 
@@ -638,7 +468,7 @@ fn list_broadcast_still_rejects_non_numeric_operands() {
                 continue;
             }
         };
-        let errs = check_program_witnesses_bidirectional(&witnesses);
+        let errs = check_program_witnesses(&witnesses);
         if errs.is_empty() {
             failures.push(format!("  [{name}] typeck 竟放行了：{src}"));
         } else {
@@ -658,18 +488,14 @@ fn list_broadcast_still_rejects_non_numeric_operands() {
 fn list_plus_list_keeps_its_length_and_concat_rules() {
     expect(&[
         // 等长 → 逐元素
-        (
-            "等长逐元素",
-            "[1,2] + [10,20]",
-            "List([Float(11.0), Float(22.0)])",
-        ),
+        ("等长逐元素", "[1,2] + [10,20]", "List([Int(11), Int(22)])"),
         // 不等长 → 拼接
         (
             "不等长拼接",
             "[1,2] + [1,2,3]",
-            "List([Float(1.0), Float(2.0), Float(1.0), Float(2.0), Float(3.0)])",
+            "List([Int(1), Int(2), Int(1), Int(2), Int(3)])",
         ),
-        ("空 + 非空", "[] + [1]", "List([Float(1.0)])"),
+        ("空 + 非空", "[] + [1]", "List([Int(1)])"),
     ]);
 }
 

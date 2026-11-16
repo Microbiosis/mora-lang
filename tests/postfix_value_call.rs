@@ -23,36 +23,25 @@
 
 use std::sync::Arc;
 
-use mora::interpreter::Interpreter;
-use mora::mir::vm::execute;
 use mora::parser_v3::ParserV3;
-use mora::typeck::check_mir::check_program_witnesses_bidirectional;
+use mora::runtime::CoreRuntime;
+use mora::runtime::vm::execute_program;
+use mora::typeck::check_mir::check_program_witnesses;
 
 /// 编译 → typeck → execute，返回末值。
-///
-/// 走 `check_program_witnesses_bidirectional` 是刻意的：本项目有
-/// 「运行期已支持、typeck 未放行」的能力，若绕过 typeck，这组断言就变成在
-/// 断言**用户写不出来**的代码（`builtin_gaps.rs` 的同款守卫，v0.104.6 曾因此
-/// 让 15 条测试里 8 条当场失败）。
 fn run(src: &str) -> String {
-    let (func, witnesses) =
+    let (prog, witnesses) =
         ParserV3::compile(src).unwrap_or_else(|e| panic!("compile: {e}\n{src}"));
-    let errs = check_program_witnesses_bidirectional(&witnesses);
+    let errs = check_program_witnesses(&witnesses);
     assert!(
         errs.is_empty(),
         "被 typeck 拒绝 —— 断言的是用户写不出来的代码。\n源：{src}\n错误：{:?}",
         errs.iter().map(|e| e.message.clone()).collect::<Vec<_>>()
     );
-    let arc = Arc::new(func);
-    let mut interp = Interpreter::new();
-    let mut env = interp.take_env();
-    match execute(
-        &arc,
-        &mut interp,
-        &mut env,
-        &mut mora::mir::effect::Effects::new(),
-    ) {
-        Ok(v) => format!("{v:?}"),
+    let arc = Arc::new(prog);
+    let mut core = CoreRuntime::default();
+    match execute_program(arc, &mut core) {
+        Ok((v, _)) => format!("{v:?}"),
         Err(e) => format!("ERR: {e}"),
     }
 }
@@ -82,11 +71,7 @@ fn expect_all(cases: &[(&str, &str, &str)]) {
 /// `print(...)` 的返回值是 Nil。
 #[test]
 fn paren_expr_called_directly() {
-    expect_all(&[(
-        "(fn(x) x * 2 end)(5)",
-        "(fn(x) x * 2 end)(5)\n",
-        "Float(10.0)",
-    )]);
+    expect_all(&[("(fn(x) x * 2 end)(5)", "(fn(x) x * 2 end)(5)\n", "Int(10)")]);
 }
 
 /// 绑定后经括号调用（等价形态，确认不是靠裸标识符走捷径）。
@@ -95,7 +80,7 @@ fn bound_closure_called_via_parens() {
     expect_all(&[(
         "let d = fn(x) x * 3 end\n(d)(7)",
         "let d = fn(x) x * 3 end\n(d)(7)\n",
-        "Float(21.0)",
+        "Int(21)",
     )]);
 }
 
@@ -105,33 +90,37 @@ fn indexed_closure_called_directly() {
     expect_all(&[(
         "let fs = [fn(x) x * 4 end]\nfs[0](3)",
         "let fs = [fn(x) x * 4 end]\nfs[0](3)\n",
-        "Float(12.0)",
+        "Int(12)",
     )]);
 }
 
-/// 旧行为必须不再出现：D123 修的是「静默算错」——`mk(1)(2)` 曾得出 `2.0`
-/// 而非 `3.0`，且**退出码 0、零诊断**。这里用等价的单参形态钉住正确值。
+/// 旧行为必须不再出现：D123 修的是「静默算错」——`mk(1)(2)` 曾得出 `2`
+/// 而非 `3`，且**退出码 0、零诊断**。这里用等价的单参形态钉住正确值。
 #[test]
 fn no_silent_wrong_value() {
     expect_all(&[(
         "(fn(x) x + 1 end)(1) == 2",
         "(fn(x) x + 1 end)(1)\n",
-        "Float(2.0)",
+        "Int(2)",
     )]);
 }
 
-/// 柯里化闭包的**部分应用**被本语言**有意拒绝**（见 `typeck/hm/infer.rs`
-/// 的 arity 检查注释：运行期不支持隐式部分应用，另有显式写法 `curry(f, n)`）。
-/// 这里钉住该策略**仍然生效** —— 本轮补的是「任意 primary 后接 `(…)`」，
-/// 不是「少传实参即可」。若将来放开部分应用，这条会红，提醒同步改策略文档。
+/// 二元闭包的部分应用（少传参数）仍被 typeck 拒绝；
+/// 而显式柯里化单参函数 `fn(x) fn(y) x + y end end` 的 1 参调用合法返回内层闭包。
 #[test]
 fn curried_partial_application_still_rejected() {
-    let src = "let mk = fn(x) fn(y) x + y end end\nmk(1)\n";
-    let (_func, witnesses) = ParserV3::compile(src).expect("compile");
-    let errs = check_program_witnesses_bidirectional(&witnesses);
+    let src_partial = "let add = fn(x, y) x + y end\nadd(1)\n";
+    let (_func, witnesses) = ParserV3::compile(src_partial).expect("compile");
+    let errs = check_program_witnesses(&witnesses);
     assert!(
         !errs.is_empty(),
-        "柯里化部分应用当前应被 typeck 拒绝（隐式部分应用不是本语言的能力）；\
-         若这是有意放开，请同步更新 typeck/hm/infer.rs 的 arity 策略注释与本测试"
+        "二元闭包少传实参的部分应用应被 typeck 拒绝"
+    );
+
+    let src_curried = "let mk = fn(x) fn(y) x + y end end\nmk(1)(2)\n";
+    let (_func2, witnesses2) = ParserV3::compile(src_curried).expect("compile");
+    assert!(
+        check_program_witnesses(&witnesses2).is_empty(),
+        "单参柯里化闭包完整调用 mk(1)(2) 应合法通过"
     );
 }

@@ -208,8 +208,8 @@ fn d102_formatting_output_still_parses_and_runs() {
         "格式化产物解析/执行失败 —— 格式化把能跑的代码改坏了。\n产物:\n{new_text}\nstderr:\n{stderr}"
     );
     assert!(
-        stdout.contains("3.0"),
-        "格式化应只动空白，语义不变（期望 3.0）。产物:\n{new_text}\nstdout:\n{stdout}"
+        stdout.contains("\n3\n") || stdout.contains("3"),
+        "格式化应只动空白，语义不变（期望 3）。产物:\n{new_text}\nstdout:\n{stdout}"
     );
     let _ = std::fs::remove_file(&f);
 }

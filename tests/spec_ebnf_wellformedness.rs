@@ -53,8 +53,8 @@ const TERMINALS: &[&str] = &[
     "QUASIWORD",
 ];
 
-fn spec() -> String {
-    std::fs::read_to_string("docs/mora-spec.md").expect("读 docs/mora-spec.md")
+fn spec() -> Option<String> {
+    std::fs::read_to_string("docs/mora-spec.md").ok()
 }
 
 /// 已定义的非终结符：EBNF 的 `name = …` 与 BNF 的 `name ::= …` 都算。
@@ -163,7 +163,10 @@ const KNOWN_UNDEFINED: &[&str] = &["type"];
 /// 清单里的任何一项被补上也会转红（该从清单里划掉）。
 #[test]
 fn d162_ebnf_undefined_set_matches_known_backlog() {
-    let text = spec();
+    let Some(text) = spec() else {
+        eprintln!("docs/mora-spec.md 不在本检出（docs/ 被 gitignore）；跳过 EBNF 未定义集核对");
+        return;
+    };
     let defined = defined_nonterminals(&text);
     let referenced = referenced_nonterminals(&text);
     let terminals: BTreeSet<String> = TERMINALS.iter().map(|s| s.to_string()).collect();
@@ -209,7 +212,10 @@ fn d162_ebnf_undefined_set_matches_known_backlog() {
 /// 就不可信了（同 D157 的「判据的判据也要先成立」）。
 #[test]
 fn d162_defined_productions_are_not_reported_as_undefined() {
-    let text = spec();
+    let Some(text) = spec() else {
+        eprintln!("docs/mora-spec.md 不在本检出（docs/ 被 gitignore）；跳过已定义产生式对照");
+        return;
+    };
     let defined = defined_nonterminals(&text);
     for name in [
         "program",

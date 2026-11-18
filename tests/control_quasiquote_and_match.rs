@@ -227,12 +227,11 @@ fn d366_lexer_only_tokenizes_double_comma() {
         lexer.contains("单 `,` → Comma"),
         "lexer 注释应说明单 `,` → Comma"
     );
-    // spec 承诺的也是 `,,`
-    let spec = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/docs/mora-spec.md"))
-        .expect("读 spec");
+    // `docs/mora-spec.md` 已不在树里。`,,` = unquote-splice 的约定现在写在
+    // lexer 自己的注释里（与 CommaComma 分支同一处）。
     assert!(
-        spec.contains("unquote-splice"),
-        "spec §11.7 应有 unquote-splice 章节"
+        lexer.contains("unquote-splice"),
+        "lexer 应把 `,,` 记为 unquote-splice"
     );
 }
 

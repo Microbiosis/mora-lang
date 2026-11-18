@@ -81,6 +81,7 @@ fn mora(dir: &Path, args: &[&str]) -> (String, i32) {
 fn blames_a_missing_file(out: &str) -> bool {
     out.contains("系统找不到指定的文件")
         || out.contains("No such file")
+        || out.contains("cannot find the file specified")
         || out.contains("failed to read --")
 }
 

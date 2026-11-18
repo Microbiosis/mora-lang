@@ -163,7 +163,9 @@ fn d192_missing_file_still_says_not_found() {
         let (out, code) = mora(dir.path(), &args);
         assert_ne!(code, 0, "[{}] 应判失败", args.join(" "));
         assert!(
-            out.contains("系统找不到指定的文件") || out.contains("No such file"),
+            out.contains("系统找不到指定的文件")
+                || out.contains("No such file")
+                || out.contains("cannot find the file specified"),
             "[{}] 文件真的不存在时必须照实说，不能被编码消息吞掉:\n{}",
             args.join(" "),
             out

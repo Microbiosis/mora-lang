@@ -1,0 +1,10 @@
+let name: string = "mora"
+let count: number = 42
+
+task add(a: number, b: number): number
+  return a + b
+end
+
+let total = add(count, 8)
+let inc = fn(x: number) x + 1 end
+print(inc(total))

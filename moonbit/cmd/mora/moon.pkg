@@ -1,0 +1,13 @@
+import {
+  "microbiosis/mora_moon" @lib,
+  "moonbitlang/core/env" @env,
+  "moonbitlang/core/async",
+  "moonbitlang/core/async/fs" @fs,
+  "moonbitlang/core/async/stdio" @stdio,
+}
+
+pkgtype(kind: "executable")
+
+supported_targets = "-all+native"
+
+options("allow-experimental-packages": true)

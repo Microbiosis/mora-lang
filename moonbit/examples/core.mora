@@ -1,0 +1,64 @@
+-- In-scope core beyond the README glance.
+let nums = [1, 2, 3, 4]
+let doubled = nums |> map(fn(x) x * 2 end)
+print("pipe =", doubled)
+
+let big = nums.filter(fn(x) x > 2 end)
+print("filter =", big)
+
+let sum = nums.reduce(fn(a, b) a + b end, 0)
+print("reduce =", sum)
+
+let greeting = "  Hi, Mora  "
+print("trim =", greeting.trim())
+print("lower =", greeting.trim().lower())
+print("len =", greeting.trim().len())
+print("has =", greeting.contains("Mora"))
+print("parts =", "a,b,c".split(","))
+print("rep =", "aba".replace("a", "c"))
+
+let d = {a: 10, b: 20}
+print("get =", d.get("b"))
+print("keys =", d.keys())
+
+let acc = 0
+for x in nums
+  assign acc = acc + x
+end
+print("for =", acc)
+
+let i = 0
+while i < 3
+  print("i =", i)
+  assign i = i + 1
+end
+
+print("range =", range(1, 4))
+print("and =", true and false)
+print("or =", false or true)
+print("not =", not false)
+print("neg =", -(sum))
+print("pow =", 2 ** 10)
+print("str =", "n=" + str(sum))
+
+if sum > 0 then
+  print("sign =", "positive")
+else
+  print("sign =", "other")
+end
+
+task fact(n: int): int
+  if n <= 1 then
+    1
+  else
+    n * fact(n - 1)
+  end
+end
+print("fact =", fact(5))
+
+for x in [1, 2, 3]
+  if x == 2 then
+    continue
+  end
+  print("skip =", x)
+end

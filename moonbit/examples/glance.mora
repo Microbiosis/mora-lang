@@ -1,0 +1,18 @@
+-- Named tasks, closures, lists, and pattern matching
+task double_all(xs)
+  return xs.map(fn(x) x * 2 end)
+end
+
+let nums = [1, 2, 3, 4]
+let doubled = double_all(nums)
+print("doubled =", doubled)
+
+let classify = fn(n)
+  match n with
+    x when x > 0 -> "positive"
+    0 -> "zero"
+    _ -> "negative"
+  end
+end
+
+print(classify(5))

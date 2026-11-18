@@ -1,0 +1,37 @@
+// Generated using `moon info`, DON'T EDIT IT
+package "microbiosis/mora_moon"
+
+// Values
+pub const VERSION : String = "0.110.0-moonbit"
+
+pub fn check_source(String) -> Unit raise MoraError
+
+pub fn run_source(String) -> Outcome raise MoraError
+
+// Errors
+pub suberror MoraError {
+  ParseErr(String)
+  TypeErr(String)
+  RuntimeErr(String)
+}
+pub fn MoraError::code(Self) -> Int32
+pub fn MoraError::message(Self) -> String
+
+// Types and methods
+pub struct Engine {
+  // private fields
+}
+pub fn Engine::check(Self, String) -> Unit raise MoraError
+pub fn Engine::new() -> Self
+pub fn Engine::run(Self, String) -> Outcome raise MoraError
+
+pub struct Outcome {
+  lines : Array[String]
+  shown : String
+  is_nil : Bool
+}
+pub fn Outcome::text(Self) -> String
+
+// Type aliases
+
+// Traits

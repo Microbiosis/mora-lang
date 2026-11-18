@@ -26,10 +26,11 @@ selfhost/mora.sh moonbit/examples/typed.mora
 selfhost/mora.sh moonbit/examples/core.mora
 selfhost/mora.sh examples/hm_basic_demo.mora
 selfhost/mora.sh --check moonbit/examples/typed.mora
+selfhost/mora.sh --boot moonbit/examples/typed.mora
 selfhost/mora.sh --version
 ```
 
-`selfhost/mora.sh` writes the mode and path to `selfhost/.argv` (gitignored), runs `target/release/mora selfhost/mora.mora`, and forwards the trial's diagnostic file to stderr. The Rust host still prints its own banner on stderr. Program output is the trial's stdout.
+`selfhost/mora.sh` writes one or more frames to `selfhost/.argv` (gitignored), runs `target/release/mora selfhost/mora.mora`, and forwards the trial's diagnostic file to stderr. The Rust host still prints its own banner on stderr. Program output is the trial's stdout. A frame is a mode line and a path line. `--boot` writes two frames separated by `---`: the outer frame is `run selfhost/mora.mora`, and the inner frame is the command you passed. The outer copy pops its frame, rewrites `.argv` to what remains, and only then evaluates the next program, so the inner copy does not reread the outer command.
 
 `--check` prints `No type errors found. (N expressions)` and does not evaluate. `N` is the number of top-level statements. On the four programs above it matches the Rust host's witness count. A type error exits 2. The trial reports the first type error and then `1 type error(s) found.` Parse errors also exit 2. Runtime errors exit 1.
 
@@ -50,15 +51,34 @@ Against `target/release/mora` on this tree, stdout matched the host byte for byt
 
 ## Bootstrap
 
-The self-hosted checker accepts its own source:
+Stage 1 is the Rust host running this file, which runs an example. Stdout matched `target/release/mora` byte for byte, and `--check` matched the host line, for all four programs:
+
+```bash
+selfhost/mora.sh moonbit/examples/glance.mora
+selfhost/mora.sh --check moonbit/examples/typed.mora
+```
+
+Stage 2 is the host running this file, which runs this file again, which runs the example. The same four programs matched again, including `--check`:
+
+```bash
+selfhost/mora.sh --boot moonbit/examples/glance.mora
+selfhost/mora.sh --boot moonbit/examples/typed.mora
+selfhost/mora.sh --boot moonbit/examples/core.mora
+selfhost/mora.sh --boot examples/hm_basic_demo.mora
+selfhost/mora.sh --boot --check moonbit/examples/typed.mora
+```
+
+`--boot --check` prints the same `No type errors found. (N expressions)` line as the host (6, 6, 33, and 43 for the four programs). Each stage-2 run typechecks this file on the host before the inner interpreter starts, so it takes longer than stage 1. On this machine the four stage-2 runs were about one to three minutes each.
+
+The self-check of this file still passes:
 
 ```bash
 selfhost/mora.sh --check selfhost/mora.mora
 ```
 
-That prints `No type errors found. (171 expressions)`. It is the lexer, parser, and Hindley–Milner pass of this file running on this file, under the Rust host. Tasks may call tasks defined later; the checker binds every task signature before it checks bodies.
+That prints `No type errors found. (179 expressions)`. Tasks may call tasks defined later; the checker binds every task signature before it checks bodies.
 
-Evaluating `selfhost/mora.mora` as a user program does not interpret a second program inside it. The top of the file reads `selfhost/.argv` and then runs whatever path is written there, so pointing the driver at itself reads that same slot again. A nested run would also typecheck this whole file inside the already-interpreted checker. The bootstrap that this trial actually completes is the `--check` above.
+Environment frames are atoms. An assignment inside a called task updates the frame the caller still holds, which is what lets the inner interpreter keep its lexer position and its type environment. A closure keeps those same atoms, so it sees a later assignment to a variable in a frame it captured.
 
 ## In scope
 
@@ -70,7 +90,7 @@ Same surface as the programs above, checked and then evaluated:
 - `|>` whose right-hand side is a call `name(...)` is a method call. Lists, string-keyed dicts, indexing.
 - `int` stays `int` under arithmetic. Mixed `int` and `float` become `float`. `+` concatenates when either side is a string. Equal-length list `+` follows the host (elementwise); other list `+` concatenates.
 - List `map`, `filter`, `reduce`, `len`, `get`, `push`. Dict `get`, `set`, `keys`, `values`, `len` (keys sorted by the host). String `len`, `upper`, `lower`, `trim`, `contains`, `starts_with`, `ends_with`, `split`, `replace`.
-- Builtins `print` (tab-separated), `str`, `len`, `range`, `int`, `float`, `type_of`.
+- Builtins `print` (tab-separated), `str`, `len`, `range`, `int`, `float`, `type_of`, `atom`, `deref`, and `swap`. `atom` / `deref` / `swap` are how environment frames stay shared across calls.
 - Types: `int`, `float`, `number` (`int` widens to `float` and to `number`), `string`, `bool`, `nil`, `char`, `any`, `list<T>`, `dict<K, V>`. Let-generalization uses the value restriction. `and` / `or` are short-circuit and return `bool`.
 - Display of the values above is the host's display, because the evaluator keeps host ints, floats, strings, bools, lists, and dicts and prints them with host `str`.
 
@@ -89,7 +109,7 @@ Rejected with a diagnostic, or absent from the wrapper. Not accepted under anoth
 - Matrix multiplication `@`. Bigint (`n`).
 - SSA / MIR, `--opt`, the bytecode VM, JIT, `mora install`, `mora-lsp`.
 - The REPL (`--repl` exits 2).
-- Closures that must observe a later assignment to a captured variable. Tasks use the live environment, so top-level recursion works. A closure snapshots the frame list at the `fn`. The examples do not assign through a closure.
+- A third stage (this file interpreting this file interpreting this file). Stage 2 is the nesting this trial runs.
 - More than the first type error. The Rust host can report several; this trial stops at the first.
 
 The Rust compiler remains the source of truth for that list.

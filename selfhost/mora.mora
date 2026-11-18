@@ -2082,7 +2082,7 @@ task is_value(e: any): bool
 end
 
 task builtin_name(name: string): bool
-  if name == "print" or name == "str" or name == "len" or name == "range" or name == "int" or name == "float" or name == "type_of" then
+  if name == "print" or name == "str" or name == "len" or name == "range" or name == "int" or name == "float" or name == "type_of" or name == "atom" or name == "deref" or name == "swap" then
     return true
   end
   return false
@@ -2127,6 +2127,21 @@ task infer_builtin(name: string, args: list<any>, line: int, col: int): any
     end
     infer_expr(args[0])
     return ty_base("string")
+  end
+  if name == "atom" or name == "deref" then
+    if args.len() != 1 then
+      return die_ty(line, col, name + "() expects 1 argument")
+    end
+    infer_expr(args[0])
+    return ty_base("any")
+  end
+  if name == "swap" then
+    if args.len() != 2 then
+      return die_ty(line, col, "swap() expects 2 arguments")
+    end
+    infer_expr(args[0])
+    infer_expr(args[1])
+    return ty_base("any")
   end
   if name == "len" then
     if args.len() != 1 then
@@ -2859,24 +2874,34 @@ end
 
 task init_eval(): any
   FRAMES = empty_list()
-  FRAMES = FRAMES.push(blank())
+  FRAMES = FRAMES.push(atom(blank()))
+  return nil
+end
+
+task frame_get(i: int): dict<string, any>
+  return deref(FRAMES[i])
+end
+
+task frame_put(i: int, frame: dict<string, any>): any
+  let box = FRAMES[i]
+  swap(box, fn(old) frame end)
   return nil
 end
 
 task bind_name(name: string, value: any): any
   let last = FRAMES.len() - 1
-  let frame = FRAMES[last]
+  let frame = frame_get(last)
   let cell: dict<string, any> = {there: true}
   cell = cell.set("v", value)
   frame = frame.set("k:" + name, cell)
-  FRAMES = replace_at(FRAMES, last, frame)
+  frame_put(last, frame)
   return nil
 end
 
 task lookup_name(name: string, line: int, col: int): any
   let i = FRAMES.len() - 1
   while i >= 0
-    let cell = FRAMES[i].get("k:" + name)
+    let cell = frame_get(i).get("k:" + name)
     if cell != nil then
       return ok(cell["v"])
     end
@@ -2888,12 +2913,12 @@ end
 task assign_name(name: string, value: any, line: int, col: int): any
   let i = FRAMES.len() - 1
   while i >= 0
-    let frame = FRAMES[i]
+    let frame = frame_get(i)
     if frame.get("k:" + name) != nil then
       let cell: dict<string, any> = {there: true}
       cell = cell.set("v", value)
       frame = frame.set("k:" + name, cell)
-      FRAMES = replace_at(FRAMES, i, frame)
+      frame_put(i, frame)
       return ok(nil)
     end
     i = i - 1
@@ -2944,7 +2969,7 @@ task call_func(func: any, args: list<any>, line: int, col: int): dict<string, an
   if func["kind"] == "closure" then
     FRAMES = copy_list(func["env"])
   end
-  FRAMES = FRAMES.push(blank())
+  FRAMES = FRAMES.push(atom(blank()))
   let i = 0
   while i < params.len()
     bind_name(params[i], args[i])
@@ -3000,6 +3025,24 @@ task eval_builtin(name: string, args: list<any>, line: int, col: int): dict<stri
   end
   if name == "type_of" then
     return ok(type_of(args[0]))
+  end
+  if name == "atom" then
+    return ok(atom(args[0]))
+  end
+  if name == "deref" then
+    return ok(deref(args[0]))
+  end
+  if name == "swap" then
+    let old = deref(args[0])
+    let one = empty_list()
+    one = one.push(old)
+    let got = call_value(args[1], one, line, col)
+    if got["tag"] != "ok" then
+      return got
+    end
+    let updated = got["v"]
+    swap(args[0], fn(ignored) updated end)
+    return ok(updated)
   end
   if name == "int" then
     return ok(int(args[0]))
@@ -3186,9 +3229,6 @@ task eval_method(expr: any): dict<string, any>
     return method_string(target, name, args, expr["line"], expr["col"])
   end
   if kind == "dict" then
-    if target["tag"] == "func" then
-      return fail("Runtime error at line " + str(expr["line"]) + ":" + str(expr["col"]) + ": cannot call method '" + name + "' on a function")
-    end
     return method_dict(target, name, args, expr["line"], expr["col"])
   end
   return fail("Runtime error at line " + str(expr["line"]) + ":" + str(expr["col"]) + ": cannot call method '" + name + "' on " + kind)
@@ -3298,7 +3338,7 @@ task eval_match(expr: any): dict<string, any>
   while i < arms.len()
     let arm = arms[i]
     if pat_match(arm["pat"], scrut["v"]) then
-      FRAMES = FRAMES.push(blank())
+      FRAMES = FRAMES.push(atom(blank()))
       if arm["pat"]["tag"] == "bind" then
         bind_name(arm["pat"]["name"], scrut["v"])
       end
@@ -3518,7 +3558,7 @@ task eval_for(stmt: any): dict<string, any>
   let items = iter["v"]
   let i = 0
   while i < items.len()
-    FRAMES = FRAMES.push(blank())
+    FRAMES = FRAMES.push(atom(blank()))
     bind_name(stmt["name"], items[i])
     let flowv = eval_block(stmt["body"])
     FRAMES = drop_last(FRAMES)
@@ -3662,7 +3702,19 @@ task finish(code: int): any
 end
 
 let raw = file.read_text("selfhost/.argv")
-let parts = raw.split("\n")
+let frames = raw.split("\n---\n")
+let first = frames[0]
+let rest = ""
+let frame_i = 1
+while frame_i < frames.len()
+  if rest != "" then
+    rest = rest + "\n---\n"
+  end
+  rest = rest + frames[frame_i]
+  frame_i = frame_i + 1
+end
+file.write_text("selfhost/.argv", rest)
+let parts = first.split("\n")
 let mode = parts[0]
 let path = ""
 if parts.len() > 1 then
@@ -3675,6 +3727,7 @@ else
   if mode == "help" then
     print("Mora v0.110.0-selfhost — Mora written in Mora")
     print("usage: selfhost/mora.sh [--check] <file.mora>")
+    print("       selfhost/mora.sh --boot [--check] <file.mora>")
     print("       selfhost/mora.sh --version")
     finish(0)
   else
@@ -3684,7 +3737,14 @@ else
     else
       let src = file.read_text(path)
       run_source(src, mode)
-      finish(EXITC)
+      if EXITC != 0 then
+        finish(EXITC)
+      else
+        let written = file.read_text("selfhost/.code").trim()
+        if written == "" then
+          finish(0)
+        end
+      end
     end
   end
 end

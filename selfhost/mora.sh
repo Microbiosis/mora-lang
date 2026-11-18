@@ -4,6 +4,7 @@
 # Usage, from the repository root or from anywhere:
 #   selfhost/mora.sh <file.mora>
 #   selfhost/mora.sh --check <file.mora>
+#   selfhost/mora.sh --boot <file.mora>
 #   selfhost/mora.sh --version
 
 set -euo pipefail
@@ -18,6 +19,11 @@ fi
 
 mode="run"
 path=""
+boot=0
+if [[ "${1:-}" == "--boot" ]]; then
+  boot=1
+  shift
+fi
 case "${1:-}" in
   --check)
     mode="check"
@@ -52,8 +58,15 @@ if [[ "$mode" == "run" || "$mode" == "check" ]]; then
   fi
 fi
 
-printf '%s\n%s\n' "$mode" "$path" > selfhost/.argv
-rm -f selfhost/.code selfhost/.diag
+if [[ "$boot" -eq 1 ]]; then
+  # Outer frame runs this interpreter; the inner frame is what that copy runs.
+  # The outer pops its frame before evaluating, so the inner read sees only the rest.
+  printf '%s\n%s\n---\n%s\n%s\n' "run" "selfhost/mora.mora" "$mode" "$path" > selfhost/.argv
+else
+  printf '%s\n%s\n' "$mode" "$path" > selfhost/.argv
+fi
+printf '' > selfhost/.code
+printf '' > selfhost/.diag
 set +e
 "$HOST" selfhost/mora.mora
 host_status=$?

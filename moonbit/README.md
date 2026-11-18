@@ -39,6 +39,56 @@ Arguments after `--` are the Mora CLI arguments. A release binary is also produc
 
 On this toolchain the native executable name ends in `.exe` even on Linux.
 
+## Linux ARM64 cross-build
+
+From an x86_64 Linux host, this produces a dynamically linked glibc binary for `aarch64-linux-gnu` (ELF `e_machine` 183). MoonBit’s native cross-compile is a compiler selected by `MOON_CC`, not a second `--target`. `MOON_CC` is a program path. Moon runs `cc -dumpmachine`. When that triple’s architecture, OS, or ABI differs from the host, this Moon version (`0.1.20261117`) does not link the host objects `libmoonbitrun.o`, the SIMDUTF objects, or `libbacktrace.a`. The runtime then uses the system allocator, the scalar UTF path, and panics do not print a backtrace. A package-level `cc` does not retarget the shared runtime, so it cannot cross-compile. See [Native build configuration](https://moonbitlang.github.io/moon/native.html#cross-compiling).
+
+Prerequisites on Debian/Ubuntu:
+
+```bash
+sudo apt-get install gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+```
+
+Build:
+
+```bash
+cd moonbit
+export MOON_CC=aarch64-linux-gnu-gcc
+export MOON_AR=aarch64-linux-gnu-ar
+"$MOON_CC" -dumpmachine    # aarch64-linux-gnu
+moon build --target native --release --target-dir _build/aarch64-linux-gnu
+```
+
+The same commands are `scripts/cross-linux-arm64.sh`. The binary is
+
+`_build/aarch64-linux-gnu/native/release/build/cmd/mora/mora.exe`
+
+It is gitignored with the rest of `_build/`. Check the header:
+
+```bash
+file _build/aarch64-linux-gnu/native/release/build/cmd/mora/mora.exe
+readelf -h _build/aarch64-linux-gnu/native/release/build/cmd/mora/mora.exe
+```
+
+A successful build reports `ELF 64-bit LSB pie executable, ARM aarch64` and `Machine: AArch64`. The ELF header field `e_machine` is 183. `readelf -d` lists `libm.so.6`, `libc.so.6`, and `ld-linux-aarch64.so.1`.
+
+Smoke it with qemu-user and the cross sysroot (install `qemu-user-static`):
+
+```bash
+qemu-aarch64-static -L /usr/aarch64-linux-gnu \
+  _build/aarch64-linux-gnu/native/release/build/cmd/mora/mora.exe \
+  examples/glance.mora
+```
+
+Measured on this x86_64 Linux VM with `gcc-aarch64-linux-gnu` 13 and `qemu-aarch64-static`: `e_machine` was 183, `--version` printed `Mora v0.110.0-moonbit`, `print(1 + 2)` printed `3`, `--check examples/typed.mora` printed `ok`, and `examples/glance.mora` printed `doubled =	[2, 4, 6, 8]` and `positive`.
+
+What this build is not:
+
+- Not musl. `moonrockz/zig-cross`’s `linux-arm64` target is `aarch64-linux-musl`. This recipe is glibc `aarch64-linux-gnu`. A device needs an aarch64 glibc dynamic linker, or qemu’s `-L` sysroot.
+- Not armv7 and not Android. Those triples are not produced here. The published zig-cross target list has no armv7 or Android NDK entry. Do not treat a successful aarch64-linux-gnu link as support for them.
+- Not a Windows or macOS binary. The `platform` cfg and the prebuilt `core` library still follow the host. A Linux host and a Linux ARM64 target share the Linux cfg, so `OsString` paths and arguments stay in the Linux form. A Windows binary built on Linux would still see the host cfg and is not a shippable artifact. Do not set `MOON_CC` to a Windows cross compiler on this host.
+- Not a second MoonBit backend. `--target native` stays native; only the C compiler changes. Host `moon test` still runs on x86_64.
+
 `print` writes to stdout. The startup banner and diagnostics go to stderr, matching the Rust CLI. Parse and type errors exit 2. Runtime and I/O errors exit 1.
 
 `mora` with no arguments, or `mora --repl`, starts a line-oriented REPL. `exit` or `quit` leaves it. A chunk is executed when `task` / `fn` / `if` / `match` / `for` / `while` are balanced by `end`.

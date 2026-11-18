@@ -1,0 +1,3690 @@
+-- Mora written in Mora: lexer, iterative Pratt parser, Hindley-Milner, tree-walk evaluator.
+-- Copyright (c) 2026 Microbiosis. BSD-3-Clause. See the repository LICENSE.
+-- Host: the Rust `mora` binary. This file is the trial, not a replacement of that compiler.
+
+let ERR = ""
+let SRC = ""
+let SI = 0
+let SLEN = 0
+let LINE = 1
+let COL = 1
+let TOKS: list<any> = []
+let PI = 0
+let NEXT = 0
+let SUBST: dict<string, any> = {ready: true}
+let NUM: dict<string, any> = {ready: true}
+let TY_FRAMES: list<any> = []
+let FRAMES: list<any> = []
+
+task empty_list(): list<any>
+  let xs: list<any> = []
+  return xs
+end
+
+task die(msg: string): any
+  if ERR == "" then
+    ERR = msg
+  end
+  return nil
+end
+
+task bad(): bool
+  return ERR != ""
+end
+
+task node(tag: string, line: int, col: int): dict<string, any>
+  let d: dict<string, any> = {tag: tag}
+  d = d.set("line", line)
+  d = d.set("col", col)
+  return d
+end
+
+task block_of(stmts: list<any>): dict<string, any>
+  let b = node("block", 1, 1)
+  b = b.set("stmts", stmts)
+  return b
+end
+
+task expr_stmt(e: any): dict<string, any>
+  let s = node("expr", e["line"], e["col"])
+  s = s.set("expr", e)
+  return s
+end
+
+-- ── lexer ────────────────────────────────────────────────────────────
+
+task at(i: int): string
+  if i < 0 then
+    return ""
+  end
+  if i >= SLEN then
+    return ""
+  end
+  return str(SRC[i])
+end
+
+task bump(): string
+  if SI >= SLEN then
+    return ""
+  end
+  let c = str(SRC[SI])
+  SI = SI + 1
+  if c == "\n" then
+    LINE = LINE + 1
+    COL = 1
+  else
+    COL = COL + 1
+  end
+  return c
+end
+
+task is_digit(c: string): bool
+  return "0123456789".contains(c)
+end
+
+task is_alpha(c: string): bool
+  if c == "_" then
+    return true
+  end
+  return "abcdefghijklmnopqrstuvwxyz".contains(c.lower())
+end
+
+task is_alnum(c: string): bool
+  if is_alpha(c) then
+    return true
+  end
+  return is_digit(c)
+end
+
+task emit(kind: string, text: string, line: int, col: int, num: any, ch: any): any
+  let t: dict<string, any> = {kind: kind}
+  t = t.set("text", text)
+  t = t.set("line", line)
+  t = t.set("col", col)
+  t = t.set("num", num)
+  t = t.set("ch", ch)
+  TOKS = TOKS.push(t)
+  return nil
+end
+
+task keyword_kind(name: string): string
+  if name == "let" or name == "task" or name == "fn" or name == "return" or name == "if" or name == "then" or name == "else" or name == "end" or name == "match" or name == "with" or name == "for" or name == "in" or name == "while" or name == "break" or name == "continue" or name == "assign" or name == "true" or name == "false" or name == "nil" then
+    return name
+  end
+  return "ident"
+end
+
+task strip_us(text: string): string
+  return text.replace("_", "")
+end
+
+task scan_number(line: int, col: int): any
+  let text = ""
+  let is_float = false
+  while is_digit(at(SI)) or at(SI) == "_"
+    text = text + at(SI)
+    bump()
+  end
+  if at(SI) == "." then
+    if is_digit(at(SI + 1)) then
+      is_float = true
+      text = text + bump()
+      while is_digit(at(SI)) or at(SI) == "_"
+        text = text + bump()
+      end
+    end
+  end
+  if at(SI) == "e" or at(SI) == "E" then
+    is_float = true
+    text = text + bump()
+    if at(SI) == "+" or at(SI) == "-" then
+      text = text + bump()
+    end
+    while is_digit(at(SI)) or at(SI) == "_"
+      text = text + bump()
+    end
+  end
+  if is_alpha(at(SI)) then
+    let suf = ""
+    while is_alnum(at(SI))
+      suf = suf + bump()
+    end
+    if suf == "n" then
+      return die("Parse error at line " + str(line) + ":" + str(col) + ": bigint suffix 'n' is not in this trial")
+    end
+  end
+  let cleaned = strip_us(text)
+  if is_float then
+    return emit("float", cleaned, line, col, float(cleaned), nil)
+  end
+  return emit("int", cleaned, line, col, int(cleaned), nil)
+end
+
+task scan_string(line: int, col: int): any
+  let out = ""
+  while SI < SLEN
+    let c = at(SI)
+    if c == "\"" then
+      bump()
+      return emit("str", out, line, col, 0, nil)
+    end
+    if c == "\\" then
+      bump()
+      let e = at(SI)
+      bump()
+      if e == "n" then
+        out = out + "\n"
+      else
+        if e == "t" then
+          out = out + "\t"
+        else
+          if e == "r" then
+            out = out + "\r"
+          else
+            if e == "\\" or e == "\"" or e == "'" then
+              out = out + e
+            else
+              out = out + e
+            end
+          end
+        end
+      end
+    else
+      out = out + bump()
+    end
+  end
+  return die("Parse error at line " + str(line) + ":" + str(col) + ": unterminated string")
+end
+
+task scan_char(line: int, col: int): any
+  if SI >= SLEN then
+    return die("Parse error at line " + str(line) + ":" + str(col) + ": unterminated character")
+  end
+  let text = bump()
+  if text == "\\" then
+    let e = bump()
+    if e == "n" then
+      text = "\n"
+    else
+      if e == "t" then
+        text = "\t"
+      else
+        if e == "r" then
+          text = "\r"
+        else
+          text = e
+        end
+      end
+    end
+  end
+  if at(SI) != "'" then
+    return die("Parse error at line " + str(line) + ":" + str(col) + ": unterminated character")
+  end
+  bump()
+  return emit("char", text, line, col, 0, text)
+end
+
+task scan_ident(line: int, col: int): any
+  let text = ""
+  while is_alnum(at(SI))
+    text = text + bump()
+  end
+  let kind = keyword_kind(text)
+  return emit(kind, text, line, col, 0, nil)
+end
+
+task lex_all(src: string): any
+  SRC = src
+  SLEN = src.len()
+  SI = 0
+  LINE = 1
+  COL = 1
+  TOKS = empty_list()
+  ERR = ""
+  while SI < SLEN
+    if bad() then
+      return nil
+    end
+    let c = at(SI)
+    if c == " " or c == "\t" or c == "\r" then
+      bump()
+    else
+      if c == "\n" then
+        let ln = LINE
+        let cl = COL
+        bump()
+        emit("nl", "", ln, cl, 0, nil)
+      else
+        if c == "-" and at(SI + 1) == "-" then
+          while SI < SLEN
+            if at(SI) == "\n" then
+              break
+            end
+            bump()
+          end
+        else
+          let ln = LINE
+          let cl = COL
+          if is_digit(c) then
+            scan_number(ln, cl)
+          else
+            if c == "\"" then
+              bump()
+              scan_string(ln, cl)
+            else
+              if c == "'" then
+                bump()
+                scan_char(ln, cl)
+              else
+                if is_alpha(c) then
+                  scan_ident(ln, cl)
+                else
+                  if c == "-" and at(SI + 1) == ">" then
+                    bump()
+                    bump()
+                    emit("->", "->", ln, cl, 0, nil)
+                  else
+                    if c == "*" and at(SI + 1) == "*" then
+                      bump()
+                      bump()
+                      emit("**", "**", ln, cl, 0, nil)
+                    else
+                      if c == "=" and at(SI + 1) == "=" then
+                        bump()
+                        bump()
+                        emit("==", "==", ln, cl, 0, nil)
+                      else
+                        if c == "=" and at(SI + 1) == ">" then
+                          bump()
+                          bump()
+                          emit("=>", "=>", ln, cl, 0, nil)
+                        else
+                          if c == "!" and at(SI + 1) == "=" then
+                            bump()
+                            bump()
+                            emit("!=", "!=", ln, cl, 0, nil)
+                          else
+                            if c == "<" and at(SI + 1) == "=" then
+                              bump()
+                              bump()
+                              emit("<=", "<=", ln, cl, 0, nil)
+                            else
+                              if c == ">" and at(SI + 1) == "=" then
+                                bump()
+                                bump()
+                                emit(">=", ">=", ln, cl, 0, nil)
+                              else
+                                if c == "|" and at(SI + 1) == ">" then
+                                  bump()
+                                  bump()
+                                  emit("|>", "|>", ln, cl, 0, nil)
+                                else
+                                  if c == ":" and at(SI + 1) == ":" then
+                                    bump()
+                                    bump()
+                                    emit("::", "::", ln, cl, 0, nil)
+                                  else
+                                    bump()
+                                    emit(c, c, ln, cl, 0, nil)
+                                  end
+                                end
+                              end
+                            end
+                          end
+                        end
+                      end
+                    end
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+  emit("eof", "", LINE, COL, 0, nil)
+  return nil
+end
+
+-- ── parser ───────────────────────────────────────────────────────────
+
+task peek(): any
+  if PI >= TOKS.len() then
+    return TOKS[TOKS.len() - 1]
+  end
+  return TOKS[PI]
+end
+
+task adv(): any
+  let t = peek()
+  if PI < TOKS.len() then
+    PI = PI + 1
+  end
+  return t
+end
+
+task peek_kind(): string
+  return peek()["kind"]
+end
+
+task peek_text(): string
+  return peek()["text"]
+end
+
+task kind_at(i: int): string
+  if i < 0 then
+    return "eof"
+  end
+  if i >= TOKS.len() then
+    return "eof"
+  end
+  return TOKS[i]["kind"]
+end
+
+task skip_nl(): any
+  while peek_kind() == "nl"
+    adv()
+  end
+  return nil
+end
+
+task die_here(msg: string): any
+  let t = peek()
+  return die("Parse error at line " + str(t["line"]) + ":" + str(t["col"]) + ": " + msg)
+end
+
+task unsupported(what: string): any
+  return die_here(what + " is not in this trial")
+end
+
+task parse_program(): any
+  let stmts: list<any> = []
+  skip_nl()
+  while peek_kind() != "eof"
+    if bad() then
+      return nil
+    end
+    let s = parse_stmt()
+    if bad() then
+      return nil
+    end
+    stmts = stmts.push(s)
+    skip_nl()
+  end
+  let n = node("program", 1, 1)
+  n = n.set("stmts", stmts)
+  return n
+end
+
+task parse_stmt(): any
+  if bad() then
+    return nil
+  end
+  skip_nl()
+  let k = peek_kind()
+  if k == "let" then
+    return parse_let()
+  end
+  if k == "task" then
+    return parse_task()
+  end
+  if k == "for" then
+    return parse_for()
+  end
+  if k == "while" then
+    return parse_while()
+  end
+  if k == "return" then
+    return parse_return()
+  end
+  if k == "break" then
+    let t = adv()
+    return node("break", t["line"], t["col"])
+  end
+  if k == "continue" then
+    let t = adv()
+    return node("continue", t["line"], t["col"])
+  end
+  if k == "if" then
+    return expr_stmt(parse_if())
+  end
+  if k == "match" then
+    return expr_stmt(parse_match())
+  end
+  if k == "assign" then
+    let t = adv()
+    if peek_kind() != "ident" then
+      return die_here("expected a variable name after 'assign'")
+    end
+    let name = adv()
+    if peek_kind() != "=" then
+      return die_here("expected '=' in assign statement")
+    end
+    adv()
+    let rhs = parse_expr()
+    if bad() then
+      return nil
+    end
+    let a = node("assign", t["line"], t["col"])
+    a = a.set("name", name["text"])
+    a = a.set("expr", rhs)
+    return expr_stmt(a)
+  end
+  if k == "import" or k == "export" then
+    return unsupported("modules (import/export)")
+  end
+  if k == "ident" then
+    let name = peek_text()
+    if name == "perform" or name == "handle" then
+      return unsupported("algebraic effects (perform/handle)")
+    end
+    if name == "spawn" or name == "channel" or name == "select" or name == "context" or name == "sleep" then
+      return unsupported("concurrency (spawn/channel/select/context/sleep)")
+    end
+    if name == "parallel" or name == "worker" then
+      return unsupported("parallel blocks")
+    end
+    if name == "type" then
+      return unsupported("type aliases")
+    end
+    if name == "enum" then
+      return unsupported("enums")
+    end
+    if name == "struct" then
+      return unsupported("structs")
+    end
+    if name == "macro" or name == "quote" then
+      return unsupported("macros and quote")
+    end
+    if name == "trait" or name == "impl" or name == "dyn" then
+      return unsupported("traits and dyn dispatch")
+    end
+    if name == "loop" then
+      return unsupported("`loop`")
+    end
+    if name == "transaction" or name == "commit" or name == "rollback" or name == "eval" or name == "aggregate" or name == "effect" then
+      return unsupported("`" + name + "`")
+    end
+  end
+  let e = parse_expr()
+  if bad() then
+    return nil
+  end
+  return expr_stmt(e)
+end
+
+task parse_let(): any
+  let t = adv()
+  if peek_kind() != "ident" then
+    return die_here("expected a variable name after 'let'")
+  end
+  let name = adv()
+  let ann = nil
+  if peek_kind() == ":" then
+    adv()
+    ann = parse_ty()
+    if bad() then
+      return nil
+    end
+  end
+  if peek_kind() != "=" then
+    return die_here("expected '=' in let binding")
+  end
+  adv()
+  let rhs = parse_expr()
+  if bad() then
+    return nil
+  end
+  let n = node("let", t["line"], t["col"])
+  n = n.set("name", name["text"])
+  n = n.set("ann", ann)
+  n = n.set("expr", rhs)
+  return n
+end
+
+task parse_task(): any
+  let t = adv()
+  if peek_kind() != "ident" then
+    return die_here("expected a task name")
+  end
+  let name = adv()
+  if peek_kind() == "<" then
+    return unsupported("generic tasks")
+  end
+  if peek_kind() != "(" then
+    return die_here("expected '(' after task name")
+  end
+  adv()
+  let params = parse_params()
+  if bad() then
+    return nil
+  end
+  let ann = nil
+  if peek_kind() == ":" then
+    adv()
+    ann = parse_ty()
+    if bad() then
+      return nil
+    end
+  end
+  let body = parse_task_body(t["line"], t["col"])
+  if bad() then
+    return nil
+  end
+  let n = node("task", t["line"], t["col"])
+  n = n.set("name", name["text"])
+  n = n.set("params", params)
+  n = n.set("ann", ann)
+  n = n.set("body", body)
+  return n
+end
+
+task parse_params(): list<any>
+  let params: list<any> = []
+  skip_nl()
+  while peek_kind() != ")"
+    if peek_kind() == "eof" then
+      die_here("expected ')' after parameters")
+      return params
+    end
+    if peek_kind() != "ident" then
+      die_here("expected a parameter name")
+      return params
+    end
+    let name = adv()
+    let ann = nil
+    if peek_kind() == ":" then
+      adv()
+      ann = parse_ty()
+      if bad() then
+        return params
+      end
+    end
+    let p = node("param", name["line"], name["col"])
+    p = p.set("name", name["text"])
+    p = p.set("ann", ann)
+    params = params.push(p)
+    skip_nl()
+    if peek_kind() == "," then
+      adv()
+      skip_nl()
+    end
+  end
+  adv()
+  return params
+end
+
+task simple_ty(name: string, line: int, col: int): any
+  let kind = ""
+  if name == "int" or name == "i4" or name == "i8" or name == "i16" or name == "i32" or name == "i64" or name == "u8" or name == "u16" or name == "u32" or name == "u64" then
+    kind = "int"
+  else
+    if name == "float" or name == "f16" or name == "bf16" or name == "fp8" or name == "f32" or name == "f64" then
+      kind = "float"
+    else
+      if name == "number" then
+        kind = "number"
+      else
+        if name == "string" then
+          kind = "string"
+        else
+          if name == "bool" then
+            kind = "bool"
+          else
+            if name == "nil" then
+              kind = "nil"
+            else
+              if name == "char" then
+                kind = "char"
+              else
+                if name == "any" then
+                  kind = "any"
+                else
+                  return die("Parse error at line " + str(line) + ":" + str(col) + ": type annotation '" + name + "' is not in this trial")
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+  let n = node("ty", line, col)
+  n = n.set("name", kind)
+  return n
+end
+
+task parse_ty(): any
+  if bad() then
+    return nil
+  end
+  if peek_kind() == "nil" then
+    let t = adv()
+    return simple_ty("nil", t["line"], t["col"])
+  end
+  if peek_kind() != "ident" then
+    return die_here("expected a type annotation")
+  end
+  let t = adv()
+  let name = t["text"].lower()
+  if peek_kind() == "<" then
+    adv()
+    let args: list<any> = []
+    skip_nl()
+    while peek_kind() != ">"
+      if peek_kind() == "eof" then
+        return die_here("expected '>' after generic type arguments")
+      end
+      let a = parse_ty()
+      if bad() then
+        return nil
+      end
+      args = args.push(a)
+      skip_nl()
+      if peek_kind() == "," then
+        adv()
+        skip_nl()
+      end
+    end
+    adv()
+    if peek_kind() == "|" then
+      return unsupported("union types other than 'number'")
+    end
+    let n = node("ty", t["line"], t["col"])
+    if name == "list" then
+      if args.len() < 1 then
+        return die_here("list<T> needs one type argument")
+      end
+      n = n.set("name", "list")
+      n = n.set("elem", args[0])
+      return n
+    end
+    if name == "dict" then
+      if args.len() < 2 then
+        return die_here("dict<K, V> needs two type arguments")
+      end
+      n = n.set("name", "dict")
+      n = n.set("key", args[0])
+      n = n.set("val", args[1])
+      return n
+    end
+    return die("Parse error at line " + str(t["line"]) + ":" + str(t["col"]) + ": generic type '" + name + "' is not in this trial")
+  end
+  if peek_kind() == "|" then
+    return unsupported("union types other than 'number'")
+  end
+  return simple_ty(name, t["line"], t["col"])
+end
+
+task parse_end_block(stop_else: bool): any
+  skip_nl()
+  let stmts: list<any> = []
+  while true
+    if bad() then
+      return nil
+    end
+    let k = peek_kind()
+    if k == "end" then
+      adv()
+      break
+    end
+    if k == "eof" then
+      return die_here("expected 'end'")
+    end
+    if stop_else and peek_kind() == "else" then
+      break
+    end
+    let s = parse_stmt()
+    if bad() then
+      return nil
+    end
+    stmts = stmts.push(s)
+    skip_nl()
+  end
+  return block_of(stmts)
+end
+
+task parse_task_body(line: int, col: int): any
+  if peek_kind() == "nl" or peek_kind() == "end" then
+    return parse_end_block(false)
+  end
+  let e = parse_expr()
+  if bad() then
+    return nil
+  end
+  if peek_kind() == "end" then
+    adv()
+  end
+  let stmts: list<any> = []
+  stmts = stmts.push(expr_stmt(e))
+  return block_of(stmts)
+end
+
+task parse_for(): any
+  let t = adv()
+  if peek_kind() != "ident" then
+    return die_here("expected a loop variable")
+  end
+  let name = adv()
+  if peek_kind() != "in" then
+    return die_here("expected 'in' in for loop")
+  end
+  adv()
+  let iter = parse_expr()
+  if bad() then
+    return nil
+  end
+  let body = parse_end_block(false)
+  if bad() then
+    return nil
+  end
+  let n = node("for", t["line"], t["col"])
+  n = n.set("name", name["text"])
+  n = n.set("iter", iter)
+  n = n.set("body", body)
+  return n
+end
+
+task parse_while(): any
+  let t = adv()
+  let cond = parse_expr()
+  if bad() then
+    return nil
+  end
+  let body = parse_end_block(false)
+  if bad() then
+    return nil
+  end
+  let n = node("while", t["line"], t["col"])
+  n = n.set("cond", cond)
+  n = n.set("body", body)
+  return n
+end
+
+task stmt_ends(): bool
+  let k = peek_kind()
+  if k == "nl" or k == "end" or k == "eof" or k == ")" or k == "}" then
+    return true
+  end
+  if peek_kind() == "else" then
+    return true
+  end
+  return false
+end
+
+task parse_return(): any
+  let t = adv()
+  let n = node("return", t["line"], t["col"])
+  if stmt_ends() then
+    n = n.set("expr", nil)
+    return n
+  end
+  let e = parse_expr()
+  if bad() then
+    return nil
+  end
+  n = n.set("expr", e)
+  return n
+end
+
+task parse_if(): any
+  let t = adv()
+  let cond = parse_expr()
+  if bad() then
+    return nil
+  end
+  if peek_kind() != "then" then
+    return die_here("expected 'then' after if condition")
+  end
+  adv()
+  let th = parse_end_block(true)
+  if bad() then
+    return nil
+  end
+  let has_else = false
+  let el = nil
+  if peek_kind() == "else" then
+    adv()
+    has_else = true
+    el = parse_end_block(false)
+    if bad() then
+      return nil
+    end
+  end
+  let n = node("if", t["line"], t["col"])
+  n = n.set("cond", cond)
+  n = n.set("then", th)
+  n = n.set("else", el)
+  n = n.set("has_else", has_else)
+  return n
+end
+
+task parse_match(): any
+  let t = adv()
+  let scrut = parse_expr()
+  if bad() then
+    return nil
+  end
+  let brace = false
+  if peek_kind() == "with" then
+    adv()
+  else
+    if peek_kind() == "{" then
+      adv()
+      brace = true
+    else
+      return die_here("expected 'with' or '{' after match subject")
+    end
+  end
+  let arms: list<any> = []
+  skip_nl()
+  while true
+    if bad() then
+      return nil
+    end
+    if brace and peek_kind() == "}" then
+      adv()
+      break
+    end
+    if not brace and peek_kind() == "end" then
+      adv()
+      break
+    end
+    if peek_kind() == "eof" then
+      return die_here("expected the end of match")
+    end
+    let arm = parse_arm()
+    if bad() then
+      return nil
+    end
+    arms = arms.push(arm)
+    skip_nl()
+    if brace and peek_kind() == "," then
+      adv()
+      skip_nl()
+    end
+  end
+  let n = node("match", t["line"], t["col"])
+  n = n.set("scrut", scrut)
+  n = n.set("arms", arms)
+  return n
+end
+
+task parse_arm(): any
+  let pat = parse_pat()
+  if bad() then
+    return nil
+  end
+  let guard_expr = nil
+  if peek_kind() == "ident" and peek_text() == "when" then
+    adv()
+    guard_expr = parse_expr()
+    if bad() then
+      return nil
+    end
+  end
+  if peek_kind() != "->" and peek_kind() != "=>" then
+    return die_here("malformed match arm — an arm body must be an expression: `pattern [when <expr>] -> <expr>`")
+  end
+  adv()
+  let body = parse_expr()
+  if bad() then
+    return nil
+  end
+  let n = node("arm", pat["line"], pat["col"])
+  n = n.set("pat", pat)
+  n = n.set("guard", guard_expr)
+  n = n.set("body", body)
+  return n
+end
+
+task parse_pat(): any
+  let k = peek_kind()
+  if k == "[" or k == "{" then
+    return unsupported("list and dict patterns")
+  end
+  if k == "ident" and peek_text() == "_" then
+    let t = adv()
+    let n = node("wild", t["line"], t["col"])
+    return n
+  end
+  if k == "ident" then
+    let t = adv()
+    let n = node("bind", t["line"], t["col"])
+    n = n.set("name", t["text"])
+    return n
+  end
+  if k == "int" or k == "float" or k == "str" or k == "char" or k == "true" or k == "false" or k == "nil" then
+    let t = adv()
+    let n = node("lit", t["line"], t["col"])
+    n = n.set("lit", t["kind"])
+    n = n.set("text", t["text"])
+    n = n.set("num", t["num"])
+    n = n.set("ch", t["ch"])
+    return n
+  end
+  if k == "-" then
+    let t = adv()
+    if peek_kind() == "int" then
+      let ntok = adv()
+      let n = node("lit", t["line"], t["col"])
+      n = n.set("lit", "int")
+      n = n.set("num", 0 - ntok["num"])
+      n = n.set("text", "-" + ntok["text"])
+      n = n.set("ch", nil)
+      return n
+    end
+    if peek_kind() == "float" then
+      let ntok = adv()
+      let n = node("lit", t["line"], t["col"])
+      n = n.set("lit", "float")
+      n = n.set("num", 0.0 - ntok["num"])
+      n = n.set("text", "-" + ntok["text"])
+      n = n.set("ch", nil)
+      return n
+    end
+    return die_here("expected a literal after '-' in a pattern")
+  end
+  return die_here("expected a pattern")
+end
+
+task parse_expr(): any
+  if bad() then
+    return nil
+  end
+  if peek_kind() == "if" then
+    return parse_if()
+  end
+  if peek_kind() == "match" then
+    return parse_match()
+  end
+  if peek_kind() == "ident" then
+    let saved = PI
+    let name_tok = adv()
+    if peek_kind() == "=" then
+      adv()
+      let rhs = parse_expr()
+      if bad() then
+        return nil
+      end
+      let n = node("assign", name_tok["line"], name_tok["col"])
+      n = n.set("name", name_tok["text"])
+      n = n.set("expr", rhs)
+      return n
+    end
+    PI = saved
+  end
+  return parse_prec(1)
+end
+
+task lookahead_prec(): int
+  if kind_at(PI) == "nl" and kind_at(PI + 1) == "|>" then
+    return 4
+  end
+  if peek_kind() == "ident" then
+    if peek_text() == "or" then
+      return 1
+    end
+    if peek_text() == "and" then
+      return 2
+    end
+    return -1
+  end
+  let k = peek_kind()
+  if k == "==" or k == "!=" then
+    return 3
+  end
+  if k == "|>" then
+    return 4
+  end
+  if k == "<" or k == ">" or k == "<=" or k == ">=" then
+    return 5
+  end
+  if k == "+" or k == "-" then
+    return 6
+  end
+  if k == "*" or k == "/" or k == "%" then
+    return 7
+  end
+  if k == "**" then
+    return 8
+  end
+  if k == "@" then
+    return 100
+  end
+  return -1
+end
+
+task consume_op(): string
+  if kind_at(PI) == "nl" and kind_at(PI + 1) == "|>" then
+    adv()
+    adv()
+    return "|>"
+  end
+  if peek_kind() == "ident" then
+    let t = peek_text()
+    adv()
+    return t
+  end
+  let k = peek_kind()
+  adv()
+  return k
+end
+
+task fold_op(op: string, left: any, right: any): any
+  if op == "@" then
+    die("Parse error at line " + str(left["line"]) + ":" + str(left["col"]) + ": matrix multiplication ('@') is not in this trial")
+    return nil
+  end
+  if op == "|>" then
+    if right["tag"] == "call" then
+      let callee = right["callee"]
+      if callee["tag"] == "var" then
+        let m = node("method", left["line"], left["col"])
+        m = m.set("recv", left)
+        m = m.set("name", callee["name"])
+        m = m.set("args", right["args"])
+        return m
+      end
+    end
+  end
+  let n = node("binary", left["line"], left["col"])
+  n = n.set("op", op)
+  n = n.set("left", left)
+  n = n.set("right", right)
+  return n
+end
+
+task parse_prec(minp: int): any
+  let left = parse_unary()
+  if bad() then
+    return nil
+  end
+  while true
+    let p = lookahead_prec()
+    if p < minp then
+      break
+    end
+    let op = consume_op()
+    let next_min = p + 1
+    if op == "**" then
+      next_min = p
+    end
+    let right = parse_prec(next_min)
+    if bad() then
+      return nil
+    end
+    left = fold_op(op, left, right)
+    if bad() then
+      return nil
+    end
+  end
+  return left
+end
+
+task parse_unary(): any
+  if bad() then
+    return nil
+  end
+  if (peek_kind() == "ident" and peek_text() == "not") or peek_kind() == "!" or peek_kind() == "-" then
+    let op = "neg"
+    if (peek_kind() == "ident" and peek_text() == "not") or peek_kind() == "!" then
+      op = "not"
+    end
+    let t = adv()
+    let inner = parse_unary()
+    if bad() then
+      return nil
+    end
+    let n = node("unary", t["line"], t["col"])
+    n = n.set("op", op)
+    n = n.set("expr", inner)
+    return n
+  end
+  return parse_postfix()
+end
+
+task stdlib_name(name: string): bool
+  if name == "json" or name == "exec" or name == "math" or name == "stats" or name == "linalg" or name == "random" then
+    return true
+  end
+  return false
+end
+
+task parse_postfix(): any
+  let expr = parse_primary()
+  if bad() then
+    return nil
+  end
+  while true
+    if peek_kind() == "." then
+      adv()
+      if peek_kind() != "ident" then
+        return die_here("expected a method name")
+      end
+      let name_tok = adv()
+      if expr["tag"] == "var" and stdlib_name(expr["name"]) then
+        return unsupported("stdlib namespace '" + expr["name"] + ".*'")
+      end
+      if expr["tag"] == "var" and expr["name"] == "file" then
+        if name_tok["text"] != "read_text" and name_tok["text"] != "write_text" then
+          return unsupported("file." + name_tok["text"] + " (this trial only keeps file.read_text and file.write_text)")
+        end
+      end
+      let args: list<any> = []
+      if peek_kind() == "(" then
+        args = parse_args()
+        if bad() then
+          return nil
+        end
+      end
+      let m = node("method", name_tok["line"], name_tok["col"])
+      m = m.set("recv", expr)
+      m = m.set("name", name_tok["text"])
+      m = m.set("args", args)
+      expr = m
+    else
+      if peek_kind() == "[" then
+        let t = adv()
+        skip_nl()
+        let idx = parse_expr()
+        if bad() then
+          return nil
+        end
+        skip_nl()
+        if peek_kind() != "]" then
+          return die_here("expected ']' after index")
+        end
+        adv()
+        let n = node("index", t["line"], t["col"])
+        n = n.set("recv", expr)
+        n = n.set("index", idx)
+        expr = n
+      else
+        if peek_kind() == "(" then
+          let args = parse_args()
+          if bad() then
+            return nil
+          end
+          let n = node("call", expr["line"], expr["col"])
+          n = n.set("callee", expr)
+          n = n.set("args", args)
+          expr = n
+        else
+          if peek_kind() == "::" then
+            return unsupported("associated paths ('::')")
+          else
+            break
+          end
+        end
+      end
+    end
+  end
+  return expr
+end
+
+task parse_args(): list<any>
+  adv()
+  let args: list<any> = []
+  skip_nl()
+  while peek_kind() != ")"
+    if peek_kind() == "eof" then
+      die_here("expected ')'")
+      return args
+    end
+    let a = parse_expr()
+    if bad() then
+      return args
+    end
+    args = args.push(a)
+    skip_nl()
+    if peek_kind() == "," then
+      adv()
+      skip_nl()
+    end
+  end
+  adv()
+  return args
+end
+
+task parse_list(): any
+  let t = adv()
+  let items: list<any> = []
+  skip_nl()
+  while peek_kind() != "]"
+    if peek_kind() == "eof" then
+      return die_here("expected ']'")
+    end
+    let a = parse_expr()
+    if bad() then
+      return nil
+    end
+    items = items.push(a)
+    skip_nl()
+    if peek_kind() == "," then
+      adv()
+      skip_nl()
+    end
+  end
+  adv()
+  let n = node("list", t["line"], t["col"])
+  n = n.set("items", items)
+  return n
+end
+
+task parse_dict(): any
+  let t = adv()
+  let pairs: list<any> = []
+  skip_nl()
+  while peek_kind() != "}"
+    if peek_kind() == "eof" then
+      return die_here("expected '}'")
+    end
+    let key = ""
+    if peek_kind() == "str" or peek_kind() == "ident" then
+      key = adv()["text"]
+    else
+      return die_here("expected a dict key")
+    end
+    if peek_kind() != ":" then
+      return die_here("expected ':' after dict key")
+    end
+    adv()
+    let val = parse_expr()
+    if bad() then
+      return nil
+    end
+    let pair: dict<string, any> = {k: key}
+    pair = pair.set("v", val)
+    pairs = pairs.push(pair)
+    skip_nl()
+    if peek_kind() == "," then
+      adv()
+      skip_nl()
+    end
+  end
+  adv()
+  let n = node("dict", t["line"], t["col"])
+  n = n.set("pairs", pairs)
+  return n
+end
+
+task parse_fn(): any
+  let t = adv()
+  if peek_kind() == "<" then
+    return unsupported("generic closures")
+  end
+  if peek_kind() != "(" then
+    return die_here("expected '(' after 'fn'")
+  end
+  adv()
+  let params = parse_params()
+  if bad() then
+    return nil
+  end
+  let body: any = nil
+  if peek_kind() == "nl" or peek_kind() == "end" or peek_kind() == "{" then
+    body = parse_end_block(false)
+  else
+    let e = parse_expr()
+    if bad() then
+      return nil
+    end
+    if peek_kind() == "end" then
+      adv()
+    end
+    let stmts: list<any> = []
+    stmts = stmts.push(expr_stmt(e))
+    body = block_of(stmts)
+  end
+  if bad() then
+    return nil
+  end
+  let n = node("fn", t["line"], t["col"])
+  n = n.set("params", params)
+  n = n.set("body", body)
+  return n
+end
+
+task parse_primary(): any
+  if bad() then
+    return nil
+  end
+  let k = peek_kind()
+  if k == "int" or k == "float" or k == "str" or k == "char" or k == "true" or k == "false" or k == "nil" then
+    let t = adv()
+    let tag = k
+    if k == "true" or k == "false" then
+      tag = "bool"
+    end
+    let n = node(tag, t["line"], t["col"])
+    n = n.set("text", t["text"])
+    n = n.set("num", t["num"])
+    n = n.set("ch", t["ch"])
+    if k == "true" then
+      n = n.set("bool", true)
+    end
+    if k == "false" then
+      n = n.set("bool", false)
+    end
+    return n
+  end
+  if k == "ident" then
+    let t = adv()
+    let name = t["text"]
+    if name == "perform" or name == "handle" then
+      return die("Parse error at line " + str(t["line"]) + ":" + str(t["col"]) + ": algebraic effects (perform/handle) is not in this trial")
+    end
+    if name == "spawn" or name == "select" or name == "quote" then
+      return die("Parse error at line " + str(t["line"]) + ":" + str(t["col"]) + ": '" + name + "' is not in this trial")
+    end
+    let n = node("var", t["line"], t["col"])
+    n = n.set("name", name)
+    return n
+  end
+  if k == "(" then
+    adv()
+    skip_nl()
+    let e = parse_expr()
+    if bad() then
+      return nil
+    end
+    skip_nl()
+    if peek_kind() != ")" then
+      return die_here("expected ')'")
+    end
+    adv()
+    return e
+  end
+  if k == "[" then
+    return parse_list()
+  end
+  if k == "{" then
+    return parse_dict()
+  end
+  if k == "fn" then
+    return parse_fn()
+  end
+  if k == "match" then
+    return parse_match()
+  end
+  if k == "if" then
+    return parse_if()
+  end
+  if k == "@" then
+    return unsupported("matrix multiplication ('@')")
+  end
+  return die_here("expected an expression")
+end
+
+task parse_source(src: string): any
+  lex_all(src)
+  if bad() then
+    return nil
+  end
+  PI = 0
+  return parse_program()
+end
+-- ── types ────────────────────────────────────────────────────────────
+
+let RET: any = nil
+let EXITC = 0
+
+task ty_base(name: string): dict<string, any>
+  let d: dict<string, any> = {tag: name}
+  return d
+end
+
+task ty_var(id: int): dict<string, any>
+  let d: dict<string, any> = {tag: "var"}
+  d = d.set("id", id)
+  return d
+end
+
+task ty_list(elem: any): dict<string, any>
+  let d: dict<string, any> = {tag: "list"}
+  d = d.set("elem", elem)
+  return d
+end
+
+task ty_dict(key: any, val: any): dict<string, any>
+  let d: dict<string, any> = {tag: "dict"}
+  d = d.set("key", key)
+  d = d.set("val", val)
+  return d
+end
+
+task ty_arrow(params: list<any>, ret: any): dict<string, any>
+  let d: dict<string, any> = {tag: "arrow"}
+  d = d.set("params", params)
+  d = d.set("ret", ret)
+  return d
+end
+
+task fresh(): dict<string, any>
+  let id = NEXT
+  NEXT = NEXT + 1
+  return ty_var(id)
+end
+
+task mono(ty: any): dict<string, any>
+  let s: dict<string, any> = {body: ty}
+  s = s.set("vars", empty_list())
+  s = s.set("numeric", empty_list())
+  return s
+end
+
+task die_ty(line: int, col: int, msg: string): any
+  return die("Type error at line " + str(line) + ":" + str(col) + ": " + msg)
+end
+
+task mismatch(line: int, col: int, expected: string, actual: string): any
+  let msg = "Type mismatch: expected " + expected + ", got " + actual + " at line " + str(line) + ", column " + str(col) + "\n  expected: " + expected + "\n  actual:   " + actual
+  return die_ty(line, col, msg)
+end
+
+task resolve(ty: any): any
+  if ty == nil then
+    return ty_base("nil")
+  end
+  if ty["tag"] == "var" then
+    let found = SUBST.get(str(ty["id"]))
+    if found != nil then
+      return resolve(found)
+    end
+  end
+  return ty
+end
+
+task occurs(id: int, ty: any): bool
+  let t = resolve(ty)
+  if t["tag"] == "var" then
+    return t["id"] == id
+  end
+  if t["tag"] == "list" then
+    return occurs(id, t["elem"])
+  end
+  if t["tag"] == "dict" then
+    if occurs(id, t["key"]) then
+      return true
+    end
+    return occurs(id, t["val"])
+  end
+  if t["tag"] == "arrow" then
+    let params = t["params"]
+    let i = 0
+    while i < params.len()
+      if occurs(id, params[i]) then
+        return true
+      end
+      i = i + 1
+    end
+    return occurs(id, t["ret"])
+  end
+  return false
+end
+
+task bind_var(id: int, ty: any, line: int, col: int): any
+  let bound = resolve(ty)
+  if bound["tag"] == "var" and bound["id"] == id then
+    return nil
+  end
+  if occurs(id, bound) then
+    return die_ty(line, col, "infinite type")
+  end
+  if NUM.get(str(id)) == true then
+    if bound["tag"] == "var" then
+      NUM = NUM.set(str(bound["id"]), true)
+    end
+    if bound["tag"] != "var" then
+      if bound["tag"] != "int" then
+        if bound["tag"] != "float" then
+          if bound["tag"] != "number" then
+            if bound["tag"] != "any" then
+              return mismatch(line, col, "numeric type (int, float, or number)", type_name(bound))
+            end
+          end
+        end
+      end
+    end
+  end
+  SUBST = SUBST.set(str(id), bound)
+  return nil
+end
+
+task unify(left: any, right: any, line: int, col: int): any
+  if bad() then
+    return nil
+  end
+  let a = resolve(left)
+  let b = resolve(right)
+  if a["tag"] == "any" or b["tag"] == "any" then
+    return nil
+  end
+  if a["tag"] == "var" then
+    return bind_var(a["id"], b, line, col)
+  end
+  if b["tag"] == "var" then
+    return bind_var(b["id"], a, line, col)
+  end
+  if a["tag"] == b["tag"] and (a["tag"] == "int" or a["tag"] == "float" or a["tag"] == "number" or a["tag"] == "bool" or a["tag"] == "string" or a["tag"] == "nil" or a["tag"] == "char" or a["tag"] == "file") then
+    return nil
+  end
+  if a["tag"] == "list" and b["tag"] == "list" then
+    return unify(a["elem"], b["elem"], line, col)
+  end
+  if a["tag"] == "dict" and b["tag"] == "dict" then
+    unify(a["key"], b["key"], line, col)
+    if bad() then
+      return nil
+    end
+    return unify(a["val"], b["val"], line, col)
+  end
+  if a["tag"] == "arrow" and b["tag"] == "arrow" then
+    let pa = a["params"]
+    let pb = b["params"]
+    if pa.len() != pb.len() then
+      return mismatch(line, col, type_name(a), type_name(b))
+    end
+    let i = 0
+    while i < pa.len()
+      unify(pa[i], pb[i], line, col)
+      if bad() then
+        return nil
+      end
+      i = i + 1
+    end
+    return unify(a["ret"], b["ret"], line, col)
+  end
+  return mismatch(line, col, type_name(a), type_name(b))
+end
+
+task subtype(sub: any, sup: any): bool
+  let a = resolve(sub)
+  let b = resolve(sup)
+  if a["tag"] == "any" or b["tag"] == "any" then
+    return true
+  end
+  if a["tag"] == "var" then
+    bind_var(a["id"], b, 1, 1)
+    return bad() == false
+  end
+  if b["tag"] == "var" then
+    return false
+  end
+  if a["tag"] == b["tag"] and (a["tag"] == "int" or a["tag"] == "float" or a["tag"] == "number" or a["tag"] == "bool" or a["tag"] == "string" or a["tag"] == "nil" or a["tag"] == "char") then
+    return true
+  end
+  if a["tag"] == "int" and (b["tag"] == "float" or b["tag"] == "number") then
+    return true
+  end
+  if a["tag"] == "float" and b["tag"] == "number" then
+    return true
+  end
+  if a["tag"] == "list" and b["tag"] == "list" then
+    return subtype(a["elem"], b["elem"])
+  end
+  if a["tag"] == "dict" and b["tag"] == "dict" then
+    if subtype(a["key"], b["key"]) then
+      return subtype(a["val"], b["val"])
+    end
+    return false
+  end
+  if a["tag"] == "arrow" and b["tag"] == "arrow" then
+    let pa = a["params"]
+    let pb = b["params"]
+    if pa.len() != pb.len() then
+      return false
+    end
+    if subtype(a["ret"], b["ret"]) == false then
+      return false
+    end
+    let i = 0
+    while i < pa.len()
+      if subtype(pb[i], pa[i]) == false then
+        return false
+      end
+      i = i + 1
+    end
+    return true
+  end
+  return false
+end
+
+task expect_sub(actual: any, expected: any, line: int, col: int): any
+  if subtype(actual, expected) then
+    return nil
+  end
+  return mismatch(line, col, type_name(expected), type_name(actual))
+end
+
+task apply(ty: any): any
+  let t = resolve(ty)
+  if t["tag"] == "list" then
+    return ty_list(apply(t["elem"]))
+  end
+  if t["tag"] == "dict" then
+    return ty_dict(apply(t["key"]), apply(t["val"]))
+  end
+  if t["tag"] == "arrow" then
+    let params = t["params"]
+    let ps = empty_list()
+    let i = 0
+    while i < params.len()
+      ps = ps.push(apply(params[i]))
+      i = i + 1
+    end
+    return ty_arrow(ps, apply(t["ret"]))
+  end
+  return t
+end
+
+task type_name(ty: any): string
+  let t = apply(ty)
+  if t["tag"] == "list" then
+    return "list<" + type_name(t["elem"]) + ">"
+  end
+  if t["tag"] == "dict" then
+    return "dict<" + type_name(t["key"]) + ", " + type_name(t["val"]) + ">"
+  end
+  if t["tag"] == "arrow" then
+    let text = "("
+    let params = t["params"]
+    let i = 0
+    while i < params.len()
+      if i > 0 then
+        text = text + ", "
+      end
+      text = text + type_name(params[i])
+      i = i + 1
+    end
+    return text + ") -> " + type_name(t["ret"])
+  end
+  if t["tag"] == "var" then
+    if NUM.get(str(t["id"])) == true then
+      return "'n" + str(t["id"])
+    end
+    return "'t" + str(t["id"])
+  end
+  return t["tag"]
+end
+
+task mark_num(ty: any, line: int, col: int): any
+  let t = resolve(ty)
+  if t["tag"] == "int" or t["tag"] == "float" or t["tag"] == "number" or t["tag"] == "any" then
+    return nil
+  end
+  if t["tag"] == "var" then
+    NUM = NUM.set(str(t["id"]), true)
+    return nil
+  end
+  return die_ty(line, col, "expected a numeric type (int, float, or number)\n  actual:   " + type_name(t))
+end
+
+task is_num(ty: any): bool
+  let t = resolve(ty)
+  if t["tag"] == "int" or t["tag"] == "float" or t["tag"] == "number" then
+    return true
+  end
+  if t["tag"] == "var" and NUM.get(str(t["id"])) == true then
+    return true
+  end
+  return false
+end
+
+task arith(op: string, left: any, right: any, line: int, col: int): any
+  let a = resolve(left)
+  let b = resolve(right)
+  if op == "+" and (a["tag"] == "string" or b["tag"] == "string") then
+    return ty_base("string")
+  end
+  if op == "+" and (a["tag"] == "any" or b["tag"] == "any") then
+    return ty_base("any")
+  end
+  mark_num(a, line, col)
+  if bad() then
+    return nil
+  end
+  mark_num(b, line, col)
+  if bad() then
+    return nil
+  end
+  a = resolve(left)
+  b = resolve(right)
+  if a["tag"] == "int" and b["tag"] == "int" then
+    return ty_base("int")
+  end
+  if a["tag"] == "var" and b["tag"] == "int" then
+    bind_var(a["id"], b, line, col)
+    return ty_base("int")
+  end
+  if b["tag"] == "var" and a["tag"] == "int" then
+    bind_var(b["id"], a, line, col)
+    return ty_base("int")
+  end
+  if a["tag"] == "var" and b["tag"] == "float" then
+    bind_var(a["id"], b, line, col)
+    return ty_base("float")
+  end
+  if b["tag"] == "var" and a["tag"] == "float" then
+    bind_var(b["id"], a, line, col)
+    return ty_base("float")
+  end
+  if a["tag"] == "var" and b["tag"] == "number" then
+    bind_var(a["id"], b, line, col)
+    return ty_base("number")
+  end
+  if b["tag"] == "var" and a["tag"] == "number" then
+    bind_var(b["id"], a, line, col)
+    return ty_base("number")
+  end
+  if a["tag"] == "var" and b["tag"] == "var" then
+    unify(a, b, line, col)
+    return resolve(a)
+  end
+  if a["tag"] == "float" or b["tag"] == "float" then
+    return ty_base("float")
+  end
+  if a["tag"] == "number" or b["tag"] == "number" then
+    return ty_base("number")
+  end
+  if a["tag"] == "any" or b["tag"] == "any" then
+    return ty_base("any")
+  end
+  return die_ty(line, col, "operands must be numbers, or strings for '+'\n  actual:   " + type_name(a) + " and " + type_name(b))
+end
+
+task ann_to_ty(ann: any): any
+  let name = ann["name"]
+  if name == "list" then
+    return ty_list(ann_to_ty(ann["elem"]))
+  end
+  if name == "dict" then
+    return ty_dict(ann_to_ty(ann["key"]), ann_to_ty(ann["val"]))
+  end
+  return ty_base(name)
+end
+
+task replace_at(xs: list<any>, i: int, v: any): list<any>
+  let out = empty_list()
+  let k = 0
+  while k < xs.len()
+    if k == i then
+      out = out.push(v)
+    else
+      out = out.push(xs[k])
+    end
+    k = k + 1
+  end
+  return out
+end
+
+task drop_last(xs: list<any>): list<any>
+  let out = empty_list()
+  let k = 0
+  let n = xs.len() - 1
+  while k < n
+    out = out.push(xs[k])
+    k = k + 1
+  end
+  return out
+end
+
+task list_has(xs: list<any>, id: int): bool
+  let i = 0
+  while i < xs.len()
+    if xs[i] == id then
+      return true
+    end
+    i = i + 1
+  end
+  return false
+end
+
+task bind_scheme(name: string, scheme: any): any
+  let last = TY_FRAMES.len() - 1
+  let frame = TY_FRAMES[last]
+  frame = frame.set("t:" + name, scheme)
+  TY_FRAMES = replace_at(TY_FRAMES, last, frame)
+  return nil
+end
+
+task lookup_scheme(name: string): any
+  let i = TY_FRAMES.len() - 1
+  while i >= 0
+    let found = TY_FRAMES[i].get("t:" + name)
+    if found != nil then
+      return found
+    end
+    i = i - 1
+  end
+  return nil
+end
+
+task push_ty(): any
+  let frame: dict<string, any> = {}
+  TY_FRAMES = TY_FRAMES.push(frame)
+  return nil
+end
+
+task pop_ty(): any
+  TY_FRAMES = drop_last(TY_FRAMES)
+  return nil
+end
+
+task free_map(ty: any): dict<string, any>
+  let acc: dict<string, any> = {}
+  return free_into(ty, acc)
+end
+
+task free_into(ty: any, acc: dict<string, any>): dict<string, any>
+  let t = apply(ty)
+  if t["tag"] == "var" then
+    acc = acc.set(str(t["id"]), true)
+    return acc
+  end
+  if t["tag"] == "list" then
+    return free_into(t["elem"], acc)
+  end
+  if t["tag"] == "dict" then
+    acc = free_into(t["key"], acc)
+    return free_into(t["val"], acc)
+  end
+  if t["tag"] == "arrow" then
+    let params = t["params"]
+    let i = 0
+    while i < params.len()
+      acc = free_into(params[i], acc)
+      i = i + 1
+    end
+    return free_into(t["ret"], acc)
+  end
+  return acc
+end
+
+task env_free(): dict<string, any>
+  let acc: dict<string, any> = {}
+  let i = 0
+  while i < TY_FRAMES.len()
+    let keys = TY_FRAMES[i].keys()
+    let j = 0
+    while j < keys.len()
+      let key = keys[j]
+      if key.starts_with("t:") then
+        let scheme = TY_FRAMES[i].get(key)
+        let own = free_map(scheme["body"])
+        let ks = own.keys()
+        let k = 0
+        while k < ks.len()
+          let id = ks[k]
+          if list_has(scheme["vars"], int(id)) == false then
+            acc = acc.set(id, true)
+          end
+          k = k + 1
+        end
+      end
+      j = j + 1
+    end
+    i = i + 1
+  end
+  return acc
+end
+
+task subst_var(ty: any, id: int, replacement: any): any
+  let t = ty
+  if t["tag"] == "var" and t["id"] == id then
+    return replacement
+  end
+  if t["tag"] == "list" then
+    return ty_list(subst_var(t["elem"], id, replacement))
+  end
+  if t["tag"] == "dict" then
+    return ty_dict(subst_var(t["key"], id, replacement), subst_var(t["val"], id, replacement))
+  end
+  if t["tag"] == "arrow" then
+    let params = t["params"]
+    let ps = empty_list()
+    let i = 0
+    while i < params.len()
+      ps = ps.push(subst_var(params[i], id, replacement))
+      i = i + 1
+    end
+    return ty_arrow(ps, subst_var(t["ret"], id, replacement))
+  end
+  return t
+end
+
+task instantiate(scheme: any): any
+  let body = scheme["body"]
+  let vars = scheme["vars"]
+  let numeric = scheme["numeric"]
+  let i = 0
+  while i < vars.len()
+    let id = vars[i]
+    let fr = fresh()
+    if list_has(numeric, id) then
+      NUM = NUM.set(str(fr["id"]), true)
+    end
+    body = subst_var(body, id, fr)
+    i = i + 1
+  end
+  return body
+end
+
+task generalize(ty: any): dict<string, any>
+  let resolved = apply(ty)
+  let envf = env_free()
+  let own = free_map(resolved)
+  let vars = empty_list()
+  let numeric = empty_list()
+  let keys = own.keys()
+  let i = 0
+  while i < keys.len()
+    let key = keys[i]
+    if envf.get(key) == nil then
+      let id = int(key)
+      vars = vars.push(id)
+      if NUM.get(key) == true then
+        numeric = numeric.push(id)
+      end
+    end
+    i = i + 1
+  end
+  let s: dict<string, any> = {body: resolved}
+  s = s.set("vars", vars)
+  s = s.set("numeric", numeric)
+  return s
+end
+
+task contains_var(ty: any): bool
+  let t = resolve(ty)
+  if t["tag"] == "var" then
+    return true
+  end
+  if t["tag"] == "list" then
+    return contains_var(t["elem"])
+  end
+  if t["tag"] == "dict" then
+    if contains_var(t["key"]) then
+      return true
+    end
+    return contains_var(t["val"])
+  end
+  if t["tag"] == "arrow" then
+    let params = t["params"]
+    let i = 0
+    while i < params.len()
+      if contains_var(params[i]) then
+        return true
+      end
+      i = i + 1
+    end
+    return contains_var(t["ret"])
+  end
+  return false
+end
+
+task check_arg(actual: any, expected: any, line: int, col: int): any
+  if contains_var(expected) or contains_var(actual) then
+    return unify(actual, expected, line, col)
+  end
+  return expect_sub(actual, expected, line, col)
+end
+
+task apply_arrow(callee: any, args: list<any>, line: int, col: int): any
+  let c = resolve(callee)
+  if c["tag"] == "any" then
+    return ty_base("any")
+  end
+  if c["tag"] == "var" then
+    let result = fresh()
+    bind_var(c["id"], ty_arrow(args, result), line, col)
+    return result
+  end
+  if c["tag"] != "arrow" then
+    mismatch(line, col, "function", type_name(c))
+    return nil
+  end
+  let params = c["params"]
+  if params.len() != args.len() then
+    return die_ty(line, col, "arity mismatch\n  expected: " + str(params.len()) + " argument(s)\n  actual:   " + str(args.len()))
+  end
+  let i = 0
+  while i < params.len()
+    check_arg(args[i], params[i], line, col)
+    if bad() then
+      return nil
+    end
+    i = i + 1
+  end
+  return apply(c["ret"])
+end
+
+task init_ty(): any
+  NEXT = 0
+  SUBST = {ready: true}
+  NUM = {ready: true}
+  TY_FRAMES = empty_list()
+  RET = nil
+  let frame: dict<string, any> = {}
+  frame = frame.set("t:file", mono(ty_base("file")))
+  TY_FRAMES = TY_FRAMES.push(frame)
+  return nil
+end
+
+task is_value(e: any): bool
+  let t = e["tag"]
+  if t == "int" or t == "float" or t == "str" or t == "bool" or t == "nil" or t == "char" or t == "fn" or t == "var" then
+    return true
+  end
+  return false
+end
+
+task builtin_name(name: string): bool
+  if name == "print" or name == "str" or name == "len" or name == "range" or name == "int" or name == "float" or name == "type_of" then
+    return true
+  end
+  return false
+end
+
+task infer_builtin(name: string, args: list<any>, line: int, col: int): any
+  if name == "print" then
+    let i = 0
+    while i < args.len()
+      infer_expr(args[i])
+      if bad() then
+        return nil
+      end
+      i = i + 1
+    end
+    return ty_base("nil")
+  end
+  if name == "str" then
+    if args.len() != 1 then
+      return die_ty(line, col, "str() expects 1 argument")
+    end
+    infer_expr(args[0])
+    return ty_base("string")
+  end
+  if name == "int" then
+    if args.len() != 1 then
+      return die_ty(line, col, "int() expects 1 argument")
+    end
+    infer_expr(args[0])
+    return ty_base("int")
+  end
+  if name == "float" then
+    if args.len() != 1 then
+      return die_ty(line, col, "float() expects 1 argument")
+    end
+    infer_expr(args[0])
+    return ty_base("float")
+  end
+  if name == "type_of" then
+    if args.len() != 1 then
+      return die_ty(line, col, "type_of() expects 1 argument")
+    end
+    infer_expr(args[0])
+    return ty_base("string")
+  end
+  if name == "len" then
+    if args.len() != 1 then
+      return die_ty(line, col, "len() expects 1 argument")
+    end
+    let ty = resolve(infer_expr(args[0]))
+    if bad() then
+      return nil
+    end
+    if ty["tag"] == "string" or ty["tag"] == "list" or ty["tag"] == "dict" or ty["tag"] == "var" or ty["tag"] == "any" then
+      return ty_base("int")
+    end
+    return mismatch(line, col, "string, list, or dict", type_name(ty))
+  end
+  if name == "range" then
+    if args.len() < 1 or args.len() > 3 then
+      return die_ty(line, col, "range() expects 1, 2, or 3 numeric arguments")
+    end
+    let i = 0
+    while i < args.len()
+      let ty = infer_expr(args[i])
+      if bad() then
+        return nil
+      end
+      mark_num(ty, line, col)
+      if bad() then
+        return nil
+      end
+      i = i + 1
+    end
+    return ty_list(ty_base("int"))
+  end
+  return die_ty(line, col, "unknown builtin '" + name + "'")
+end
+
+task infer_args(args: list<any>): list<any>
+  let out = empty_list()
+  let i = 0
+  while i < args.len()
+    let ty = infer_expr(args[i])
+    if bad() then
+      return out
+    end
+    out = out.push(ty)
+    i = i + 1
+  end
+  return out
+end
+
+task type_list_method(elem: any, name: string, args: list<any>, line: int, col: int): any
+  if name == "len" then
+    return ty_base("int")
+  end
+  if name == "get" or name == "push" then
+    if name == "get" then
+      return elem
+    end
+    return ty_list(elem)
+  end
+  if name == "map" then
+    if args.len() != 1 then
+      return die_ty(line, col, "map() expects 1 argument")
+    end
+    let one = empty_list()
+    one = one.push(elem)
+    let ret = apply_arrow(args[0], one, line, col)
+    if bad() then
+      return nil
+    end
+    return ty_list(ret)
+  end
+  if name == "filter" then
+    if args.len() != 1 then
+      return die_ty(line, col, "filter() expects 1 argument")
+    end
+    let one = empty_list()
+    one = one.push(elem)
+    let ret = apply_arrow(args[0], one, line, col)
+    if bad() then
+      return nil
+    end
+    expect_sub(ret, ty_base("bool"), line, col)
+    return ty_list(elem)
+  end
+  if name == "reduce" then
+    if args.len() != 2 then
+      return die_ty(line, col, "reduce() expects a function and an initial value")
+    end
+    let two = empty_list()
+    two = two.push(args[1])
+    two = two.push(elem)
+    let ret = apply_arrow(args[0], two, line, col)
+    if bad() then
+      return nil
+    end
+    check_arg(ret, args[1], line, col)
+    return args[1]
+  end
+  return die_ty(line, col, "list has no method '" + name + "'")
+end
+
+task type_string_method(name: string, line: int, col: int): any
+  if name == "len" then
+    return ty_base("int")
+  end
+  if name == "upper" or name == "lower" or name == "trim" or name == "replace" then
+    return ty_base("string")
+  end
+  if name == "contains" or name == "starts_with" or name == "ends_with" then
+    return ty_base("bool")
+  end
+  if name == "split" then
+    return ty_list(ty_base("string"))
+  end
+  return die_ty(line, col, "string has no method '" + name + "'")
+end
+
+task type_dict_method(val: any, name: string, line: int, col: int): any
+  if name == "get" then
+    return val
+  end
+  if name == "set" then
+    return ty_dict(ty_base("string"), ty_base("any"))
+  end
+  if name == "keys" then
+    return ty_list(ty_base("string"))
+  end
+  if name == "values" then
+    return ty_list(val)
+  end
+  if name == "len" then
+    return ty_base("int")
+  end
+  return die_ty(line, col, "dict has no method '" + name + "'")
+end
+
+task infer_method(recv: any, name: string, args: list<any>, line: int, col: int): any
+  let recv_ty = infer_expr(recv)
+  if bad() then
+    return nil
+  end
+  let arg_tys = infer_args(args)
+  if bad() then
+    return nil
+  end
+  let t = resolve(recv_ty)
+  if t["tag"] == "file" then
+    if name == "read_text" then
+      return ty_base("string")
+    end
+    if name == "write_text" then
+      return ty_base("nil")
+    end
+    return die_ty(line, col, "file." + name + " is not in this trial")
+  end
+  if t["tag"] == "string" then
+    return type_string_method(name, line, col)
+  end
+  if t["tag"] == "list" then
+    return type_list_method(t["elem"], name, arg_tys, line, col)
+  end
+  if t["tag"] == "dict" then
+    return type_dict_method(t["val"], name, line, col)
+  end
+  if t["tag"] == "any" then
+    return ty_base("any")
+  end
+  if t["tag"] == "var" then
+    return fresh()
+  end
+  return die_ty(line, col, "cannot call method '" + name + "' on " + type_name(t))
+end
+
+task infer_call(expr: any): any
+  let callee = expr["callee"]
+  let args = expr["args"]
+  if callee["tag"] == "var" and builtin_name(callee["name"]) then
+    return infer_builtin(callee["name"], args, expr["line"], expr["col"])
+  end
+  let callee_ty = infer_expr(callee)
+  if bad() then
+    return nil
+  end
+  let arg_tys = infer_args(args)
+  if bad() then
+    return nil
+  end
+  return apply_arrow(callee_ty, arg_tys, expr["line"], expr["col"])
+end
+
+task infer_index(expr: any): any
+  let recv = resolve(infer_expr(expr["recv"]))
+  if bad() then
+    return nil
+  end
+  infer_expr(expr["index"])
+  if bad() then
+    return nil
+  end
+  if recv["tag"] == "list" then
+    return recv["elem"]
+  end
+  if recv["tag"] == "string" then
+    return ty_base("char")
+  end
+  if recv["tag"] == "dict" then
+    return recv["val"]
+  end
+  if recv["tag"] == "any" or recv["tag"] == "var" then
+    return fresh()
+  end
+  return die_ty(expr["line"], expr["col"], "cannot index " + type_name(recv))
+end
+
+task infer_fn(expr: any): any
+  let params = expr["params"]
+  let param_tys = empty_list()
+  push_ty()
+  let i = 0
+  while i < params.len()
+    let ty = fresh()
+    if params[i]["ann"] != nil then
+      ty = ann_to_ty(params[i]["ann"])
+    end
+    param_tys = param_tys.push(ty)
+    bind_scheme(params[i]["name"], mono(ty))
+    i = i + 1
+  end
+  let saved = RET
+  RET = fresh()
+  let body_ty = infer_block(expr["body"])
+  if bad() then
+    RET = saved
+    pop_ty()
+    return nil
+  end
+  unify(body_ty, RET, expr["line"], expr["col"])
+  let arrow = ty_arrow(param_tys, apply(RET))
+  RET = saved
+  pop_ty()
+  return arrow
+end
+
+task infer_if(expr: any): any
+  let cond = infer_expr(expr["cond"])
+  if bad() then
+    return nil
+  end
+  expect_sub(cond, ty_base("bool"), expr["line"], expr["col"])
+  if bad() then
+    return nil
+  end
+  if expr["has_else"] == false then
+    infer_block(expr["then"])
+    return ty_base("nil")
+  end
+  let th = infer_block(expr["then"])
+  if bad() then
+    return nil
+  end
+  let el = infer_block(expr["else"])
+  if bad() then
+    return nil
+  end
+  unify(th, el, expr["line"], expr["col"])
+  return resolve(th)
+end
+
+task infer_match(expr: any): any
+  let scrut = infer_expr(expr["scrut"])
+  if bad() then
+    return nil
+  end
+  let arms = expr["arms"]
+  if arms.len() == 0 then
+    return ty_base("nil")
+  end
+  let result = nil
+  let i = 0
+  while i < arms.len()
+    let arm = arms[i]
+    push_ty()
+    bind_pat(arm["pat"], scrut, expr["line"], expr["col"])
+    if arm["guard"] != nil then
+      let g = infer_expr(arm["guard"])
+      expect_sub(g, ty_base("bool"), arm["line"], arm["col"])
+    end
+    let body = infer_expr(arm["body"])
+    pop_ty()
+    if bad() then
+      return nil
+    end
+    if result == nil then
+      result = body
+    else
+      unify(result, body, arm["line"], arm["col"])
+      result = resolve(result)
+    end
+    i = i + 1
+  end
+  return result
+end
+
+task bind_pat(pat: any, scrut: any, line: int, col: int): any
+  if pat["tag"] == "wild" then
+    return nil
+  end
+  if pat["tag"] == "bind" then
+    return bind_scheme(pat["name"], mono(scrut))
+  end
+  if pat["tag"] == "lit" then
+    let lit = pat["lit"]
+    if lit == "int" then
+      return unify(scrut, ty_base("int"), line, col)
+    end
+    if lit == "float" then
+      return unify(scrut, ty_base("float"), line, col)
+    end
+    if lit == "str" then
+      return unify(scrut, ty_base("string"), line, col)
+    end
+    if lit == "char" then
+      return unify(scrut, ty_base("char"), line, col)
+    end
+    if lit == "true" or lit == "false" then
+      return unify(scrut, ty_base("bool"), line, col)
+    end
+    if lit == "nil" then
+      return unify(scrut, ty_base("nil"), line, col)
+    end
+  end
+  return nil
+end
+
+task infer_binary(expr: any): any
+  let op = expr["op"]
+  let line = expr["line"]
+  let col = expr["col"]
+  if op == "and" or op == "or" then
+    expect_sub(infer_expr(expr["left"]), ty_base("bool"), line, col)
+    if bad() then
+      return nil
+    end
+    expect_sub(infer_expr(expr["right"]), ty_base("bool"), line, col)
+    return ty_base("bool")
+  end
+  if op == "==" or op == "!=" then
+    let l = infer_expr(expr["left"])
+    let r = infer_expr(expr["right"])
+    if bad() then
+      return nil
+    end
+    if is_num(l) and is_num(r) then
+      arith("+", l, r, line, col)
+    else
+      unify(l, r, line, col)
+    end
+    return ty_base("bool")
+  end
+  if op == "<" or op == ">" or op == "<=" or op == ">=" then
+    let l = infer_expr(expr["left"])
+    let r = infer_expr(expr["right"])
+    if bad() then
+      return nil
+    end
+    arith("+", l, r, line, col)
+    return ty_base("bool")
+  end
+  if op == "|>" then
+    let arg = infer_expr(expr["left"])
+    let callee = infer_expr(expr["right"])
+    if bad() then
+      return nil
+    end
+    let one = empty_list()
+    one = one.push(arg)
+    return apply_arrow(callee, one, line, col)
+  end
+  let l = infer_expr(expr["left"])
+  let r = infer_expr(expr["right"])
+  if bad() then
+    return nil
+  end
+  let lr = resolve(l)
+  let rr = resolve(r)
+  if lr["tag"] == "list" or rr["tag"] == "list" then
+    if lr["tag"] == "list" and rr["tag"] == "list" then
+      return ty_list(arith(op, lr["elem"], rr["elem"], line, col))
+    end
+    if lr["tag"] == "list" then
+      return ty_list(arith(op, lr["elem"], rr, line, col))
+    end
+    return ty_list(arith(op, lr, rr["elem"], line, col))
+  end
+  return arith(op, l, r, line, col)
+end
+
+task infer_expr(expr: any): any
+  if bad() then
+    return nil
+  end
+  let tag = expr["tag"]
+  if tag == "int" then
+    return ty_base("int")
+  end
+  if tag == "float" then
+    return ty_base("float")
+  end
+  if tag == "str" then
+    return ty_base("string")
+  end
+  if tag == "char" then
+    return ty_base("char")
+  end
+  if tag == "bool" then
+    return ty_base("bool")
+  end
+  if tag == "nil" then
+    return ty_base("nil")
+  end
+  if tag == "var" then
+    if builtin_name(expr["name"]) then
+      return fresh()
+    end
+    let scheme = lookup_scheme(expr["name"])
+    if scheme == nil then
+      die_ty(expr["line"], expr["col"], "unbound variable '" + expr["name"] + "'")
+      return nil
+    end
+    return instantiate(scheme)
+  end
+  if tag == "unary" then
+    let ty = infer_expr(expr["expr"])
+    if expr["op"] == "not" then
+      expect_sub(ty, ty_base("bool"), expr["line"], expr["col"])
+      return ty_base("bool")
+    end
+    mark_num(ty, expr["line"], expr["col"])
+    return resolve(ty)
+  end
+  if tag == "binary" then
+    return infer_binary(expr)
+  end
+  if tag == "call" then
+    return infer_call(expr)
+  end
+  if tag == "method" then
+    return infer_method(expr["recv"], expr["name"], expr["args"], expr["line"], expr["col"])
+  end
+  if tag == "index" then
+    return infer_index(expr)
+  end
+  if tag == "list" then
+    let items = expr["items"]
+    if items.len() == 0 then
+      return ty_list(fresh())
+    end
+    let elem = infer_expr(items[0])
+    let i = 1
+    while i < items.len()
+      let next = infer_expr(items[i])
+      if bad() then
+        return nil
+      end
+      if is_num(elem) and is_num(next) then
+        elem = arith("+", elem, next, expr["line"], expr["col"])
+      else
+        unify(elem, next, expr["line"], expr["col"])
+        elem = resolve(elem)
+      end
+      i = i + 1
+    end
+    return ty_list(elem)
+  end
+  if tag == "dict" then
+    let pairs = expr["pairs"]
+    if pairs.len() == 0 then
+      return ty_dict(ty_base("string"), fresh())
+    end
+    let val = infer_expr(pairs[0]["v"])
+    let i = 1
+    while i < pairs.len()
+      let next = infer_expr(pairs[i]["v"])
+      if is_num(val) and is_num(next) then
+        val = arith("+", val, next, expr["line"], expr["col"])
+      else
+        unify(val, next, expr["line"], expr["col"])
+        val = resolve(val)
+      end
+      if bad() then
+        return nil
+      end
+      i = i + 1
+    end
+    return ty_dict(ty_base("string"), val)
+  end
+  if tag == "fn" then
+    return infer_fn(expr)
+  end
+  if tag == "if" then
+    return infer_if(expr)
+  end
+  if tag == "match" then
+    return infer_match(expr)
+  end
+  if tag == "assign" then
+    let ty = infer_expr(expr["expr"])
+    let scheme = lookup_scheme(expr["name"])
+    if scheme == nil then
+      return die_ty(expr["line"], expr["col"], "unbound variable '" + expr["name"] + "'")
+    end
+    check_arg(ty, scheme["body"], expr["line"], expr["col"])
+    return ty_base("nil")
+  end
+  return die_ty(expr["line"], expr["col"], "cannot type expression '" + tag + "'")
+end
+
+task infer_block(block: any): any
+  let stmts = block["stmts"]
+  let last = ty_base("nil")
+  let i = 0
+  while i < stmts.len()
+    last = infer_stmt(stmts[i])
+    if bad() then
+      return nil
+    end
+    i = i + 1
+  end
+  return last
+end
+
+task prebind_task(stmt: any): any
+  let params = stmt["params"]
+  let param_tys = empty_list()
+  let i = 0
+  while i < params.len()
+    let ty = fresh()
+    if params[i]["ann"] != nil then
+      ty = ann_to_ty(params[i]["ann"])
+    end
+    param_tys = param_tys.push(ty)
+    i = i + 1
+  end
+  let ret = fresh()
+  if stmt["ann"] != nil then
+    ret = ann_to_ty(stmt["ann"])
+  end
+  return bind_scheme(stmt["name"], mono(ty_arrow(param_tys, ret)))
+end
+
+task infer_task(stmt: any): any
+  let arrow = lookup_scheme(stmt["name"])["body"]
+  let param_tys = arrow["params"]
+  let ret = arrow["ret"]
+  let params = stmt["params"]
+  push_ty()
+  let i = 0
+  while i < params.len()
+    bind_scheme(params[i]["name"], mono(param_tys[i]))
+    i = i + 1
+  end
+  let saved = RET
+  RET = ret
+  let body_ty = infer_block(stmt["body"])
+  RET = saved
+  pop_ty()
+  if bad() then
+    return nil
+  end
+  if stmt["ann"] != nil then
+    expect_sub(body_ty, ret, stmt["line"], stmt["col"])
+  else
+    unify(body_ty, ret, stmt["line"], stmt["col"])
+  end
+  if bad() then
+    return nil
+  end
+  let arrow = ty_arrow(param_tys, apply(ret))
+  return bind_scheme(stmt["name"], generalize(arrow))
+end
+
+task infer_stmt(stmt: any): any
+  if bad() then
+    return nil
+  end
+  let tag = stmt["tag"]
+  if tag == "let" then
+    let inferred = infer_expr(stmt["expr"])
+    if bad() then
+      return nil
+    end
+    if stmt["ann"] != nil then
+      let expected = ann_to_ty(stmt["ann"])
+      expect_sub(inferred, expected, stmt["expr"]["line"], stmt["expr"]["col"])
+      bind_scheme(stmt["name"], mono(expected))
+    else
+      if is_value(stmt["expr"]) then
+        bind_scheme(stmt["name"], generalize(inferred))
+      else
+        bind_scheme(stmt["name"], mono(apply(inferred)))
+      end
+    end
+    return ty_base("nil")
+  end
+  if tag == "task" then
+    infer_task(stmt)
+    return ty_base("nil")
+  end
+  if tag == "return" then
+    if RET == nil then
+      return die_ty(stmt["line"], stmt["col"], "'return' outside of a task or closure")
+    end
+    let actual = ty_base("nil")
+    if stmt["expr"] != nil then
+      actual = infer_expr(stmt["expr"])
+    end
+    check_arg(actual, RET, stmt["line"], stmt["col"])
+    return RET
+  end
+  if tag == "for" then
+    let iter = resolve(infer_expr(stmt["iter"]))
+    if bad() then
+      return nil
+    end
+    let elem = fresh()
+    if iter["tag"] == "list" then
+      elem = iter["elem"]
+    else
+      if iter["tag"] == "var" then
+        bind_var(iter["id"], ty_list(elem), stmt["line"], stmt["col"])
+      else
+        if iter["tag"] != "any" then
+          return mismatch(stmt["line"], stmt["col"], "list<_>", type_name(iter))
+        end
+      end
+    end
+    push_ty()
+    bind_scheme(stmt["name"], mono(elem))
+    infer_block(stmt["body"])
+    pop_ty()
+    return ty_base("nil")
+  end
+  if tag == "while" then
+    expect_sub(infer_expr(stmt["cond"]), ty_base("bool"), stmt["line"], stmt["col"])
+    if bad() then
+      return nil
+    end
+    push_ty()
+    infer_block(stmt["body"])
+    pop_ty()
+    return ty_base("nil")
+  end
+  if tag == "break" or tag == "continue" then
+    return ty_base("nil")
+  end
+  if tag == "expr" then
+    let e = stmt["expr"]
+    if e["tag"] == "if" and e["has_else"] == false then
+      infer_if(e)
+      return ty_base("nil")
+    end
+    return infer_expr(e)
+  end
+  return die_ty(stmt["line"], stmt["col"], "cannot type statement '" + tag + "'")
+end
+
+task infer_program(prog: any): any
+  let stmts = prog["stmts"]
+  let i = 0
+  while i < stmts.len()
+    if stmts[i]["tag"] == "task" then
+      prebind_task(stmts[i])
+      if bad() then
+        return nil
+      end
+    end
+    i = i + 1
+  end
+  i = 0
+  while i < stmts.len()
+    infer_stmt(stmts[i])
+    if bad() then
+      return nil
+    end
+    i = i + 1
+  end
+  return nil
+end
+
+-- ── evaluator ────────────────────────────────────────────────────────
+
+task ok(v: any): dict<string, any>
+  let d: dict<string, any> = {tag: "ok"}
+  d = d.set("v", v)
+  return d
+end
+
+task errf(): dict<string, any>
+  let d: dict<string, any> = {tag: "err"}
+  d = d.set("v", nil)
+  return d
+end
+
+task fail(msg: string): dict<string, any>
+  die(msg)
+  EXITC = 1
+  return errf()
+end
+
+task flow(tag: string, v: any): dict<string, any>
+  let d: dict<string, any> = {tag: tag}
+  d = d.set("v", v)
+  return d
+end
+
+task blank(): dict<string, any>
+  let d: dict<string, any> = {}
+  return d
+end
+
+task copy_list(xs: list<any>): list<any>
+  let out = empty_list()
+  let i = 0
+  while i < xs.len()
+    out = out.push(xs[i])
+    i = i + 1
+  end
+  return out
+end
+
+task init_eval(): any
+  FRAMES = empty_list()
+  FRAMES = FRAMES.push(blank())
+  return nil
+end
+
+task bind_name(name: string, value: any): any
+  let last = FRAMES.len() - 1
+  let frame = FRAMES[last]
+  let cell: dict<string, any> = {there: true}
+  cell = cell.set("v", value)
+  frame = frame.set("k:" + name, cell)
+  FRAMES = replace_at(FRAMES, last, frame)
+  return nil
+end
+
+task lookup_name(name: string, line: int, col: int): any
+  let i = FRAMES.len() - 1
+  while i >= 0
+    let cell = FRAMES[i].get("k:" + name)
+    if cell != nil then
+      return ok(cell["v"])
+    end
+    i = i - 1
+  end
+  return fail("Runtime error at line " + str(line) + ":" + str(col) + ": unbound variable '" + name + "'")
+end
+
+task assign_name(name: string, value: any, line: int, col: int): any
+  let i = FRAMES.len() - 1
+  while i >= 0
+    let frame = FRAMES[i]
+    if frame.get("k:" + name) != nil then
+      let cell: dict<string, any> = {there: true}
+      cell = cell.set("v", value)
+      frame = frame.set("k:" + name, cell)
+      FRAMES = replace_at(FRAMES, i, frame)
+      return ok(nil)
+    end
+    i = i - 1
+  end
+  return fail("Runtime error at line " + str(line) + ":" + str(col) + ": unbound variable '" + name + "'")
+end
+
+task param_names(params: list<any>): list<any>
+  let names = empty_list()
+  let i = 0
+  while i < params.len()
+    names = names.push(params[i]["name"])
+    i = i + 1
+  end
+  return names
+end
+
+task make_func(kind: string, params: list<any>, body: any, env: list<any>): dict<string, any>
+  let f: dict<string, any> = {tag: "func"}
+  f = f.set("kind", kind)
+  f = f.set("params", param_names(params))
+  f = f.set("body", body)
+  f = f.set("env", env)
+  return f
+end
+
+task eval_block(block: any): dict<string, any>
+  let stmts = block["stmts"]
+  let last = nil
+  let i = 0
+  while i < stmts.len()
+    let flowv = eval_stmt(stmts[i])
+    if flowv["tag"] != "ok" then
+      return flowv
+    end
+    last = flowv["v"]
+    i = i + 1
+  end
+  return ok(last)
+end
+
+task call_func(func: any, args: list<any>, line: int, col: int): dict<string, any>
+  let params = func["params"]
+  if params.len() != args.len() then
+    return fail("Runtime error at line " + str(line) + ":" + str(col) + ": arity mismatch, expected " + str(params.len()) + " argument(s)")
+  end
+  let saved = FRAMES
+  if func["kind"] == "closure" then
+    FRAMES = copy_list(func["env"])
+  end
+  FRAMES = FRAMES.push(blank())
+  let i = 0
+  while i < params.len()
+    bind_name(params[i], args[i])
+    i = i + 1
+  end
+  let flowv = eval_block(func["body"])
+  FRAMES = saved
+  if flowv["tag"] == "ok" or flowv["tag"] == "return" then
+    return ok(flowv["v"])
+  end
+  if flowv["tag"] == "err" then
+    return flowv
+  end
+  return fail("Runtime error at line " + str(line) + ":" + str(col) + ": '" + flowv["tag"] + "' outside of a loop")
+end
+
+task call_value(func: any, args: list<any>, line: int, col: int): dict<string, any>
+  if type_of(func) == "dict" and func["tag"] == "func" then
+    return call_func(func, args, line, col)
+  end
+  return fail("Runtime error at line " + str(line) + ":" + str(col) + ": cannot call " + type_of(func))
+end
+
+task do_print(args: list<any>): dict<string, any>
+  let msg = ""
+  let i = 0
+  while i < args.len()
+    if i > 0 then
+      msg = msg + "\t"
+    end
+    msg = msg + str(args[i])
+    i = i + 1
+  end
+  print(msg)
+  return ok(nil)
+end
+
+task eval_builtin(name: string, args: list<any>, line: int, col: int): dict<string, any>
+  if name == "print" then
+    return do_print(args)
+  end
+  if name == "str" then
+    if args.len() != 1 then
+      return fail("Runtime error at line " + str(line) + ":" + str(col) + ": str() expects 1 argument")
+    end
+    return ok(str(args[0]))
+  end
+  if name == "len" then
+    if args.len() != 1 then
+      return fail("Runtime error at line " + str(line) + ":" + str(col) + ": len() expects 1 argument")
+    end
+    return ok(len(args[0]))
+  end
+  if name == "type_of" then
+    return ok(type_of(args[0]))
+  end
+  if name == "int" then
+    return ok(int(args[0]))
+  end
+  if name == "float" then
+    return ok(float(args[0]))
+  end
+  if name == "range" then
+    if args.len() == 1 then
+      return ok(range(args[0]))
+    end
+    if args.len() == 2 then
+      return ok(range(args[0], args[1]))
+    end
+    if args.len() == 3 then
+      return ok(range(args[0], args[1], args[2]))
+    end
+    return fail("Runtime error at line " + str(line) + ":" + str(col) + ": range() expects 1, 2, or 3 arguments")
+  end
+  return fail("Runtime error at line " + str(line) + ":" + str(col) + ": unknown builtin '" + name + "'")
+end
+
+task eval_args(args: list<any>): any
+  let out = empty_list()
+  let i = 0
+  while i < args.len()
+    let flowv = eval_expr(args[i])
+    if flowv["tag"] != "ok" then
+      return flowv
+    end
+    out = out.push(flowv["v"])
+    i = i + 1
+  end
+  return ok(out)
+end
+
+task method_list(items: any, name: string, args: list<any>, line: int, col: int): dict<string, any>
+  if name == "map" then
+    if args.len() != 1 then
+      return fail("Runtime error at line " + str(line) + ":" + str(col) + ": map() requires a function")
+    end
+    let out = empty_list()
+    let i = 0
+    while i < items.len()
+      let one = empty_list()
+      one = one.push(items[i])
+      let flowv = call_value(args[0], one, line, col)
+      if flowv["tag"] != "ok" then
+        return flowv
+      end
+      out = out.push(flowv["v"])
+      i = i + 1
+    end
+    return ok(out)
+  end
+  if name == "filter" then
+    let out = empty_list()
+    let i = 0
+    while i < items.len()
+      let one = empty_list()
+      one = one.push(items[i])
+      let flowv = call_value(args[0], one, line, col)
+      if flowv["tag"] != "ok" then
+        return flowv
+      end
+      if flowv["v"] != true then
+        if flowv["v"] != false then
+          return fail("Runtime error at line " + str(line) + ":" + str(col) + ": filter predicate must return bool")
+        end
+      end
+      if flowv["v"] == true then
+        out = out.push(items[i])
+      end
+      i = i + 1
+    end
+    return ok(out)
+  end
+  if name == "reduce" then
+    if args.len() < 2 then
+      return fail("Runtime error at line " + str(line) + ":" + str(col) + ": reduce() requires an initial value")
+    end
+    let acc = args[1]
+    let i = 0
+    while i < items.len()
+      let two = empty_list()
+      two = two.push(acc)
+      two = two.push(items[i])
+      let flowv = call_value(args[0], two, line, col)
+      if flowv["tag"] != "ok" then
+        return flowv
+      end
+      acc = flowv["v"]
+      i = i + 1
+    end
+    return ok(acc)
+  end
+  if name == "len" then
+    return ok(items.len())
+  end
+  if name == "get" then
+    return ok(items.get(args[0]))
+  end
+  if name == "push" then
+    let item = nil
+    if args.len() > 0 then
+      item = args[0]
+    end
+    return ok(items.push(item))
+  end
+  return fail("Runtime error at line " + str(line) + ":" + str(col) + ": list has no method '" + name + "'")
+end
+
+task method_string(text: string, name: string, args: list<any>, line: int, col: int): dict<string, any>
+  if name == "len" then
+    return ok(text.len())
+  end
+  if name == "upper" then
+    return ok(text.upper())
+  end
+  if name == "lower" then
+    return ok(text.lower())
+  end
+  if name == "trim" then
+    return ok(text.trim())
+  end
+  if name == "contains" then
+    return ok(text.contains(str(args[0])))
+  end
+  if name == "starts_with" then
+    return ok(text.starts_with(str(args[0])))
+  end
+  if name == "ends_with" then
+    return ok(text.ends_with(str(args[0])))
+  end
+  if name == "split" then
+    return ok(text.split(str(args[0])))
+  end
+  if name == "replace" then
+    return ok(text.replace(str(args[0]), str(args[1])))
+  end
+  return fail("Runtime error at line " + str(line) + ":" + str(col) + ": string has no method '" + name + "'")
+end
+
+task method_dict(map: any, name: string, args: list<any>, line: int, col: int): dict<string, any>
+  if name == "get" then
+    return ok(map.get(str(args[0])))
+  end
+  if name == "set" then
+    let value = nil
+    if args.len() > 1 then
+      value = args[1]
+    end
+    return ok(map.set(str(args[0]), value))
+  end
+  if name == "keys" then
+    return ok(map.keys())
+  end
+  if name == "values" then
+    return ok(map.values())
+  end
+  if name == "len" then
+    return ok(map.len())
+  end
+  return fail("Runtime error at line " + str(line) + ":" + str(col) + ": dict has no method '" + name + "'")
+end
+
+task eval_method(expr: any): dict<string, any>
+  let recv = eval_expr(expr["recv"])
+  if recv["tag"] != "ok" then
+    return recv
+  end
+  let argsf = eval_args(expr["args"])
+  if argsf["tag"] != "ok" then
+    return argsf
+  end
+  let target = recv["v"]
+  let args = argsf["v"]
+  let name = expr["name"]
+  let kind = type_of(target)
+  if kind == "list" then
+    return method_list(target, name, args, expr["line"], expr["col"])
+  end
+  if kind == "string" then
+    return method_string(target, name, args, expr["line"], expr["col"])
+  end
+  if kind == "dict" then
+    if target["tag"] == "func" then
+      return fail("Runtime error at line " + str(expr["line"]) + ":" + str(expr["col"]) + ": cannot call method '" + name + "' on a function")
+    end
+    return method_dict(target, name, args, expr["line"], expr["col"])
+  end
+  return fail("Runtime error at line " + str(expr["line"]) + ":" + str(expr["col"]) + ": cannot call method '" + name + "' on " + kind)
+end
+
+task zero_like(v: any): bool
+  if v == 0 then
+    return true
+  end
+  if v == 0.0 then
+    return true
+  end
+  return false
+end
+
+task apply_bin(op: string, l: any, r: any, line: int, col: int): dict<string, any>
+  if op == "/" or op == "%" then
+    if zero_like(r) then
+      return fail("Runtime error at line " + str(line) + ":" + str(col) + ": division by zero")
+    end
+  end
+  if op == "+" then
+    return ok(l + r)
+  end
+  if op == "-" then
+    return ok(l - r)
+  end
+  if op == "*" then
+    return ok(l * r)
+  end
+  if op == "/" then
+    return ok(l / r)
+  end
+  if op == "%" then
+    return ok(l % r)
+  end
+  if op == "**" then
+    return ok(l ** r)
+  end
+  if op == "==" then
+    return ok(l == r)
+  end
+  if op == "!=" then
+    return ok(l != r)
+  end
+  if op == "<" then
+    return ok(l < r)
+  end
+  if op == ">" then
+    return ok(l > r)
+  end
+  if op == "<=" then
+    return ok(l <= r)
+  end
+  if op == ">=" then
+    return ok(l >= r)
+  end
+  return fail("Runtime error at line " + str(line) + ":" + str(col) + ": unknown operator '" + op + "'")
+end
+
+task eval_if(expr: any): dict<string, any>
+  let cond = eval_expr(expr["cond"])
+  if cond["tag"] != "ok" then
+    return cond
+  end
+  if cond["v"] != true and cond["v"] != false then
+    return fail("Runtime error at line " + str(expr["line"]) + ":" + str(expr["col"]) + ": condition must be bool")
+  end
+  if cond["v"] == true then
+    return eval_block(expr["then"])
+  end
+  if expr["has_else"] == true then
+    return eval_block(expr["else"])
+  end
+  return ok(nil)
+end
+
+task pat_match(pat: any, value: any): bool
+  if pat["tag"] == "wild" or pat["tag"] == "bind" then
+    return true
+  end
+  if pat["lit"] == "int" or pat["lit"] == "float" then
+    return value == pat["num"]
+  end
+  if pat["lit"] == "str" or pat["lit"] == "char" then
+    return str(value) == pat["text"]
+  end
+  if pat["lit"] == "true" then
+    return value == true
+  end
+  if pat["lit"] == "false" then
+    return value == false
+  end
+  if pat["lit"] == "nil" then
+    return value == nil
+  end
+  return false
+end
+
+task eval_match(expr: any): dict<string, any>
+  let scrut = eval_expr(expr["scrut"])
+  if scrut["tag"] != "ok" then
+    return scrut
+  end
+  let arms = expr["arms"]
+  let i = 0
+  while i < arms.len()
+    let arm = arms[i]
+    if pat_match(arm["pat"], scrut["v"]) then
+      FRAMES = FRAMES.push(blank())
+      if arm["pat"]["tag"] == "bind" then
+        bind_name(arm["pat"]["name"], scrut["v"])
+      end
+      let take = true
+      if arm["guard"] != nil then
+        let g = eval_expr(arm["guard"])
+        if g["tag"] != "ok" then
+          FRAMES = drop_last(FRAMES)
+          return g
+        end
+        if g["v"] != true then
+          take = false
+        end
+      end
+      if take then
+        let body = eval_expr(arm["body"])
+        FRAMES = drop_last(FRAMES)
+        return body
+      end
+      FRAMES = drop_last(FRAMES)
+    end
+    i = i + 1
+  end
+  return fail("Runtime error at line " + str(expr["line"]) + ":" + str(expr["col"]) + ": non-exhaustive match")
+end
+
+task eval_expr(expr: any): dict<string, any>
+  if bad() then
+    return errf()
+  end
+  let tag = expr["tag"]
+  if tag == "int" or tag == "float" then
+    return ok(expr["num"])
+  end
+  if tag == "str" then
+    return ok(expr["text"])
+  end
+  if tag == "char" then
+    return ok(expr["text"])
+  end
+  if tag == "bool" then
+    return ok(expr["bool"])
+  end
+  if tag == "nil" then
+    return ok(nil)
+  end
+  if tag == "var" then
+    if expr["name"] == "file" then
+      let marker: dict<string, any> = {tag: "file"}
+      return ok(marker)
+    end
+    if builtin_name(expr["name"]) then
+      let marker: dict<string, any> = {tag: "builtin"}
+      marker = marker.set("name", expr["name"])
+      return ok(marker)
+    end
+    return lookup_name(expr["name"], expr["line"], expr["col"])
+  end
+  if tag == "unary" then
+    let inner = eval_expr(expr["expr"])
+    if inner["tag"] != "ok" then
+      return inner
+    end
+    if expr["op"] == "not" then
+      if inner["v"] == true then
+        return ok(false)
+      end
+      if inner["v"] == false then
+        return ok(true)
+      end
+      return fail("Runtime error at line " + str(expr["line"]) + ":" + str(expr["col"]) + ": 'not' expects bool")
+    end
+    return ok(0 - inner["v"])
+  end
+  if tag == "binary" then
+    if expr["op"] == "and" then
+      let l = eval_expr(expr["left"])
+      if l["tag"] != "ok" then
+        return l
+      end
+      if l["v"] == false then
+        return ok(false)
+      end
+      if l["v"] != true then
+        return fail("Runtime error at line " + str(expr["line"]) + ":" + str(expr["col"]) + ": 'and' expects bool")
+      end
+      return eval_expr(expr["right"])
+    end
+    if expr["op"] == "or" then
+      let l = eval_expr(expr["left"])
+      if l["tag"] != "ok" then
+        return l
+      end
+      if l["v"] == true then
+        return ok(true)
+      end
+      if l["v"] != false then
+        return fail("Runtime error at line " + str(expr["line"]) + ":" + str(expr["col"]) + ": 'or' expects bool")
+      end
+      return eval_expr(expr["right"])
+    end
+    let l = eval_expr(expr["left"])
+    if l["tag"] != "ok" then
+      return l
+    end
+    let r = eval_expr(expr["right"])
+    if r["tag"] != "ok" then
+      return r
+    end
+    return apply_bin(expr["op"], l["v"], r["v"], expr["line"], expr["col"])
+  end
+  if tag == "call" then
+    if expr["callee"]["tag"] == "var" and builtin_name(expr["callee"]["name"]) then
+      let argsf = eval_args(expr["args"])
+      if argsf["tag"] != "ok" then
+        return argsf
+      end
+      return eval_builtin(expr["callee"]["name"], argsf["v"], expr["line"], expr["col"])
+    end
+    let callee = eval_expr(expr["callee"])
+    if callee["tag"] != "ok" then
+      return callee
+    end
+    let argsf = eval_args(expr["args"])
+    if argsf["tag"] != "ok" then
+      return argsf
+    end
+    if type_of(callee["v"]) == "dict" and callee["v"]["tag"] == "builtin" then
+      return eval_builtin(callee["v"]["name"], argsf["v"], expr["line"], expr["col"])
+    end
+    return call_value(callee["v"], argsf["v"], expr["line"], expr["col"])
+  end
+  if tag == "method" then
+    if expr["recv"]["tag"] == "var" and expr["recv"]["name"] == "file" then
+      let argsf = eval_args(expr["args"])
+      if argsf["tag"] != "ok" then
+        return argsf
+      end
+      let args = argsf["v"]
+      if expr["name"] == "read_text" then
+        return ok(file.read_text(args[0]))
+      end
+      if expr["name"] == "write_text" then
+        file.write_text(args[0], args[1])
+        return ok(nil)
+      end
+      return fail("Runtime error at line " + str(expr["line"]) + ":" + str(expr["col"]) + ": file." + expr["name"] + " is not in this trial")
+    end
+    return eval_method(expr)
+  end
+  if tag == "index" then
+    let recv = eval_expr(expr["recv"])
+    if recv["tag"] != "ok" then
+      return recv
+    end
+    let idx = eval_expr(expr["index"])
+    if idx["tag"] != "ok" then
+      return idx
+    end
+    return ok(recv["v"][idx["v"]])
+  end
+  if tag == "list" then
+    let items = expr["items"]
+    let out = empty_list()
+    let i = 0
+    while i < items.len()
+      let flowv = eval_expr(items[i])
+      if flowv["tag"] != "ok" then
+        return flowv
+      end
+      out = out.push(flowv["v"])
+      i = i + 1
+    end
+    return ok(out)
+  end
+  if tag == "dict" then
+    let pairs = expr["pairs"]
+    let out: dict<string, any> = {}
+    let i = 0
+    while i < pairs.len()
+      let flowv = eval_expr(pairs[i]["v"])
+      if flowv["tag"] != "ok" then
+        return flowv
+      end
+      out = out.set(pairs[i]["k"], flowv["v"])
+      i = i + 1
+    end
+    return ok(out)
+  end
+  if tag == "fn" then
+    return ok(make_func("closure", expr["params"], expr["body"], copy_list(FRAMES)))
+  end
+  if tag == "if" then
+    return eval_if(expr)
+  end
+  if tag == "match" then
+    return eval_match(expr)
+  end
+  if tag == "assign" then
+    let rhs = eval_expr(expr["expr"])
+    if rhs["tag"] != "ok" then
+      return rhs
+    end
+    return assign_name(expr["name"], rhs["v"], expr["line"], expr["col"])
+  end
+  return fail("Runtime error at line " + str(expr["line"]) + ":" + str(expr["col"]) + ": cannot evaluate '" + tag + "'")
+end
+
+task eval_for(stmt: any): dict<string, any>
+  let iter = eval_expr(stmt["iter"])
+  if iter["tag"] != "ok" then
+    return iter
+  end
+  if type_of(iter["v"]) != "list" then
+    return fail("Runtime error at line " + str(stmt["line"]) + ":" + str(stmt["col"]) + ": for loop expects a list")
+  end
+  let items = iter["v"]
+  let i = 0
+  while i < items.len()
+    FRAMES = FRAMES.push(blank())
+    bind_name(stmt["name"], items[i])
+    let flowv = eval_block(stmt["body"])
+    FRAMES = drop_last(FRAMES)
+    if flowv["tag"] == "return" or flowv["tag"] == "err" then
+      return flowv
+    end
+    if flowv["tag"] == "break" then
+      return ok(nil)
+    end
+    i = i + 1
+  end
+  return ok(nil)
+end
+
+task eval_while(stmt: any): dict<string, any>
+  let going = true
+  while going
+    let cond = eval_expr(stmt["cond"])
+    if cond["tag"] != "ok" then
+      return cond
+    end
+    if cond["v"] != true then
+      going = false
+    end
+    if cond["v"] == true then
+      let flowv = eval_block(stmt["body"])
+      if flowv["tag"] == "return" or flowv["tag"] == "err" then
+        return flowv
+      end
+      if flowv["tag"] == "break" then
+        going = false
+      end
+    end
+  end
+  return ok(nil)
+end
+
+task eval_stmt(stmt: any): dict<string, any>
+  if bad() then
+    return errf()
+  end
+  let tag = stmt["tag"]
+  if tag == "let" then
+    let rhs = eval_expr(stmt["expr"])
+    if rhs["tag"] != "ok" then
+      return rhs
+    end
+    bind_name(stmt["name"], rhs["v"])
+    return ok(nil)
+  end
+  if tag == "task" then
+    bind_name(stmt["name"], make_func("task", stmt["params"], stmt["body"], empty_list()))
+    return ok(nil)
+  end
+  if tag == "return" then
+    if stmt["expr"] == nil then
+      return flow("return", nil)
+    end
+    let rhs = eval_expr(stmt["expr"])
+    if rhs["tag"] != "ok" then
+      return rhs
+    end
+    return flow("return", rhs["v"])
+  end
+  if tag == "break" then
+    return flow("break", nil)
+  end
+  if tag == "continue" then
+    return flow("continue", nil)
+  end
+  if tag == "for" then
+    return eval_for(stmt)
+  end
+  if tag == "while" then
+    return eval_while(stmt)
+  end
+  if tag == "expr" then
+    return eval_expr(stmt["expr"])
+  end
+  return fail("Runtime error: cannot evaluate statement '" + tag + "'")
+end
+
+task run_source(src: string, mode: string): any
+  ERR = ""
+  EXITC = 0
+  let prog = parse_source(src)
+  if bad() then
+    EXITC = 2
+    return nil
+  end
+  init_ty()
+  infer_program(prog)
+  if bad() then
+    EXITC = 2
+    return nil
+  end
+  if mode == "check" then
+    print("No type errors found. (" + str(prog["stmts"].len()) + " expressions)")
+    EXITC = 0
+    return nil
+  end
+  init_eval()
+  let flowv = eval_block(block_of(prog["stmts"]))
+  if bad() or flowv["tag"] == "err" then
+    if ERR == "" then
+      die("Runtime error: failed")
+    end
+    EXITC = 1
+    return nil
+  end
+  if flowv["tag"] == "return" then
+    die("Runtime error: 'return' outside of a task or closure")
+    EXITC = 1
+    return nil
+  end
+  if flowv["tag"] == "break" then
+    die("Runtime error: 'break' outside of a loop")
+    EXITC = 1
+    return nil
+  end
+  if flowv["tag"] == "continue" then
+    die("Runtime error: 'continue' outside of a loop")
+    EXITC = 1
+    return nil
+  end
+  EXITC = 0
+  return nil
+end
+
+task finish(code: int): any
+  if code == 2 and ERR.starts_with("Type error") then
+    ERR = ERR + "\n\n1 type error(s) found."
+  end
+  file.write_text("selfhost/.code", str(code))
+  if ERR == "" then
+    file.write_text("selfhost/.diag", "")
+  else
+    file.write_text("selfhost/.diag", ERR + "\n")
+  end
+  return nil
+end
+
+let raw = file.read_text("selfhost/.argv")
+let parts = raw.split("\n")
+let mode = parts[0]
+let path = ""
+if parts.len() > 1 then
+  path = parts[1]
+end
+if mode == "version" then
+  print("Mora v0.110.0-selfhost")
+  finish(0)
+else
+  if mode == "help" then
+    print("Mora v0.110.0-selfhost — Mora written in Mora")
+    print("usage: selfhost/mora.sh [--check] <file.mora>")
+    print("       selfhost/mora.sh --version")
+    finish(0)
+  else
+    if mode == "repl" then
+      die("REPL is not in this trial")
+      finish(2)
+    else
+      let src = file.read_text(path)
+      run_source(src, mode)
+      finish(EXITC)
+    end
+  end
+end

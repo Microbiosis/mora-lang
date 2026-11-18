@@ -4,6 +4,8 @@ Copyright (c) 2026 Microbiosis. BSD-3-Clause. The license at the repository root
 
 This is a **trial** implementation of [Mora](../README.md), written in MoonBit. It does not replace the Rust compiler. `cargo build`, `cargo test`, and the `mora` / `mora-lsp` binaries at the repository root are unchanged.
 
+A second trial, written in Mora itself and hosted by that Rust compiler, lives in [`../selfhost`](../selfhost/README.md). This MoonBit tree does not host it.
+
 The trial implements the functional core that the README quick start and “language at a glance” actually exercise: lexing, an iterative Pratt parser, Hindley–Milner type checking, and a tree-walk evaluator. It is not a port of Control SSA, the stackful VM, or the Tokio scheduler.
 
 Toolchain this tree was written against: `moon 0.1.20261117`, `moonc v0.10.21`. The module targets native only.

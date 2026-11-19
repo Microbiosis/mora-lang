@@ -1,6 +1,6 @@
 # Agent Rules for mora-lang
 
-本文件约束所有 AI 编码助手在此仓库中的工作方式。Claude Code、Cursor、Aider、Copilot 等工具都应遵守。
+本文件约束所有 AI 编码助手在此仓库中的工作方式。
 
 > ## 0. 最高优先级原则：架构优先 + 完整实现（v0.78 用户硬性约束）
 >
@@ -17,12 +17,12 @@
 >
 > ### 0.2 实现功能必须从底层架构开始构建地基
 >
-> 当我们决定实现一个功能（algebraic effects / persistent environment / row-polymorphic types / TEA / HAMT / 等），必须先回答：
+> 当我们决定实现一个功能（algebraic effects / row-polymorphic types / Control SSA IR / Go-style concurrency / tensor compute graphs / 等），必须先回答：
 >
-> 1. **这个功能的底层原语是什么**？（如 algebraic effects 的原语是 perform/handle + effect rows + handler frame）
-> 2. **它的类型基础是什么**？（如 EffectRow enum、Type::Arrow、MirInst::Perform）
-> 3. **它对现有架构的最小侵入点是什么**？（如 MirFunction 加 effects 字段、MirHost 加 perform_effect）
-> 4. **它的完整语义需要哪些配套**？（如 classify_call_effect 累积、Default impl 传播、handler 注册表）
+> 1. **这个功能的底层原语是什么**？（如 algebraic effects 的原语是 perform/handle + effect rows + multi-shot delimited continuation frame）
+> 2. **它的类型基础是什么**？（如 EffectRow enum、Type::Arrow、ControlInst::Perform / ControlInst::Spawn / ControlInst::Select）
+> 3. **它对现有架构的最小侵入点是什么**？（如 ControlProgram 指令与验证器、typeck::hm 约束求解、runtime::vm 堆帧状态机）
+> 4. **它的完整语义需要哪些配套**？（如 EffectRow 包含检查、ML Value Restriction、TaskScheduler / AsyncIoReactor 协作取消）
 >
 > 把这些底层原语 + 类型基础 + 配套**全部**先建好，再写语法糖。**不能**先写一个 syntax sugar 然后说「底层以后再说」—— 「以后再说」就是补丁。
 >
@@ -32,7 +32,7 @@
 >
 > - 引入**隐式语义**（用户看不见的副作用）—— 违反 §6 透明性
 > - 制造**未来技术债**（需要二次重构）—— 违反 §6 扩展成本最小化
-> - 与**项目定位脱节**（Mora 的"AI-native"承诺是类型系统强制的函数式，纯字面量语法糖做不到）—— 违反 §6 架构正确性
+> - 与**项目定位脱节**（Mora 的核心定位是 **AI-native 静态类型语言**，面向大模型底层、计算图与算子、大模型推理/训练与资源动态调控，同时具备 Go 式云原生并发属性并对 HTTP 与 MCP 服务提供语言原语级友好支持；纯字面量语法糖做不到）—— 违反 §6 架构正确性
 > - 让**测试失去验证意义**（没有类型基础的实现只能 smoke test）—— 违反 §3 测试同步原则
 >
 > ### 0.4 决策矩阵：当「保守」vs「完整」冲突时
@@ -59,18 +59,18 @@
 >
 > 任何一项回答"否"，必须先回答"否"的具体原因，再决定是否能进行。
 >
-> ### 0.6 上下文实例（v0.78 起强制）
+> ### 0.6 上下文实例（v0.78+ ~ v0.110.0 起强制）
 >
-> - **Stage 1（FP 转型）**：不做「先加 EffectRow 字段、handler 以后再说」，必须把 `perform`/`handle` MirInst 指令、`Type::Arrow`、row-polymorphic HM unification、MirHost::perform_effect trait 一起设计完整。
-> - **Stage 2（algebraic effects）**：不做「先支持 `handle Ai {}` 语法、再考虑其他 effect」，必须从底层 EffectRow + EffectHandler trait + perform/handle 完整管线开始。
-> - **Stage 3（TEA + Transducers）**：不做「先实现 Msg 录制、再考虑 replay」，必须 Model/Msg/Update/Cmd 完整架构 + 流式 transducer pipeline 一起交付。
-> - **Stage 4（Units + Roc-style）**：不做「先加 Tokens 类型、再考虑量纲检查」，必须 MeasureExpr + 规范化 + 加法兼容性 + 编译期擦除 完整机制。
+> - **Wave 1（架构解耦与编译器瘦身）**：核心只保留语言原语与 7 个基础内建模块（`json`/`file`/`exec`/`math`/`stats`/`linalg`/`random`），上层应用耦合构造彻底迁出，`BigInt` 独立至 `std/math/bigint`（`mora-std-bigint`）。
+> - **Wave 2（单一 Control SSA 管线、堆帧 VM 与 Go 式云原生并发）**：不做双轨兼容桥，直接收口至 `MirWitness[] → ControlProgram` 单遍 SSA IR、堆帧状态机 VM（`O(1)` 尾调用 + 多发定界续延 `Value::Continuation`）、Tokio `TaskScheduler` / `AsyncIoReactor`、Go 式 `spawn` / 不变 `channel<T>` / 公平 `select` / `context` / `sleep` 与 `FsPolicy` / `CheckedPath` 沙箱隔离。
+> - **Wave 3（精确数值与统一 HM 求解器 → 一等 Tensor 与形状/设备检查）**：Stage 3A 严格分离 `Int`/`Float` 字面量与低位宽后缀（`f16`/`bf16`/`fp8`/`i4`..`i64`）、`**`/`@`/`!` 及单一 `Span` 追踪 HM 约束求解器（`check_program_witnesses`）；Stage 3B 构建一等 `Tensor<DType, Shape, Device>` 与 `grad` 接口。
+> - **Wave 4（AI 原生计算图、动态显存调控与云原生标准库闭环）**：原生 `TensorComputeDag`、VJP/JVP 自动微分、算子融合、`KVPageAllocator` 动态资源调控、`mora build` 单二进制交付及纯 Mora `std/net/http`（含 SSE）与 `std/mcp` 标准库。
 >
 > ### 0.7 违反本原则的处理
 >
 > 如果 AI 助手提交了「最小实现」型 PR，**用户会拒绝 review**。这不是
-> 用户偏好，是项目定位本身决定的：Mora 是「AI-native scripting language」，
-> 这个定位的工程现实是**类型系统强制**函数式承诺的实现完整度——任何妥协
+> 用户偏好，是项目定位本身决定的：Mora 是 **AI-native 静态类型语言**（面向大模型底层、计算图与算子、大模型推理/训练与资源动态调控，兼具 Go 式云原生并发与 HTTP/MCP 原语友好支持），
+> 这个定位的工程现实是**类型系统与 SSA 编译器/运行时内核强制**承诺的实现完整度——任何妥协
 > 都是对项目定位的背叛。
 >
 > ---
@@ -85,7 +85,7 @@
 
 以下场景**必须**先调用 MCP 搜索：
 
-- 任何第三方库的 API、配置、版本兼容性（如 `ureq`、`serde`、`tokio`、`rmcp` 等）
+- 任何第三方库的 API、配置、版本兼容性（如 `tokio`、`parking_lot`、`libc`、`proptest` 等）
 - 任何外部协议/规范的最新动态（如 MCP 协议、HTTP 标准、语言标准库）
 - 当前日期附近的发布说明、breaking change、CVE
 - 官方推荐的 best practice、迁移指南
@@ -93,11 +93,9 @@
 
 ### 1.2 例外（可直接用训练数据）
 
-- Mora 语言自身的语法、语义、执行管线 —— 直接读 `src/` 与 `docs/`（**项目无 AST**，v0.55 去 AST 化后已无 AST 解释器）
-  - **生产主路径（单遍编译）**：`source → Lexer → ParserV3::compile → MirWitness[] → 9 层管线（witness → FCFG → MirFunction<MirInst>）→ witness typecheck → MIR optimize → DAG analyze/optimize/cache → vm::execute`
-    （v0.75.40+ 全部执行入口切 compile；**v0.104.6 D474 起 parser 只产 witness**，MIR 全部由 9 层产出，**没有第二条编译路径**；`MirExpr` 仅为 orchestrate/pregel 数据构造类型）
-  - 旧路径 `ParserV3::parse → MirExpr → lower → MirInst` 是历史/兼容路径，仅 LSP 测试桥保留
-  - 执行内核：`src/mir/vm/`（interp + dag_interp 合并，v0.75.48）+ `src/mir/jit.rs`（copy-and-patch JIT，零 LLVM，Float/Int 算术 + Mod + 控制流子集，未覆盖回落解释器）
+- Mora 语言自身的语法、语义、执行管线 —— 直接读 `src/` 与 `docs/`（**项目无 AST**，v0.55 去 AST 化后已无 AST 解释器；v0.110.0 Wave 1/2 已移除旧 `src/interpreter/`、9 层 FCFG/EHIR/Core/DAG/JIT 与 HAMT `value/persistent.rs`）
+  - **单一生产主路径（单遍编译 + Control SSA IR）**：`source → Lexer::scan_tokens → ParserV3::compile (parse_witnesses → MirWitness[] + mir::control::lower_program → ControlProgram SSA IR + mir::control::verify_program) → typeck::check_mir::check_program_witnesses (统一 Span 追踪 HM 约束求解器 + 跨模块 import 符号校验) → mir::control::optimize_program (OptLevel 0/1/2) → runtime::vm::execute_program`
+  - **单一执行内核与并发底座**：`src/runtime/vm/`（堆帧状态机 VM，`Vec<CallFrame>`，`O(1)` 尾调用帧复用 + 多发定界续延 `Value::Continuation`）+ `src/runtime/{core,scheduler,reactor,fs}.rs`（`CoreRuntime` + 进程级共享 `EngineShared { scheduler: TaskScheduler, reactor: AsyncIoReactor }`，支持 Go 式 `spawn` / 不变 `channel<T>` / 公平 `select` / 分层取消 `context` / 可取消 `sleep`、`AsyncTcpListener` 以及 `FsPolicy` / `CheckedPath` 文件系统边界隔离），**没有第二条编译或解释路径**
   - **测试临时目录的唯一入口**：`src/test_support.rs` 的 `TempDir` / `TempFile`（v0.104.6 D475）。根目录、命名、回收策略都只此一处；**别处不得直接调 `std::env::temp_dir()`** —— `tests/test_tempdir_hygiene.rs` 守卫会判失败。此前全仓 163 处散落写法（5+ 种命名、4 种回收策略）在 `%TEMP%` 累积了 9 205 个空目录。
 - 项目内部命名、模块结构、历史 commit 含义 —— 直接 `grep` / `git log`
 - 通用编程语言基础（Rust 语法、Python 语法等）
@@ -235,18 +233,19 @@
 
 ## Project layout
 
-- `src/` — library + binaries (`mora`, `mora-lsp`)
+- `src/` — core compiler, unified HM type checker, Control SSA IR, stackful VM, Tokio scheduler/reactor, and binaries (`mora`, `mora-lsp`)
+- `std/` — modular standard library workspace crates (including `std/math/bigint` / `mora-std-bigint`)
 - `tests/` — integration tests + property-based tests (proptest)
 - `examples/` — runnable Mora demo scripts (CI also runs these against the release binary)
-- `docs/` — language spec, influences, learning plan, architecture
+- `docs/` — language spec, influences, learning plan, architecture diagram
 - `scripts/` — repo utility scripts (PowerShell helpers)
-- `editors/vscode/` — VSCode extension support
+- `editors/` — editor integrations (`vscode/`, `neovim/`, `helix/`, `sublime/`, `vim/`, `emacs/`)
 - `vendor/` — vendored code / sample input
 - `test_data/` — test fixtures
 
 ## Code style
 
-- Rust edition 2024, MSRV 1.85 (required by `ureq` 3.4)
+- Rust edition 2024, MSRV 1.85
 - Default `rustfmt` (no `.rustfmt.toml` checked in)
 - Clippy: `cargo clippy --all-targets --all-features -- -D warnings` (CI-enforced, treat warnings as errors)
 - Run `cargo fmt --all` before committing
@@ -256,20 +255,17 @@
 
 - The project builds on the **Rust stable release channel only** — no nightly lane.
 - v0.104.6 dropped the `nightly` entry that used to sit in the `ci.yml` test matrix.
-  Reason (measured, not assumed): the one change it motivated — silencing
-  `clippy::needless_range_loop` in `src/mir/ssa/deconstruct.rs` — **does not fire on
-  stable**. Reverting it leaves `cargo clippy --all-targets --all-features -- -D warnings`
-  green on stable. Chasing nightly-only lints buys no coverage here, only per-release churn.
+  Reason (measured, not assumed): chasing nightly-only lints buys no coverage here, only per-release churn.
 - No `rust-toolchain.toml` and no `rust-version` in `Cargo.toml`: the toolchain floats with
   `stable` by design, matching CI's `dtolnay/rust-toolchain@stable`.
 
 ## Testing instructions
 
 - Unit + integration tests: `cargo test --all-targets` (CI matrix: Ubuntu / Windows / macOS, stable only)
+- Workspace std crates: `cargo test -p mora-std-bigint`
 - Library tests only: `cargo test --lib`
 - Property-based tests: `proptest = "1.7"` dev-dep (see `tests/proptest_*.rs`)
 - LSP smoke: `cargo run --release --example lsp_smoke -- ./target/release/mora-lsp`
-- Record / snapshot CLI: covered by CI (`mora record list`, `mora snapshot`)
 - Add tests for every new behavior — see existing `tests/*.rs` files for the pattern
 - All tests must pass before opening a PR
 
@@ -277,4 +273,4 @@
 
 - License: BSD-3-Clause (`LICENSE` in repo root)
 - Never commit secrets — `.env` and tool caches are in `.gitignore`
-- `AGENTS.md` is intentionally tracked; `CLAUDE.md` is excluded per project policy
+- `AGENTS.md` is intentionally tracked as the single project-level AI rules source of truth

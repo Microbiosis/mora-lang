@@ -35,7 +35,7 @@ fn dispatch() -> i32 {
             }
             "--help" | "-h" => {
                 println!(
-                    "Mora v{} — statically-typed functional scripting language",
+                    "Mora v{} — AI-native statically-typed language for compute graphs, LLM systems, and cloud-native services",
                     mora::VERSION
                 );
                 println!();
@@ -68,8 +68,8 @@ fn dispatch() -> i32 {
     }
 
     // v0.75.30: 显式编译选项 `--opt=N`（0=关/1=Basic/>=2=Aggressive）—
-    // 从环境变量提升为 CLI 一等参数，供 run_file/run_record/run_replay/
-    // run_snapshot 四个编译入口使用。未指定 → None → 各入口走 env 兜底。
+    // 从环境变量提升为 CLI 一等参数，供 run_file 编译入口使用。
+    // 未指定 → None → 走 MORA_OPT env 兜底。
     // 剥掉 flag 后重组 args，后续 match 逻辑不变（`--opt` 只在 args[1]，
     // 不进入子命令参数）。
     let opt_level: Option<mora::mir::control::OptLevel> = args
@@ -182,11 +182,16 @@ fn command_exists(cmd: &str) -> bool {
 }
 
 fn print_banner() {
-    eprintln!("Mora v{}", mora::VERSION);
-    eprintln!("  Built-in: json.* / file.* / exec.* / math.* / stats.* / linalg.* / random.*");
-    eprintln!("  Trait 系统: trait / impl / dyn / ::new() / 继承 / 默认实现");
     eprintln!(
-        "  类型与执行: HM typeck + algebraic effects (perform/handle) + Control SSA IR / stackful VM + Tokio scheduler"
+        "Mora v{} — AI-native statically-typed language",
+        mora::VERSION
+    );
+    eprintln!("  Built-in: json.* / file.* / exec.* / math.* / stats.* / linalg.* / random.*");
+    eprintln!(
+        "  并发与抽象: spawn / channel<T> / select / context / sleep | trait / impl / dyn / ::new()"
+    );
+    eprintln!(
+        "  类型与执行: Span-tracked HM typeck + algebraic effects (perform/handle) + Control SSA IR / stackful VM"
     );
     eprintln!();
 }

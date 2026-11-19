@@ -1,21 +1,21 @@
 # Mora for VS Code
 
-[Mora](https://github.com/Microbiosis/mora-lang) language support: syntax highlighting + LSP-backed diagnostics/hover/completion.
+[Mora](https://github.com/Microbiosis/mora-lang) language support: syntax highlighting + LSP-backed diagnostics, HM-inferred hover, completion, go-to-definition, references, rename, and formatting.
 
 ## Install
 
-### From Marketplace ()
+### From Marketplace (待发布)
 1. Open VS Code
 2. Extensions → search "Mora" → Install
 
 ### From local VSIX
 ```bash
-# 
+# 在本目录构建
 cd editors/vscode
 npm install -g @vscode/vsce
-vsce package  #  mora-0.1.0.vsix
+vsce package  # 生成 mora-0.1.0.vsix
 
-#  VS Code
+# 安装到 VS Code
 code --install-extension mora-0.1.0.vsix
 ```
 
@@ -24,7 +24,7 @@ code --install-extension mora-0.1.0.vsix
 cd editors/vscode
 npm install
 npm run compile
-# F5 in VS Code
+# 启动调试：F5 in VS Code
 ```
 
 ## Prerequisite
@@ -42,8 +42,8 @@ Pre-built binaries: see [Releases](https://github.com/Microbiosis/mora-lang/rele
 ## Features
 
 - Syntax highlighting (keywords, strings, numbers, types, builtins)
-- Inline error squiggles (from typeck)
-- Hover on identifiers: shows type signature
+- Inline error squiggles (from Span-tracked Hindley-Milner type checking)
+- Hover on identifiers: shows HM-inferred or annotated type signature
 - Go-to-definition (F12)
 - Find references (Shift+F12)
 - Autocompletion (Ctrl+Space): keywords, variables, tasks, builtin modules

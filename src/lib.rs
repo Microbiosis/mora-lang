@@ -1,7 +1,9 @@
-//! Mora 标准库（v11+ 拆出）
+//! Mora 核心编译器与运行时库（v0.110.0）
 //!
-//! 暴露 lexer / parser_v3 / runtime / typeck / mir / lsp 等模块，
-//! 让 CLI binary（src/main.rs）和 LSP server binary（src/bin/lsp.rs）共享。
+//! AI-native 静态类型语言核心，面向大模型底层、计算图与算子、大模型推理/训练与资源动态调控，
+//! 并具备 Go 式云原生并发与 HTTP/MCP 原语友好支持。
+//! 暴露 lexer / parser_v3 / mir / typeck / runtime / value / flow / lsp / cli 等模块，
+//! 让 CLI binary（`src/main.rs`）和 LSP server binary（`src/bin/lsp.rs`）共享。
 
 /// v0.51: 版本号叙事的单一真相源。
 ///

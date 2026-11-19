@@ -45,18 +45,28 @@ fn d117_census_of_readme_mora_blocks() {
 
     let mut bad = Vec::new();
     for (line, src) in &blocks {
-        if let Err(e) = ParserV3::compile(src) {
-            let msg = e.to_string();
-            let first = msg.lines().next().unwrap_or("").to_string();
-            bad.push(format!("README 行 {line}: {first}"));
-            eprintln!(
-                "  README:{line} 不可解析 — {first}\n    |{}|",
-                src.lines().next().unwrap_or("")
-            );
+        match ParserV3::compile(src) {
+            Ok((_prog, witnesses)) => {
+                let type_errors = mora::typeck::check_mir::check_program_witnesses(&witnesses);
+                if !type_errors.is_empty() {
+                    let msg = mora::typeck::format_error(&type_errors[0]);
+                    bad.push(format!("README 行 {line} 类型检查失败: {msg}"));
+                }
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                let first = msg.lines().next().unwrap_or("").to_string();
+                bad.push(format!("README 行 {line}: {first}"));
+                eprintln!(
+                    "  README:{line} 不可解析 — {first}\n    |{}|",
+                    src.lines().next().unwrap_or("")
+                );
+            }
         }
     }
-    eprintln!(
-        "D117 不可解析清单（{}/{}）：\n  {}",
+    assert!(
+        bad.is_empty(),
+        "D117 README 代码块不可解析或类型检查失败（{}/{}）：\n  {}",
         bad.len(),
         blocks.len(),
         bad.join("\n  ")

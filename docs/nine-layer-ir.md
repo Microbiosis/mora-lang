@@ -1,6 +1,17 @@
-# IR 架构（v0.104.6 起为 5 层）
+# IR 架构历史记录（v0.89–v0.104.6 的 5/9 层管线，已于 v0.110.0 Wave 2 退役）
 
-> v0.89-v0.90 实施（2026-08-21~23）；v0.104.6 移除不在产出路径上的三层。
+> **状态更新（v0.110.0 Wave 2）**：本文档记录的 `Token → FCFG → EHIR → Core → MIR` 多层过渡管线（及 `fcfg.rs` / `core.rs` / `core_exec.rs` / `MirFunction<MirInst>` / `jit.rs`）已于 **v0.110.0 Wave 2** 彻底退役并移除。
+>
+> **当前唯一生产编译与执行管线**（详见 [`docs/architecture-diagram.md`](architecture-diagram.md) 与 [`AGENTS.md`](../AGENTS.md) §1.2）：
+> ```
+> source → Lexer::scan_tokens → ParserV3::compile (parse_witnesses)
+>   → MirWitness[] + mir::control::lower_program (ControlProgram SSA IR)
+>   → mir::control::verify_program (SSA 支配与槽位校验)
+>   → typeck::check_mir::check_program_witnesses (单一 Span 追踪 HM 约束求解器 + import 检查)
+>   → mir::control::optimize_program (OptLevel 0/1/2: CopyProp / GVN-CSE / LICM / DCE)
+>   → runtime::vm::execute_program (堆帧状态机 VM + Tokio TaskScheduler / AsyncIoReactor)
+> ```
+> 下文保留为 v0.89–v0.104.6 阶段的历史架构演进记录。
 
 ## 概述
 

@@ -713,7 +713,7 @@ mod tests_v043_exec {
     // 在 Windows 的 `cmd /C` 下无对应物 —— 故按平台门控，不再因平台差异误报。
     fn exec_parallel_collects_stdout_per_command() {
         let cmds = vec![cmd("echo line1"), cmd("printf line2"), cmd("echo line3")];
-        let result = call_exec("parallel", &[Value::List(cmds)]).unwrap();
+        let result = call_exec("parallel", &[Value::List(cmds.into())]).unwrap();
         let list = match result {
             Value::List(l) => l,
             _ => panic!("expected List"),
@@ -754,7 +754,11 @@ mod tests_v043_exec {
         let cmds = vec![cmd("sleep 10")];
         let result = call_exec(
             "parallel",
-            &[Value::List(cmds), Value::Float(1.0), Value::Float(200.0)],
+            &[
+                Value::List(cmds.into()),
+                Value::Float(1.0),
+                Value::Float(200.0),
+            ],
         )
         .unwrap();
         let list = match result {
@@ -848,7 +852,7 @@ mod tests_v043_exec {
     fn exec_parallel_returns_error_for_missing_command() {
         // sh -c 调用不存在的命令 → sh 返回 exit_code=127, stderr "command not found"
         let cmds = vec![cmd("this_command_definitely_does_not_exist_xyz")];
-        let result = call_exec("parallel", &[Value::List(cmds)]).unwrap();
+        let result = call_exec("parallel", &[Value::List(cmds.into())]).unwrap();
         let list = match result {
             Value::List(l) => l,
             _ => panic!("expected List"),

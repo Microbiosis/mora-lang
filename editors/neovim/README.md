@@ -1,29 +1,29 @@
 # Mora language server for Neovim
 
-[LSP ] Mora  Neovim 
+[LSP 集成] Mora 语言的 Neovim 配置。
 
-## 
+## 安装
 
-`mora-lsp`  `$PATH`  `cmd` 
+确保 `mora-lsp` 在 `$PATH` 上（或通过 `cmd` 参数指定绝对路径）。
 
- `lua/mora-lsp.lua`  Neovim 
+把 `lua/mora-lsp.lua` 复制到你的 Neovim 配置目录：
 
 ```bash
 cp lua/mora-lsp.lua ~/.config/nvim/lua/
 ```
 
-## init.lua 
+## `init.lua` 配置
 
 ```lua
---  LSP
+-- 启用 LSP
 require('mora-lsp').setup({
-    -- 
+    -- 可选：自定义命令
     -- cmd = { '/opt/mora/bin/mora-lsp' },
 
-    --  capabilities completion-nvim 
+    -- 可选：自定义 capabilities（如果你用了 cmp-nvim-lsp 等）
     -- capabilities = require('cmp_nvim_lsp').default_capabilities(),
 
-    --  on_attach keymap
+    -- 可选：自定义 on_attach（设置 keymap）
     on_attach = function(client, bufnr)
         local bufopts = { noremap = true, silent = true, buffer = bufnr }
         vim.keymap.set('n', 'gd', vim.lsp.buf.definition, bufopts)
@@ -38,9 +38,9 @@ require('mora-lsp').setup({
 })
 ```
 
-## filetype 
+## `filetype` 检测
 
- Neovim  `.mora` 
+如果你的 Neovim 没有自动识别 `.mora` 文件，可以加：
 
 ```lua
 vim.api.nvim_create_autocmd('BufRead,BufNewFile', {
@@ -49,13 +49,13 @@ vim.api.nvim_create_autocmd('BufRead,BufNewFile', {
 })
 ```
 
-## Treesitter 
+## Treesitter / 语法高亮
 
-`mora`  treesitter  grammar  Lua  grammar  syntax  `editors/vscode/syntaxes/mora.tmLanguage.json`  TextMate Neovim  `vim-tmux-syntax`  `nvim-treesitter` 
+`mora` 暂未进入 treesitter 官方 grammar 列表。本仓库的 `editors/vscode/syntaxes/mora.tmLanguage.json` 为 TextMate 格式，也可配合 `editors/vim/ftplugin/mora.vim` 使用。
 
-##  Neovim (0.10 )
+## 旧版 Neovim (0.10 之前)
 
-`vim.lsp.start`  0.11 0.10  `vim.lsp.start_client`
+`vim.lsp.start` 在 Neovim 0.10+ 可用；更早版本可使用 `vim.lsp.start_client`：
 
 ```lua
 vim.api.nvim_create_autocmd('FileType', {

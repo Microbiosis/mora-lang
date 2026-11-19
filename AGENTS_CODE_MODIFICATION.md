@@ -1,7 +1,7 @@
 # Code Modification Behavior Constraints
 
 > 代码修改行为约束。所有 AI 编码助手在此仓库中修改任何文件前，必须遵守本文件列出的原则。
-> 与 `AGENTS.md`（外部信息来源 + 代码质量门禁）和 `CLAUDE.md`（Claude Code 工具约定）并列。
+> 与 `AGENTS.md`（外部信息来源 + 代码质量门禁）并列。
 
 **核心精神**：文档不可信，代码是唯一真相；取巧即垃圾；可局部移植才是有用代码；修改者必须对引入的 Bug 负全责。
 
@@ -117,7 +117,6 @@
 | 文件 | 约束范围 |
 |------|---------|
 | `AGENTS.md` | 外部信息来源（MCP 搜索）+ 代码质量门禁（build/test/clippy/fmt）+ unwrap/panic 政策 |
-| `CLAUDE.md` | Claude Code 工具约定（CLAUDE 特有的提示） |
 | 本文件 | 代码修改**行为**约束（7 原则 + 红线）—— 适用于任何 AI 助手写代码前 |
 
 本文件不与 `AGENTS.md` §3（代码质量）冲突，而是从**行为层面**对其补充：

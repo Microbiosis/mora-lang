@@ -477,6 +477,7 @@ impl ParserV3 {
                     "tcp_stream" | "tcpstream" => Type::TcpStream,
                     "compute_dag" | "computedag" => Type::ComputeDag,
                     "kv_allocator" | "kvallocator" => Type::KVAllocator,
+                    "memory_pool" | "memorypool" => Type::MemoryPool,
                     "channel" => Type::Channel(Box::new(Type::Any)),
                     "task_handle" | "taskhandle" => Type::TaskHandle(Box::new(Type::Any)),
                     "tensor" => Type::any_tensor(),

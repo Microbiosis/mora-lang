@@ -741,6 +741,7 @@ pub fn type_name(value: &Value) -> &'static str {
         Value::TcpStream(_) => "tcp_stream",
         Value::ComputeDag(_) => "compute_dag",
         Value::KVAllocator(_) => "kv_allocator",
+        Value::MemoryPool(_) => "memory_pool",
         Value::Tensor(_) => "tensor",
         Value::StructType(_) => "struct_type",
         Value::StructInstance { .. } => "struct",

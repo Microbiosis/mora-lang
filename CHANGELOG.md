@@ -87,13 +87,19 @@ All notable changes to Mora will be documented in this file.
 
 ### Wave 4 AI 原生计算图、显存页调度、纯 Mora HTTP/MCP 标准库与 `mora build` 单二进制
 
-- **原生 `TensorComputeDag`、算子融合、`DeviceBackend` 与前向 `jvp`（`tests/w4_compute_dag_jvp_fusion.rs`）**：
-  - 新增 `src/runtime/compute_dag.rs`：`DeviceBackend`（`CpuDeviceBackend` + 多设备模拟后端）、`TensorComputeDag` 图捕获（`trace_dag`）、`FusedLinearAct`（`MatMul + BiasAdd + Act`）与 `FusedElementwise` 算子融合及 DCE、`run()` 执行与 `to_dot()` 导出。
-  - 在 `src/runtime/autograd.rs` 补齐前向模式雅可比向量积 `AutogradTape::forward_jvp` 与一等内建 `jvp(f, primals, tangents)`（支持异构参数列表及标量/张量静态校验）。
-- **动态显存 KV-Cache 资源调度 `KVPageAllocator`（`tests/w4_kv_cache_allocator.rs`）**：
-  - 新增 `src/runtime/kv_cache.rs`：实现基于 64 字节对齐紧凑物理页池的 `kv_allocator(total_pages, page_tokens, num_heads, head_dim, dtype?, device?)`，支持 `alloc_seq`/`append_tokens`/零拷贝 `fork_seq` + 写时复制（CoW）分裂/`write_kv`/`read_kv`/`free_seq`/`evict_lru`/`stats`/`utilization`/`bytes_used`。
-- **纯 Mora `std/net/http`（含 SSE）与 `std/mcp` 标准库（`tests/w4_std_http_and_mcp.rs`）**：
-  - 升级 `src/typeck/imports.rs` 支持跨模块 `export` `struct`/`enum`/`trait`/`impl`/参数规范与菱形缓存传播，并在 `src/parser_v3/emit.rs` 预扫描导入名义类型，内嵌 `std/net/http.mora`（HTTP/1.1 服务端/路由/客户端 + SSE）与 `std/mcp.mora`（MCP JSON-RPC 2.0 + HTTP/SSE）。
+- **原生 `TensorComputeDag`、深度算子融合、SIMD 多线程内核、图缓存/Buffer 复用与高阶 AD（`tests/w4_compute_dag_jvp_fusion.rs`）**：
+  - 新增 `src/runtime/compute_dag.rs` 与 `src/runtime/simd_kernels.rs`：
+    - `DeviceBackend`（`CpuDeviceBackend` + 多设备模拟后端）搭载运行期自检稳定版硬件 SIMD（`AVX2+FMA` / `NEON` / 4 路展开标量回退）与 `std::thread::scope` 缓存分块（`MC=KC=NC=64`）多线程内核。
+    - 4 遍算子融合管线：`FusedFlashAttention`（`Br=32, Bc=32` 分块在线 Softmax FlashAttention-2，零 `O(Sq*Sk)` 注意力分数矩阵分配，吸收 `Transpose`、支持 GQA/MQA 广播与因果掩码）、`FusedRmsNormLinear`（2D/批量 ND `RMSNorm [* gamma] + Linear [+ bias] [+ Act]`，零中间张量堆分配）、`FusedLinearAct` 与 `FusedElementwise` + DCE。
+    - 编译期线性扫描活跃度分析 `DagMemoryPlan` 与物理可复用草稿区 `DagWorkspace`，配合挂接于 `EngineShared` 的线程安全结构指纹编译缓存 `DagPlanCache`（暴露 `.compile()` / `.memory_plan()` / `.cache_stats()` / `.cache_key()` / `.backend_info()`）。
+  - 在 `src/runtime/autograd.rs` 与 `src/runtime/autograd_higher_order.rs` 升级多磁带 `Tensor.grad_nodes: Vec<TapeNodeId>`、`SumAxis`/`ScatterAdd` 伴随原语与 `backward_tracked`/`forward_jvp_tracked`（`create_graph = true`），端到端支持任意阶导数（`grad(grad(f))`、`grad(grad(grad(f)))`）、三模式精确 Hessian-Vector Product（前向套反向 `jvp(grad(f), x, v)`、反向套前向、反向套反向）及 `trace_dag(grad(f), x).compile()` 反向计算图融合；同步支持 `Tensor.transpose(-2, -1)` 负轴索引静态与运行期校验。
+- **动态显存 KV-Cache 资源调度与通用张量 `MemoryPool`（`tests/w4_kv_cache_allocator.rs`）**：
+  - 深化 `src/runtime/kv_cache.rs`：在 64 字节对齐紧凑物理页池 `kv_allocator(total_pages, page_tokens, num_heads, head_dim, dtype?, device?, max_bytes?)` 之上补齐硬字节配额（`max_bytes`/`set_quota`/`quota_bytes` 原子超限拒批）、序列优先级与抢占式驱逐（`alloc_seq(id, priority?)`/`set_priority`/`seq_priority`/`evict_preempt(max_victim_priority?)`/`reclaim_for(pages, req_priority)`）、以及上升沿水位线回调（`on_watermark(threshold, cb)`/`clear_watermarks`，带回差复位并通过堆帧 VM `CombinatorFrame::WatermarkCallbacks` 在解锁后无死锁执行）。
+  - 新增 `src/runtime/memory_pool.rs` 与一等 `memory_pool(max_bytes, device?)`（`Value::MemoryPool` / `Type::MemoryPool` / LSP 补全）：64 字节缓存行对齐 2 次幂分桶 Slab 缓存池，支持 `alloc`/`zeros`/`full`/`release`（物理 `AlignedByteBuffer` 原地回收零 OS 重分配 + 释放句柄安全脱钩防 UB）/`trim`/`set_quota`/`on_watermark`/`clear_watermarks`/`active_bytes`/`cached_bytes`/`max_bytes`/`utilization`/`stats` 及并发 `spawn` 线程安全。
+- **纯 Mora `std/net/http`（含 Router/Chunked/Keep-Alive/SSE）与 `std/mcp` 标准库（`tests/w4_std_http_and_mcp.rs`）**：
+  - 升级 `src/typeck/imports.rs` 支持跨模块 `export` `struct`/`enum`/`trait`/`impl`/参数规范与菱形缓存传播，并在 `src/parser_v3/emit.rs` 预扫描导入名义类型。
+  - 深化纯 Mora `std/net/http.mora`：新增声明式 `Router`（支持 `:param` 路径参数、`*` 通配、洋葱模型中间件、自动 `404`/`405 Method Not Allowed` + `Allow` 头）、HTTP/1.1 `Transfer-Encoding: chunked` 双向编解码（`chunked_response`/`post_chunked`/`send_chunked_request_on`）、可配置请求体硬字节上限 `max_body_bytes`（零无界分配直接返回 `413 Payload Too Large`）与 `Connection: keep-alive` 长连接单套接字多请求复用（`send_request_on` / `max_keepalive_requests`）。
+  - 深化纯 Mora `std/mcp.mora`：补齐完整 `prompts/list` & `prompts/get` 能力与必填参数校验、基于名义 `Struct::schema()` 与 `@tag(json=..., desc=..., optional=...)` 的自动 JSON Schema 生成（`schema_from_struct`/`typed_tool`）及 `tools/call` 运行期参数校验（`-32602`），并新增 Stdio NDJSON 行协议传输（`handle_stdio_line`/`serve_stdio_lines`/`serve_stdio_channels`/`serve_stdio_stream`）。
   - 修复 `src/typeck/hm/infer.rs` 中开放元变量与 `nil` 判等（`x == nil` / `x != nil`）错误坍缩为 `Type::Nil` 的边界问题。
 - **`mora build` 单二进制静态交付（`tests/w4_mora_build_single_binary.rs`）**：
   - 新增 `src/cli/bundle.rs` 与 `mora build <file.mora> [-o <output>]`：编译期完成传递 `import` 闭包打包、HM 全量静态检查与 SSA 优化，生成带 `MORABUNDLE01` 校验尾部的独立单二进制可执行程序。

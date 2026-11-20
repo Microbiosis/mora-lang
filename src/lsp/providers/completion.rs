@@ -97,6 +97,10 @@ const STAGE3B_TYPES_AND_CTORS: &[(&str, &str)] = &[
         "Paged KV-cache dynamic resource allocator type (kv_allocator)",
     ),
     (
+        "memory_pool",
+        "64-byte aligned size-classed tensor memory pool type (memory_pool)",
+    ),
+    (
         "Tensor::zeros",
         "Tensor::zeros(shape, dtype?, device?, requires_grad?)",
     ),

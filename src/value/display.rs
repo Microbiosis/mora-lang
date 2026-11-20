@@ -164,6 +164,16 @@ impl std::fmt::Display for Value {
                     kv.device
                 )
             }
+            Value::MemoryPool(pool) => {
+                write!(
+                    f,
+                    "<memory_pool active={}/{} cached={} device={}>",
+                    pool.active_bytes(),
+                    pool.max_bytes(),
+                    pool.cached_bytes(),
+                    pool.device
+                )
+            }
             Value::Tensor(t) => write!(f, "{t}"),
             Value::StructType(def) => write!(f, "<struct {}>", def.name),
             Value::StructInstance {

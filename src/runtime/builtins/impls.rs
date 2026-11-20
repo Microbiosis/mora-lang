@@ -81,7 +81,8 @@ pub(crate) fn eval_pure_builtin(
         | BuiltinFnId::TcpListen
         | BuiltinFnId::Jvp
         | BuiltinFnId::TraceDag
-        | BuiltinFnId::KvAllocator => None,
+        | BuiltinFnId::KvAllocator
+        | BuiltinFnId::MemoryPool => None,
     }
 }
 

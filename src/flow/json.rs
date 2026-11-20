@@ -625,6 +625,7 @@ pub fn value_to_json(value: &Value) -> String {
                 Value::TcpStream(_) => out.push_str("\"<tcp_stream>\""),
                 Value::ComputeDag(_) => out.push_str("\"<compute_dag>\""),
                 Value::KVAllocator(_) => out.push_str("\"<kv_allocator>\""),
+                Value::MemoryPool(_) => out.push_str("\"<memory_pool>\""),
                 Value::External(obj) => match obj.to_json() {
                     Some(v) if atom_depth < MAX_JSON_DEPTH => {
                         stack.push(SerStep::Val(Cow::Owned(v), atom_depth + 1));

@@ -349,6 +349,7 @@ impl<'a> VmEngine<'a> {
                 let tape = self.core.autograd.pop_tape(tape_id).ok_or_else(|| {
                     MoraError::Runtime("autograd: active tape missing on completion".to_string())
                 })?;
+                let higher_order = self.core.autograd.is_recording();
                 let (display_val, grad_tensors) = match &reply {
                     Value::Tensor(t) => {
                         if t.numel() != 1 {
@@ -357,7 +358,7 @@ impl<'a> VmEngine<'a> {
                                 t.shape
                             )));
                         }
-                        let disp = if t.shape.is_empty() {
+                        let disp = if t.shape.is_empty() && !higher_order {
                             let scalar_v = t.get_linear(0);
                             if t.dtype == DType::F64 {
                                 Value::Float(scalar_v)
@@ -369,10 +370,16 @@ impl<'a> VmEngine<'a> {
                         } else {
                             Value::Tensor(Arc::clone(t))
                         };
-                        let grads = if let Some((tid, out_idx)) = t.grad_node
-                            && tid == tape_id
-                        {
-                            tape.backward(out_idx, &leaf_nodes)?
+                        let grads = if let Some(out_idx) = t.node_on_tape(tape_id) {
+                            if higher_order {
+                                tape.backward_tracked(
+                                    out_idx,
+                                    &leaf_nodes,
+                                    &mut self.core.autograd,
+                                )?
+                            } else {
+                                tape.backward(out_idx, &leaf_nodes)?
+                            }
                         } else {
                             tape.zero_grads_for_leaves(&leaf_nodes)?
                         };
@@ -390,7 +397,9 @@ impl<'a> VmEngine<'a> {
                 };
                 let mut grad_vals = Vec::with_capacity(grad_tensors.len());
                 for (gt, scalar_flag) in grad_tensors.into_iter().zip(scalar_flags) {
-                    if let Some(dt) = scalar_flag {
+                    if let Some(dt) = scalar_flag
+                        && !higher_order
+                    {
                         let v = gt.get_linear(0);
                         if dt == DType::F64 {
                             grad_vals.push(Value::Float(v));
@@ -425,12 +434,20 @@ impl<'a> VmEngine<'a> {
                 let tape = self.core.autograd.pop_tape(tape_id).ok_or_else(|| {
                     MoraError::Runtime("jvp: active tape missing on completion".to_string())
                 })?;
+                let higher_order = self.core.autograd.is_recording();
                 let (primal_val, tangent_val) = match &reply {
                     Value::Tensor(t) => {
-                        let tangent_t = if let Some((tid, out_idx)) = t.grad_node
-                            && tid == tape_id
-                        {
-                            tape.forward_jvp(out_idx, &leaf_nodes, &leaf_tangents)?
+                        let tangent_t = if let Some(out_idx) = t.node_on_tape(tape_id) {
+                            if higher_order {
+                                tape.forward_jvp_tracked(
+                                    out_idx,
+                                    &leaf_nodes,
+                                    &leaf_tangents,
+                                    &mut self.core.autograd,
+                                )?
+                            } else {
+                                tape.forward_jvp(out_idx, &leaf_nodes, &leaf_tangents)?
+                            }
                         } else {
                             crate::value::tensor::Tensor::zeros(
                                 t.shape.clone(),
@@ -439,7 +456,7 @@ impl<'a> VmEngine<'a> {
                                 false,
                             )?
                         };
-                        if t.shape.is_empty() && scalar_out_dtype.is_some() {
+                        if t.shape.is_empty() && scalar_out_dtype.is_some() && !higher_order {
                             let pv = t.get_linear(0);
                             let tv = tangent_t.get_linear(0);
                             let p_out = if t.dtype == DType::F64 {
@@ -486,14 +503,10 @@ impl<'a> VmEngine<'a> {
                         crate::flow::type_name(&reply)
                     )));
                 };
-                let out_idx = match t.grad_node {
-                    Some((tid, idx)) if tid == tape_id => idx,
-                    _ => {
-                        return Err(MoraError::Runtime(
-                            "trace_dag: output tensor is disconnected from traced inputs"
-                                .to_string(),
-                        ));
-                    }
+                let Some(out_idx) = t.node_on_tape(tape_id) else {
+                    return Err(MoraError::Runtime(
+                        "trace_dag: output tensor is disconnected from traced inputs".to_string(),
+                    ));
                 };
                 let dag = crate::runtime::compute_dag::TensorComputeDag::from_tape(
                     &tape,
@@ -534,6 +547,24 @@ impl<'a> VmEngine<'a> {
                         current_field: next_field,
                     }));
                 let action = resolve_value_call(thunk, Vec::new(), self.core)?;
+                self.apply_action_chained(action)?;
+                Ok(None)
+            }
+            CombinatorFrame::WatermarkCallbacks {
+                final_result,
+                mut pending,
+            } => {
+                let _ = reply;
+                if pending.is_empty() {
+                    return Ok(Some(final_result));
+                }
+                let (next_cb, next_event) = pending.remove(0);
+                self.frames
+                    .push(CallFrame::Combinator(CombinatorFrame::WatermarkCallbacks {
+                        final_result,
+                        pending,
+                    }));
+                let action = resolve_value_call(next_cb, vec![Value::Dict(next_event)], self.core)?;
                 self.apply_action_chained(action)?;
                 Ok(None)
             }

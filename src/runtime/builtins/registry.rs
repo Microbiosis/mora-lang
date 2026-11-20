@@ -26,6 +26,7 @@ pub const RUNTIME_BUILTIN_NAMES: &[&str] = &[
     "kv_allocator",
     "len",
     "macroexpand",
+    "memory_pool",
     "merge_with",
     "methods_of",
     "partial",

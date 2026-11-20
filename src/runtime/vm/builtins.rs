@@ -211,6 +211,7 @@ pub fn resolve_builtin_call_named(
                     "head_dim",
                     "dtype",
                     "device",
+                    "max_bytes",
                 ];
                 let mut slots: Vec<Option<Value>> = vec![None; names.len()];
                 if args.len() > names.len() {
@@ -232,6 +233,37 @@ pub fn resolve_builtin_call_named(
                     if slots[pos].is_some() {
                         return Err(MoraError::Runtime(format!(
                             "kv_allocator(): duplicate argument '{k}'"
+                        )));
+                    }
+                    slots[pos] = Some(v);
+                }
+                while matches!(slots.last(), Some(None)) {
+                    slots.pop();
+                }
+                args = slots.into_iter().map(|s| s.unwrap_or(Value::Nil)).collect();
+            }
+            BuiltinFnId::MemoryPool => {
+                let names = ["max_bytes", "device"];
+                let mut slots: Vec<Option<Value>> = vec![None; names.len()];
+                if args.len() > names.len() {
+                    return Err(MoraError::Runtime(format!(
+                        "memory_pool(): expected at most {} positional args, got {}",
+                        names.len(),
+                        args.len()
+                    )));
+                }
+                for (i, v) in args.into_iter().enumerate() {
+                    slots[i] = Some(v);
+                }
+                for (k, v) in named_args {
+                    let Some(pos) = names.iter().position(|&n| n == k.as_str()) else {
+                        return Err(MoraError::Runtime(format!(
+                            "memory_pool(): unexpected keyword argument '{k}'"
+                        )));
+                    };
+                    if slots[pos].is_some() {
+                        return Err(MoraError::Runtime(format!(
+                            "memory_pool(): duplicate argument '{k}'"
                         )));
                     }
                     slots[pos] = Some(v);
@@ -528,7 +560,76 @@ pub fn resolve_builtin_call_named(
                         leaf_nodes.push(leaf_idx);
                         leaf_tangents.push(tt);
                         tracked_args
-                            .push(Value::Tensor(pt.with_grad_node(Some((tape_id, leaf_idx)))));
+                            .push(Value::Tensor(pt.with_pushed_grad_node((tape_id, leaf_idx))));
+                    }
+                    (Value::Tensor(pt), tv) if pt.shape.is_empty() && pt.dtype.is_float() => {
+                        let (_, _, _, t_val) = match promote_scalar(&tv) {
+                            Ok(x) => x,
+                            Err(e) => {
+                                core.autograd.pop_tape(tape_id);
+                                return Err(e);
+                            }
+                        };
+                        if i == 0 {
+                            scalar_out_dtype = Some(pt.dtype);
+                        }
+                        let Some((_, leaf_idx)) = core.autograd.register_leaf(
+                            tape_id,
+                            Vec::new(),
+                            pt.dtype,
+                            pt.device.clone(),
+                        ) else {
+                            core.autograd.pop_tape(tape_id);
+                            return Err(MoraError::Runtime(
+                                "jvp: failed to allocate scalar autograd leaf".to_string(),
+                            ));
+                        };
+                        let t_tensor = crate::value::tensor::Tensor::from_raw(
+                            vec![t_val],
+                            Vec::new(),
+                            pt.dtype,
+                            pt.device.clone(),
+                            false,
+                        )?;
+                        leaf_nodes.push(leaf_idx);
+                        leaf_tangents.push(t_tensor);
+                        tracked_args
+                            .push(Value::Tensor(pt.with_pushed_grad_node((tape_id, leaf_idx))));
+                    }
+                    (pv, Value::Tensor(tt)) if tt.shape.is_empty() && tt.dtype.is_float() => {
+                        let (_, _, _, p_val) = match promote_scalar(&pv) {
+                            Ok(x) => x,
+                            Err(e) => {
+                                core.autograd.pop_tape(tape_id);
+                                return Err(e);
+                            }
+                        };
+                        if i == 0 {
+                            scalar_out_dtype = Some(tt.dtype);
+                        }
+                        let Some((_, leaf_idx)) = core.autograd.register_leaf(
+                            tape_id,
+                            Vec::new(),
+                            tt.dtype,
+                            tt.device.clone(),
+                        ) else {
+                            core.autograd.pop_tape(tape_id);
+                            return Err(MoraError::Runtime(
+                                "jvp: failed to allocate scalar autograd leaf".to_string(),
+                            ));
+                        };
+                        let p_tensor = crate::value::tensor::Tensor::from_raw(
+                            vec![p_val],
+                            Vec::new(),
+                            tt.dtype,
+                            tt.device.clone(),
+                            true,
+                        )?;
+                        leaf_nodes.push(leaf_idx);
+                        leaf_tangents.push(tt);
+                        tracked_args.push(Value::Tensor(
+                            p_tensor.with_pushed_grad_node((tape_id, leaf_idx)),
+                        ));
                     }
                     (pv, tv) => {
                         let (p_shape, p_dt, p_dev, p_val) = match promote_scalar(&pv) {
@@ -576,7 +677,7 @@ pub fn resolve_builtin_call_named(
                         leaf_nodes.push(leaf_idx);
                         leaf_tangents.push(t_tensor);
                         tracked_args.push(Value::Tensor(
-                            p_tensor.with_grad_node(Some((tape_id, leaf_idx))),
+                            p_tensor.with_pushed_grad_node((tape_id, leaf_idx)),
                         ));
                     }
                 }
@@ -653,7 +754,7 @@ pub fn resolve_builtin_call_named(
                     ));
                 };
                 leaf_nodes.push(leaf_idx);
-                tracked_args.push(Value::Tensor(t.with_grad_node(Some((tape_id, leaf_idx)))));
+                tracked_args.push(Value::Tensor(t.with_pushed_grad_node((tape_id, leaf_idx))));
             }
 
             Ok(CallAction::PushCombinator {
@@ -666,9 +767,9 @@ pub fn resolve_builtin_call_named(
             })
         }
         BuiltinFnId::KvAllocator => {
-            if args.len() < 4 || args.len() > 6 {
+            if args.len() < 4 || args.len() > 7 {
                 return Err(MoraError::Runtime(format!(
-                    "kv_allocator(total_pages, page_tokens, num_heads, head_dim, dtype?, device?) expects 4..=6 arguments, got {}",
+                    "kv_allocator(total_pages, page_tokens, num_heads, head_dim, dtype?, device?, max_bytes?) expects 4..=7 arguments, got {}",
                     args.len()
                 )));
             }
@@ -708,15 +809,50 @@ pub fn resolve_builtin_call_named(
                     )));
                 }
             };
-            let alloc = crate::runtime::kv_cache::KVPageAllocator::new(
+            let max_bytes = match args.get(6) {
+                None | Some(Value::Nil) => None,
+                Some(v) => Some(pos_usize(v, "max_bytes")?),
+            };
+            let alloc = crate::runtime::kv_cache::KVPageAllocator::new_with_quota(
                 total_pages,
                 page_tokens,
                 num_heads,
                 head_dim,
                 dtype,
                 device,
+                max_bytes,
             )?;
             Ok(CallAction::Done(Value::KVAllocator(alloc)))
+        }
+        BuiltinFnId::MemoryPool => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(MoraError::Runtime(format!(
+                    "memory_pool(max_bytes, device?) expects 1..=2 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let max_bytes = match &args[0] {
+                Value::Int(n) if *n > 0 => *n as usize,
+                other => {
+                    return Err(MoraError::Runtime(format!(
+                        "memory_pool: 'max_bytes' must be a positive integer, got {other}"
+                    )));
+                }
+            };
+            let device = match args.get(1) {
+                None | Some(Value::Nil) => crate::common::Device::Cpu,
+                Some(Value::String(s)) => {
+                    crate::common::Device::parse(s).map_err(MoraError::Runtime)?
+                }
+                Some(other) => {
+                    return Err(MoraError::Runtime(format!(
+                        "memory_pool: device must be string, got {}",
+                        crate::flow::type_name(other)
+                    )));
+                }
+            };
+            let pool = crate::runtime::memory_pool::MemoryPool::new(max_bytes, device)?;
+            Ok(CallAction::Done(Value::MemoryPool(pool)))
         }
         _ => unreachable!("all BuiltinFnId handled cleanly"),
     }
@@ -1050,8 +1186,9 @@ pub fn resolve_method_call_named(
         Value::Context(ctx) => resolve_context_method(&ctx, method, args, core),
         Value::TcpListener(l) => resolve_tcp_listener_method(&l, method, args, core),
         Value::TcpStream(s) => resolve_tcp_stream_method(&s, method, args, core),
-        Value::ComputeDag(dag) => resolve_compute_dag_method(&dag, method, args),
+        Value::ComputeDag(dag) => resolve_compute_dag_method(&dag, method, args, core),
         Value::KVAllocator(kv) => resolve_kv_allocator_method(&kv, method, args),
+        Value::MemoryPool(pool) => resolve_memory_pool_method(&pool, method, args),
         Value::List(list) => match method {
             "map" => {
                 let mapper = args
@@ -1560,16 +1697,18 @@ fn resolve_compute_dag_method(
     dag: &Arc<crate::runtime::compute_dag::TensorComputeDag>,
     method: &str,
     args: Vec<Value>,
+    core: &CoreRuntime,
 ) -> MoraResult<CallAction> {
     match method {
-        "fuse" => {
+        "fuse" | "compile" => {
             if !args.is_empty() {
                 return Err(MoraError::Runtime(format!(
-                    "ComputeDag.fuse() expects 0 arguments, got {}",
+                    "ComputeDag.{method}() expects 0 arguments, got {}",
                     args.len()
                 )));
             }
-            Ok(CallAction::Done(Value::ComputeDag(Arc::new(dag.fuse()))))
+            let compiled = dag.compile_with_cache(core.shared().dag_cache());
+            Ok(CallAction::Done(Value::ComputeDag(Arc::new(compiled))))
         }
         "run" => {
             let raw_inputs: Vec<Value> = if args.len() == 1
@@ -1605,7 +1744,7 @@ fn resolve_compute_dag_method(
                     }
                 }
             }
-            let out = dag.run(&tensors)?;
+            let out = dag.run_with_cache(core.shared().dag_cache(), &tensors)?;
             Ok(CallAction::Done(Value::Tensor(out)))
         }
         "node_count" => {
@@ -1653,8 +1792,150 @@ fn resolve_compute_dag_method(
             }
             Ok(CallAction::Done(Value::String(dag.to_dot())))
         }
+        "cache_key" => {
+            if !args.is_empty() {
+                return Err(MoraError::Runtime(
+                    "ComputeDag.cache_key() expects 0 arguments".to_string(),
+                ));
+            }
+            Ok(CallAction::Done(Value::String(format!(
+                "{:016x}",
+                dag.fingerprint()
+            ))))
+        }
+        "memory_plan" => {
+            if !args.is_empty() {
+                return Err(MoraError::Runtime(
+                    "ComputeDag.memory_plan() expects 0 arguments".to_string(),
+                ));
+            }
+            let mem = dag.memory_plan();
+            let mut m = std::collections::HashMap::new();
+            m.insert(
+                "total_intermediates".to_string(),
+                Value::Int(mem.total_intermediates as i64),
+            );
+            m.insert(
+                "buffer_slots".to_string(),
+                Value::Int(mem.buffer_slots as i64),
+            );
+            m.insert(
+                "naive_peak_bytes".to_string(),
+                Value::Int(mem.naive_peak_bytes as i64),
+            );
+            m.insert(
+                "planned_peak_bytes".to_string(),
+                Value::Int(mem.planned_peak_bytes as i64),
+            );
+            m.insert(
+                "reuse_count".to_string(),
+                Value::Int(mem.reuse_count as i64),
+            );
+            Ok(CallAction::Done(Value::Dict(m)))
+        }
+        "cache_stats" => {
+            if !args.is_empty() {
+                return Err(MoraError::Runtime(
+                    "ComputeDag.cache_stats() expects 0 arguments".to_string(),
+                ));
+            }
+            let stats = core.shared().dag_cache().stats();
+            let mut m = std::collections::HashMap::new();
+            m.insert("hits".to_string(), Value::Int(stats.hits as i64));
+            m.insert("misses".to_string(), Value::Int(stats.misses as i64));
+            m.insert("entries".to_string(), Value::Int(stats.entries as i64));
+            Ok(CallAction::Done(Value::Dict(m)))
+        }
+        "backend_info" => {
+            if !args.is_empty() {
+                return Err(MoraError::Runtime(
+                    "ComputeDag.backend_info() expects 0 arguments".to_string(),
+                ));
+            }
+            let dev = dag.output_device();
+            let backend = crate::runtime::compute_dag::backend_for_device(&dev);
+            let mut m = std::collections::HashMap::new();
+            m.insert("device".to_string(), Value::String(dev.to_string()));
+            m.insert(
+                "backend".to_string(),
+                Value::String(backend.name().to_string()),
+            );
+            m.insert(
+                "simd_isa".to_string(),
+                Value::String(backend.simd_isa().to_string()),
+            );
+            m.insert(
+                "worker_threads".to_string(),
+                Value::String(backend.worker_threads().to_string()),
+            );
+            Ok(CallAction::Done(Value::Dict(m)))
+        }
         _ => Err(MoraError::Runtime(format!(
             "ComputeDag has no method: {method}"
+        ))),
+    }
+}
+
+fn is_callable_value(v: &Value) -> bool {
+    matches!(
+        v,
+        Value::Closure { .. }
+            | Value::Task { .. }
+            | Value::Builtin(_)
+            | Value::Compose(_)
+            | Value::Partial(_, _)
+            | Value::Curry { .. }
+            | Value::GradFn { .. }
+            | Value::Continuation(_)
+    )
+}
+
+fn dispatch_with_watermarks(
+    final_result: Value,
+    mut fired: Vec<crate::runtime::kv_cache::TriggeredWatermark>,
+) -> CallAction {
+    if fired.is_empty() {
+        return CallAction::Done(final_result);
+    }
+    let (first_cb, first_event) = fired.remove(0);
+    CallAction::PushCombinator {
+        combinator: CombinatorFrame::WatermarkCallbacks {
+            final_result,
+            pending: fired,
+        },
+        callee: first_cb,
+        args: vec![Value::Dict(first_event)],
+    }
+}
+
+fn parse_shape_arg(val: &Value, ctx: &str) -> MoraResult<Vec<usize>> {
+    let Value::List(items) = val else {
+        return Err(MoraError::Runtime(format!(
+            "{ctx}: shape must be list<int>, got {}",
+            crate::flow::type_name(val)
+        )));
+    };
+    let mut dims = Vec::with_capacity(items.len());
+    for item in items.iter() {
+        match item {
+            Value::Int(n) if *n >= 0 => dims.push(*n as usize),
+            other => {
+                return Err(MoraError::Runtime(format!(
+                    "{ctx}: shape dimension must be non-negative int, got {other}"
+                )));
+            }
+        }
+    }
+    Ok(dims)
+}
+
+fn parse_f64_arg(val: &Value, ctx: &str, label: &str) -> MoraResult<f64> {
+    match val {
+        Value::Float(f) => Ok(*f),
+        Value::Int(n) => Ok(*n as f64),
+        Value::Scalar(s) => Ok(s.as_f64()),
+        other => Err(MoraError::Runtime(format!(
+            "{ctx}: '{label}' must be a number, got {other}"
         ))),
     }
 }
@@ -1672,6 +1953,14 @@ fn resolve_kv_allocator_method(
             ))),
         }
     };
+    let as_i64 = |v: &Value, label: &str| -> MoraResult<i64> {
+        match v {
+            Value::Int(n) => Ok(*n),
+            _ => Err(MoraError::Runtime(format!(
+                "kv_allocator.{method}: '{label}' must be an integer, got {v}"
+            ))),
+        }
+    };
     let as_usize = |v: &Value, label: &str| -> MoraResult<usize> {
         match v {
             Value::Int(n) if *n >= 0 => Ok(*n as usize),
@@ -1683,13 +1972,83 @@ fn resolve_kv_allocator_method(
 
     match method {
         "alloc_seq" => {
-            if args.len() != 1 {
+            if args.is_empty() || args.len() > 2 {
                 return Err(MoraError::Runtime(
-                    "kv_allocator.alloc_seq(seq_id) expects 1 argument".to_string(),
+                    "kv_allocator.alloc_seq(seq_id, priority?) expects 1..=2 arguments".to_string(),
                 ));
             }
             let seq_id = as_u64(&args[0], "seq_id")?;
-            Ok(CallAction::Done(Value::Bool(kv.alloc_seq(seq_id)?)))
+            let priority = match args.get(1) {
+                None | Some(Value::Nil) => 0,
+                Some(v) => as_i64(v, "priority")?,
+            };
+            Ok(CallAction::Done(Value::Bool(
+                kv.alloc_seq_with_priority(seq_id, priority)?,
+            )))
+        }
+        "set_priority" => {
+            if args.len() != 2 {
+                return Err(MoraError::Runtime(
+                    "kv_allocator.set_priority(seq_id, priority) expects 2 arguments".to_string(),
+                ));
+            }
+            let seq_id = as_u64(&args[0], "seq_id")?;
+            let priority = as_i64(&args[1], "priority")?;
+            kv.set_priority(seq_id, priority)?;
+            Ok(CallAction::Done(Value::Nil))
+        }
+        "seq_priority" => {
+            if args.len() != 1 {
+                return Err(MoraError::Runtime(
+                    "kv_allocator.seq_priority(seq_id) expects 1 argument".to_string(),
+                ));
+            }
+            let seq_id = as_u64(&args[0], "seq_id")?;
+            Ok(CallAction::Done(Value::Int(kv.seq_priority(seq_id)?)))
+        }
+        "set_quota" => {
+            if args.len() != 1 {
+                return Err(MoraError::Runtime(
+                    "kv_allocator.set_quota(max_bytes) expects 1 argument".to_string(),
+                ));
+            }
+            let max_bytes = as_usize(&args[0], "max_bytes")?;
+            kv.set_quota(max_bytes)?;
+            Ok(CallAction::Done(Value::Nil))
+        }
+        "quota_bytes" => {
+            if !args.is_empty() {
+                return Err(MoraError::Runtime(
+                    "kv_allocator.quota_bytes() expects 0 arguments".to_string(),
+                ));
+            }
+            Ok(CallAction::Done(Value::Int(kv.quota_bytes() as i64)))
+        }
+        "on_watermark" => {
+            if args.len() != 2 {
+                return Err(MoraError::Runtime(
+                    "kv_allocator.on_watermark(threshold, callback) expects 2 arguments"
+                        .to_string(),
+                ));
+            }
+            let threshold = parse_f64_arg(&args[0], "kv_allocator.on_watermark", "threshold")?;
+            if !is_callable_value(&args[1]) {
+                return Err(MoraError::Runtime(format!(
+                    "kv_allocator.on_watermark: 'callback' must be callable, got {}",
+                    crate::flow::type_name(&args[1])
+                )));
+            }
+            kv.register_watermark(threshold, args[1].clone())?;
+            Ok(CallAction::Done(Value::Nil))
+        }
+        "clear_watermarks" => {
+            if !args.is_empty() {
+                return Err(MoraError::Runtime(
+                    "kv_allocator.clear_watermarks() expects 0 arguments".to_string(),
+                ));
+            }
+            kv.clear_watermarks();
+            Ok(CallAction::Done(Value::Nil))
         }
         "append_tokens" => {
             if args.len() != 2 {
@@ -1699,12 +2058,12 @@ fn resolve_kv_allocator_method(
             }
             let seq_id = as_u64(&args[0], "seq_id")?;
             let count = as_usize(&args[1], "count")?;
-            let pages: Vec<Value> = kv
-                .append_tokens(seq_id, count)?
+            let (raw_pages, fired) = kv.append_tokens_with_watermarks(seq_id, count)?;
+            let pages: Vec<Value> = raw_pages
                 .into_iter()
                 .map(|p| Value::Int(p as i64))
                 .collect();
-            Ok(CallAction::Done(Value::List(pages.into())))
+            Ok(dispatch_with_watermarks(Value::List(pages.into()), fired))
         }
         "fork_seq" => {
             if args.len() != 2 {
@@ -1740,8 +2099,8 @@ fn resolve_kv_allocator_method(
                     "kv_allocator.write_kv: 'v' must be a Tensor".to_string(),
                 ));
             };
-            kv.write_kv(seq_id, token_pos, k, v)?;
-            Ok(CallAction::Done(Value::Nil))
+            let fired = kv.write_kv_with_watermarks(seq_id, token_pos, k, v)?;
+            Ok(dispatch_with_watermarks(Value::Nil, fired))
         }
         "read_kv" => {
             if args.len() != 1 {
@@ -1771,6 +2130,35 @@ fn resolve_kv_allocator_method(
                 ));
             }
             Ok(CallAction::Done(Value::Int(kv.evict_lru())))
+        }
+        "evict_preempt" => {
+            if args.len() > 1 {
+                return Err(MoraError::Runtime(
+                    "kv_allocator.evict_preempt(max_victim_priority?) expects 0..=1 arguments"
+                        .to_string(),
+                ));
+            }
+            let limit = match args.first() {
+                None | Some(Value::Nil) => None,
+                Some(v) => Some(as_i64(v, "max_victim_priority")?),
+            };
+            Ok(CallAction::Done(Value::Int(kv.evict_preempt(limit))))
+        }
+        "reclaim_for" => {
+            if args.len() != 2 {
+                return Err(MoraError::Runtime(
+                    "kv_allocator.reclaim_for(pages_needed, requester_priority) expects 2 arguments"
+                        .to_string(),
+                ));
+            }
+            let pages_needed = as_usize(&args[0], "pages_needed")?;
+            let req_prio = as_i64(&args[1], "requester_priority")?;
+            let evicted: Vec<Value> = kv
+                .reclaim_for(pages_needed, req_prio)
+                .into_iter()
+                .map(|id| Value::Int(id as i64))
+                .collect();
+            Ok(CallAction::Done(Value::List(evicted.into())))
         }
         "seq_pages" => {
             if args.len() != 1 {
@@ -1803,6 +2191,123 @@ fn resolve_kv_allocator_method(
         "stats" => Ok(CallAction::Done(Value::Dict(kv.stats_dict()))),
         _ => Err(MoraError::Runtime(format!(
             "KVAllocator has no method: {method}"
+        ))),
+    }
+}
+
+fn resolve_memory_pool_method(
+    pool: &Arc<crate::runtime::memory_pool::MemoryPool>,
+    method: &str,
+    args: Vec<Value>,
+) -> MoraResult<CallAction> {
+    let parse_dtype_opt = |opt: Option<&Value>, ctx: &str| -> MoraResult<crate::common::DType> {
+        match opt {
+            None | Some(Value::Nil) => Ok(crate::common::DType::F64),
+            Some(Value::String(s)) => crate::common::DType::from_name(s)
+                .ok_or_else(|| MoraError::Runtime(format!("{ctx}: unknown dtype '{s}'"))),
+            Some(other) => Err(MoraError::Runtime(format!(
+                "{ctx}: dtype must be string, got {}",
+                crate::flow::type_name(other)
+            ))),
+        }
+    };
+
+    match method {
+        "alloc" | "zeros" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(MoraError::Runtime(format!(
+                    "memory_pool.{method}(shape, dtype?) expects 1..=2 arguments"
+                )));
+            }
+            let ctx = format!("memory_pool.{method}");
+            let shape = parse_shape_arg(&args[0], &ctx)?;
+            let dtype = parse_dtype_opt(args.get(1), &ctx)?;
+            let (tensor, fired) = pool.alloc_tensor_with_watermarks(shape, dtype, 0.0)?;
+            Ok(dispatch_with_watermarks(Value::Tensor(tensor), fired))
+        }
+        "full" => {
+            if args.len() < 2 || args.len() > 3 {
+                return Err(MoraError::Runtime(
+                    "memory_pool.full(shape, value, dtype?) expects 2..=3 arguments".to_string(),
+                ));
+            }
+            let shape = parse_shape_arg(&args[0], "memory_pool.full")?;
+            let fill = parse_f64_arg(&args[1], "memory_pool.full", "value")?;
+            let dtype = parse_dtype_opt(args.get(2), "memory_pool.full")?;
+            let (tensor, fired) = pool.alloc_tensor_with_watermarks(shape, dtype, fill)?;
+            Ok(dispatch_with_watermarks(Value::Tensor(tensor), fired))
+        }
+        "release" => {
+            if args.len() != 1 {
+                return Err(MoraError::Runtime(
+                    "memory_pool.release(tensor) expects 1 argument".to_string(),
+                ));
+            }
+            let Value::Tensor(t) = &args[0] else {
+                return Err(MoraError::Runtime(format!(
+                    "memory_pool.release: expected Tensor, got {}",
+                    crate::flow::type_name(&args[0])
+                )));
+            };
+            Ok(CallAction::Done(Value::Int(pool.release_tensor(t)? as i64)))
+        }
+        "trim" => {
+            if !args.is_empty() {
+                return Err(MoraError::Runtime(
+                    "memory_pool.trim() expects 0 arguments".to_string(),
+                ));
+            }
+            Ok(CallAction::Done(Value::Int(pool.trim() as i64)))
+        }
+        "set_quota" => {
+            if args.len() != 1 {
+                return Err(MoraError::Runtime(
+                    "memory_pool.set_quota(max_bytes) expects 1 argument".to_string(),
+                ));
+            }
+            let max_bytes = match &args[0] {
+                Value::Int(n) if *n > 0 => *n as usize,
+                other => {
+                    return Err(MoraError::Runtime(format!(
+                        "memory_pool.set_quota: 'max_bytes' must be positive int, got {other}"
+                    )));
+                }
+            };
+            pool.set_quota(max_bytes)?;
+            Ok(CallAction::Done(Value::Nil))
+        }
+        "on_watermark" => {
+            if args.len() != 2 {
+                return Err(MoraError::Runtime(
+                    "memory_pool.on_watermark(threshold, callback) expects 2 arguments".to_string(),
+                ));
+            }
+            let threshold = parse_f64_arg(&args[0], "memory_pool.on_watermark", "threshold")?;
+            if !is_callable_value(&args[1]) {
+                return Err(MoraError::Runtime(format!(
+                    "memory_pool.on_watermark: 'callback' must be callable, got {}",
+                    crate::flow::type_name(&args[1])
+                )));
+            }
+            pool.register_watermark(threshold, args[1].clone())?;
+            Ok(CallAction::Done(Value::Nil))
+        }
+        "clear_watermarks" => {
+            if !args.is_empty() {
+                return Err(MoraError::Runtime(
+                    "memory_pool.clear_watermarks() expects 0 arguments".to_string(),
+                ));
+            }
+            pool.clear_watermarks();
+            Ok(CallAction::Done(Value::Nil))
+        }
+        "active_bytes" => Ok(CallAction::Done(Value::Int(pool.active_bytes() as i64))),
+        "cached_bytes" => Ok(CallAction::Done(Value::Int(pool.cached_bytes() as i64))),
+        "max_bytes" => Ok(CallAction::Done(Value::Int(pool.max_bytes() as i64))),
+        "utilization" => Ok(CallAction::Done(Value::Float(pool.utilization()))),
+        "stats" => Ok(CallAction::Done(Value::Dict(pool.stats_dict()))),
+        _ => Err(MoraError::Runtime(format!(
+            "MemoryPool has no method: {method}"
         ))),
     }
 }
@@ -1930,7 +2435,7 @@ pub fn resolve_value_call_named(
                             leaf_nodes.push(leaf_idx);
                             scalar_flags.push(None);
                             tracked_args[idx] =
-                                Value::Tensor(t.with_grad_node(Some((tape_id, leaf_idx))));
+                                Value::Tensor(t.with_pushed_grad_node((tape_id, leaf_idx)));
                         }
                         Value::Float(f) => {
                             let Some((_, leaf_idx)) = core.autograd.register_leaf(
@@ -1954,7 +2459,7 @@ pub fn resolve_value_call_named(
                                 true,
                             )?;
                             tracked_args[idx] =
-                                Value::Tensor(t.with_grad_node(Some((tape_id, leaf_idx))));
+                                Value::Tensor(t.with_pushed_grad_node((tape_id, leaf_idx)));
                         }
                         Value::Scalar(s) if s.dtype().is_float() => {
                             let dt = s.dtype();
@@ -1979,7 +2484,7 @@ pub fn resolve_value_call_named(
                                 true,
                             )?;
                             tracked_args[idx] =
-                                Value::Tensor(t.with_grad_node(Some((tape_id, leaf_idx))));
+                                Value::Tensor(t.with_pushed_grad_node((tape_id, leaf_idx)));
                         }
                         other => {
                             core.autograd.pop_tape(tape_id);

@@ -1205,7 +1205,10 @@ impl HMInference {
         if !named_args.is_empty() {
             if let Some(spec) = builtin_sig.as_ref()
                 && let WitnessCallee::Name(bname) | WitnessCallee::Var(bname) = callee
-                && (bname == "tcp_listen" || bname == "tcp_connect" || bname == "kv_allocator")
+                && (bname == "tcp_listen"
+                    || bname == "tcp_connect"
+                    || bname == "kv_allocator"
+                    || bname == "memory_pool")
             {
                 let pnames: Vec<String> = if bname == "tcp_listen" {
                     vec!["addr".to_string()]
@@ -1215,6 +1218,8 @@ impl HMInference {
                         "timeout_ms".to_string(),
                         "ctx".to_string(),
                     ]
+                } else if bname == "memory_pool" {
+                    vec!["max_bytes".to_string(), "device".to_string()]
                 } else {
                     vec![
                         "total_pages".to_string(),
@@ -1223,6 +1228,7 @@ impl HMInference {
                         "head_dim".to_string(),
                         "dtype".to_string(),
                         "device".to_string(),
+                        "max_bytes".to_string(),
                     ]
                 };
                 let fspec = FnParamSpec {
@@ -4228,26 +4234,35 @@ impl HMInference {
                                 span: Some(span),
                             }]);
                         }
-                        let ax0 = match args.first() {
-                            None => Some(cur_dims.len() - 2),
-                            Some(w) => Self::extract_static_int_literal(w)
-                                .filter(|&n| n >= 0)
-                                .map(|n| n as usize),
-                        };
-                        let ax1 = match args.get(1) {
-                            None => Some(cur_dims.len() - 1),
-                            Some(w) => Self::extract_static_int_literal(w)
-                                .filter(|&n| n >= 0)
-                                .map(|n| n as usize),
-                        };
+                        let rank_i = cur_dims.len() as i64;
+                        let resolve_axis =
+                            |opt: Option<&MirWitness>,
+                             default_ax: usize|
+                             -> Result<Option<usize>, Vec<TypeError>> {
+                                match opt {
+                                    None => Ok(Some(default_ax)),
+                                    Some(w) => {
+                                        let Some(raw) = Self::extract_static_int_literal(w) else {
+                                            return Ok(None);
+                                        };
+                                        let adj = if raw < 0 { raw + rank_i } else { raw };
+                                        if adj < 0 || adj >= rank_i {
+                                            return Err(vec![TypeError::UnificationFailure {
+                                                expected: format!(
+                                                    "transpose axis within [-{rank_i}, {})",
+                                                    rank_i - 1
+                                                ),
+                                                got: format!("axis {raw}"),
+                                                span: Some(w.span),
+                                            }]);
+                                        }
+                                        Ok(Some(adj as usize))
+                                    }
+                                }
+                            };
+                        let ax0 = resolve_axis(args.first(), cur_dims.len() - 2)?;
+                        let ax1 = resolve_axis(args.get(1), cur_dims.len() - 1)?;
                         if let (Some(a0), Some(a1)) = (ax0, ax1) {
-                            if a0 >= cur_dims.len() || a1 >= cur_dims.len() {
-                                return Err(vec![TypeError::UnificationFailure {
-                                    expected: format!("transpose axes < rank {}", cur_dims.len()),
-                                    got: format!("axes ({a0}, {a1})"),
-                                    span: Some(span),
-                                }]);
-                            }
                             let mut swapped = cur_dims.clone();
                             swapped.swap(a0, a1);
                             ShapeType::Ranked(swapped)

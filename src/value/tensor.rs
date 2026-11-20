@@ -58,6 +58,60 @@ impl AlignedByteBuffer {
         }
     }
 
+    /// Allocate a zero-initialized 64-byte aligned buffer backed by at least `cap_bytes` bytes (for slab pooling).
+    pub(crate) fn with_capacity_bytes(cap_bytes: usize, len: usize, dtype: DType) -> Self {
+        let byte_len = dtype.storage_bytes(len);
+        let num_blocks = cap_bytes.max(byte_len).div_ceil(64).max(1);
+        Self {
+            blocks: vec![AlignedCacheLine([0u8; 64]); num_blocks],
+            byte_len,
+            dtype,
+            len,
+        }
+    }
+
+    /// Lightweight zero-allocation sentinel left inside a [`TensorStorage`] after `MemoryPool.release`.
+    pub(crate) fn empty_detached(dtype: DType) -> Self {
+        Self {
+            blocks: Vec::new(),
+            byte_len: 0,
+            dtype,
+            len: 0,
+        }
+    }
+
+    /// Repurpose this physical 64-byte aligned buffer in place for `len` zeroed elements of `dtype`,
+    /// avoiding OS heap reallocation whenever existing block capacity suffices.
+    pub(crate) fn repurpose_zeroed(&mut self, len: usize, dtype: DType) {
+        let byte_len = dtype.storage_bytes(len);
+        let needed_blocks = byte_len.div_ceil(64).max(1);
+        if self.blocks.len() < needed_blocks {
+            self.blocks
+                .resize(needed_blocks, AlignedCacheLine([0u8; 64]));
+        }
+        for blk in self.blocks.iter_mut().take(needed_blocks) {
+            blk.0.fill(0);
+        }
+        self.byte_len = byte_len;
+        self.dtype = dtype;
+        self.len = len;
+    }
+
+    /// Repurpose this physical 64-byte aligned buffer in place filled with `val`.
+    pub(crate) fn repurpose_with_value(&mut self, len: usize, val: f64, dtype: DType) {
+        self.repurpose_zeroed(len, dtype);
+        if val != 0.0 {
+            for i in 0..len {
+                self.set_f64(i, val);
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn capacity_bytes(&self) -> usize {
+        self.blocks.len() * 64
+    }
+
     /// Allocate a compact buffer filled with `val` encoded into `dtype`.
     pub fn with_value(len: usize, val: f64, dtype: DType) -> Self {
         let mut buf = Self::zeroed(len, dtype);
@@ -142,7 +196,9 @@ impl AlignedByteBuffer {
 
     /// Decode element `idx` as `f64` for arithmetic kernels.
     pub fn get_f64(&self, idx: usize) -> f64 {
-        debug_assert!(idx < self.len);
+        if idx >= self.len {
+            return 0.0;
+        }
         match self.dtype {
             DType::F64 => f64::from_le_bytes(self.read_bytes::<8>(idx * 8)),
             DType::F32 => f32::from_le_bytes(self.read_bytes::<4>(idx * 4)) as f64,
@@ -180,7 +236,9 @@ impl AlignedByteBuffer {
     /// Decode element `idx` into its exact Mora runtime [`Value`] (`Value::Int`, `Value::Float`,
     /// `Value::Bool`, or `Value::Scalar(ScalarValue)`).
     pub fn get_value(&self, idx: usize) -> Value {
-        debug_assert!(idx < self.len);
+        if idx >= self.len {
+            return scalar_value_for_dtype(0.0, self.dtype);
+        }
         match self.dtype {
             DType::F64 => Value::Float(f64::from_le_bytes(self.read_bytes::<8>(idx * 8))),
             DType::F32 => Value::Scalar(ScalarValue::F32(f32::from_le_bytes(
@@ -363,6 +421,13 @@ impl TensorStorage {
         })
     }
 
+    /// Atomically detach and return the underlying 64-byte aligned buffer, leaving an empty
+    /// detached placeholder so any stale handle reads cleanly return `0.0` without UB.
+    pub(crate) fn detach_buffer(&self, dtype: DType) -> AlignedByteBuffer {
+        let mut guard = self.data.write();
+        std::mem::replace(&mut *guard, AlignedByteBuffer::empty_detached(dtype))
+    }
+
     /// Physical packed storage byte length.
     pub fn byte_len(&self) -> usize {
         self.data.read().byte_len()
@@ -385,8 +450,9 @@ pub struct Tensor {
     pub device: Device,
     pub requires_grad: bool,
     pub is_view: bool,
-    /// Stage 3C: Optional active reverse-mode autograd tape node `(tape_id, node_idx)`.
-    pub grad_node: Option<TapeNodeId>,
+    /// Stage 3C / Wave 4 P1: Active autograd tape nodes `(tape_id, node_idx)` tracking this tensor
+    /// across arbitrary nested differentiation levels (`grad(grad(f))`, `jvp(grad(f))`, `trace_dag(grad(f))`).
+    pub grad_nodes: Vec<TapeNodeId>,
 }
 
 /// Wave 3 Stage 3C: Runtime axis specification for zero-copy multi-dimensional slicing `t[0..4, :, -1]`.
@@ -492,7 +558,38 @@ impl Tensor {
             device,
             requires_grad,
             is_view: false,
-            grad_node: None,
+            grad_nodes: Vec::new(),
+        }))
+    }
+
+    /// Construct a contiguous compact tensor directly from a pooled 64-byte aligned buffer.
+    pub(crate) fn from_aligned_buffer(
+        buf: AlignedByteBuffer,
+        shape: Vec<usize>,
+        device: Device,
+        requires_grad: bool,
+    ) -> MoraResult<Arc<Self>> {
+        let expected = checked_numel(&shape)?;
+        if buf.len() != expected {
+            return Err(MoraError::Runtime(format!(
+                "Tensor buffer length {} does not match shape {:?} ({} elements)",
+                buf.len(),
+                shape,
+                expected
+            )));
+        }
+        let dtype = buf.dtype();
+        let strides = contiguous_strides(&shape);
+        Ok(Arc::new(Self {
+            storage: TensorStorage::new(buf),
+            shape,
+            strides,
+            offset: 0,
+            dtype,
+            device,
+            requires_grad,
+            is_view: false,
+            grad_nodes: Vec::new(),
         }))
     }
 
@@ -523,7 +620,7 @@ impl Tensor {
             device,
             requires_grad,
             is_view: false,
-            grad_node: None,
+            grad_nodes: Vec::new(),
         }))
     }
 
@@ -544,7 +641,7 @@ impl Tensor {
             device,
             requires_grad,
             is_view: false,
-            grad_node: None,
+            grad_nodes: Vec::new(),
         }))
     }
 
@@ -575,7 +672,7 @@ impl Tensor {
             device,
             requires_grad,
             is_view: false,
-            grad_node: None,
+            grad_nodes: Vec::new(),
         }))
     }
 
@@ -836,7 +933,7 @@ impl Tensor {
             device: self.device.clone(),
             requires_grad: self.requires_grad,
             is_view: true,
-            grad_node: None,
+            grad_nodes: Vec::new(),
         }))
     }
 
@@ -861,7 +958,7 @@ impl Tensor {
                 device: self.device.clone(),
                 requires_grad: self.requires_grad,
                 is_view: true,
-                grad_node: None,
+                grad_nodes: Vec::new(),
             }));
         }
         let vals = self.to_flat_values();
@@ -908,19 +1005,119 @@ impl Tensor {
         let mut cloned = (**self).clone();
         cloned.requires_grad = flag;
         if !flag {
-            cloned.grad_node = None;
+            cloned.grad_nodes.clear();
         }
         Arc::new(cloned)
     }
 
-    /// Return a copy of this tensor attached to an active autograd tape node.
-    pub fn with_grad_node(self: &Arc<Self>, node: Option<TapeNodeId>) -> Arc<Self> {
+    /// Look up this tensor's local node index on `tape_id`, if tracked by that tape.
+    #[inline]
+    pub(crate) fn node_on_tape(&self, tape_id: u64) -> Option<usize> {
+        self.grad_nodes
+            .iter()
+            .rev()
+            .find_map(|&(tid, idx)| if tid == tape_id { Some(idx) } else { None })
+    }
+
+    /// Return a copy of this tensor attached to all active tape nodes in `nodes`.
+    pub(crate) fn with_grad_nodes(self: &Arc<Self>, nodes: Vec<TapeNodeId>) -> Arc<Self> {
         let mut cloned = (**self).clone();
-        cloned.grad_node = node;
-        if node.is_some() {
+        if !nodes.is_empty() {
             cloned.requires_grad = true;
         }
+        cloned.grad_nodes = nodes;
         Arc::new(cloned)
+    }
+
+    /// Return a copy of this tensor preserving existing outer tape memberships and pushing `node`
+    /// for a newly entered inner tape (`grad(grad(f))`, `jvp(grad(f))`, `trace_dag(grad(f))`).
+    pub(crate) fn with_pushed_grad_node(self: &Arc<Self>, node: TapeNodeId) -> Arc<Self> {
+        let mut cloned = (**self).clone();
+        cloned.grad_nodes.retain(|&(tid, _)| tid != node.0);
+        cloned.grad_nodes.push(node);
+        cloned.requires_grad = true;
+        Arc::new(cloned)
+    }
+
+    /// Sum reduction along `axis` with optional multi-tape autograd tracking.
+    pub(crate) fn sum_axis_tracked(
+        self: &Arc<Self>,
+        axis: usize,
+        keepdim: bool,
+        autograd: Option<&mut AutogradContext>,
+    ) -> MoraResult<Arc<Self>> {
+        if axis >= self.shape.len() {
+            return Err(MoraError::Runtime(format!(
+                "Tensor.sum_axis: axis {axis} out of bounds for rank {}",
+                self.shape.len()
+            )));
+        }
+        let flat = self.to_flat_vec();
+        let out_shape = crate::runtime::autograd::sum_axis_output_shape(&self.shape, axis, keepdim);
+        let out_vals = crate::runtime::autograd::sum_axis_flat(&flat, &self.shape, axis, keepdim);
+        let out = Self::from_raw(out_vals, out_shape, self.dtype, self.device.clone(), false)?;
+        if let Some(ag) = autograd {
+            let orig = self.shape.clone();
+            return Ok(ag.record_unary(self, out, |src| TapeOp::SumAxis {
+                a: src,
+                axis,
+                keepdim,
+                orig_shape: orig.clone(),
+            }));
+        }
+        Ok(out)
+    }
+
+    /// Flat gather with optional multi-tape autograd tracking.
+    pub(crate) fn gather_tracked(
+        self: &Arc<Self>,
+        out_shape: Vec<usize>,
+        src_flat_indices: Vec<usize>,
+        autograd: Option<&mut AutogradContext>,
+    ) -> MoraResult<Arc<Self>> {
+        let flat = self.to_flat_vec();
+        let gathered: Vec<f64> = src_flat_indices
+            .iter()
+            .map(|&si| flat.get(si).copied().unwrap_or(0.0))
+            .collect();
+        let out = Self::from_raw(gathered, out_shape, self.dtype, self.device.clone(), false)?;
+        if let Some(ag) = autograd {
+            let src_numel = self.numel();
+            return Ok(ag.record_unary(self, out, |src| TapeOp::Gather {
+                a: src,
+                src_numel,
+                src_flat_indices: src_flat_indices.clone(),
+            }));
+        }
+        Ok(out)
+    }
+
+    /// Flat scatter-add (adjoint of `gather_tracked`) with optional multi-tape autograd tracking.
+    pub(crate) fn scatter_add_tracked(
+        self: &Arc<Self>,
+        out_shape: Vec<usize>,
+        dst_flat_indices: Vec<usize>,
+        autograd: Option<&mut AutogradContext>,
+    ) -> MoraResult<Arc<Self>> {
+        let out_numel = checked_numel(&out_shape)?;
+        let flat = self.to_flat_vec();
+        let scattered =
+            crate::runtime::autograd::scatter_add_flat(&flat, out_numel, &dst_flat_indices);
+        let out = Self::from_raw(
+            scattered,
+            out_shape.clone(),
+            self.dtype,
+            self.device.clone(),
+            false,
+        )?;
+        if let Some(ag) = autograd {
+            return Ok(ag.record_unary(self, out, |src| TapeOp::ScatterAdd {
+                a: src,
+                out_shape: out_shape.clone(),
+                dst_flat_indices: dst_flat_indices.clone(),
+            }));
+        }
+        Ok(out)
     }
 
     /// Resource / Autograd safety check before any in-place mutation (`fill_`, `add_`, `mul_`).
@@ -1120,9 +1317,9 @@ impl Tensor {
         )
     }
 
-    /// Index along axis 0 (`t[idx]`): supports negative indices and optional autograd tracking.
+    /// Index along axis 0 (`t[idx]`): supports negative indices and optional multi-tape autograd tracking.
     pub fn index_axis0_tracked(
-        &self,
+        self: &Arc<Self>,
         raw_idx: isize,
         autograd: Option<&mut AutogradContext>,
     ) -> MoraResult<Value> {
@@ -1142,65 +1339,59 @@ impl Tensor {
         let idx_u = idx as usize;
         let stride0 = self.strides[0];
         let base = (self.offset as isize) + (idx_u as isize) * stride0;
-        let tracked_src = autograd
-            .as_ref()
-            .and_then(|ag| ag.active_node_index(self.grad_node));
+        let is_tracked = autograd.as_ref().is_some_and(|ag| ag.is_tracked(self));
 
         if self.shape.len() == 1 {
-            if let (Some(ag), Some(src_node)) = (autograd, tracked_src) {
+            if let Some(ag) = autograd
+                && is_tracked
+            {
                 let val = self.storage.data.read().get_f64(base as usize);
-                let node = ag.record(
-                    TapeOp::Gather {
-                        a: src_node,
-                        src_numel: self.numel(),
-                        src_flat_indices: vec![idx_u],
-                    },
-                    Vec::new(),
-                    self.dtype,
-                    self.device.clone(),
-                );
                 let out =
                     Tensor::from_raw(vec![val], Vec::new(), self.dtype, self.device.clone(), true)?;
-                return Ok(Value::Tensor(out.with_grad_node(node)));
+                let src_numel = self.numel();
+                let tracked = ag.record_unary(self, out, |src_node| TapeOp::Gather {
+                    a: src_node,
+                    src_numel,
+                    src_flat_indices: vec![idx_u],
+                });
+                return Ok(Value::Tensor(tracked));
             }
             let guard = self.storage.data.read();
             Ok(guard.get_value(base as usize))
         } else {
             let new_shape = self.shape[1..].to_vec();
-            let grad_node = if let (Some(ag), Some(src_node)) = (autograd, tracked_src) {
-                let row_size: usize = new_shape.iter().copied().product::<usize>().max(1);
-                let start_flat = idx_u * row_size;
-                let indices: Vec<usize> = (start_flat..start_flat + row_size).collect();
-                ag.record(
-                    TapeOp::Gather {
-                        a: src_node,
-                        src_numel: self.numel(),
-                        src_flat_indices: indices,
-                    },
-                    new_shape.clone(),
-                    self.dtype,
-                    self.device.clone(),
-                )
-            } else {
-                None
-            };
-            Ok(Value::Tensor(Arc::new(Self {
+            let view = Arc::new(Self {
                 storage: Arc::clone(&self.storage),
-                shape: new_shape,
+                shape: new_shape.clone(),
                 strides: self.strides[1..].to_vec(),
                 offset: base as usize,
                 dtype: self.dtype,
                 device: self.device.clone(),
-                requires_grad: grad_node.is_some() || self.requires_grad,
+                requires_grad: self.requires_grad,
                 is_view: true,
-                grad_node,
-            })))
+                grad_nodes: Vec::new(),
+            });
+            if let Some(ag) = autograd
+                && is_tracked
+            {
+                let row_size: usize = new_shape.iter().copied().product::<usize>().max(1);
+                let start_flat = idx_u * row_size;
+                let indices: Vec<usize> = (start_flat..start_flat + row_size).collect();
+                let src_numel = self.numel();
+                let tracked = ag.record_unary(self, view, |src_node| TapeOp::Gather {
+                    a: src_node,
+                    src_numel,
+                    src_flat_indices: indices.clone(),
+                });
+                return Ok(Value::Tensor(tracked));
+            }
+            Ok(Value::Tensor(view))
         }
     }
 
     /// Stage 3C: Zero-copy multi-dimensional strided slicing `t[0..4, :, -1]`, `t[1:5:2, ..., None]`.
     pub fn slice_nd(
-        &self,
+        self: &Arc<Self>,
         axes: &[RuntimeSliceAxis],
         autograd: Option<&mut AutogradContext>,
     ) -> MoraResult<Value> {
@@ -1360,9 +1551,7 @@ impl Tensor {
             }
         }
 
-        let tracked_src = autograd
-            .as_ref()
-            .and_then(|ag| ag.active_node_index(self.grad_node));
+        let is_tracked = autograd.as_ref().is_some_and(|ag| ag.is_tracked(self));
 
         let build_gather_indices = || -> Vec<usize> {
             let out_numel: usize = new_shape.iter().copied().product::<usize>().max(1);
@@ -1392,59 +1581,57 @@ impl Tensor {
         };
 
         if new_shape.is_empty() {
-            if let (Some(ag), Some(src_node)) = (autograd, tracked_src) {
+            if let Some(ag) = autograd
+                && is_tracked
+            {
                 let indices = build_gather_indices();
                 let val = self.storage.data.read().get_f64(new_offset as usize);
-                let node = ag.record(
-                    TapeOp::Gather {
-                        a: src_node,
-                        src_numel: self.numel(),
-                        src_flat_indices: indices,
-                    },
-                    Vec::new(),
-                    self.dtype,
-                    self.device.clone(),
-                );
                 let out =
                     Tensor::from_raw(vec![val], Vec::new(), self.dtype, self.device.clone(), true)?;
-                return Ok(Value::Tensor(out.with_grad_node(node)));
+                let src_numel = self.numel();
+                let tracked = ag.record_unary(self, out, |src_node| TapeOp::Gather {
+                    a: src_node,
+                    src_numel,
+                    src_flat_indices: indices.clone(),
+                });
+                return Ok(Value::Tensor(tracked));
             }
             let guard = self.storage.data.read();
             return Ok(guard.get_value(new_offset as usize));
         }
 
-        let grad_node = if let (Some(ag), Some(src_node)) = (autograd, tracked_src) {
-            let indices = build_gather_indices();
-            ag.record(
-                TapeOp::Gather {
-                    a: src_node,
-                    src_numel: self.numel(),
-                    src_flat_indices: indices,
-                },
-                new_shape.clone(),
-                self.dtype,
-                self.device.clone(),
-            )
+        let indices_opt = if is_tracked {
+            Some(build_gather_indices())
         } else {
             None
         };
-
-        Ok(Value::Tensor(Arc::new(Self {
+        let view = Arc::new(Self {
             storage: Arc::clone(&self.storage),
             shape: new_shape,
             strides: new_strides,
             offset: new_offset as usize,
             dtype: self.dtype,
             device: self.device.clone(),
-            requires_grad: grad_node.is_some() || self.requires_grad,
+            requires_grad: self.requires_grad,
             is_view: true,
-            grad_node,
-        })))
+            grad_nodes: Vec::new(),
+        });
+        if let (Some(ag), Some(indices)) = (autograd, indices_opt) {
+            let src_numel = self.numel();
+            let tracked = ag.record_unary(self, view, |src_node| TapeOp::Gather {
+                a: src_node,
+                src_numel,
+                src_flat_indices: indices.clone(),
+            });
+            return Ok(Value::Tensor(tracked));
+        }
+
+        Ok(Value::Tensor(view))
     }
 
     /// Index along axis 0 (`t[idx]`): returns an exact scalar `Value` for 1D tensors or a
     /// zero-copy strided `(rank - 1)`-dimensional view `Value::Tensor` for ND (`rank >= 2`).
-    pub fn index_axis0(&self, idx: usize) -> MoraResult<Value> {
+    pub fn index_axis0(self: &Arc<Self>, idx: usize) -> MoraResult<Value> {
         self.index_axis0_tracked(idx as isize, None)
     }
 
@@ -1960,9 +2147,7 @@ pub fn call_tensor_method_tracked(
     args: &[Value],
     mut autograd: Option<&mut AutogradContext>,
 ) -> MoraResult<Value> {
-    let tracked_src = autograd
-        .as_ref()
-        .and_then(|ag| ag.active_node_index(t.grad_node));
+    let is_tracked = autograd.as_ref().is_some_and(|ag| ag.is_tracked(t));
     match method {
         "shape" => Ok(Value::List(
             t.shape
@@ -1980,14 +2165,12 @@ pub fn call_tensor_method_tracked(
         "is_contiguous" => Ok(Value::Bool(t.is_contiguous())),
         "contiguous" => {
             let out = t.contiguous()?;
-            if let (Some(ag), Some(src)) = (autograd.as_deref_mut(), tracked_src) {
-                let node = ag.record(
-                    TapeOp::Identity { a: src },
-                    out.shape.clone(),
-                    out.dtype,
-                    out.device.clone(),
-                );
-                return Ok(Value::Tensor(out.with_grad_node(node)));
+            if let Some(ag) = autograd.as_deref_mut()
+                && is_tracked
+            {
+                return Ok(Value::Tensor(
+                    ag.record_unary(t, out, |src| TapeOp::Identity { a: src }),
+                ));
             }
             Ok(Value::Tensor(out))
         }
@@ -2028,46 +2211,60 @@ pub fn call_tensor_method_tracked(
                 dims
             };
             let out = t.reshape(new_shape)?;
-            if let (Some(ag), Some(src)) = (autograd.as_deref_mut(), tracked_src) {
-                let node = ag.record(
+            if let Some(ag) = autograd.as_deref_mut()
+                && is_tracked
+            {
+                let orig = t.shape.clone();
+                return Ok(Value::Tensor(ag.record_unary(t, out, |src| {
                     TapeOp::Reshape {
                         a: src,
-                        orig_shape: t.shape.clone(),
-                    },
-                    out.shape.clone(),
-                    out.dtype,
-                    out.device.clone(),
-                );
-                return Ok(Value::Tensor(out.with_grad_node(node)));
+                        orig_shape: orig.clone(),
+                    }
+                })));
             }
             Ok(Value::Tensor(out))
         }
         "transpose" => {
+            let rank = t.shape.len();
+            let norm_axis = |v: &Value| -> MoraResult<usize> {
+                let raw = parse_num_arg(v, "Tensor.transpose")?;
+                if !raw.is_finite() || raw.fract() != 0.0 {
+                    return Err(MoraError::Runtime(format!(
+                        "Tensor.transpose: axis must be an integer, got {raw}"
+                    )));
+                }
+                let idx = raw as isize;
+                let resolved = if idx < 0 { idx + (rank as isize) } else { idx };
+                if resolved < 0 || (resolved as usize) >= rank {
+                    return Err(MoraError::Runtime(format!(
+                        "Tensor.transpose axis {idx} out of bounds for {rank}D tensor"
+                    )));
+                }
+                Ok(resolved as usize)
+            };
             let d0 = match args.first() {
                 None | Some(Value::Nil) => None,
-                Some(v) => Some(parse_num_arg(v, "Tensor.transpose")? as usize),
+                Some(v) => Some(norm_axis(v)?),
             };
             let d1 = match args.get(1) {
                 None | Some(Value::Nil) => None,
-                Some(v) => Some(parse_num_arg(v, "Tensor.transpose")? as usize),
+                Some(v) => Some(norm_axis(v)?),
             };
-            let rank = t.shape.len();
             let eff_d0 = d0.unwrap_or_else(|| rank.saturating_sub(2));
             let eff_d1 = d1.unwrap_or_else(|| rank.saturating_sub(1));
             let out = t.transpose(d0, d1)?;
-            if let (Some(ag), Some(src)) = (autograd.as_deref_mut(), tracked_src) {
-                let node = ag.record(
+            if let Some(ag) = autograd.as_deref_mut()
+                && is_tracked
+            {
+                let orig = t.shape.clone();
+                return Ok(Value::Tensor(ag.record_unary(t, out, |src| {
                     TapeOp::Transpose {
                         a: src,
                         dim0: eff_d0,
                         dim1: eff_d1,
-                        orig_shape: t.shape.clone(),
-                    },
-                    out.shape.clone(),
-                    out.dtype,
-                    out.device.clone(),
-                );
-                return Ok(Value::Tensor(out.with_grad_node(node)));
+                        orig_shape: orig.clone(),
+                    }
+                })));
             }
             Ok(Value::Tensor(out))
         }
@@ -2081,14 +2278,12 @@ pub fn call_tensor_method_tracked(
                 MoraError::Runtime(format!("Tensor.to_dtype: unknown dtype '{s}'"))
             })?;
             let out = t.to_dtype(dt)?;
-            if let (Some(ag), Some(src)) = (autograd.as_deref_mut(), tracked_src) {
-                let node = ag.record(
-                    TapeOp::Identity { a: src },
-                    out.shape.clone(),
-                    out.dtype,
-                    out.device.clone(),
-                );
-                return Ok(Value::Tensor(out.with_grad_node(node)));
+            if let Some(ag) = autograd.as_deref_mut()
+                && is_tracked
+            {
+                return Ok(Value::Tensor(
+                    ag.record_unary(t, out, |src| TapeOp::Identity { a: src }),
+                ));
             }
             Ok(Value::Tensor(out))
         }
@@ -2100,14 +2295,12 @@ pub fn call_tensor_method_tracked(
             };
             let dev = Device::parse(s).map_err(MoraError::Runtime)?;
             let out = t.to_device(dev)?;
-            if let (Some(ag), Some(src)) = (autograd.as_deref_mut(), tracked_src) {
-                let node = ag.record(
-                    TapeOp::Identity { a: src },
-                    out.shape.clone(),
-                    out.dtype,
-                    out.device.clone(),
-                );
-                return Ok(Value::Tensor(out.with_grad_node(node)));
+            if let Some(ag) = autograd.as_deref_mut()
+                && is_tracked
+            {
+                return Ok(Value::Tensor(
+                    ag.record_unary(t, out, |src| TapeOp::Identity { a: src }),
+                ));
             }
             Ok(Value::Tensor(out))
         }
@@ -2132,14 +2325,12 @@ pub fn call_tensor_method_tracked(
                     cur = cur.to_device(dev)?;
                 }
             }
-            if let (Some(ag), Some(src)) = (autograd.as_deref_mut(), tracked_src) {
-                let node = ag.record(
-                    TapeOp::Identity { a: src },
-                    cur.shape.clone(),
-                    cur.dtype,
-                    cur.device.clone(),
-                );
-                return Ok(Value::Tensor(cur.with_grad_node(node)));
+            if let Some(ag) = autograd.as_deref_mut()
+                && is_tracked
+            {
+                return Ok(Value::Tensor(
+                    ag.record_unary(t, cur, |src| TapeOp::Identity { a: src }),
+                ));
             }
             Ok(Value::Tensor(cur))
         }
@@ -2181,18 +2372,15 @@ pub fn call_tensor_method_tracked(
         "sum" => {
             let flat = t.to_flat_vec();
             let s: f64 = flat.iter().sum();
-            if let (Some(ag), Some(src)) = (autograd.as_deref_mut(), tracked_src) {
-                let node = ag.record(
-                    TapeOp::Sum {
-                        a: src,
-                        a_shape: t.shape.clone(),
-                    },
-                    Vec::new(),
-                    t.dtype,
-                    t.device.clone(),
-                );
+            if let Some(ag) = autograd.as_deref_mut()
+                && is_tracked
+            {
                 let out = Tensor::from_raw(vec![s], Vec::new(), t.dtype, t.device.clone(), true)?;
-                return Ok(Value::Tensor(out.with_grad_node(node)));
+                let a_shape = t.shape.clone();
+                return Ok(Value::Tensor(ag.record_unary(t, out, |src| TapeOp::Sum {
+                    a: src,
+                    a_shape: a_shape.clone(),
+                })));
             }
             Ok(scalar_value_for_dtype(s, t.dtype))
         }
@@ -2209,18 +2397,15 @@ pub fn call_tensor_method_tracked(
             } else {
                 DType::F64
             };
-            if let (Some(ag), Some(src)) = (autograd.as_deref_mut(), tracked_src) {
-                let node = ag.record(
-                    TapeOp::Mean {
-                        a: src,
-                        a_shape: t.shape.clone(),
-                    },
-                    Vec::new(),
-                    dt,
-                    t.device.clone(),
-                );
+            if let Some(ag) = autograd.as_deref_mut()
+                && is_tracked
+            {
                 let out = Tensor::from_raw(vec![m], Vec::new(), dt, t.device.clone(), true)?;
-                return Ok(Value::Tensor(out.with_grad_node(node)));
+                let a_shape = t.shape.clone();
+                return Ok(Value::Tensor(ag.record_unary(t, out, |src| TapeOp::Mean {
+                    a: src,
+                    a_shape: a_shape.clone(),
+                })));
             }
             Ok(scalar_value_for_dtype(m, dt))
         }
@@ -2259,19 +2444,18 @@ pub fn call_tensor_method_tracked(
         }
         "softmax" => {
             let out = t.softmax()?;
-            if let (Some(ag), Some(src)) = (autograd.as_deref_mut(), tracked_src) {
+            if let Some(ag) = autograd.as_deref_mut()
+                && is_tracked
+            {
                 let last_dim = t.shape.last().copied().unwrap_or(1);
-                let node = ag.record(
+                let out_vals = out.to_flat_vec();
+                return Ok(Value::Tensor(ag.record_unary(t, out, |src| {
                     TapeOp::Softmax {
                         a: src,
-                        out_vals: out.to_flat_vec(),
+                        out_vals: out_vals.clone(),
                         last_dim,
-                    },
-                    out.shape.clone(),
-                    out.dtype,
-                    out.device.clone(),
-                );
-                return Ok(Value::Tensor(out.with_grad_node(node)));
+                    }
+                })));
             }
             Ok(Value::Tensor(out))
         }
@@ -2281,20 +2465,19 @@ pub fn call_tensor_method_tracked(
                 Some(v) => parse_num_arg(v, "Tensor.rms_norm")?,
             };
             let out = t.rms_norm(eps)?;
-            if let (Some(ag), Some(src)) = (autograd.as_deref_mut(), tracked_src) {
+            if let Some(ag) = autograd.as_deref_mut()
+                && is_tracked
+            {
                 let last_dim = t.shape.last().copied().unwrap_or(1);
-                let node = ag.record(
+                let a_vals = t.to_flat_vec();
+                return Ok(Value::Tensor(ag.record_unary(t, out, |src| {
                     TapeOp::RmsNorm {
                         a: src,
-                        a_vals: t.to_flat_vec(),
+                        a_vals: a_vals.clone(),
                         last_dim,
                         eps,
-                    },
-                    out.shape.clone(),
-                    out.dtype,
-                    out.device.clone(),
-                );
-                return Ok(Value::Tensor(out.with_grad_node(node)));
+                    }
+                })));
             }
             Ok(Value::Tensor(out))
         }
@@ -2304,20 +2487,19 @@ pub fn call_tensor_method_tracked(
                 Some(v) => parse_num_arg(v, "Tensor.layer_norm")?,
             };
             let out = t.layer_norm(eps)?;
-            if let (Some(ag), Some(src)) = (autograd, tracked_src) {
+            if let Some(ag) = autograd
+                && is_tracked
+            {
                 let last_dim = t.shape.last().copied().unwrap_or(1);
-                let node = ag.record(
+                let a_vals = t.to_flat_vec();
+                return Ok(Value::Tensor(ag.record_unary(t, out, |src| {
                     TapeOp::LayerNorm {
                         a: src,
-                        a_vals: t.to_flat_vec(),
+                        a_vals: a_vals.clone(),
                         last_dim,
                         eps,
-                    },
-                    out.shape.clone(),
-                    out.dtype,
-                    out.device.clone(),
-                );
-                return Ok(Value::Tensor(out.with_grad_node(node)));
+                    }
+                })));
             }
             Ok(Value::Tensor(out))
         }
@@ -2328,15 +2510,13 @@ pub fn call_tensor_method_tracked(
     }
 }
 
-/// Evaluate unary mathematical / activation functions on a [`Tensor`] with optional autograd tracking.
+/// Evaluate unary mathematical / activation functions on a [`Tensor`] with optional multi-tape autograd tracking.
 pub fn eval_tensor_math_unary_tracked(
     t: &Arc<Tensor>,
     op: &str,
     autograd: Option<&mut AutogradContext>,
 ) -> MoraResult<Value> {
-    let tracked_src = autograd
-        .as_ref()
-        .and_then(|ag| ag.active_node_index(t.grad_node));
+    let is_tracked = autograd.as_ref().is_some_and(|ag| ag.is_tracked(t));
     let out = match op {
         "abs" => t.map_unary(|x| x.abs())?,
         "sqrt" => t.map_unary(|x| x.sqrt())?,
@@ -2358,61 +2538,66 @@ pub fn eval_tensor_math_unary_tracked(
             )));
         }
     };
-    if let (Some(ag), Some(src)) = (autograd, tracked_src) {
-        let tape_op = match op {
+    if let Some(ag) = autograd
+        && is_tracked
+    {
+        let payload = match op {
+            "sqrt" | "exp" | "tanh" | "sigmoid" => out.to_flat_vec(),
+            _ => t.to_flat_vec(),
+        };
+        let tracked = ag.record_unary(t, out, |src| match op {
             "abs" => TapeOp::Abs {
                 a: src,
-                a_vals: t.to_flat_vec(),
+                a_vals: payload.clone(),
             },
             "sqrt" => TapeOp::Sqrt {
                 a: src,
-                out_vals: out.to_flat_vec(),
+                out_vals: payload.clone(),
             },
             "exp" => TapeOp::Exp {
                 a: src,
-                out_vals: out.to_flat_vec(),
+                out_vals: payload.clone(),
             },
             "ln" | "log" => TapeOp::Ln {
                 a: src,
-                a_vals: t.to_flat_vec(),
+                a_vals: payload.clone(),
             },
             "sin" => TapeOp::Sin {
                 a: src,
-                a_vals: t.to_flat_vec(),
+                a_vals: payload.clone(),
             },
             "cos" => TapeOp::Cos {
                 a: src,
-                a_vals: t.to_flat_vec(),
+                a_vals: payload.clone(),
             },
             "relu" => TapeOp::Relu {
                 a: src,
-                a_vals: t.to_flat_vec(),
+                a_vals: payload.clone(),
             },
             "gelu" => TapeOp::Gelu {
                 a: src,
-                a_vals: t.to_flat_vec(),
+                a_vals: payload.clone(),
             },
             "silu" => TapeOp::Silu {
                 a: src,
-                a_vals: t.to_flat_vec(),
+                a_vals: payload.clone(),
             },
             "tanh" => TapeOp::Tanh {
                 a: src,
-                out_vals: out.to_flat_vec(),
+                out_vals: payload.clone(),
             },
             "sigmoid" => TapeOp::Sigmoid {
                 a: src,
-                out_vals: out.to_flat_vec(),
+                out_vals: payload.clone(),
             },
             _ => unreachable!(),
-        };
-        let node = ag.record(tape_op, out.shape.clone(), out.dtype, out.device.clone());
-        return Ok(Value::Tensor(out.with_grad_node(node)));
+        });
+        return Ok(Value::Tensor(tracked));
     }
     Ok(Value::Tensor(out))
 }
 
-/// Evaluate unary `-tensor` with optional autograd tracking.
+/// Evaluate unary `-tensor` with optional multi-tape autograd tracking.
 pub fn eval_tensor_neg_tracked(
     t: &Arc<Tensor>,
     autograd: Option<&mut AutogradContext>,
@@ -2424,17 +2609,12 @@ pub fn eval_tensor_neg_tracked(
         )));
     }
     let out = t.map_unary(|x| -x)?;
-    let tracked_src = autograd
-        .as_ref()
-        .and_then(|ag| ag.active_node_index(t.grad_node));
-    if let (Some(ag), Some(src)) = (autograd, tracked_src) {
-        let node = ag.record(
-            TapeOp::Neg { a: src },
-            out.shape.clone(),
-            out.dtype,
-            out.device.clone(),
-        );
-        return Ok(Value::Tensor(out.with_grad_node(node)));
+    if let Some(ag) = autograd
+        && ag.is_tracked(t)
+    {
+        return Ok(Value::Tensor(
+            ag.record_unary(t, out, |src| TapeOp::Neg { a: src }),
+        ));
     }
     Ok(Value::Tensor(out))
 }
@@ -2590,91 +2770,90 @@ pub fn eval_tensor_binary_tracked(
                 let vb = read_broadcast_elem(b, &out_shape, idx);
                 out.push(apply_scalar_op(op, va, vb, a.dtype)?);
             }
-            let na = autograd
+            let tracked_any = autograd
                 .as_ref()
-                .and_then(|ag| ag.active_node_index(a.grad_node));
-            let nb = autograd
-                .as_ref()
-                .and_then(|ag| ag.active_node_index(b.grad_node));
-            let grad_node = if (na.is_some() || nb.is_some())
-                && let Some(ag) = autograd.as_deref_mut()
-            {
-                let tape_op = match op {
-                    BinaryOp::Add => Some(TapeOp::Add {
-                        a: na,
-                        b: nb,
-                        a_const: if na.is_none() {
-                            Some(a.to_flat_vec())
-                        } else {
-                            None
-                        },
-                        b_const: if nb.is_none() {
-                            Some(b.to_flat_vec())
-                        } else {
-                            None
-                        },
-                        a_shape: a.shape.clone(),
-                        b_shape: b.shape.clone(),
-                    }),
-                    BinaryOp::Sub => Some(TapeOp::Sub {
-                        a: na,
-                        b: nb,
-                        a_const: if na.is_none() {
-                            Some(a.to_flat_vec())
-                        } else {
-                            None
-                        },
-                        b_const: if nb.is_none() {
-                            Some(b.to_flat_vec())
-                        } else {
-                            None
-                        },
-                        a_shape: a.shape.clone(),
-                        b_shape: b.shape.clone(),
-                    }),
-                    BinaryOp::Mul => Some(TapeOp::Mul {
-                        a: na,
-                        b: nb,
-                        a_vals: a.to_flat_vec(),
-                        b_vals: b.to_flat_vec(),
-                        a_shape: a.shape.clone(),
-                        b_shape: b.shape.clone(),
-                    }),
-                    BinaryOp::Div => Some(TapeOp::Div {
-                        a: na,
-                        b: nb,
-                        a_vals: a.to_flat_vec(),
-                        b_vals: b.to_flat_vec(),
-                        a_shape: a.shape.clone(),
-                        b_shape: b.shape.clone(),
-                    }),
-                    BinaryOp::Pow => Some(TapeOp::Pow {
-                        a: na,
-                        b: nb,
-                        a_vals: a.to_flat_vec(),
-                        b_vals: b.to_flat_vec(),
-                        out_vals: out.clone(),
-                        a_shape: a.shape.clone(),
-                        b_shape: b.shape.clone(),
-                    }),
-                    _ => None,
-                };
-                tape_op.and_then(|op| ag.record(op, out_shape.clone(), a.dtype, a.device.clone()))
-            } else {
-                None
-            };
+                .is_some_and(|ag| ag.is_tracked(a) || ag.is_tracked(b));
             let t = Tensor::from_raw(
-                out,
+                out.clone(),
                 out_shape,
                 a.dtype,
                 a.device.clone(),
-                grad_node.is_some() || a.requires_grad || b.requires_grad,
+                tracked_any || a.requires_grad || b.requires_grad,
             )?;
-            Ok(Value::Tensor(if grad_node.is_some() {
-                t.with_grad_node(grad_node)
-            } else {
-                t
-            }))
+            if tracked_any
+                && let Some(ag) = autograd.as_deref_mut()
+                && matches!(
+                    op,
+                    BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Pow
+                )
+            {
+                let a_vals = a.to_flat_vec();
+                let b_vals = b.to_flat_vec();
+                let a_shape = a.shape.clone();
+                let b_shape = b.shape.clone();
+                let tracked = ag.record_binary(a, b, t, |na, nb| match op {
+                    BinaryOp::Add => TapeOp::Add {
+                        a: na,
+                        b: nb,
+                        a_const: if na.is_none() {
+                            Some(a_vals.clone())
+                        } else {
+                            None
+                        },
+                        b_const: if nb.is_none() {
+                            Some(b_vals.clone())
+                        } else {
+                            None
+                        },
+                        a_shape: a_shape.clone(),
+                        b_shape: b_shape.clone(),
+                    },
+                    BinaryOp::Sub => TapeOp::Sub {
+                        a: na,
+                        b: nb,
+                        a_const: if na.is_none() {
+                            Some(a_vals.clone())
+                        } else {
+                            None
+                        },
+                        b_const: if nb.is_none() {
+                            Some(b_vals.clone())
+                        } else {
+                            None
+                        },
+                        a_shape: a_shape.clone(),
+                        b_shape: b_shape.clone(),
+                    },
+                    BinaryOp::Mul => TapeOp::Mul {
+                        a: na,
+                        b: nb,
+                        a_vals: a_vals.clone(),
+                        b_vals: b_vals.clone(),
+                        a_shape: a_shape.clone(),
+                        b_shape: b_shape.clone(),
+                    },
+                    BinaryOp::Div => TapeOp::Div {
+                        a: na,
+                        b: nb,
+                        a_vals: a_vals.clone(),
+                        b_vals: b_vals.clone(),
+                        a_shape: a_shape.clone(),
+                        b_shape: b_shape.clone(),
+                    },
+                    BinaryOp::Pow => TapeOp::Pow {
+                        a: na,
+                        b: nb,
+                        a_vals: a_vals.clone(),
+                        b_vals: b_vals.clone(),
+                        out_vals: out.clone(),
+                        a_shape: a_shape.clone(),
+                        b_shape: b_shape.clone(),
+                    },
+                    _ => unreachable!(),
+                });
+                return Ok(Value::Tensor(tracked));
+            }
+            Ok(Value::Tensor(t))
         }
         (Value::Tensor(t), scalar) => {
             let Some((s_dt, s_val)) = scalar_val_dtype_and_f64(scalar) else {
@@ -2696,55 +2875,53 @@ pub fn eval_tensor_binary_tracked(
             for &v in &flat {
                 out.push(apply_scalar_op(op, v, s_val, t.dtype)?);
             }
-            let na = autograd
-                .as_ref()
-                .and_then(|ag| ag.active_node_index(t.grad_node));
-            let grad_node = if let (Some(ag), Some(ia)) = (autograd.as_deref_mut(), na) {
-                let tape_op = match op {
-                    BinaryOp::Add => Some(TapeOp::AddScalar {
-                        a: ia,
-                        scalar: s_val,
-                    }),
-                    BinaryOp::Sub => Some(TapeOp::SubScalar {
-                        a: ia,
-                        scalar: s_val,
-                        reversed: false,
-                    }),
-                    BinaryOp::Mul => Some(TapeOp::MulScalar {
-                        a: ia,
-                        scalar: s_val,
-                    }),
-                    BinaryOp::Div => Some(TapeOp::DivScalar {
-                        a: ia,
-                        scalar: s_val,
-                        reversed: false,
-                        a_vals: flat,
-                    }),
-                    BinaryOp::Pow => Some(TapeOp::PowScalar {
-                        a: ia,
-                        scalar: s_val,
-                        reversed: false,
-                        a_vals: flat,
-                        out_vals: out.clone(),
-                    }),
-                    _ => None,
-                };
-                tape_op.and_then(|op| ag.record(op, t.shape.clone(), t.dtype, t.device.clone()))
-            } else {
-                None
-            };
+            let tracked_t = autograd.as_ref().is_some_and(|ag| ag.is_tracked(t));
             let res = Tensor::from_raw(
-                out,
+                out.clone(),
                 t.shape.clone(),
                 t.dtype,
                 t.device.clone(),
-                grad_node.is_some() || t.requires_grad,
+                tracked_t || t.requires_grad,
             )?;
-            Ok(Value::Tensor(if grad_node.is_some() {
-                res.with_grad_node(grad_node)
-            } else {
-                res
-            }))
+            if tracked_t
+                && let Some(ag) = autograd.as_deref_mut()
+                && matches!(
+                    op,
+                    BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Pow
+                )
+            {
+                let tracked = ag.record_unary(t, res, |ia| match op {
+                    BinaryOp::Add => TapeOp::AddScalar {
+                        a: ia,
+                        scalar: s_val,
+                    },
+                    BinaryOp::Sub => TapeOp::SubScalar {
+                        a: ia,
+                        scalar: s_val,
+                        reversed: false,
+                    },
+                    BinaryOp::Mul => TapeOp::MulScalar {
+                        a: ia,
+                        scalar: s_val,
+                    },
+                    BinaryOp::Div => TapeOp::DivScalar {
+                        a: ia,
+                        scalar: s_val,
+                        reversed: false,
+                        a_vals: flat.clone(),
+                    },
+                    BinaryOp::Pow => TapeOp::PowScalar {
+                        a: ia,
+                        scalar: s_val,
+                        reversed: false,
+                        a_vals: flat.clone(),
+                        out_vals: out.clone(),
+                    },
+                    _ => unreachable!(),
+                });
+                return Ok(Value::Tensor(tracked));
+            }
+            Ok(Value::Tensor(res))
         }
         (scalar, Value::Tensor(t)) => {
             let Some((s_dt, s_val)) = scalar_val_dtype_and_f64(scalar) else {
@@ -2766,55 +2943,53 @@ pub fn eval_tensor_binary_tracked(
             for &v in &flat {
                 out.push(apply_scalar_op(op, s_val, v, t.dtype)?);
             }
-            let na = autograd
-                .as_ref()
-                .and_then(|ag| ag.active_node_index(t.grad_node));
-            let grad_node = if let (Some(ag), Some(ia)) = (autograd, na) {
-                let tape_op = match op {
-                    BinaryOp::Add => Some(TapeOp::AddScalar {
-                        a: ia,
-                        scalar: s_val,
-                    }),
-                    BinaryOp::Sub => Some(TapeOp::SubScalar {
-                        a: ia,
-                        scalar: s_val,
-                        reversed: true,
-                    }),
-                    BinaryOp::Mul => Some(TapeOp::MulScalar {
-                        a: ia,
-                        scalar: s_val,
-                    }),
-                    BinaryOp::Div => Some(TapeOp::DivScalar {
-                        a: ia,
-                        scalar: s_val,
-                        reversed: true,
-                        a_vals: flat,
-                    }),
-                    BinaryOp::Pow => Some(TapeOp::PowScalar {
-                        a: ia,
-                        scalar: s_val,
-                        reversed: true,
-                        a_vals: flat,
-                        out_vals: out.clone(),
-                    }),
-                    _ => None,
-                };
-                tape_op.and_then(|op| ag.record(op, t.shape.clone(), t.dtype, t.device.clone()))
-            } else {
-                None
-            };
+            let tracked_t = autograd.as_ref().is_some_and(|ag| ag.is_tracked(t));
             let res = Tensor::from_raw(
-                out,
+                out.clone(),
                 t.shape.clone(),
                 t.dtype,
                 t.device.clone(),
-                grad_node.is_some() || t.requires_grad,
+                tracked_t || t.requires_grad,
             )?;
-            Ok(Value::Tensor(if grad_node.is_some() {
-                res.with_grad_node(grad_node)
-            } else {
-                res
-            }))
+            if tracked_t
+                && let Some(ag) = autograd
+                && matches!(
+                    op,
+                    BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Pow
+                )
+            {
+                let tracked = ag.record_unary(t, res, |ia| match op {
+                    BinaryOp::Add => TapeOp::AddScalar {
+                        a: ia,
+                        scalar: s_val,
+                    },
+                    BinaryOp::Sub => TapeOp::SubScalar {
+                        a: ia,
+                        scalar: s_val,
+                        reversed: true,
+                    },
+                    BinaryOp::Mul => TapeOp::MulScalar {
+                        a: ia,
+                        scalar: s_val,
+                    },
+                    BinaryOp::Div => TapeOp::DivScalar {
+                        a: ia,
+                        scalar: s_val,
+                        reversed: true,
+                        a_vals: flat.clone(),
+                    },
+                    BinaryOp::Pow => TapeOp::PowScalar {
+                        a: ia,
+                        scalar: s_val,
+                        reversed: true,
+                        a_vals: flat.clone(),
+                        out_vals: out.clone(),
+                    },
+                    _ => unreachable!(),
+                });
+                return Ok(Value::Tensor(tracked));
+            }
+            Ok(Value::Tensor(res))
         }
         _ => Err(MoraError::Runtime(format!(
             "Unsupported tensor binary operands: {} {:?} {}",
@@ -2830,7 +3005,7 @@ pub fn eval_tensor_matmul(left: &Value, right: &Value) -> MoraResult<Value> {
     eval_tensor_matmul_tracked(left, right, None)
 }
 
-/// Evaluate matrix/tensor contraction (`@`) with optional reverse-mode autograd tape recording.
+/// Evaluate matrix/tensor contraction (`@`) with optional multi-tape autograd tape recording.
 pub fn eval_tensor_matmul_tracked(
     left: &Value,
     right: &Value,
@@ -2864,13 +3039,9 @@ pub fn eval_tensor_matmul_tracked(
 
     let dt = a.dtype;
     let dev = a.device.clone();
-    let na = autograd
+    let tracked = autograd
         .as_ref()
-        .and_then(|ag| ag.active_node_index(a.grad_node));
-    let nb = autograd
-        .as_ref()
-        .and_then(|ag| ag.active_node_index(b.grad_node));
-    let tracked = na.is_some() || nb.is_some();
+        .is_some_and(|ag| ag.is_tracked(a) || ag.is_tracked(b));
     let req_grad = tracked || a.requires_grad || b.requires_grad;
 
     let attach = |out_data: Vec<f64>,
@@ -2879,29 +3050,21 @@ pub fn eval_tensor_matmul_tracked(
                   fb: Vec<f64>,
                   ag_opt: Option<&mut AutogradContext>|
      -> MoraResult<Value> {
-        let grad_node = if tracked && let Some(ag) = ag_opt {
-            ag.record(
-                TapeOp::MatMul {
-                    a: na,
-                    b: nb,
-                    a_vals: fa,
-                    b_vals: fb,
-                    a_shape: a.shape.clone(),
-                    b_shape: b.shape.clone(),
-                },
-                out_shape.clone(),
-                dt,
-                dev.clone(),
-            )
-        } else {
-            None
-        };
         let t = Tensor::from_raw(out_data, out_shape, dt, dev.clone(), req_grad)?;
-        Ok(Value::Tensor(if grad_node.is_some() {
-            t.with_grad_node(grad_node)
-        } else {
-            t
-        }))
+        if tracked && let Some(ag) = ag_opt {
+            let a_shape = a.shape.clone();
+            let b_shape = b.shape.clone();
+            let tracked_t = ag.record_binary(a, b, t, |na, nb| TapeOp::MatMul {
+                a: na,
+                b: nb,
+                a_vals: fa.clone(),
+                b_vals: fb.clone(),
+                a_shape: a_shape.clone(),
+                b_shape: b_shape.clone(),
+            });
+            return Ok(Value::Tensor(tracked_t));
+        }
+        Ok(Value::Tensor(t))
     };
 
     match (a.shape.as_slice(), b.shape.as_slice()) {

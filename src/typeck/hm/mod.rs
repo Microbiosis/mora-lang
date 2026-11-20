@@ -821,6 +821,7 @@ impl HMInference {
             "tcp_stream" | "tcpstream" => Type::TcpStream,
             "compute_dag" | "computedag" => Type::ComputeDag,
             "kv_allocator" | "kvallocator" => Type::KVAllocator,
+            "memory_pool" | "memorypool" => Type::MemoryPool,
             "list" => Type::List(Box::new(gen_tys.into_iter().next().unwrap_or(Type::Any))),
             "dict" => {
                 let mut it = gen_tys.into_iter();

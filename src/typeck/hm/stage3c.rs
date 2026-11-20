@@ -150,6 +150,7 @@ pub(super) fn canonical_target_name_of(ty: &Type) -> Option<String> {
         Type::TcpStream => Some("tcp_stream".to_string()),
         Type::ComputeDag => Some("compute_dag".to_string()),
         Type::KVAllocator => Some("kv_allocator".to_string()),
+        Type::MemoryPool => Some("memory_pool".to_string()),
         _ => None,
     }
 }

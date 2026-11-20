@@ -1,14 +1,17 @@
--- Pure-Mora HTTP/1.1 + Server-Sent Events (SSE) Standard Library (`std/net/http`)
+-- Pure-Mora HTTP/1.1 + Router + Chunked + Keep-Alive + SSE Standard Library (`std/net/http`)
 -- Built directly on Mora's Wave 2 async TCP primitives (`tcp_listen`, `tcp_connect`,
--- `tcp_listener`, `tcp_stream`, `spawn`, `context`).
+-- `tcp_listener`, `tcp_stream`, `spawn`, `context`) with zero Rust HTTP runtime coupling.
 
 export struct HttpRequest
   method: string = "GET"
   path: string = "/"
   query: string = ""
   headers: dict<string, string>
+  params: dict<string, string>
   body: string = ""
   raw_target: string = "/"
+  http_version: string = "HTTP/1.1"
+  too_large: bool = false
 end
 
 export struct HttpResponse
@@ -30,6 +33,28 @@ export struct HttpClientResponse
   body: string = ""
 end
 
+export struct RouteEntry
+  method: string
+  pattern: string
+  handler: any
+end
+
+export struct Router
+  routes: list<RouteEntry>
+  middlewares: list<any>
+end
+
+struct RouteMatch
+  matched: bool
+  params: dict<string, string>
+end
+
+struct ChunkedResult
+  body: string
+  too_large: bool
+  error: string
+end
+
 export task status_reason(code: int): string
   if code == 200 then
     return "OK"
@@ -39,6 +64,9 @@ export task status_reason(code: int): string
   end
   if code == 204 then
     return "No Content"
+  end
+  if code == 304 then
+    return "Not Modified"
   end
   if code == 400 then
     return "Bad Request"
@@ -55,8 +83,29 @@ export task status_reason(code: int): string
   if code == 405 then
     return "Method Not Allowed"
   end
+  if code == 408 then
+    return "Request Timeout"
+  end
+  if code == 411 then
+    return "Length Required"
+  end
+  if code == 413 then
+    return "Payload Too Large"
+  end
+  if code == 422 then
+    return "Unprocessable Entity"
+  end
+  if code == 429 then
+    return "Too Many Requests"
+  end
   if code == 500 then
     return "Internal Server Error"
+  end
+  if code == 502 then
+    return "Bad Gateway"
+  end
+  if code == 503 then
+    return "Service Unavailable"
   end
   return "OK"
 end
@@ -72,6 +121,72 @@ export task json_response(status: int, data: any): HttpResponse
   return HttpResponse(status=status, headers=hdrs, body=payload)
 end
 
+export task parse_hex_int(raw: string): int
+  let base = raw.split(";").get(0).trim().lower()
+  if base == "" then
+    return -1
+  end
+  let n = base.len()
+  let acc = 0
+  let i = 0
+  while i < n
+    let ch = str(base[i])
+    let d = -1
+    if ch == "0" then assign d = 0 end
+    if ch == "1" then assign d = 1 end
+    if ch == "2" then assign d = 2 end
+    if ch == "3" then assign d = 3 end
+    if ch == "4" then assign d = 4 end
+    if ch == "5" then assign d = 5 end
+    if ch == "6" then assign d = 6 end
+    if ch == "7" then assign d = 7 end
+    if ch == "8" then assign d = 8 end
+    if ch == "9" then assign d = 9 end
+    if ch == "a" then assign d = 10 end
+    if ch == "b" then assign d = 11 end
+    if ch == "c" then assign d = 12 end
+    if ch == "d" then assign d = 13 end
+    if ch == "e" then assign d = 14 end
+    if ch == "f" then assign d = 15 end
+    if d < 0 then
+      return -1
+    end
+    assign acc = acc * 16 + d
+    assign i = i + 1
+  end
+  return acc
+end
+
+export task int_to_hex(n: int): string
+  if n <= 0 then
+    return "0"
+  end
+  let digits = "0123456789abcdef"
+  let v = n
+  let out = ""
+  while v > 0
+    let rem = v % 16
+    assign out = str(digits[rem]) + out
+    assign v = v / 16
+  end
+  return out
+end
+
+export task encode_chunked_body(chunks: list<string>): string
+  let out = ""
+  for chunk in chunks
+    if chunk.len() > 0 then
+      assign out = out + int_to_hex(chunk.len()) + "\r\n" + chunk + "\r\n"
+    end
+  end
+  return out + "0\r\n\r\n"
+end
+
+export task chunked_response(status: int, chunks: list<string>, content_type: string = "text/plain; charset=utf-8"): HttpResponse
+  let hdrs: dict<string, string> = {"Content-Type": content_type, "Transfer-Encoding": "chunked"}
+  return HttpResponse(status=status, headers=hdrs, body=encode_chunked_body(chunks))
+end
+
 task join_tail(parts: list<string>, sep: string): string
   let n = parts.len()
   if n == 0 then
@@ -84,6 +199,134 @@ task join_tail(parts: list<string>, sep: string): string
     assign i = i + 1
   end
   return acc
+end
+
+task split_path_segments(p: string): list<string>
+  let out: list<string> = []
+  for seg in p.split("/")
+    if seg != "" then
+      assign out = out.push(seg)
+    end
+  end
+  return out
+end
+
+task match_route_pattern(pattern: string, path: string): RouteMatch
+  let p_segs = split_path_segments(pattern)
+  let r_segs = split_path_segments(path)
+  let p_len = p_segs.len()
+  let r_len = r_segs.len()
+  let params: dict<string, string> = {}
+  let i = 0
+  while i < p_len
+    let pseg = p_segs.get(i)
+    if pseg == "*" then
+      let tail = join_tail(r_segs.drop(i), "/")
+      assign params = params.set("*", tail)
+      return RouteMatch(matched=true, params=params)
+    end
+    if i >= r_len then
+      return RouteMatch(matched=false, params=params)
+    end
+    let rseg = r_segs.get(i)
+    if pseg.starts_with(":") and pseg.len() > 1 then
+      let pname = join_tail(pseg.split(":").drop(1), ":")
+      assign params = params.set(pname, rseg)
+    end
+    if !(pseg.starts_with(":") and pseg.len() > 1) and pseg != rseg then
+      return RouteMatch(matched=false, params=params)
+    end
+    assign i = i + 1
+  end
+  if r_len != p_len then
+    return RouteMatch(matched=false, params=params)
+  end
+  return RouteMatch(matched=true, params=params)
+end
+
+task run_middleware_chain(mws: list<any>, idx: int, req: HttpRequest, stream: tcp_stream, target: any): any
+  if idx >= mws.len() then
+    return target(req, stream)
+  end
+  let mw = mws.get(idx)
+  let next_fn = fn(r: HttpRequest, s: tcp_stream) run_middleware_chain(mws, idx + 1, r, s, target) end
+  return mw(req, stream, next_fn)
+end
+
+export task router(): Router
+  let rs: list<RouteEntry> = []
+  let ms: list<any> = []
+  return Router(routes=rs, middlewares=ms)
+end
+
+export impl Router
+  task route(self, method: string, pattern: string, handler: any): Router
+    let entry = RouteEntry(method=method.upper(), pattern=pattern, handler=handler)
+    return Router(routes=self.routes.push(entry), middlewares=self.middlewares)
+  end
+
+  task get(self, pattern: string, handler: any): Router
+    return self.route("GET", pattern, handler)
+  end
+
+  task post(self, pattern: string, handler: any): Router
+    return self.route("POST", pattern, handler)
+  end
+
+  task put(self, pattern: string, handler: any): Router
+    return self.route("PUT", pattern, handler)
+  end
+
+  task delete(self, pattern: string, handler: any): Router
+    return self.route("DELETE", pattern, handler)
+  end
+
+  task patch(self, pattern: string, handler: any): Router
+    return self.route("PATCH", pattern, handler)
+  end
+
+  task use_middleware(self, mw: any): Router
+    return Router(routes=self.routes, middlewares=self.middlewares.push(mw))
+  end
+
+  task handle(self, req: HttpRequest, stream: tcp_stream): any
+    let routes = self.routes
+    let mws = self.middlewares
+    let dispatch = fn(r: HttpRequest, s: tcp_stream)
+      let allowed: list<string> = []
+      let req_method = r.method.upper()
+      for entry in routes
+        let m = match_route_pattern(entry.pattern, r.path)
+        if m.matched then
+          if entry.method == req_method or entry.method == "*" then
+            let bound_req = HttpRequest(method=r.method, path=r.path, query=r.query, headers=r.headers, params=m.params, body=r.body, raw_target=r.raw_target, http_version=r.http_version, too_large=r.too_large)
+            let hfn = entry.handler
+            return hfn(bound_req, s)
+          end
+          assign allowed = allowed.push(entry.method)
+        end
+      end
+      if allowed.len() > 0 then
+        let allow_hdr = join_tail(allowed, ", ")
+        let hdrs: dict<string, string> = {"Content-Type": "text/plain; charset=utf-8", "Allow": allow_hdr}
+        return HttpResponse(status=405, headers=hdrs, body="Method Not Allowed")
+      end
+      return response(404, "Not Found")
+    end
+    return run_middleware_chain(mws, 0, req, stream, dispatch)
+  end
+
+  task serve_listener(self, listener: tcp_listener, max_requests: int = 0, ctx: any = nil, max_body_bytes: int = 1048576, max_keepalive_requests: int = 100): int
+    let h = fn(req: HttpRequest, stream: tcp_stream) self.handle(req, stream) end
+    return serve_listener(listener, h, max_requests, ctx, max_body_bytes, max_keepalive_requests)
+  end
+
+  task serve(self, addr: string, max_requests: int = 0, ctx: any = nil, max_body_bytes: int = 1048576, max_keepalive_requests: int = 100): int
+    let listener = tcp_listen(addr)
+    let count = self.serve_listener(listener, max_requests, ctx, max_body_bytes, max_keepalive_requests)
+    listener.close()
+    return count
+  end
 end
 
 task parse_headers_from_stream(stream: tcp_stream, ctx: any): dict<string, string>
@@ -120,15 +363,49 @@ task read_exact_body(stream: tcp_stream, content_len: int, ctx: any): string
   return body
 end
 
-export task read_request(stream: tcp_stream, ctx: any = nil): HttpRequest
+task read_chunked_body(stream: tcp_stream, max_body_bytes: int, ctx: any): ChunkedResult
+  let body = ""
+  while true
+    let size_line = stream.read_line(4096, ctx)
+    if size_line == "" then
+      break
+    end
+    let chunk_size = parse_hex_int(size_line)
+    if chunk_size < 0 then
+      return ChunkedResult(body="", too_large=false, error="invalid chunk size")
+    end
+    if chunk_size == 0 then
+      -- Consume optional trailing headers until blank CRLF line
+      while true
+        let trailer = stream.read_line(4096, ctx).trim()
+        if trailer == "" then
+          break
+        end
+      end
+      break
+    end
+    if max_body_bytes > 0 and body.len() + chunk_size > max_body_bytes then
+      return ChunkedResult(body="", too_large=true, error="payload too large")
+    end
+    let data = read_exact_body(stream, chunk_size, ctx)
+    assign body = body + data
+    -- Consume trailing CRLF after chunk payload
+    let _crlf = stream.read_line(64, ctx)
+  end
+  return ChunkedResult(body=body, too_large=false, error="")
+end
+
+export task read_request(stream: tcp_stream, ctx: any = nil, max_body_bytes: int = 1048576): HttpRequest
+  let empty_p: dict<string, string> = {}
   let start_line = stream.read_line(8192, ctx).trim()
   if start_line == "" then
     let empty_h: dict<string, string> = {}
-    return HttpRequest(method="", path="", query="", headers=empty_h, body="", raw_target="")
+    return HttpRequest(method="", path="", query="", headers=empty_h, params=empty_p, body="", raw_target="", http_version="HTTP/1.1", too_large=false)
   end
   let parts = start_line.split(" ")
   let method = parts.get(0).upper()
   let raw_target = if parts.len() >= 2 then parts.get(1) else "/" end
+  let http_version = if parts.len() >= 3 then parts.get(2).upper() else "HTTP/1.1" end
   let path = raw_target
   let query = ""
   if raw_target.contains("?") then
@@ -137,42 +414,88 @@ export task read_request(stream: tcp_stream, ctx: any = nil): HttpRequest
     assign query = join_tail(qp.drop(1), "?")
   end
   let hdrs = parse_headers_from_stream(stream, ctx)
+  let te_str = hdrs.get("transfer-encoding")
   let cl_str = hdrs.get("content-length")
   let body = ""
-  if cl_str != nil then
-    let clen = int(cl_str.trim())
-    assign body = read_exact_body(stream, clen, ctx)
+  let too_large = false
+  let is_chunked = te_str != nil and te_str.lower().contains("chunked")
+  if is_chunked then
+    let cr = read_chunked_body(stream, max_body_bytes, ctx)
+    if cr.too_large then
+      assign too_large = true
+    end
+    if !cr.too_large then
+      assign body = cr.body
+    end
   end
-  return HttpRequest(method=method, path=path, query=query, headers=hdrs, body=body, raw_target=raw_target)
+  if !is_chunked and cl_str != nil then
+    let clen = int(cl_str.trim())
+    if max_body_bytes > 0 and clen > max_body_bytes then
+      assign too_large = true
+    end
+    if !(max_body_bytes > 0 and clen > max_body_bytes) then
+      assign body = read_exact_body(stream, clen, ctx)
+    end
+  end
+  return HttpRequest(method=method, path=path, query=query, headers=hdrs, params=empty_p, body=body, raw_target=raw_target, http_version=http_version, too_large=too_large)
 end
 
-export task write_response(stream: tcp_stream, resp: HttpResponse, ctx: any = nil): nil
+task should_keep_alive(req: HttpRequest, allow_keep_alive: bool): bool
+  if !allow_keep_alive or req.too_large then
+    return false
+  end
+  let conn_hdr = req.headers.get("connection")
+  if req.http_version == "HTTP/1.0" then
+    return conn_hdr != nil and conn_hdr.lower().contains("keep-alive")
+  end
+  if conn_hdr != nil and conn_hdr.lower().contains("close") then
+    return false
+  end
+  return true
+end
+
+export task write_response(stream: tcp_stream, resp: HttpResponse, ctx: any = nil, keep_alive: bool = false): nil
   let reason = status_reason(resp.status)
   let out = "HTTP/1.1 " + str(resp.status) + " " + reason + "\r\n"
   let has_cl = false
   let has_conn = false
+  let is_chunked = false
+  let explicit_close = false
   for k in resp.headers.keys()
     let lk = k.lower()
+    let v = resp.headers.get(k)
     if lk == "content-length" then
       assign has_cl = true
     end
+    if lk == "transfer-encoding" and v != nil and str(v).lower().contains("chunked") then
+      assign is_chunked = true
+    end
     if lk == "connection" then
       assign has_conn = true
+      if v != nil and str(v).lower().contains("close") then
+        assign explicit_close = true
+      end
     end
-    let v = resp.headers.get(k)
     if v != nil then
       assign out = out + k + ": " + str(v) + "\r\n"
     end
   end
-  if !has_cl then
+  if !has_cl and !is_chunked then
     assign out = out + "Content-Length: " + str(resp.body.len()) + "\r\n"
   end
+  let effective_keep = keep_alive and !explicit_close
   if !has_conn then
-    assign out = out + "Connection: close\r\n"
+    if effective_keep then
+      assign out = out + "Connection: keep-alive\r\n"
+    else
+      assign out = out + "Connection: close\r\n"
+    end
   end
   assign out = out + "\r\n" + resp.body
   stream.write(out, ctx)
-  stream.shutdown()
+  if !effective_keep then
+    stream.shutdown()
+  end
   return nil
 end
 
@@ -240,74 +563,126 @@ export task sse_read_event(stream: tcp_stream, ctx: any = nil): SseEvent
   return SseEvent(event=ev_name, data=ev_data, id=ev_id)
 end
 
-export task serve_listener(listener: tcp_listener, handler: any, max_requests: int = 0, ctx: any = nil): int
-  let served = 0
+export task serve_listener(listener: tcp_listener, handler: any, max_requests: int = 0, ctx: any = nil, max_body_bytes: int = 1048576, max_keepalive_requests: int = 100): int
+  let accepted = 0
   let workers: list<task_handle<any>> = []
-  while max_requests <= 0 or served < max_requests
+  while max_requests <= 0 or accepted < max_requests
     if ctx != nil and ctx.is_cancelled() then
       break
     end
     let stream = listener.accept(ctx)
-    assign served = served + 1
+    assign accepted = accepted + 1
     let h = spawn fn()
-      let req = read_request(stream, ctx)
-      if req.method != "" then
+      let conn_reqs = 0
+      let limit = if max_keepalive_requests > 0 then max_keepalive_requests else 1 end
+      while conn_reqs < limit
+        if ctx != nil and ctx.is_cancelled() then
+          break
+        end
+        let req = read_request(stream, ctx, max_body_bytes)
+        if req.method == "" then
+          break
+        end
+        assign conn_reqs = conn_reqs + 1
+        if req.too_large then
+          write_response(stream, response(413, "Payload Too Large"), ctx, false)
+          break
+        end
+        let keep = should_keep_alive(req, conn_reqs < limit)
         let res = handler(req, stream)
         if is_instance(res, "HttpResponse") then
-          write_response(stream, res, ctx)
+          write_response(stream, res, ctx, keep)
+          if !keep then
+            break
+          end
+        else
+          -- Handler took raw stream ownership (e.g. SSE streaming)
+          break
         end
       end
       stream.close()
-      return nil
+      return conn_reqs
     end
     assign workers = workers.push(h)
   end
+  let total_served = 0
   for w in workers
-    w.join()
+    let cnt = w.join()
+    if type_of(cnt) == "int" then
+      assign total_served = total_served + int(str(cnt))
+    end
   end
-  return served
+  return total_served
 end
 
-export task serve(addr: string, handler: any, max_requests: int = 0, ctx: any = nil): int
+export task serve(addr: string, handler: any, max_requests: int = 0, ctx: any = nil, max_body_bytes: int = 1048576, max_keepalive_requests: int = 100): int
   let listener = tcp_listen(addr)
-  let count = serve_listener(listener, handler, max_requests, ctx)
+  let count = serve_listener(listener, handler, max_requests, ctx, max_body_bytes, max_keepalive_requests)
   listener.close()
   return count
 end
 
-task read_http_response(stream: tcp_stream, ctx: any): HttpClientResponse
+export task read_http_response(stream: tcp_stream, ctx: any = nil, max_body_bytes: int = 0): HttpClientResponse
   let status_line = stream.read_line(8192, ctx).trim()
   let parts = status_line.split(" ")
   let code = if parts.len() >= 2 then int(parts.get(1)) else 200 end
   let reason = if parts.len() >= 3 then join_tail(parts.drop(2), " ") else "OK" end
   let hdrs = parse_headers_from_stream(stream, ctx)
+  let te_str = hdrs.get("transfer-encoding")
   let cl_str = hdrs.get("content-length")
   let body = ""
-  if cl_str != nil then
+  let is_chunked = te_str != nil and te_str.lower().contains("chunked")
+  if is_chunked then
+    let cr = read_chunked_body(stream, max_body_bytes, ctx)
+    assign body = cr.body
+  end
+  if !is_chunked and cl_str != nil then
     let clen = int(cl_str.trim())
     assign body = read_exact_body(stream, clen, ctx)
   end
-  if cl_str == nil then
-    while true
-      let chunk = stream.read(65536, ctx)
-      if chunk == "" then
-        break
+  if !is_chunked and cl_str == nil and code != 204 and code != 304 then
+    let conn_h = hdrs.get("connection")
+    if conn_h == nil or !conn_h.lower().contains("keep-alive") then
+      while true
+        let chunk = stream.read(65536, ctx)
+        if chunk == "" then
+          break
+        end
+        assign body = body + chunk
       end
-      assign body = body + chunk
     end
   end
   return HttpClientResponse(status=code, status_text=reason, headers=hdrs, body=body)
 end
 
-export task request(method: string, addr: string, path: string, body: string = "", content_type: string = "application/json", timeout_ms: int = 5000): HttpClientResponse
-  let stream = tcp_connect(addr, timeout_ms)
-  let req = method.upper() + " " + path + " HTTP/1.1\r\nHost: " + addr + "\r\nConnection: close\r\n"
+export task send_request_on(stream: tcp_stream, method: string, host: string, path: string, body: string = "", content_type: string = "application/json", keep_alive: bool = true, ctx: any = nil): HttpClientResponse
+  let conn_val = if keep_alive then "keep-alive" else "close" end
+  let req = method.upper() + " " + path + " HTTP/1.1\r\nHost: " + host + "\r\nConnection: " + conn_val + "\r\n"
   if body != "" then
     assign req = req + "Content-Type: " + content_type + "\r\nContent-Length: " + str(body.len()) + "\r\n"
   end
   assign req = req + "\r\n" + body
-  stream.write(req)
-  let resp = read_http_response(stream, nil)
+  stream.write(req, ctx)
+  return read_http_response(stream, ctx, 0)
+end
+
+export task send_chunked_request_on(stream: tcp_stream, method: string, host: string, path: string, chunks: list<string>, content_type: string = "text/plain", keep_alive: bool = false, ctx: any = nil): HttpClientResponse
+  let conn_val = if keep_alive then "keep-alive" else "close" end
+  let req = method.upper() + " " + path + " HTTP/1.1\r\nHost: " + host + "\r\nConnection: " + conn_val + "\r\nContent-Type: " + content_type + "\r\nTransfer-Encoding: chunked\r\n\r\n" + encode_chunked_body(chunks)
+  stream.write(req, ctx)
+  return read_http_response(stream, ctx, 0)
+end
+
+export task request(method: string, addr: string, path: string, body: string = "", content_type: string = "application/json", timeout_ms: int = 5000): HttpClientResponse
+  let stream = tcp_connect(addr, timeout_ms)
+  let resp = send_request_on(stream, method, addr, path, body, content_type, false, nil)
+  stream.close()
+  return resp
+end
+
+export task post_chunked(addr: string, path: string, chunks: list<string>, content_type: string = "text/plain", timeout_ms: int = 5000): HttpClientResponse
+  let stream = tcp_connect(addr, timeout_ms)
+  let resp = send_chunked_request_on(stream, "POST", addr, path, chunks, content_type, false, nil)
   stream.close()
   return resp
 end

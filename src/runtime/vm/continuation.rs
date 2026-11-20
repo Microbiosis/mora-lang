@@ -211,6 +211,12 @@ pub enum CombinatorFrame {
         pending_defaults: Vec<(String, FnId)>,
         current_field: String,
     },
+    /// Wave 4 P1: Dispatches rising-edge memory watermark callbacks outside allocator locks
+    /// on the stackful VM frame stack before yielding `final_result`.
+    WatermarkCallbacks {
+        final_result: Value,
+        pending: Vec<(Value, HashMap<String, Value>)>,
+    },
 }
 
 /// Snapshot & compensation state for `ControlInst::Transaction`.

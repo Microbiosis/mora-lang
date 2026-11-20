@@ -1,6 +1,8 @@
 -- Pure-Mora Model Context Protocol (MCP) Standard Library (`std/mcp`)
--- Implements JSON-RPC 2.0 MCP server (initialize, ping, tools/list, tools/call,
--- resources/list, resources/read) over HTTP + SSE using `std/net/http`.
+-- Implements JSON-RPC 2.0 MCP server (initialize, ping, notifications/initialized,
+-- tools/list, tools/call with JSON Schema validation, resources/list, resources/read,
+-- prompts/list, prompts/get) over HTTP+SSE (`std/net/http`) and Stdio NDJSON transports,
+-- plus automatic `Struct::schema()` -> JSON Schema binding.
 
 import "std/net/http"
 
@@ -19,17 +21,199 @@ export struct McpResource
   reader: any
 end
 
+export struct McpPrompt
+  name: string
+  description: string
+  arguments: list<dict<string, any>>
+  handler: any
+end
+
 export struct McpServer
   name: string = "mora-mcp"
   version: string = "0.1.0"
   tools: dict<string, McpTool>
   resources: dict<string, McpResource>
+  prompts: dict<string, McpPrompt>
+end
+
+export task prompt_arg(name: string, description: string = "", required: bool = true): dict<string, any>
+  let arg: dict<string, any> = {}
+  assign arg = arg.set("name", name).set("description", description).set("required", required)
+  return arg
 end
 
 export task server(name: string = "mora-mcp", version: string = "0.1.0"): McpServer
   let t: dict<string, McpTool> = {}
   let r: dict<string, McpResource> = {}
-  return McpServer(name=name, version=version, tools=t, resources=r)
+  let p: dict<string, McpPrompt> = {}
+  return McpServer(name=name, version=version, tools=t, resources=r, prompts=p)
+end
+
+task slice_str(s: string, start: int, end_excl: int): string
+  let out = ""
+  let i = start
+  let n = s.len()
+  let lim = if end_excl < n then end_excl else n end
+  while i < lim
+    assign out = out + str(s[i])
+    assign i = i + 1
+  end
+  return out
+end
+
+export task mora_type_to_json_schema(mora_ty: string): dict<string, any>
+  let ty = mora_ty.trim().lower()
+  let out: dict<string, any> = {}
+  if ty == "int" or ty == "i64" or ty == "i32" or ty == "i16" or ty == "i8" or ty == "i4" or ty == "u64" or ty == "u32" or ty == "u16" or ty == "u8" then
+    return out.set("type", "integer")
+  end
+  if ty == "float" or ty == "f64" or ty == "f32" or ty == "f16" or ty == "bf16" or ty == "fp8" or ty == "number" then
+    return out.set("type", "number")
+  end
+  if ty == "string" or ty == "char" then
+    return out.set("type", "string")
+  end
+  if ty == "bool" then
+    return out.set("type", "boolean")
+  end
+  if ty.starts_with("list<") and ty.ends_with(">") then
+    let inner = slice_str(ty, 5, ty.len() - 1)
+    return out.set("type", "array").set("items", mora_type_to_json_schema(inner))
+  end
+  if ty == "list" then
+    return out.set("type", "array")
+  end
+  if ty == "dict" or ty.starts_with("dict<") then
+    return out.set("type", "object")
+  end
+  return out
+end
+
+-- Convert a nominal Mora struct's `MyStruct::schema()` metadata (including `@tag(json=..., desc=..., optional=...)`
+-- and default field flags) into a standard MCP JSON Schema object.
+export task schema_from_struct(struct_schema: dict<string, any>): dict<string, any>
+  let sname = struct_schema.get("name")
+  let fields = struct_schema.get("fields")
+  let props: dict<string, any> = {}
+  let req_fields: list<string> = []
+  if fields != nil and type_of(fields) == "list" then
+    let flist: any = fields
+    for f in flist
+      let fname = str(f.get("name"))
+      let ftype = str(f.get("type"))
+      let has_def = f.get("has_default") == true
+      let tags = f.get("tags")
+      let prop_name = fname
+      let prop_schema = mora_type_to_json_schema(ftype)
+      let tag_optional = false
+      let tag_skip = false
+      if tags != nil and type_of(tags) == "dict" then
+        let json_alias = tags.get("json")
+        if json_alias != nil and str(json_alias) != "" then
+          let jraw = str(json_alias).trim()
+          if jraw == "-" then
+            assign tag_skip = true
+          end
+          if !tag_skip then
+            let jparts = jraw.split(",")
+            let jname = jparts.get(0).trim()
+            if jname != "" then
+              assign prop_name = jname
+            end
+            for jp in jparts.drop(1)
+              if jp.trim() == "omitempty" then
+                assign tag_optional = true
+              end
+            end
+          end
+        end
+        let desc = tags.get("desc")
+        let desc2 = tags.get("description")
+        if desc != nil and str(desc) != "" then
+          assign prop_schema = prop_schema.set("description", str(desc))
+        end
+        if (desc == nil or str(desc) == "") and desc2 != nil and str(desc2) != "" then
+          assign prop_schema = prop_schema.set("description", str(desc2))
+        end
+        let opt_flag = tags.get("optional")
+        if opt_flag != nil and str(opt_flag).lower() == "true" then
+          assign tag_optional = true
+        end
+      end
+      if !tag_skip then
+        assign props = props.set(prop_name, prop_schema)
+        if !has_def and !tag_optional then
+          assign req_fields = req_fields.push(prop_name)
+        end
+      end
+    end
+  end
+  let out: dict<string, any> = {}
+  assign out = out.set("type", "object")
+  if sname != nil and str(sname) != "" then
+    assign out = out.set("title", str(sname))
+  end
+  assign out = out.set("properties", props).set("required", req_fields).set("additionalProperties", false)
+  return out
+end
+
+task validate_json_value_type(val: any, expected_type: string): bool
+  let actual = type_of(val)
+  if expected_type == "integer" then
+    return actual == "int"
+  end
+  if expected_type == "number" then
+    return actual == "int" or actual == "float"
+  end
+  if expected_type == "string" then
+    return actual == "string"
+  end
+  if expected_type == "boolean" then
+    return actual == "bool"
+  end
+  if expected_type == "array" then
+    return actual == "list"
+  end
+  if expected_type == "object" then
+    return actual == "dict"
+  end
+  return true
+end
+
+task validate_tool_args(schema: dict<string, any>, args: dict<string, any>): string
+  let req = schema.get("required")
+  if req != nil and type_of(req) == "list" then
+    let rlist: any = req
+    for rk in rlist
+      let key = str(rk)
+      if args.get(key) == nil then
+        return "missing required argument '" + key + "'"
+      end
+    end
+  end
+  let props = schema.get("properties")
+  let disallow_extra = schema.get("additionalProperties") == false
+  if props != nil and type_of(props) == "dict" then
+    for ak in args.keys()
+      let prop = props.get(ak)
+      if prop == nil then
+        if disallow_extra then
+          return "unexpected argument '" + ak + "'"
+        end
+      else
+        if type_of(prop) == "dict" then
+          let expected = prop.get("type")
+          if expected != nil then
+            let aval = args.get(ak)
+            if aval != nil and !validate_json_value_type(aval, str(expected)) then
+              return "argument '" + ak + "' expected " + str(expected) + ", got " + type_of(aval)
+            end
+          end
+        end
+      end
+    end
+  end
+  return ""
 end
 
 task rpc_ok(id: any, result: any): string
@@ -50,13 +234,24 @@ export impl McpServer
   task tool(self, name: string, description: string, schema: dict<string, any>, handler: any): McpServer
     let t = McpTool(name=name, description=description, schema=schema, handler=handler)
     let next_tools = self.tools.set(name, t)
-    return McpServer(name=self.name, version=self.version, tools=next_tools, resources=self.resources)
+    return McpServer(name=self.name, version=self.version, tools=next_tools, resources=self.resources, prompts=self.prompts)
+  end
+
+  task typed_tool(self, name: string, description: string, struct_schema: dict<string, any>, handler: any): McpServer
+    let json_schema = schema_from_struct(struct_schema)
+    return self.tool(name, description, json_schema, handler)
   end
 
   task resource(self, uri: string, name: string, description: string, mime_type: string, reader: any): McpServer
     let res = McpResource(uri=uri, name=name, description=description, mime_type=mime_type, reader=reader)
     let next_res = self.resources.set(uri, res)
-    return McpServer(name=self.name, version=self.version, tools=self.tools, resources=next_res)
+    return McpServer(name=self.name, version=self.version, tools=self.tools, resources=next_res, prompts=self.prompts)
+  end
+
+  task prompt(self, name: string, description: string, arguments: list<dict<string, any>>, handler: any): McpServer
+    let p = McpPrompt(name=name, description=description, arguments=arguments, handler=handler)
+    let next_prompts = self.prompts.set(name, p)
+    return McpServer(name=self.name, version=self.version, tools=self.tools, resources=self.resources, prompts=next_prompts)
   end
 
   task handle_jsonrpc(self, raw_json: string): string
@@ -75,7 +270,7 @@ export impl McpServer
 
     if method == "initialize" then
       let empty_obj: dict<string, any> = {}
-      let caps: dict<string, any> = {"tools": empty_obj, "resources": empty_obj}
+      let caps: dict<string, any> = {"tools": empty_obj, "resources": empty_obj, "prompts": empty_obj}
       let info: dict<string, string> = {"name": self.name, "version": self.version}
       let res_obj: dict<string, any> = {}
       assign res_obj = res_obj.set("protocolVersion", "2024-11-05").set("capabilities", caps).set("serverInfo", info)
@@ -114,6 +309,10 @@ export impl McpServer
       if tool == nil then
         return rpc_err(id, -32602, "Unknown tool: " + str(tname))
       end
+      let val_err = validate_tool_args(tool.schema, targs)
+      if val_err != "" then
+        return rpc_err(id, -32602, "Invalid params: " + val_err)
+      end
       let fn_handler = tool.handler
       let result_val = fn_handler(targs)
       let text_out = if type_of(result_val) == "string" then str(result_val) else json.stringify(result_val) end
@@ -147,7 +346,123 @@ export impl McpServer
       let item: dict<string, any> = {"uri": r.uri, "mimeType": r.mime_type, "text": text_val}
       return rpc_ok(id, {"contents": [item]})
     end
+    if method == "prompts/list" then
+      let plist: list<any> = []
+      for pname in self.prompts.keys()
+        let p = self.prompts.get(pname)
+        if p != nil then
+          let entry: dict<string, any> = {}
+          assign entry = entry.set("name", p.name).set("description", p.description).set("arguments", p.arguments)
+          assign plist = plist.push(entry)
+        end
+      end
+      return rpc_ok(id, {"prompts": plist})
+    end
+    if method == "prompts/get" then
+      if params == nil then
+        return rpc_err(id, -32602, "Invalid params: missing params")
+      end
+      let pname = params.get("name")
+      let p = self.prompts.get(str(pname))
+      if p == nil then
+        return rpc_err(id, -32602, "Unknown prompt: " + str(pname))
+      end
+      let pargs = params.get("arguments")
+      if pargs == nil then
+        let empty_pargs: dict<string, any> = {}
+        assign pargs = empty_pargs
+      end
+      for arg_spec in p.arguments
+        let is_req = arg_spec.get("required") == true
+        let aname = str(arg_spec.get("name"))
+        if is_req and pargs.get(aname) == nil then
+          return rpc_err(id, -32602, "Invalid params: missing required prompt argument '" + aname + "'")
+        end
+      end
+      let pfn = p.handler
+      let pval = pfn(pargs)
+      if type_of(pval) == "string" then
+        let content_obj: dict<string, any> = {"type": "text", "text": str(pval)}
+        let msg: dict<string, any> = {}
+        assign msg = msg.set("role", "user").set("content", content_obj)
+        let res_p: dict<string, any> = {}
+        assign res_p = res_p.set("description", p.description).set("messages", [msg])
+        return rpc_ok(id, res_p)
+      end
+      if type_of(pval) == "list" then
+        let res_p2: dict<string, any> = {}
+        assign res_p2 = res_p2.set("description", p.description).set("messages", pval)
+        return rpc_ok(id, res_p2)
+      end
+      return rpc_ok(id, pval)
+    end
     return rpc_err(id, -32601, "Method not found: " + str(method))
+  end
+
+  -- Stdio NDJSON line-delimited JSON-RPC 2.0 transport helpers
+  task handle_stdio_line(self, line: string): string
+    let trimmed = line.trim()
+    if trimmed == "" then
+      return ""
+    end
+    return self.handle_jsonrpc(trimmed)
+  end
+
+  task serve_stdio_lines(self, lines: list<string>): list<string>
+    let out: list<string> = []
+    for line in lines
+      let reply = self.handle_stdio_line(line)
+      if reply != "" then
+        assign out = out.push(reply)
+      end
+    end
+    return out
+  end
+
+  task serve_stdio_channels(self, in_ch: channel<string>, out_ch: channel<string>, max_messages: int = 0, ctx: any = nil): int
+    let processed = 0
+    while max_messages <= 0 or processed < max_messages
+      if ctx != nil and ctx.is_cancelled() then
+        break
+      end
+      let line = if ctx != nil then in_ch.recv_ctx(ctx) else in_ch.recv() end
+      if line == "" then
+        break
+      end
+      assign processed = processed + 1
+      let reply = self.handle_stdio_line(line)
+      if reply != "" then
+        if ctx != nil then
+          out_ch.send_ctx(reply, ctx)
+        else
+          out_ch.send(reply)
+        end
+      end
+    end
+    return processed
+  end
+
+  task serve_stdio_stream(self, stream: tcp_stream, ctx: any = nil): int
+    let processed = 0
+    while true
+      if ctx != nil and ctx.is_cancelled() then
+        break
+      end
+      let raw = stream.read_line(65536, ctx)
+      if raw == "" then
+        break
+      end
+      let trimmed = raw.trim()
+      if trimmed == "" then
+        continue
+      end
+      assign processed = processed + 1
+      let reply = self.handle_stdio_line(trimmed)
+      if reply != "" then
+        stream.write(reply + "\n", ctx)
+      end
+    end
+    return processed
   end
 
   task dispatch_http(self, req: HttpRequest, stream: tcp_stream): any
@@ -170,14 +485,14 @@ export impl McpServer
     return json_response(404, {"error": "not found", "path": req.path})
   end
 
-  task serve_listener(self, listener: tcp_listener, max_requests: int = 0, ctx: any = nil): int
+  task serve_listener(self, listener: tcp_listener, max_requests: int = 0, ctx: any = nil, max_body_bytes: int = 1048576): int
     let handler = fn(req: HttpRequest, stream: tcp_stream) self.dispatch_http(req, stream) end
-    return serve_listener(listener, handler, max_requests, ctx)
+    return serve_listener(listener, handler, max_requests, ctx, max_body_bytes)
   end
 
-  task serve_http(self, addr: string, max_requests: int = 0, ctx: any = nil): int
+  task serve_http(self, addr: string, max_requests: int = 0, ctx: any = nil, max_body_bytes: int = 1048576): int
     let listener = tcp_listen(addr)
-    let n = self.serve_listener(listener, max_requests, ctx)
+    let n = self.serve_listener(listener, max_requests, ctx, max_body_bytes)
     listener.close()
     return n
   end

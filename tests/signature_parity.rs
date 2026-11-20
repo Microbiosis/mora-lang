@@ -125,6 +125,7 @@ fn call_for(name: &str) -> Option<&'static str> {
         "jvp" => "jvp(fn(x) x end, 1.0, 1.0)",
         "trace_dag" => "trace_dag(fn(x) x * 2.0 end, tensor([1.0]))",
         "kv_allocator" => "kv_allocator(4, 4, 2, 4)",
+        "memory_pool" => "memory_pool(1024)",
         // domain prefix 模块 / 宏展开，无独立固定返回值语义
         "math" | "stats" | "linalg" | "macroexpand" => return None,
         _ => return None,

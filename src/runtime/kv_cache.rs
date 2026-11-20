@@ -1,12 +1,18 @@
-//! Wave 4: Dynamic VRAM / KV-Cache Resource Orchestration (`KVPageAllocator`).
+//! Wave 4 P1: Dynamic VRAM / KV-Cache Resource Orchestration (`KVPageAllocator`).
 //!
-//! Implements PagedAttention-style virtual-to-physical page table management:
-//! - Hardware-packed 64-byte aligned [`AlignedByteBuffer`] K/V page pools honoring exact `DType`
-//!   widths (`f16`, `bf16`, `fp8`, `f32`, `f64`, `i8`, `i4`, ...).
-//! - Per-sequence page tables, dynamic token growth (`append_tokens`), Copy-on-Write prefix
-//!   sharing (`fork_seq` + CoW split on `write_kv`), LRU eviction (`evict_lru`), and live
-//!   utilization/memory telemetry (`stats`, `utilization`, `bytes_used`).
-//! - Thread-safe via `parking_lot::Mutex` for concurrent `spawn`ed inference handlers.
+//! Architecture (`AGENTS.md §0`):
+//! - PagedAttention-style virtual-to-physical page table management backed by 64-byte aligned
+//!   hardware-packed [`AlignedByteBuffer`] K/V page pools honoring exact `DType` widths.
+//! - Copy-on-Write prefix sharing (`fork_seq` + CoW page split on `write_kv`).
+//! - Hard byte quota enforcement (`max_bytes` / `set_quota` / `quota_bytes`) checked atomically
+//!   before physical page commit so failed allocations never leak pages.
+//! - Sequence priority & preemptive eviction (`alloc_seq(id, priority?)`, `set_priority`,
+//!   `seq_priority`, `evict_preempt(min_priority?)`, `reclaim_for(pages_needed, requester_priority)`),
+//!   plus pure LRU (`evict_lru`).
+//! - Rising-edge watermark callbacks (`on_watermark(threshold, cb)` / `clear_watermarks`):
+//!   callbacks are returned as `(callee, event_dict)` AFTER releasing the pool lock and executed
+//!   iteratively on the stackful VM frame stack (`CombinatorFrame::WatermarkCallbacks`) so
+//!   callbacks can freely call `evict_preempt` / `free_seq` / `channel.send` with zero deadlock.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -18,10 +24,21 @@ use crate::error::{MoraError, MoraResult};
 use crate::value::Value;
 use crate::value::tensor::{AlignedByteBuffer, Tensor};
 
+/// Triggered watermark callback invocation `(mora_callable, event_payload_dict)`.
+pub(crate) type TriggeredWatermark = (Value, HashMap<String, Value>);
+
+#[derive(Debug, Clone)]
+struct WatermarkHook {
+    threshold: f64,
+    callback: Value,
+    triggered: bool,
+}
+
 #[derive(Debug, Clone)]
 struct SeqKvState {
     page_table: Vec<usize>,
     num_tokens: usize,
+    priority: i64,
     last_access_tick: u64,
 }
 
@@ -33,9 +50,15 @@ struct KvPoolInner {
     v_pages: Vec<AlignedByteBuffer>,
     seqs: HashMap<u64, SeqKvState>,
     tick: u64,
+    max_bytes: Option<usize>,
+    watermarks: Vec<WatermarkHook>,
+    evictions: u64,
+    preemptions: u64,
+    watermark_triggers: u64,
 }
 
-/// Paged KV-cache memory allocator with Copy-on-Write prefix sharing and LRU eviction.
+/// Paged KV-cache memory allocator with Copy-on-Write prefix sharing, hard byte quotas,
+/// priority-aware preemptive eviction, and rising-edge watermark callbacks.
 #[derive(Debug)]
 pub struct KVPageAllocator {
     pub total_pages: usize,
@@ -46,11 +69,13 @@ pub struct KVPageAllocator {
     pub device: Device,
     elems_per_page: usize,
     elems_per_token: usize,
+    bytes_per_page: usize,
     inner: Mutex<KvPoolInner>,
 }
 
 impl KVPageAllocator {
-    /// Create a new paged KV allocator managing `total_pages` physical blocks.
+    /// Create a new paged KV allocator managing `total_pages` physical blocks with an optional
+    /// hard byte quota `max_bytes`.
     pub fn new(
         total_pages: usize,
         page_tokens: usize,
@@ -59,10 +84,38 @@ impl KVPageAllocator {
         dtype: DType,
         device: Device,
     ) -> MoraResult<Arc<Self>> {
+        Self::new_with_quota(
+            total_pages,
+            page_tokens,
+            num_heads,
+            head_dim,
+            dtype,
+            device,
+            None,
+        )
+    }
+
+    /// Create a new paged KV allocator with optional hard byte quota `max_bytes`.
+    pub(crate) fn new_with_quota(
+        total_pages: usize,
+        page_tokens: usize,
+        num_heads: usize,
+        head_dim: usize,
+        dtype: DType,
+        device: Device,
+        max_bytes: Option<usize>,
+    ) -> MoraResult<Arc<Self>> {
         if total_pages == 0 || page_tokens == 0 || num_heads == 0 || head_dim == 0 {
             return Err(MoraError::Runtime(
                 "kv_allocator: total_pages, page_tokens, num_heads, and head_dim must all be > 0"
                     .to_string(),
+            ));
+        }
+        if let Some(q) = max_bytes
+            && q == 0
+        {
+            return Err(MoraError::Runtime(
+                "kv_allocator: max_bytes quota must be > 0".to_string(),
             ));
         }
         let elems_per_token = num_heads
@@ -80,6 +133,7 @@ impl KVPageAllocator {
             k_pages.push(AlignedByteBuffer::zeroed(elems_per_page, dtype));
             v_pages.push(AlignedByteBuffer::zeroed(elems_per_page, dtype));
         }
+        let bytes_per_page = k_pages[0].byte_len() + v_pages[0].byte_len();
 
         Ok(Arc::new(Self {
             total_pages,
@@ -90,6 +144,7 @@ impl KVPageAllocator {
             device,
             elems_per_page,
             elems_per_token,
+            bytes_per_page,
             inner: Mutex::new(KvPoolInner {
                 free_pages,
                 refcounts,
@@ -97,6 +152,11 @@ impl KVPageAllocator {
                 v_pages,
                 seqs: HashMap::new(),
                 tick: 0,
+                max_bytes,
+                watermarks: Vec::new(),
+                evictions: 0,
+                preemptions: 0,
+                watermark_triggers: 0,
             }),
         }))
     }
@@ -104,6 +164,52 @@ impl KVPageAllocator {
     fn next_tick(inner: &mut KvPoolInner) -> u64 {
         inner.tick += 1;
         inner.tick
+    }
+
+    #[inline]
+    fn used_pages_inner(&self, inner: &KvPoolInner) -> usize {
+        self.total_pages - inner.free_pages.len()
+    }
+
+    #[inline]
+    fn bytes_used_inner(&self, inner: &KvPoolInner) -> usize {
+        self.used_pages_inner(inner) * self.bytes_per_page
+    }
+
+    #[inline]
+    fn effective_quota_bytes_inner(&self, inner: &KvPoolInner) -> usize {
+        let physical_cap = self.total_pages * self.bytes_per_page;
+        match inner.max_bytes {
+            Some(q) => q.min(physical_cap),
+            None => physical_cap,
+        }
+    }
+
+    fn ensure_can_allocate(
+        &self,
+        inner: &KvPoolInner,
+        extra_pages: usize,
+        seq_id: u64,
+    ) -> MoraResult<()> {
+        if extra_pages == 0 {
+            return Ok(());
+        }
+        if extra_pages > inner.free_pages.len() {
+            return Err(MoraError::Runtime(format!(
+                "KVPageAllocator out of memory: sequence {seq_id} needs {extra_pages} page(s), only {} free",
+                inner.free_pages.len()
+            )));
+        }
+        if let Some(quota) = inner.max_bytes {
+            let projected_bytes =
+                (self.used_pages_inner(inner) + extra_pages) * self.bytes_per_page;
+            if projected_bytes > quota {
+                return Err(MoraError::Runtime(format!(
+                    "KVPageAllocator quota exceeded: sequence {seq_id} needs {projected_bytes} bytes, exceeds hard quota {quota} bytes"
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn alloc_physical_page(inner: &mut KvPoolInner) -> MoraResult<usize> {
@@ -130,8 +236,68 @@ impl KVPageAllocator {
         }
     }
 
-    /// Register a new sequence `seq_id` with an empty page table.
+    /// Update watermark hysteresis and collect any rising-edge callbacks triggered by the current utilization.
+    fn collect_triggered_watermarks(&self, inner: &mut KvPoolInner) -> Vec<TriggeredWatermark> {
+        let used = self.used_pages_inner(inner);
+        let free = inner.free_pages.len();
+        let bytes_used = used * self.bytes_per_page;
+        let quota_bytes = self.effective_quota_bytes_inner(inner);
+        let util = if quota_bytes > 0 {
+            (bytes_used as f64) / (quota_bytes as f64)
+        } else {
+            (used as f64) / (self.total_pages as f64)
+        };
+
+        let mut fired = Vec::new();
+        for wm in &mut inner.watermarks {
+            if util >= wm.threshold {
+                if !wm.triggered {
+                    wm.triggered = true;
+                    inner.watermark_triggers += 1;
+                    let mut event = HashMap::new();
+                    event.insert("utilization".to_string(), Value::Float(util));
+                    event.insert("threshold".to_string(), Value::Float(wm.threshold));
+                    event.insert("used_pages".to_string(), Value::Int(used as i64));
+                    event.insert("free_pages".to_string(), Value::Int(free as i64));
+                    event.insert(
+                        "total_pages".to_string(),
+                        Value::Int(self.total_pages as i64),
+                    );
+                    event.insert("bytes_used".to_string(), Value::Int(bytes_used as i64));
+                    event.insert("quota_bytes".to_string(), Value::Int(quota_bytes as i64));
+                    fired.push((wm.callback.clone(), event));
+                }
+            } else {
+                // Reset hysteresis once utilization drops back below threshold.
+                wm.triggered = false;
+            }
+        }
+        fired
+    }
+
+    /// Reset any triggered watermarks whose utilization has dropped below their threshold.
+    fn refresh_watermark_hysteresis(&self, inner: &mut KvPoolInner) {
+        let bytes_used = self.bytes_used_inner(inner);
+        let quota_bytes = self.effective_quota_bytes_inner(inner);
+        let util = if quota_bytes > 0 {
+            (bytes_used as f64) / (quota_bytes as f64)
+        } else {
+            0.0
+        };
+        for wm in &mut inner.watermarks {
+            if util < wm.threshold {
+                wm.triggered = false;
+            }
+        }
+    }
+
+    /// Register a new sequence `seq_id` with default priority `0`.
     pub fn alloc_seq(&self, seq_id: u64) -> MoraResult<bool> {
+        self.alloc_seq_with_priority(seq_id, 0)
+    }
+
+    /// Register a new sequence `seq_id` with explicit scheduling `priority` (higher = more protected).
+    pub(crate) fn alloc_seq_with_priority(&self, seq_id: u64, priority: i64) -> MoraResult<bool> {
         let mut inner = self.inner.lock();
         if inner.seqs.contains_key(&seq_id) {
             return Err(MoraError::Runtime(format!(
@@ -144,15 +310,92 @@ impl KVPageAllocator {
             SeqKvState {
                 page_table: Vec::new(),
                 num_tokens: 0,
+                priority,
                 last_access_tick: tick,
             },
         );
         Ok(true)
     }
 
-    /// Reserve capacity for `count` additional tokens in sequence `seq_id`, allocating pages on demand.
-    /// Rolls back newly allocated pages atomically if physical pages are exhausted mid-request.
+    /// Update the scheduling priority of an active sequence `seq_id`.
+    pub(crate) fn set_priority(&self, seq_id: u64, priority: i64) -> MoraResult<()> {
+        let mut inner = self.inner.lock();
+        let seq = inner.seqs.get_mut(&seq_id).ok_or_else(|| {
+            MoraError::Runtime(format!("kv_allocator: unknown sequence {seq_id}"))
+        })?;
+        seq.priority = priority;
+        Ok(())
+    }
+
+    /// Query the scheduling priority of an active sequence `seq_id`.
+    pub(crate) fn seq_priority(&self, seq_id: u64) -> MoraResult<i64> {
+        let inner = self.inner.lock();
+        inner
+            .seqs
+            .get(&seq_id)
+            .map(|s| s.priority)
+            .ok_or_else(|| MoraError::Runtime(format!("kv_allocator: unknown sequence {seq_id}")))
+    }
+
+    /// Configure or update the hard byte quota `max_bytes`.
+    pub(crate) fn set_quota(&self, max_bytes: usize) -> MoraResult<()> {
+        if max_bytes == 0 {
+            return Err(MoraError::Runtime(
+                "kv_allocator.set_quota: max_bytes must be > 0".to_string(),
+            ));
+        }
+        let mut inner = self.inner.lock();
+        inner.max_bytes = Some(max_bytes);
+        self.refresh_watermark_hysteresis(&mut inner);
+        Ok(())
+    }
+
+    /// Effective hard byte cap (`min(max_bytes, physical_capacity)` when configured).
+    pub(crate) fn quota_bytes(&self) -> usize {
+        let inner = self.inner.lock();
+        self.effective_quota_bytes_inner(&inner)
+    }
+
+    /// Register a rising-edge watermark callback triggered whenever utilization crosses `threshold` (`0.0..=1.0`).
+    pub(crate) fn register_watermark(&self, threshold: f64, callback: Value) -> MoraResult<()> {
+        if !threshold.is_finite() || threshold <= 0.0 || threshold > 1.0 {
+            return Err(MoraError::Runtime(format!(
+                "kv_allocator.on_watermark: threshold must be in (0.0, 1.0], got {threshold}"
+            )));
+        }
+        let mut inner = self.inner.lock();
+        let bytes_used = self.bytes_used_inner(&inner);
+        let quota_bytes = self.effective_quota_bytes_inner(&inner);
+        let util = if quota_bytes > 0 {
+            (bytes_used as f64) / (quota_bytes as f64)
+        } else {
+            0.0
+        };
+        inner.watermarks.push(WatermarkHook {
+            threshold,
+            callback,
+            triggered: util >= threshold,
+        });
+        Ok(())
+    }
+
+    /// Remove all registered watermark callbacks.
+    pub(crate) fn clear_watermarks(&self) {
+        self.inner.lock().watermarks.clear();
+    }
+
+    /// Reserve capacity for `count` additional tokens in sequence `seq_id`.
     pub fn append_tokens(&self, seq_id: u64, count: usize) -> MoraResult<Vec<usize>> {
+        self.append_tokens_with_watermarks(seq_id, count)
+            .map(|(pages, _)| pages)
+    }
+
+    /// Reserve capacity for `count` additional tokens, returning `(page_table, triggered_watermarks)`.
+    pub(crate) fn append_tokens_with_watermarks(
+        &self,
+        seq_id: u64,
+        count: usize,
+    ) -> MoraResult<(Vec<usize>, Vec<TriggeredWatermark>)> {
         let mut inner = self.inner.lock();
         let tick = Self::next_tick(&mut inner);
         let cur_tokens = inner
@@ -170,24 +413,24 @@ impl KVPageAllocator {
             new_tokens.div_ceil(self.page_tokens)
         };
         let extra = needed_pages.saturating_sub(cur_pages);
-        if extra > inner.free_pages.len() {
-            return Err(MoraError::Runtime(format!(
-                "KVPageAllocator out of memory: sequence {seq_id} needs {extra} page(s), only {} free",
-                inner.free_pages.len()
-            )));
-        }
+        self.ensure_can_allocate(&inner, extra, seq_id)?;
+
         let mut newly = Vec::with_capacity(extra);
         for _ in 0..extra {
             newly.push(Self::alloc_physical_page(&mut inner)?);
         }
-        let seq = inner.seqs.get_mut(&seq_id).expect("checked");
-        seq.page_table.extend(newly);
-        seq.num_tokens = new_tokens;
-        seq.last_access_tick = tick;
-        Ok(seq.page_table.clone())
+        let page_table = {
+            let seq = inner.seqs.get_mut(&seq_id).expect("checked");
+            seq.page_table.extend(newly);
+            seq.num_tokens = new_tokens;
+            seq.last_access_tick = tick;
+            seq.page_table.clone()
+        };
+        let fired = self.collect_triggered_watermarks(&mut inner);
+        Ok((page_table, fired))
     }
 
-    /// Fork `src_seq_id` into `dst_seq_id`, sharing existing physical pages via Copy-on-Write refcounts.
+    /// Fork `src_seq_id` into `dst_seq_id`, inheriting priority and sharing physical pages via CoW.
     pub fn fork_seq(&self, src_seq_id: u64, dst_seq_id: u64) -> MoraResult<Vec<usize>> {
         let mut inner = self.inner.lock();
         if inner.seqs.contains_key(&dst_seq_id) {
@@ -210,6 +453,7 @@ impl KVPageAllocator {
             SeqKvState {
                 page_table: src.page_table,
                 num_tokens: src.num_tokens,
+                priority: src.priority,
                 last_access_tick: tick,
             },
         );
@@ -219,8 +463,7 @@ impl KVPageAllocator {
         Ok(table)
     }
 
-    /// Write `[num_heads, head_dim]` key and value tensors at logical `token_pos` of `seq_id`.
-    /// Performs Copy-on-Write physical page splitting if the target page is shared (`refcount > 1`).
+    /// Write `[num_heads, head_dim]` K/V tensors at `token_pos`, splitting shared CoW pages if needed.
     pub fn write_kv(
         &self,
         seq_id: u64,
@@ -228,6 +471,18 @@ impl KVPageAllocator {
         k: &Tensor,
         v: &Tensor,
     ) -> MoraResult<()> {
+        self.write_kv_with_watermarks(seq_id, token_pos, k, v)
+            .map(|_| ())
+    }
+
+    /// Write K/V tensors with CoW page splitting, returning any rising-edge watermark callbacks.
+    pub(crate) fn write_kv_with_watermarks(
+        &self,
+        seq_id: u64,
+        token_pos: usize,
+        k: &Tensor,
+        v: &Tensor,
+    ) -> MoraResult<Vec<TriggeredWatermark>> {
         let expected_shape = [self.num_heads, self.head_dim];
         if k.shape != expected_shape || v.shape != expected_shape {
             return Err(MoraError::Runtime(format!(
@@ -279,7 +534,7 @@ impl KVPageAllocator {
         }
 
         let target_pid = if inner.refcounts[cur_pid] > 1 {
-            // Copy-on-Write split!
+            self.ensure_can_allocate(&inner, 1, seq_id)?;
             let new_pid = Self::alloc_physical_page(&mut inner)?;
             let cloned_k = inner.k_pages[cur_pid].clone();
             let cloned_v = inner.v_pages[cur_pid].clone();
@@ -301,7 +556,8 @@ impl KVPageAllocator {
         if let Some(seq) = inner.seqs.get_mut(&seq_id) {
             seq.last_access_tick = tick;
         }
-        Ok(())
+        let fired = self.collect_triggered_watermarks(&mut inner);
+        Ok(fired)
     }
 
     /// Materialize `[K, V]` tensors of shape `[num_tokens, num_heads, head_dim]` for `seq_id`.
@@ -344,6 +600,7 @@ impl KVPageAllocator {
                 freed += 1;
             }
         }
+        self.refresh_watermark_hysteresis(&mut inner);
         Ok(freed)
     }
 
@@ -357,7 +614,65 @@ impl KVPageAllocator {
         for pid in seq.page_table {
             let _ = Self::release_physical_page(&mut inner, pid);
         }
+        inner.evictions += 1;
+        self.refresh_watermark_hysteresis(&mut inner);
         lru_id as i64
+    }
+
+    /// Priority-aware preemptive eviction: evicts the lowest-priority sequence (breaking ties by
+    /// oldest `last_access_tick` = LRU), skipping sequences with `priority >= max_victim_priority`
+    /// when `max_victim_priority` is provided. Returns evicted `seq_id` or `-1` if none eligible.
+    pub(crate) fn evict_preempt(&self, max_victim_priority: Option<i64>) -> i64 {
+        let mut inner = self.inner.lock();
+        let victim = inner
+            .seqs
+            .iter()
+            .filter(|(_, st)| match max_victim_priority {
+                Some(limit) => st.priority < limit,
+                None => true,
+            })
+            .min_by_key(|(_, st)| (st.priority, st.last_access_tick))
+            .map(|(&id, _)| id);
+
+        let Some(victim_id) = victim else {
+            return -1;
+        };
+        let seq = inner.seqs.remove(&victim_id).expect("victim exists");
+        for pid in seq.page_table {
+            let _ = Self::release_physical_page(&mut inner, pid);
+        }
+        inner.evictions += 1;
+        inner.preemptions += 1;
+        self.refresh_watermark_hysteresis(&mut inner);
+        victim_id as i64
+    }
+
+    /// Preempt lowest-priority sequences (strictly `< requester_priority`, LRU tie-break) until
+    /// `pages_needed` physical pages can be allocated within both pool capacity and hard byte quota.
+    /// Returns the list of preempted `seq_id`s.
+    pub(crate) fn reclaim_for(&self, pages_needed: usize, requester_priority: i64) -> Vec<u64> {
+        let mut inner = self.inner.lock();
+        let mut evicted = Vec::new();
+        while self.ensure_can_allocate(&inner, pages_needed, 0).is_err() {
+            let victim = inner
+                .seqs
+                .iter()
+                .filter(|(_, st)| st.priority < requester_priority)
+                .min_by_key(|(_, st)| (st.priority, st.last_access_tick))
+                .map(|(&id, _)| id);
+            let Some(vid) = victim else {
+                break;
+            };
+            let seq = inner.seqs.remove(&vid).expect("victim exists");
+            for pid in seq.page_table {
+                let _ = Self::release_physical_page(&mut inner, pid);
+            }
+            inner.evictions += 1;
+            inner.preemptions += 1;
+            evicted.push(vid);
+        }
+        self.refresh_watermark_hysteresis(&mut inner);
+        evicted
     }
 
     pub fn seq_pages(&self, seq_id: u64) -> MoraResult<Vec<usize>> {
@@ -387,18 +702,19 @@ impl KVPageAllocator {
     }
 
     pub fn utilization(&self) -> f64 {
-        (self.used_pages() as f64) / (self.total_pages as f64)
+        let inner = self.inner.lock();
+        let bytes_used = self.bytes_used_inner(&inner);
+        let quota = self.effective_quota_bytes_inner(&inner);
+        if quota > 0 {
+            (bytes_used as f64) / (quota as f64)
+        } else {
+            (self.used_pages_inner(&inner) as f64) / (self.total_pages as f64)
+        }
     }
 
     pub fn bytes_used(&self) -> usize {
         let inner = self.inner.lock();
-        let mut bytes = 0usize;
-        for (pid, &rc) in inner.refcounts.iter().enumerate() {
-            if rc > 0 {
-                bytes += inner.k_pages[pid].byte_len() + inner.v_pages[pid].byte_len();
-            }
-        }
-        bytes
+        self.bytes_used_inner(&inner)
     }
 
     pub fn stats_dict(&self) -> HashMap<String, Value> {
@@ -406,12 +722,8 @@ impl KVPageAllocator {
         let free = inner.free_pages.len();
         let used = self.total_pages - free;
         let cow_shared = inner.refcounts.iter().filter(|&&rc| rc > 1).count();
-        let mut bytes = 0usize;
-        for (pid, &rc) in inner.refcounts.iter().enumerate() {
-            if rc > 0 {
-                bytes += inner.k_pages[pid].byte_len() + inner.v_pages[pid].byte_len();
-            }
-        }
+        let bytes = self.bytes_used_inner(&inner);
+        let quota_bytes = self.effective_quota_bytes_inner(&inner);
         let mut m = HashMap::new();
         m.insert(
             "total_pages".to_string(),
@@ -428,6 +740,7 @@ impl KVPageAllocator {
             Value::Int(cow_shared as i64),
         );
         m.insert("bytes_used".to_string(), Value::Int(bytes as i64));
+        m.insert("quota_bytes".to_string(), Value::Int(quota_bytes as i64));
         m.insert(
             "page_tokens".to_string(),
             Value::Int(self.page_tokens as i64),
@@ -435,6 +748,15 @@ impl KVPageAllocator {
         m.insert(
             "elems_per_page".to_string(),
             Value::Int(self.elems_per_page as i64),
+        );
+        m.insert("evictions".to_string(), Value::Int(inner.evictions as i64));
+        m.insert(
+            "preemptions".to_string(),
+            Value::Int(inner.preemptions as i64),
+        );
+        m.insert(
+            "watermark_triggers".to_string(),
+            Value::Int(inner.watermark_triggers as i64),
         );
         m
     }

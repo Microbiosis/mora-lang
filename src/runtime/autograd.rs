@@ -126,6 +126,19 @@ pub enum TapeOp {
         src_numel: usize,
         src_flat_indices: Vec<usize>,
     },
+    /// Adjoint of `Gather`: scatters `a` into a zero-initialized tensor of `out_shape` via `dst_flat_indices`.
+    ScatterAdd {
+        a: usize,
+        out_shape: Vec<usize>,
+        dst_flat_indices: Vec<usize>,
+    },
+    /// Sum reduction along a single `axis` (used by tracked unbroadcasting in higher-order AD).
+    SumAxis {
+        a: usize,
+        axis: usize,
+        keepdim: bool,
+        orig_shape: Vec<usize>,
+    },
     Relu {
         a: usize,
         a_vals: Vec<f64>,
@@ -195,13 +208,18 @@ pub(crate) struct TapeNode {
     pub(crate) shape: Vec<usize>,
     pub(crate) dtype: DType,
     pub(crate) device: Device,
+    /// Saved outer-tape-tracked operands/output populated only when nested tapes (`tapes.len() > 1`)
+    /// are active, enabling exact arbitrary-order AD (`grad(grad(f))`, `jvp(grad(f), ...)`, `trace_dag(grad(f))`).
+    pub(crate) saved_a: Option<Arc<Tensor>>,
+    pub(crate) saved_b: Option<Arc<Tensor>>,
+    pub(crate) saved_out: Option<Arc<Tensor>>,
 }
 
-/// One reverse-mode Wengert tape corresponding to a single `grad` / `value_and_grad` call.
+/// One reverse-mode Wengert tape corresponding to a single `grad` / `value_and_grad` / `jvp` / `trace_dag` call.
 #[derive(Debug, Clone)]
 pub struct AutogradTape {
     pub id: u64,
-    nodes: Vec<TapeNode>,
+    pub(crate) nodes: Vec<TapeNode>,
 }
 
 impl AutogradTape {
@@ -223,8 +241,43 @@ impl AutogradTape {
             shape,
             dtype,
             device,
+            saved_a: None,
+            saved_b: None,
+            saved_out: None,
         });
         idx
+    }
+
+    /// Execute higher-order tracked reverse-mode VJP accumulation onto enclosing active tapes.
+    pub(crate) fn backward_tracked(
+        &self,
+        out_idx: usize,
+        leaf_indices: &[usize],
+        autograd: &mut AutogradContext,
+    ) -> MoraResult<Vec<Arc<Tensor>>> {
+        crate::runtime::autograd_higher_order::backward_tracked(
+            self,
+            out_idx,
+            leaf_indices,
+            autograd,
+        )
+    }
+
+    /// Execute higher-order tracked forward-mode JVP propagation onto enclosing active tapes.
+    pub(crate) fn forward_jvp_tracked(
+        &self,
+        out_idx: usize,
+        leaf_indices: &[usize],
+        leaf_tangents: &[Arc<Tensor>],
+        autograd: &mut AutogradContext,
+    ) -> MoraResult<Arc<Tensor>> {
+        crate::runtime::autograd_higher_order::forward_jvp_tracked(
+            self,
+            out_idx,
+            leaf_indices,
+            leaf_tangents,
+            autograd,
+        )
     }
 
     /// Build zero-gradient tensors matching each leaf node's shape, dtype, and device
@@ -518,12 +571,27 @@ impl AutogradTape {
                     src_numel,
                     src_flat_indices,
                 } => {
-                    let mut ga = vec![0.0; *src_numel];
-                    for (&src_idx, &gv) in src_flat_indices.iter().zip(g_out.iter()) {
-                        if src_idx < ga.len() {
-                            ga[src_idx] += gv;
-                        }
-                    }
+                    let ga = scatter_add_flat(&g_out, *src_numel, src_flat_indices);
+                    accum_grad(&mut grads, *a, &ga);
+                }
+                TapeOp::ScatterAdd {
+                    a,
+                    dst_flat_indices,
+                    ..
+                } => {
+                    let ga: Vec<f64> = dst_flat_indices
+                        .iter()
+                        .map(|&di| g_out.get(di).copied().unwrap_or(0.0))
+                        .collect();
+                    accum_grad(&mut grads, *a, &ga);
+                }
+                TapeOp::SumAxis {
+                    a,
+                    axis,
+                    keepdim,
+                    orig_shape,
+                } => {
+                    let ga = expand_axis_flat(&g_out, &node.shape, *axis, *keepdim, orig_shape);
                     accum_grad(&mut grads, *a, &ga);
                 }
                 TapeOp::Relu { a, a_vals } => {
@@ -1029,6 +1097,24 @@ impl AutogradTape {
                         .map(|&si| da.get(si).copied().unwrap_or(0.0))
                         .collect()
                 }),
+                TapeOp::ScatterAdd {
+                    a,
+                    out_shape,
+                    dst_flat_indices,
+                } => {
+                    let out_n = checked_numel(out_shape)?;
+                    tangents[*a]
+                        .as_ref()
+                        .map(|da| scatter_add_flat(da, out_n, dst_flat_indices))
+                }
+                TapeOp::SumAxis {
+                    a,
+                    axis,
+                    keepdim,
+                    orig_shape,
+                } => tangents[*a]
+                    .as_ref()
+                    .map(|da| sum_axis_flat(da, orig_shape, *axis, *keepdim)),
                 TapeOp::Relu { a, a_vals } => tangents[*a].as_ref().map(|da| {
                     da.iter()
                         .zip(a_vals.iter())
@@ -1264,29 +1350,175 @@ impl AutogradContext {
         Some((tape_id, idx))
     }
 
-    /// Return the local node index on the active tape if `node` belongs to it and recording is on.
+    /// Check whether `tensor` is tracked on ANY currently active tape (and `no_grad` is inactive).
     #[inline]
-    pub fn active_node_index(&self, node: Option<TapeNodeId>) -> Option<usize> {
-        let active_id = self.active_tape_id()?;
-        let (tid, idx) = node?;
-        if tid == active_id { Some(idx) } else { None }
+    pub(crate) fn is_tracked(&self, tensor: &Tensor) -> bool {
+        if !self.is_recording() || tensor.grad_nodes.is_empty() {
+            return false;
+        }
+        self.tapes
+            .iter()
+            .any(|t| tensor.node_on_tape(t.id).is_some())
     }
 
-    pub fn record(
+    /// Record a unary operation on EVERY active tape tracking `input`, returning `out` attached to
+    /// all newly recorded `(tape_id, node_idx)` entries. When nested tapes (`tapes.len() > 1`) are
+    /// active, saves `input` and the tracked `out` on inner tapes to enable exact arbitrary-order AD.
+    pub(crate) fn record_unary(
         &mut self,
-        op: TapeOp,
-        shape: Vec<usize>,
-        dtype: DType,
-        device: Device,
-    ) -> Option<TapeNodeId> {
-        if self.no_grad_depth > 0 {
-            return None;
+        input: &Arc<Tensor>,
+        out: Arc<Tensor>,
+        mut make_op: impl FnMut(usize) -> TapeOp,
+    ) -> Arc<Tensor> {
+        if !self.is_recording() || input.grad_nodes.is_empty() {
+            return out;
         }
-        let tape = self.tapes.last_mut()?;
-        let id = tape.id;
-        let idx = tape.push_node(op, shape, dtype, device);
-        Some((id, idx))
+        let multi = self.tapes.len() > 1;
+        let mut new_nodes = Vec::with_capacity(self.tapes.len());
+        let mut inner_locs = Vec::new();
+        for (t_pos, tape) in self.tapes.iter_mut().enumerate() {
+            if let Some(src_idx) = input.node_on_tape(tape.id) {
+                let op = make_op(src_idx);
+                let node_idx = tape.push_node(op, out.shape.clone(), out.dtype, out.device.clone());
+                new_nodes.push((tape.id, node_idx));
+                if multi && t_pos > 0 {
+                    inner_locs.push((t_pos, node_idx));
+                }
+            }
+        }
+        if new_nodes.is_empty() {
+            return out;
+        }
+        let tracked_out = out.with_grad_nodes(new_nodes);
+        for (t_pos, node_idx) in inner_locs {
+            let node = &mut self.tapes[t_pos].nodes[node_idx];
+            node.saved_a = Some(Arc::clone(input));
+            node.saved_out = Some(Arc::clone(&tracked_out));
+        }
+        tracked_out
     }
+
+    /// Record a binary operation on EVERY active tape tracking `a` or `b`, returning `out` attached
+    /// to all newly recorded `(tape_id, node_idx)` entries.
+    pub(crate) fn record_binary(
+        &mut self,
+        a: &Arc<Tensor>,
+        b: &Arc<Tensor>,
+        out: Arc<Tensor>,
+        mut make_op: impl FnMut(Option<usize>, Option<usize>) -> TapeOp,
+    ) -> Arc<Tensor> {
+        if !self.is_recording() || (a.grad_nodes.is_empty() && b.grad_nodes.is_empty()) {
+            return out;
+        }
+        let multi = self.tapes.len() > 1;
+        let mut new_nodes = Vec::with_capacity(self.tapes.len());
+        let mut inner_locs = Vec::new();
+        for (t_pos, tape) in self.tapes.iter_mut().enumerate() {
+            let na = a.node_on_tape(tape.id);
+            let nb = b.node_on_tape(tape.id);
+            if na.is_some() || nb.is_some() {
+                let op = make_op(na, nb);
+                let node_idx = tape.push_node(op, out.shape.clone(), out.dtype, out.device.clone());
+                new_nodes.push((tape.id, node_idx));
+                if multi && t_pos > 0 {
+                    inner_locs.push((t_pos, node_idx));
+                }
+            }
+        }
+        if new_nodes.is_empty() {
+            return out;
+        }
+        let tracked_out = out.with_grad_nodes(new_nodes);
+        for (t_pos, node_idx) in inner_locs {
+            let node = &mut self.tapes[t_pos].nodes[node_idx];
+            node.saved_a = Some(Arc::clone(a));
+            node.saved_b = Some(Arc::clone(b));
+            node.saved_out = Some(Arc::clone(&tracked_out));
+        }
+        tracked_out
+    }
+}
+
+pub(crate) fn scatter_add_flat(
+    src_vals: &[f64],
+    out_numel: usize,
+    dst_flat_indices: &[usize],
+) -> Vec<f64> {
+    let mut out = vec![0.0; out_numel];
+    for (&dst_idx, &v) in dst_flat_indices.iter().zip(src_vals.iter()) {
+        if dst_idx < out.len() {
+            out[dst_idx] += v;
+        }
+    }
+    out
+}
+
+pub(crate) fn sum_axis_output_shape(shape: &[usize], axis: usize, keepdim: bool) -> Vec<usize> {
+    let mut out = Vec::with_capacity(shape.len());
+    for (i, &d) in shape.iter().enumerate() {
+        if i == axis {
+            if keepdim {
+                out.push(1);
+            }
+        } else {
+            out.push(d);
+        }
+    }
+    out
+}
+
+pub(crate) fn sum_axis_flat(
+    vals: &[f64],
+    orig_shape: &[usize],
+    axis: usize,
+    keepdim: bool,
+) -> Vec<f64> {
+    let out_shape = sum_axis_output_shape(orig_shape, axis, keepdim);
+    let out_numel: usize = out_shape.iter().copied().product::<usize>().max(1);
+    let mut out = vec![0.0; out_numel];
+    let outer: usize = orig_shape[..axis].iter().copied().product::<usize>().max(1);
+    let axis_dim = orig_shape[axis];
+    let inner: usize = orig_shape[axis + 1..]
+        .iter()
+        .copied()
+        .product::<usize>()
+        .max(1);
+    for o in 0..outer {
+        for k in 0..axis_dim {
+            let src_base = (o * axis_dim + k) * inner;
+            let dst_base = o * inner;
+            for i in 0..inner {
+                out[dst_base + i] += vals[src_base + i];
+            }
+        }
+    }
+    out
+}
+
+pub(crate) fn expand_axis_flat(
+    vals: &[f64],
+    _cur_shape: &[usize],
+    axis: usize,
+    _keepdim: bool,
+    orig_shape: &[usize],
+) -> Vec<f64> {
+    let orig_numel: usize = orig_shape.iter().copied().product::<usize>().max(1);
+    let mut out = vec![0.0; orig_numel];
+    let outer: usize = orig_shape[..axis].iter().copied().product::<usize>().max(1);
+    let axis_dim = orig_shape[axis];
+    let inner: usize = orig_shape[axis + 1..]
+        .iter()
+        .copied()
+        .product::<usize>()
+        .max(1);
+    for o in 0..outer {
+        let src_base = o * inner;
+        for k in 0..axis_dim {
+            let dst_base = (o * axis_dim + k) * inner;
+            out[dst_base..dst_base + inner].copy_from_slice(&vals[src_base..src_base + inner]);
+        }
+    }
+    out
 }
 
 fn accum_grad(grads: &mut [Option<Vec<f64>>], idx: usize, delta: &[f64]) {

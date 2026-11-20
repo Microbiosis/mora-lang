@@ -326,9 +326,27 @@ pub fn builtin_signatures() -> Vec<(String, Signature)> {
                         "device".to_string(),
                         Type::Union(vec![Type::String, Type::Nil]),
                     ),
+                    (
+                        "max_bytes".to_string(),
+                        Type::Union(vec![Type::Int, Type::Nil]),
+                    ),
                 ],
                 4,
                 Type::KVAllocator,
+            ),
+        ),
+        (
+            "memory_pool".to_string(),
+            Signature::with_min_arity(
+                vec![
+                    ("max_bytes".to_string(), Type::Int),
+                    (
+                        "device".to_string(),
+                        Type::Union(vec![Type::String, Type::Nil]),
+                    ),
+                ],
+                1,
+                Type::MemoryPool,
             ),
         ),
         // v0.91: 数学 builtin — math/stats/linalg/random
@@ -1058,7 +1076,7 @@ fn method_signature_builtin(receiver: &Type, method: &str) -> Option<Signature> 
             Type::String,
         )),
         // ── Wave 4: TensorComputeDag & KVPageAllocator methods ──
-        (Type::ComputeDag, "fuse") => Some(Signature::new(
+        (Type::ComputeDag, "fuse" | "compile") => Some(Signature::new(
             vec![("self".to_string(), Type::ComputeDag)],
             Type::ComputeDag,
         )),
@@ -1081,16 +1099,59 @@ fn method_signature_builtin(receiver: &Type, method: &str) -> Option<Signature> 
             vec![("self".to_string(), Type::ComputeDag)],
             Type::List(Box::new(Type::String)),
         )),
-        (Type::ComputeDag, "to_dot") => Some(Signature::new(
+        (Type::ComputeDag, "to_dot" | "cache_key") => Some(Signature::new(
             vec![("self".to_string(), Type::ComputeDag)],
             Type::String,
         )),
-        (Type::KVAllocator, "alloc_seq") => Some(Signature::new(
+        (Type::ComputeDag, "memory_plan" | "cache_stats") => Some(Signature::new(
+            vec![("self".to_string(), Type::ComputeDag)],
+            Type::Dict(Box::new(Type::String), Box::new(Type::Int)),
+        )),
+        (Type::ComputeDag, "backend_info") => Some(Signature::new(
+            vec![("self".to_string(), Type::ComputeDag)],
+            Type::Dict(Box::new(Type::String), Box::new(Type::String)),
+        )),
+        (Type::KVAllocator, "alloc_seq") => Some(Signature::with_min_arity(
             vec![
                 ("self".to_string(), Type::KVAllocator),
                 ("seq_id".to_string(), Type::Int),
+                (
+                    "priority".to_string(),
+                    Type::Union(vec![Type::Int, Type::Nil]),
+                ),
             ],
+            2,
             Type::Bool,
+        )),
+        (Type::KVAllocator, "set_priority") => Some(Signature::new(
+            vec![
+                ("self".to_string(), Type::KVAllocator),
+                ("seq_id".to_string(), Type::Int),
+                ("priority".to_string(), Type::Int),
+            ],
+            Type::Nil,
+        )),
+        (Type::KVAllocator, "set_quota") => Some(Signature::new(
+            vec![
+                ("self".to_string(), Type::KVAllocator),
+                ("max_bytes".to_string(), Type::Int),
+            ],
+            Type::Nil,
+        )),
+        (Type::KVAllocator, "on_watermark") => Some(Signature::new(
+            vec![
+                ("self".to_string(), Type::KVAllocator),
+                (
+                    "threshold".to_string(),
+                    Type::Union(vec![Type::Float, Type::Int]),
+                ),
+                ("callback".to_string(), Type::Any),
+            ],
+            Type::Nil,
+        )),
+        (Type::KVAllocator, "clear_watermarks") => Some(Signature::new(
+            vec![("self".to_string(), Type::KVAllocator)],
+            Type::Nil,
         )),
         (Type::KVAllocator, "append_tokens") => Some(Signature::new(
             vec![
@@ -1125,7 +1186,7 @@ fn method_signature_builtin(receiver: &Type, method: &str) -> Option<Signature> 
             ],
             Type::List(Box::new(Type::any_tensor())),
         )),
-        (Type::KVAllocator, "free_seq" | "seq_tokens") => Some(Signature::new(
+        (Type::KVAllocator, "free_seq" | "seq_tokens" | "seq_priority") => Some(Signature::new(
             vec![
                 ("self".to_string(), Type::KVAllocator),
                 ("seq_id".to_string(), Type::Int),
@@ -1139,9 +1200,29 @@ fn method_signature_builtin(receiver: &Type, method: &str) -> Option<Signature> 
             ],
             Type::List(Box::new(Type::Int)),
         )),
+        (Type::KVAllocator, "evict_preempt") => Some(Signature::with_min_arity(
+            vec![
+                ("self".to_string(), Type::KVAllocator),
+                (
+                    "max_victim_priority".to_string(),
+                    Type::Union(vec![Type::Int, Type::Nil]),
+                ),
+            ],
+            1,
+            Type::Int,
+        )),
+        (Type::KVAllocator, "reclaim_for") => Some(Signature::new(
+            vec![
+                ("self".to_string(), Type::KVAllocator),
+                ("pages_needed".to_string(), Type::Int),
+                ("requester_priority".to_string(), Type::Int),
+            ],
+            Type::List(Box::new(Type::Int)),
+        )),
         (
             Type::KVAllocator,
-            "evict_lru" | "free_pages" | "used_pages" | "total_pages" | "bytes_used",
+            "evict_lru" | "free_pages" | "used_pages" | "total_pages" | "bytes_used"
+            | "quota_bytes",
         ) => Some(Signature::new(
             vec![("self".to_string(), Type::KVAllocator)],
             Type::Int,
@@ -1152,6 +1233,75 @@ fn method_signature_builtin(receiver: &Type, method: &str) -> Option<Signature> 
         )),
         (Type::KVAllocator, "stats") => Some(Signature::new(
             vec![("self".to_string(), Type::KVAllocator)],
+            Type::Dict(Box::new(Type::String), Box::new(Type::Int)),
+        )),
+        // ── Wave 4 P1: General Tensor MemoryPool methods ──
+        (Type::MemoryPool, "alloc" | "zeros") => Some(Signature::with_min_arity(
+            vec![
+                ("self".to_string(), Type::MemoryPool),
+                ("shape".to_string(), Type::List(Box::new(Type::Int))),
+                (
+                    "dtype".to_string(),
+                    Type::Union(vec![Type::String, Type::Nil]),
+                ),
+            ],
+            2,
+            Type::any_tensor(),
+        )),
+        (Type::MemoryPool, "full") => Some(Signature::with_min_arity(
+            vec![
+                ("self".to_string(), Type::MemoryPool),
+                ("shape".to_string(), Type::List(Box::new(Type::Int))),
+                (
+                    "value".to_string(),
+                    Type::Union(vec![Type::Float, Type::Int]),
+                ),
+                (
+                    "dtype".to_string(),
+                    Type::Union(vec![Type::String, Type::Nil]),
+                ),
+            ],
+            3,
+            Type::any_tensor(),
+        )),
+        (Type::MemoryPool, "release") => Some(Signature::new(
+            vec![
+                ("self".to_string(), Type::MemoryPool),
+                ("tensor".to_string(), Type::any_tensor()),
+            ],
+            Type::Int,
+        )),
+        (Type::MemoryPool, "set_quota") => Some(Signature::new(
+            vec![
+                ("self".to_string(), Type::MemoryPool),
+                ("max_bytes".to_string(), Type::Int),
+            ],
+            Type::Nil,
+        )),
+        (Type::MemoryPool, "on_watermark") => Some(Signature::new(
+            vec![
+                ("self".to_string(), Type::MemoryPool),
+                (
+                    "threshold".to_string(),
+                    Type::Union(vec![Type::Float, Type::Int]),
+                ),
+                ("callback".to_string(), Type::Any),
+            ],
+            Type::Nil,
+        )),
+        (Type::MemoryPool, "clear_watermarks") => Some(Signature::new(
+            vec![("self".to_string(), Type::MemoryPool)],
+            Type::Nil,
+        )),
+        (Type::MemoryPool, "trim" | "active_bytes" | "cached_bytes" | "max_bytes") => Some(
+            Signature::new(vec![("self".to_string(), Type::MemoryPool)], Type::Int),
+        ),
+        (Type::MemoryPool, "utilization") => Some(Signature::new(
+            vec![("self".to_string(), Type::MemoryPool)],
+            Type::Float,
+        )),
+        (Type::MemoryPool, "stats") => Some(Signature::new(
+            vec![("self".to_string(), Type::MemoryPool)],
             Type::Dict(Box::new(Type::String), Box::new(Type::Int)),
         )),
         (Type::Tensor { .. }, "shape") => Some(Signature::new(

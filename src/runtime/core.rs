@@ -10,6 +10,7 @@ use std::sync::Arc;
 use crate::common::trait_info::TraitInfo;
 use crate::error::MoraResult;
 use crate::runtime::autograd::AutogradContext;
+use crate::runtime::compute_dag::DagPlanCache;
 use crate::runtime::fs::FsContext;
 use crate::runtime::reactor::AsyncIoReactor;
 use crate::runtime::scheduler::{TaskContext, TaskScheduler};
@@ -21,14 +22,21 @@ pub struct EngineShared {
     pub(crate) scheduler: Arc<TaskScheduler>,
     /// Wave 2 W2.4: Shared tokio async I/O reactor.
     pub(crate) reactor: Arc<AsyncIoReactor>,
+    /// Wave 4 P1: Thread-safe structural compilation cache for [`crate::runtime::compute_dag::TensorComputeDag`].
+    pub(crate) dag_cache: Arc<DagPlanCache>,
 }
 
 impl EngineShared {
-    /// Construct a shared runtime backing (`scheduler` + `reactor`).
+    /// Construct a shared runtime backing (`scheduler` + `reactor` + `dag_cache`).
     pub fn new() -> Self {
         let scheduler = TaskScheduler::shared();
         let reactor = Arc::new(AsyncIoReactor::new(Arc::clone(&scheduler)));
-        Self { scheduler, reactor }
+        let dag_cache = Arc::new(DagPlanCache::default());
+        Self {
+            scheduler,
+            reactor,
+            dag_cache,
+        }
     }
 
     /// Borrow the shared multi-threaded [`TaskScheduler`].
@@ -39,6 +47,11 @@ impl EngineShared {
     /// Borrow the shared [`AsyncIoReactor`].
     pub fn reactor(&self) -> &Arc<AsyncIoReactor> {
         &self.reactor
+    }
+
+    /// Borrow the shared [`DagPlanCache`].
+    pub fn dag_cache(&self) -> &Arc<DagPlanCache> {
+        &self.dag_cache
     }
 }
 

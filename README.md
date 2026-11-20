@@ -33,6 +33,7 @@ include both `mora` and `mora-lsp`.
 | Linux x86_64 (musl)     | `mora-x86_64-unknown-linux-musl.tar.gz`        |
 | macOS Intel             | `mora-x86_64-apple-darwin.tar.gz`              |
 | macOS Apple Silicon     | `mora-aarch64-apple-darwin.tar.gz`             |
+| Docker (linux/amd64)    | `mora-docker-amd64.tar.gz`                     |
 
 Add the extracted binary to `PATH`; you get both `mora` and `mora-lsp`.
 
@@ -208,22 +209,22 @@ Key modules under `src/`:
 
 - `lexer.rs` — tokenizer (`Int`/`Float` precision, numeric underscores, scientific notation, low-bitwidth suffixes, `**`, `@`, `!`)
 - `parser_v3/` — iterative Pratt expression parser and single-pass Control SSA witness compiler
-- `mir/control/` — SSA IR (`ControlProgram`, `BasicBlock`, `ControlInst`, `ControlTerminator`), lowering, verifier, and optimizer (`OptLevel`)
+- `mir/control/` — SSA IR (`ControlProgram`, `BasicBlock`, `ControlInst`, `ControlTerminator`), lowering, verifier, optimizer (`OptLevel`), and deterministic `MORABC02` binary LEB128 bytecode codec (`codec.rs`)
 - `typeck/` — unified Span-tracked Hindley-Milner solver (`src/typeck/check_mir.rs`, `src/typeck/hm/`) and cross-module `import` symbol verification
-- `runtime/` — stackful VM (`vm/`), `CoreRuntime`, process-shared `EngineShared`, `TaskScheduler` / `MoraChannel` / `AsyncIoReactor` (`scheduler.rs`, `reactor.rs`), reverse/forward autograd (`autograd.rs`), `TensorComputeDag` & `DeviceBackend` (`compute_dag.rs`), PagedAttention `KVPageAllocator` (`kv_cache.rs`), built-in domain/method handlers (`builtins/`), and `FsPolicy` / `CheckedPath` confinement (`fs.rs`)
-- `value/` & `value.rs` — `Value` (including `Scalar`, `Tensor`, `StructInstance`, `EnumVariant`, `DynTrait`, `Channel`, `TaskHandle`, `Context`, `TcpListener`, `TcpStream`, `Continuation`, `External(Arc<dyn HostObject>)`), 64-byte aligned packed `tensor.rs`, chunked persistent `list.rs`, lexical `Environment`, and `display.rs`
+- `runtime/` — stackful VM (`vm/`), `CoreRuntime`, process-shared `EngineShared`, `TaskScheduler` / `MoraChannel` / `AsyncIoReactor` (`scheduler.rs`, `reactor.rs`), reverse/forward/higher-order autograd (`autograd.rs`, `autograd_higher_order.rs`), `TensorComputeDag` & `DeviceBackend` (`compute_dag.rs`, `simd_kernels.rs`), zero-dependency hardware GPU drivers (`gpu/{mod,cuda,vulkan,metal}.rs`), PagedAttention `KVPageAllocator` (`kv_cache.rs`), 64B slab `MemoryPool` (`memory_pool.rs`), built-in domain/method handlers (`builtins/`), and `FsPolicy` / `CheckedPath` confinement (`fs.rs`)
+- `value/` & `value.rs` — `Value` (including `Scalar`, `Tensor`, `ComputeDag`, `KVPageAllocator`, `MemoryPool`, `StructInstance`, `EnumVariant`, `DynTrait`, `Channel`, `TaskHandle`, `Context`, `TcpListener`, `TcpStream`, `Continuation`, `External(Arc<dyn HostObject>)`), 64-byte aligned packed `tensor.rs`, chunked persistent `list.rs`, lexical `Environment`, and `display.rs`
 - `flow/` & `flow.rs` — shared iterative RFC 8259 JSON parser/serializer and overflow-checked numeric tower
 - `lsp/` — bounded stdio transport, JSON-RPC router, and HM-unified LSP providers
-- `cli/` — shared CLI compilation, single-binary bundler (`bundle.rs`), interactive REPL (`repl.rs`), and path helpers
-- `std/` — modular standard libraries (`std/math/bigint` Rust crate, pure-Mora `std/net/http.mora` with SSE, and `std/mcp.mora`)
+- `cli/` — shared CLI compilation, zero-source `MORABC02` single-binary bundler (`bundle.rs`), interactive REPL (`repl.rs`), and path helpers
+- `std/` — modular standard libraries (`std/math/bigint` Rust crate, pure-Mora `std/net/http.mora` with Router/Chunked/Keep-Alive/SSE, and `std/mcp.mora` with Tools/Resources/Prompts/`Struct::schema()`/Stdio)
 - `error.rs` — unified domain-typed `MoraError` / `MoraResult` with `Span` diagnostics
 
 ### Architecture evolution (Wave 1–4)
 
 - **Wave 1 (Completed, v0.110.0)** — Decoupled application-layer DSL constructs from the compiler core; extracted `BigInt` into `std/math/bigint` (`mora-std-bigint`) and focused the core runtime on language primitives and 7 foundational modules.
 - **Wave 2 (Completed, v0.110.0)** — Unified execution around the single-pass Control SSA IR & heap-framed stackful VM (`O(1)` tail-call optimization, multi-shot delimited continuations), Tokio `TaskScheduler` & `AsyncIoReactor`, Go-style `spawn`/`channel<T>`/`select`/`context`/`sleep`, first-class async TCP (`tcp_listen`/`tcp_connect`/`tcp_listener`/`tcp_stream`), `FsPolicy`/`CheckedPath` sandboxed I/O, `HostObject` extensibility, and HM-unified `mora-lsp`.
-- **Wave 3 — Stage 3A / 3B / 3C (Completed)** — Stage 3A delivered strict `Int`/`Float` lexical precision, low-bitwidth suffixes (`f16`/`bf16`/`fp8`/`i4`..`i64`), `**`/`@`/`!`, and the single Span-tracked HM constraint solver. Stage 3B added first-class `Tensor<DType, Shape, Device>` with 64-byte aligned packed storage and 5 static checks (DType, Shape, Device, Resource, Effect). Stage 3C delivered nominal `struct`/`enum`/`@tag` reflection, source-level `trait`/`impl`/`dyn`, default & named keyword arguments, zero-copy multi-dim `TensorSlice`, and reverse-mode `grad`/`value_and_grad`/`no_grad`.
-- **Wave 4 (Completed · Track 4-1 Deepened)** — Native `TensorComputeDag` (`trace_dag`) with 4-pass fusion (`FusedFlashAttention` tiled online-softmax FlashAttention-2, `FusedRmsNormLinear`, `FusedLinearAct`, `FusedElementwise`), hardware-SIMD (`AVX2+FMA`/`NEON`) multi-threaded cache-blocked `CpuDeviceBackend`, compile-time `DagMemoryPlan` physical scratch-buffer reuse & `DagPlanCache`, arbitrary-order AD (`grad(grad(f))`, `jvp(grad(f), x, v)` exact HVP, `trace_dag(grad(f))`), PagedAttention-style `KVPageAllocator` (`kv_allocator`), `mora build` single-binary compilation, and pure-Mora `std/net/http` (with SSE) & `std/mcp` standard libraries.
+- **Wave 3 — Stage 3A / 3B / 3C (Completed, v0.110.0)** — Stage 3A delivered strict `Int`/`Float` lexical precision, low-bitwidth suffixes (`f16`/`bf16`/`fp8`/`i4`..`i64`), `**`/`@`/`!`, and the single Span-tracked HM constraint solver. Stage 3B added first-class `Tensor<DType, Shape, Device>` with 64-byte aligned packed storage and 5 static checks (DType, Shape, Device, Resource, Effect). Stage 3C delivered nominal `struct`/`enum`/`@tag` reflection, source-level `trait`/`impl`/`dyn`, default & named keyword arguments, zero-copy multi-dim `TensorSlice`, and reverse-mode `grad`/`value_and_grad`/`no_grad`.
+- **Wave 4 — Track 4-1 / 4-2 / 4-3 + P1/P2 (Completed, v0.110.0)** — Native `TensorComputeDag` (`trace_dag`) with 4-pass fusion (`FusedFlashAttention` tiled online-softmax FlashAttention-2, `FusedRmsNormLinear`, `FusedLinearAct`, `FusedElementwise`), zero-dependency dynamic hardware GPU `DeviceBackend`s (NVIDIA CUDA Driver API + PTX ISA 7.0 `f64` kernels & `CudaVramArena`, Vulkan 1.0 + pure-Rust SPIR-V 1.0 compute shaders, macOS Metal MSL) plus `AVX2+FMA`/`NEON` multi-threaded `CpuDeviceBackend`, compile-time `DagMemoryPlan` physical scratch-buffer reuse & `DagPlanCache`, arbitrary-order AD (`grad(grad(f))`, `jvp(grad(f), x, v)` exact HVP, `trace_dag(grad(f))`), PagedAttention-style `KVPageAllocator` (`kv_allocator` with byte quotas, priority preemption & watermark callbacks) & 64B slab `MemoryPool` (`memory_pool`), zero-source `MORABC02` precompiled bytecode `mora build` single-binary & `.morac` execution, and pure-Mora `std/net/http` (Router/Chunked/Keep-Alive/413/SSE) & `std/mcp` (Tools/Resources/Prompts/`Struct::schema()`/Stdio) standard libraries.
 
 ## Examples & tests
 

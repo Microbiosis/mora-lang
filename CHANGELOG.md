@@ -2,9 +2,9 @@
 
 All notable changes to Mora will be documented in this file.
 
-## [0.110.0] — Wave 1 架构解耦与编译器瘦身
+## [0.110.0] — 全波次（Wave 1–4 + P1/P2）架构重铸与 AI-Native 静态类型语言定版
 
-重新校准 Mora 核心定位：**AI-native 静态类型语言，面向大模型底层、计算图与算子、大模型推理/训练与资源动态调控，同时具备云原生属性并对 HTTP 与 MCP 服务提供语言原语级友好支持**。
+重新校准并完整兑现 Mora 核心定位：**AI-native 静态类型语言，面向大模型底层、计算图与算子、大模型推理/训练与资源动态调控，同时具备 Go 式云原生并发属性并对 HTTP 与 MCP 服务提供语言原语级友好支持**。
 
 ### Breaking 变更（Wave 1 移除硬编码耦合特性）
 
@@ -111,22 +111,14 @@ All notable changes to Mora will be documented in this file.
   - **Apple Metal 后端（`src/runtime/gpu/metal.rs`）**：在 macOS 动态加载 `Metal.framework` + `libobjc.A.dylib`，支持运行期 MSL 着色器编译与 `MTLComputeCommandEncoder` 硬件派发。
   - 扩充 `Device::Vulkan(u16)`（`"vulkan"` / `"vulkan:N"`，含 HM 静态跨设备隔离与 `Tensor<f32, [2, 3], vulkan:0>` 类型标注），新增 `Tensor::devices()` / `Tensor::device_info(device?)` 完整打通运行期、HM 静态类型检查、LSP 补全及 `ComputeDag.backend_info()` 硬件遥测字段（`driver`/`gpu_name`/`vram_bytes`/`compute_capability`/`multiprocessors`/`hardware_accelerated`/`driver_version`）。
 
-## [Unreleased] — 历史提交记录（`Int` 语义统一 + D468–D491）
+## [0.104.x 历史记录] — `Int` 语义统一与早期过渡批次（D468–D491，已被 v0.110.0 统一取代）
 
-自 `v0.104.5`（最后一个真正的发布，tag `v0.104.5`）起累计：
-7 个提交 + 工作区在制品 + D468 数值塔重构。
+> 说明：以下为 `v0.110.0` 四波次重铸前的历史过渡记录（原 `0.104.5` 之后的 `Int` 精确 `i64` 语义统一与旧多轨 IR 试验记录），保留仅供历史缺陷编号（`D1`–`D491`）溯源参考。
 
-> ⚠ **本段不打版本号。** 项目尚未完善到可以定版的程度，版本号仍留在
-> `0.104.5`，等真正准备发布时再 bump 并打 tag。
->
-> 此前 CHANGELOG 里有个「`v0.104.6`（从未发布：无 tag、无 release commit）」段，
-> 其段号与 manifest 对不上 —— 读者按文档复现会去找一个不存在的 `v0.104.6`。
-> 本段保留该「从未发布」标记，其内容并入此处。
-
-### breaking 变更（尚未发布）
+### `Int` 精确 `i64` 语义统一（D468）
 
 - **`Int` 语义**：算术与比较统一为**精确 i64**（overflow 报 `MoraError`）。
-  2^53 之外的 `Int` 运算结果会变（此前静默丢最低位），`Int ⊗ Float` 超界改报错。
+  2^53 之外的 `Int` 运算结果不再静默丢最低位，`Int ⊗ Float` 超界改报错。
 
 ### D491：模块导入接上 —— Core 侧能导入模块
 

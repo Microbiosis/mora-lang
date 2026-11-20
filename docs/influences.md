@@ -1,429 +1,295 @@
-# Mora 语言设计影响源
+# Mora 语言设计影响源（v0.110.0）
 
-> 9 个学习对象，每个贡献了一个核心设计基因。
+> 9 个学习对象加上系统级原语借鉴，共同塑造了 **Mora v0.110.0**——一门面向大模型底层、计算图与算子、大模型推理/训练与动态资源调控，同时具备 Go 式云原生并发与纯 Mora HTTP/MCP 标准库的 **AI-native 静态类型语言**。
 
 ---
 
-## 1. Clojure — 不可变数据结构
+## 1. Clojure — 默认不可变、持久化向量与软件事务内存（STM）
 
-**基因**: 值语义 + 持久化数据结构
+**基因**：值语义 + 分块持久化向量（`src/value/list.rs`）+ 原子引用（`atom`/`swap`/`deref`）+ 事务回滚（`transaction`）
 
 ```clojure
-;; Clojure: 所有数据结构默认不可变
+;; Clojure: 所有数据结构默认不可变，状态变更通过 atom / dosync 显式进行
 (def a [1 2 3])
-(def b (conj a 4))   ;; a 不变，b 是新向量
+(def b (conj a 4))
+(def counter (atom 0))
+(swap! counter inc)
 ```
 
-**Mora 继承**:
+**Mora v0.110.0 体现**：
 ```mora
 let a = [1, 2, 3]
-let b = a | push(4)    -- a 不变，b 是新列表
-assign a = [10]        -- 显式修改，意图清晰
+let b = a |> push(4)   -- a 保持 [1, 2, 3]，b 为 [1, 2, 3, 4]
+assign a = [10]        -- 显式重新绑定
+
+let counter = atom(0)
+swap(counter, fn(n) n + 1 end)
+print(deref(counter))  -- 1
 ```
 
-| Clojure 原则 | Mora 体现 |
-|--------------|-----------|
-| 默认不可变 | `let` 不可变，`assign` 显式修改 |
-| 持久化数据结构 | `list`/`dict` 赋值深拷贝 |
-| STM (软件事务内存) | v1.0 计划 |
-| REPL 驱动开发 | `mora --repl` |
+| Clojure 原则 | Mora v0.110.0 实现 |
+| :--- | :--- |
+| 默认不可变绑定 | `let` 默认不可变，仅 `assign` 允许显式局部重绑定 |
+| 持久化序列 | `Value::List` 采用分块持久化向量（`src/value/list.rs`），支持结构共享 |
+| 受控共享可变状态 | `atom(v)` / `swap(a, f)` / `deref(a)` 线程安全原子更新 |
+| 事务与补偿 | `transaction ... compensation ... end` 失败自动回滚环境与补偿执行 |
+| REPL 驱动开发 | `mora --repl`（`src/cli/repl.rs`） |
 
 ---
 
-## 2. Common Lisp — 宏系统 + 多范式
+## 2. Common Lisp — 编译期宏、代数效果与多范式融合
 
-**基因**: 代码即数据、卫生宏、条件系统
+**基因**：卫生/模板宏系统、条件恢复（在 Mora 中升级为带静态效果行的多发定界续延代数效果 `effect`/`perform`/`handle`）
 
 ```lisp
-;; Common Lisp: 宏在编译期变换 AST
+;; Common Lisp: 宏变换与 handler-case / restart 条件恢复
 (defmacro when (condition &body body)
   `(if ,condition (progn ,@body)))
-
-;; 条件系统 (比 try/catch 更强)
-(handler-case (error "oops")
-  (error (c) (format t "caught: ~a" c)))
 ```
 
-**Mora 继承**:
+**Mora v0.110.0 体现**：
 ```mora
--- with 块：声明式上下文变换（类似宏的效果）
-with model = "gpt-4o", temperature = 0.7
-  let r = ai.chat("hello")
+macro unless(cond, body)
+  if !cond then
+    body
+  end
 end
 
--- Result 类型：显式错误处理（类似 condition system 的理念）
-let result = risky_call()
-match result
-  | Ok(v) => process(v)
-  | Err(e) => handle_error(e)
-end
+effect Ask(string): int
+
+let total = handle Ask {
+  let a = perform Ask("first")
+  let b = perform Ask("second")
+  a + b
+} {
+  resume(10) + resume(20)
+}
+print(total)
 ```
 
-| Common Lisp 原则 | Mora 体现 |
-|------------------|-----------|
-| 多范式共存 | 命令式 + 函数式 + OOP + 声明式 |
-| REPL 优先 | `mora --repl` |
-| 动态类型 → 静态类型 | Mora 选择静态类型（反向借鉴） |
-| 宏作为 AST 变换 | `with`/`route`/`observe` 是语法级宏 |
+| Common Lisp 原则 | Mora v0.110.0 实现 |
+| :--- | :--- |
+| 多范式共存 | 函数式 + 命令式 + 名义 `struct`/`enum`/`trait`/`impl` + 声明式计算图 |
+| 可恢复条件系统 | 升级为静态类型化代数效果 `effect`/`perform`/`handle` + 多发定界续延 `resume`（`Value::Continuation`） |
+| 显式错误代数类型 | 协变 `result<T, E>`（`Ok(v)` / `Err(e)`）配合 `match` 解构 |
+| 宏与元编程 | `macro` + `macroexpand` + `quote` / `quasiquote` |
 
 ---
 
-## 3. Prolog — 模式匹配 + 逻辑编程
+## 3. Prolog — 结构化模式匹配、守卫与合一思想
 
-**基因**: 声明式推理、回溯、合一
+**基因**：声明式模式解构、守卫条件（`when`）、编译期 HM 约束与维度符号合一（Unification）
 
 ```prolog
-% Prolog: 模式匹配 + 回溯
-factorial(0, 1).
-factorial(N, F) :- N > 0, N1 is N - 1, factorial(N1, F1), F is N * F1.
+% Prolog: 合一与守卫
+classify(0, zero).
+classify(N, positive) :- N > 0.
 ```
 
-**Mora 继承**:
+**Mora v0.110.0 体现**：
 ```mora
--- 模式匹配（来自 Prolog 的合一思想）
-let result = match value
-  | 0 => "zero"
-  | n: number => p"number: {n}"
-  | [head, ...tail] => p"list with head: {head}"
-  | {name, age} => p"person: {name}, {age}"
-  | _ => "unknown"
+enum Shape
+  Circle(float)
+  Rect(float, float)
 end
 
--- with 块：声明式配置（逻辑编程的 "声明目标"）
-with model = "gpt-4o"
-  -- 声明 "在这个上下文中执行"
+struct Point
+  x: int = 0
+  y: int = 0
 end
+
+let describe = fn(s: Shape)
+  match s with
+    Shape::Circle(r) when r > 10.0 -> "large circle"
+    Shape::Circle(_) -> "small circle"
+    Shape::Rect(w, h) -> "rect"
+  end
+end
+
+print(describe(Shape::Circle(15.0)))
 ```
 
-| Prolog 原则 | Mora 体现 |
-|-------------|-----------|
-| 模式匹配 | `match` 语句 |
-| 声明式编程 | `with`/`route`/`observe` |
-| 回溯 | `Result` + `?` 操作符（错误回溯） |
-| 合一 | 结构化模式匹配 |
+| Prolog 原则 | Mora v0.110.0 实现 |
+| :--- | :--- |
+| 模式匹配与守卫 | `match expr with ... when cond -> ... end`（支持字面量、列表 `[h, ...t]`、字典 `{k: v, ..}`、名义 `Struct { .. }` 与 `Enum::Variant(...)`） |
+| 约束合一（Unification） | `src/typeck/hm/` 单一 `Span` 追踪 HM 约束求解器 + 张量符号维度（`[M, K] @ [K, N] -> [M, N]`）合一 |
 
 ---
 
-## 4. Lisp — 代码即数据 (Homoiconicity)
+## 4. Lisp — 代码即数据（Homoiconicity）
 
-**基因**: S 表达式、宏、最小语法
+**基因**：同像性（`Value::Code`）、准引用与展开拼接（`` `(...) ``、`,expr`、`,,expr`）、运行时编译求值 `eval`
 
 ```lisp
-;; Lisp: 代码就是列表，列表就是代码
-(+ 1 2)           ;; 调用
-'(+ 1 2)          ;; 数据
-(eval '(+ 1 2))   ;; 数据变代码
+(+ 1 2)
+'(+ 1 2)
+(eval '(+ 1 2))
 ```
 
-**Mora 继承（v0.86-v0.88 完整实现 homoiconicity）**:
+**Mora v0.110.0 体现**：
 ```mora
--- eval: 运行时编译并执行 Mora 代码（v0.86）
-let code = "let x = 10 + 20"
-eval(code)           -- x = 30
-
--- quote: 表达式 → Value::Code 数据（v0.86）
-let expr = quote(1 + 2)    -- Code，不求值
-
--- gensym: 生成唯一符号（v0.86）
-let sym = gensym()          -- "g0", "g1", ...
-
--- read: 字符串 → Value::Code（v0.86）
+let expr = quote(1 + 2)
 let ast = read("let x = 42")
+let sym = gensym()
 
--- macroexpand: 展开宏调用（v0.86）
-macroexpand("my_macro", [arg1, arg2])
-
--- quasiquote + unquote + unquote-splice（v0.88）
 let items = [1, 2, 3]
-let code = `(sum ,,items)     -- splicing
+let spliced = `(sum ,,items)
 
--- apply / car / cdr / cons（v0.86）
-let list = cons(1, cons(2, nil))
-let head = car(list)           -- 1
-let tail = cdr(list)           -- (2 . nil)
+let lst = cons(1, cons(2, nil))
+print(car(lst), cdr(lst), sym)
 ```
 
-| Lisp 原则 | Mora 体现 |
-|-----------|-----------|
-| 代码即数据 (homoiconicity) | `eval`/`quote`/`read` + `Value::Code` 类型 |
-| 宏系统 | `macro_stmt` + `macroexpand` + quasiquote |
-| 最小语法 | 30 个关键字，无花括号 |
-| REPL | `mora --repl` |
-| 函数是一等公民 | 闭包、高阶函数、`apply` |
+| Lisp 原则 | Mora v0.110.0 实现 |
+| :--- | :--- |
+| 代码即数据 | `quote` / `read` / `eval` / `macroexpand` + 一等 `Value::Code` |
+| 准引用与列表拼接 | `` `( ... ,x ,,xs ) ``（`TokenType::CommaComma`） |
+| 序对与列表原语 | `cons` / `car` / `cdr` / `apply` |
 
 ---
 
-## 5. Ballerina — 云原生集成
+## 5. Ballerina & Go — 云原生并发原语与服务友好标准库
 
-**基因**: 网络原语、服务声明、类型化网络交互
+**基因**：语言级轻量协程（`spawn`）、类型化不变通道（`channel<T>`）、公平多路选择（`select`）、分层取消上下文（`context`）、非阻塞异步 TCP（`tcp_listen`/`tcp_connect`）与单二进制交付（`mora build`）
 
-```ballerina
-// Ballerina: 网络服务是一等公民
-service /api on new http:Listener(8080) {
-    resource function post chat(ChatRequest req) returns ChatResponse|error {
-        // ...
-    }
-}
-```
+> **v0.110.0 架构演进**：Mora 不再将 HTTP Router 或 MCP Server 硬编码在编译器与 `Value` 中，而是提供坚实的 Go 式并发 + 异步网络原语 + `@tag` 编译期结构体反射，在标准库 `std/net/http` 与 `std/mcp` 中**用纯 Mora 语言自身实现**。
 
-**Mora 继承**:
+**Mora v0.110.0 体现**：
 ```mora
--- 路由声明：网络服务是一等公民
-route POST /api/chat -> handle_chat
-route GET /api/health -> handle_health
+import "std/net/http"
+import "std/mcp"
 
--- HTTP 服务器：零配置启动
-let router = Router::new()
-router
-  | route("POST", "/api/chat", handle_chat)
-  | listen("0.0.0.0:3000")
-
--- MCP 服务器：协议原生支持
-let server = McpServer::new()
-server
-  | tool("greet", {name: {type: "string"}}, greet_handler)
-  | serve()
-```
-
-| Ballerina 原则 | Mora 体现 |
-|----------------|-----------|
-| 网络原语内置 | `Router::new()`, `McpServer::new()` |
-| 类型化网络交互 | `HttpRequest`, `HttpResponse` 类型 |
-| 声明式服务 | `route` 语句 |
-| 可观测性内置 | `observe`/`span` |
-
----
-
-## 6. StreamIt — 流处理
-
-**基因**: 数据流编程、流管道、生产者-消费者
-
-```streamit
-// StreamIt: 流是第一公民
-pipeline MyFilter {
-    add Source();
-    add Filter();
-    add Sink();
-}
-```
-
-**Mora 继承**:
-```mora
--- 管道运算符：流式数据处理
-let result = "hello world"
-  | upper()
-  | split(" ")
-  | map(fn(w) = w.trim())
-  | filter(fn(w) = len(w) > 3)
-  | reduce(fn(acc, w) = acc + " " + w, "")
-
--- AI 流式输出
-let stream = ai.stream("Tell me a story")
-for token in stream
-  print(token)
+struct WeatherArgs
+  city: string @tag(json="city", desc="Target city name")
+  days: int = 3 @tag(json="days", optional="true")
 end
 
--- Agent 多步执行流
-let agent = ai.create("researcher", {tools: ["search"]})
-let result = agent.run("Find latest AI news")
+let schema = mcp_schema_from_struct(WeatherArgs::schema(), "Weather query")
+let router = http_router()
+let router = http_router_get(router, "/health/:node", fn(req)
+  return http_json_response(200, {ok: true, node: http_param(req, "node")})
+end)
 ```
 
-| StreamIt 原则 | Mora 体现 |
-|---------------|-----------|
-| 流是一等公民 | `stream` 类型、`stream for` |
-| 管道组合 | `\|` 运算符 |
-| 生产者-消费者 | `ai.stream` → `for` 循环 |
-| 声明式数据流 | `map`/`filter`/`reduce` |
+| 云原生原则 | Mora v0.110.0 实现 |
+| :--- | :--- |
+| 轻量协程与通道 | `spawn`（`task_handle<T>`）、`channel(cap)`（`channel<T>` 不变类型）、`select`（`case`/`timeout`/`default`）、`context()` |
+| 非阻塞网络 I/O | `tcp_listen` / `tcp_connect` / `tcp_listener` / `tcp_stream`（基于 Tokio `AsyncIoReactor`） |
+| 纯 Mora HTTP/SSE 标准库 | `std/net/http.mora`（声明式 `Router`、`:param`/`*`、中间件、`chunked`、`keep-alive`、`max_body_bytes` 413 守卫、SSE 流） |
+| 纯 Mora MCP 标准库 | `std/mcp.mora`（JSON-RPC 2.0、Tools/Resources/Prompts、`Struct::schema()` 自动派生、HTTP+SSE 与 Stdio NDJSON） |
+| 零源码单二进制交付 | `mora build <file.mora> -o <app>`（预编译 `MORABC02` 二进制 `ControlProgram` 字节码，零源码嵌入） |
 
 ---
 
-## 7. APL — 符号密度 + 数组编程
+## 6. StreamIt — 数据流管道与计算图算子融合
 
-**基因**: 极致简洁、数组原语、符号表达力
+**基因**：声明式管道组合（`|>`）与静态数据流子图优化（在 Mora Wave 4 中演进为 `TensorComputeDag` 算子融合流水线）
 
-```apl
-⍝ APL: 一行搞定
-(+/⍵)÷⍴⍵        ⍝ 平均值
-⍳10              ⍝ 1..10
-2 3⍴⍳6           ⍝ 2x3 矩阵
-```
-
-**Mora 继承**:
+**Mora v0.110.0 体现**：
 ```mora
--- 不追求 APL 的符号密度，但追求表达力
--- 一行完成复杂操作
-let avg = numbers | reduce(fn(a, b) = a + b, 0) / len(numbers)
+-- 标量/集合流式管道
+let words = "hello cloud native mora"
+  |> upper()
+  |> split(" ")
+  |> filter(fn(w) len(w) > 4 end)
 
--- range 生成序列
-let nums = range(1, 11, 1)    -- [1, 2, ..., 10]
-
--- 模板字符串：高信息密度
-let msg = p"Processed {len(items)} items in {elapsed}ms"
-
--- v0.91: 标量数学与统计（APL 数学原语全面落地）
-let root = math.sqrt(2.0)
-let mean = [1.0, 2.0, 3.0, 4.0, 5.0] | stats.mean     -- 3.0
-let big = 99999999999999999999n                    -- BigInt 任意精度
+-- 神经网络计算图追踪与 4 遍自动算子融合（FlashAttention / RmsNormLinear / LinearAct / Elementwise）
+let x = Tensor::ones([2, 4])
+let w = Tensor::ones([4, 3])
+let b = Tensor::zeros([3])
+let dag = trace_dag(fn(inp, weight, bias)
+  return (inp @ weight + bias).gelu()
+end, [x, w, b]).compile()
+let out = dag.run([x, w, b])
 ```
 
-| APL 原则 | Mora 体现 |
-|----------|-----------|
-| 数组原语 | `list` 方法（`map`/`filter`/`reduce`/`sort`/`sum`/`mean`/`stddev`/`histogram`） |
-| 标量函数 | `math.*`（sin/cos/tan/exp/log/pow/sqrt/abs/floor/ceil + PI/E/TAU 常量） |
-| 统计函数 | `stats.*`（mean/median/stddev/var/min/max/quantile/histogram/corr/cov） |
-| 数值方法链 | `x.abs()` / `x.sqrt()` / `list.sum()` 等 Smalltalk 风格 |
-| 线性代数 | `linalg.*`（dot/cross/norm/matmul/transpose） |
-| 任意精度 | `123n` BigInt 字面量 + `Int + BigInt → BigInt` promotion |
-| 表达力 | `p"..."` 模板、管道 |
-| 简洁 | 3 行写完 HTTP 服务器 |
-| 符号有意义 | `\|` 管道、`?` 错误传播、`p"..."` 模板 |
+| StreamIt 原则 | Mora v0.110.0 实现 |
+| :--- | :--- |
+| 管道组合 | `\|>` 管道运算符 + `compose` / `partial` / `curry` |
+| 计算图融合与 Buffer 复用 | `trace_dag` → `TensorComputeDag`（4 遍算子融合 + `DagMemoryPlan` 静态草稿区复用 + `DagPlanCache`） |
 
 ---
 
-## 8. Logo — 教育性 + 最小语法
+## 7. APL — 数组/张量原语、矩阵收缩与高表达密度
 
-**基因**: 低门槛、渐进复杂度、可读性
+**基因**：一等硬件位宽 `Tensor<DType, Shape, Device>`、矩阵/批量张量收缩 `@`、幂 `**`、多维广播切片（`[:, ..., None, ::-1]`）与高阶自动微分
 
-```logo
-; Logo: 教育语言，极简语法
-TO SQUARE :SIZE
-  REPEAT 4 [FD :SIZE RT 90]
-END
+**Mora v0.110.0 体现**：
+```mora
+-- 一等 64 字节对齐紧凑张量与硬件低位宽后缀（f16/bf16/fp8/i4..i64）
+let a = Tensor::from_list([[1.0, 2.0], [3.0, 4.0]])
+let b = Tensor::eye(2)
+let c = (a @ b)[0..2, ::-1]
+
+-- 一阶/高阶自动微分（反向 grad、前向 jvp、精确 HVP）
+let f = fn(x: float) return x ** 3.0 end
+let d1 = grad(f)
+let d2 = grad(d1)
+print(d1(2.0), d2(2.0))   -- 12.0, 12.0
 ```
 
-**Mora 继承**:
+| APL / 数组语言原则 | Mora v0.110.0 实现 |
+| :--- | :--- |
+| 一等张量与硬件位宽 | `Tensor<DType, Shape, Device>`（`f64`/`f32`/`f16`/`bf16`/`fp8_e4m3`/`fp8_e5m2`/`i4`..`i64`/`u8`..`u64`/`bool`） |
+| 矩阵乘与多维切片 | 原生 `@` 算子、`**` 幂运算、零拷贝步幅切片 `t[0..4, :, None, ::-1]` |
+| 原生自动微分 | `grad` / `value_and_grad` / `jvp` / `no_grad` / 任意阶 `grad^n` & HVP |
+| 数学/统计/线性代数 | `math.*`、`stats.*`、`linalg.*`、`random.*` 原生互通 `Tensor` 与 `List`，大整数独立为 `std/math/bigint` |
+
+---
+
+## 8. Logo — 渐进复杂度与高可读性
+
+**基因**：无分号、清晰的 `task ... end` / `struct ... end` 块结构、可选类型注解（局部双向推断 + 全局 HM 求解）
+
 ```mora
--- 最小脚本：3 行
-let name = "World"
-print(p"Hello, {name}!")
+-- Level 1: 极简脚本直接运行
+print("Hello, Mora!")
 
--- 渐进复杂度：简单 → 复杂
--- Level 1: 直接执行
-print("hello")
-
--- Level 2: 函数
-task greet(name)
-  print(p"Hello, {name}!")
+-- Level 2: 带默认参数与命名参数的任务
+task scale_vec(v: list<float>, factor: float = 2.0): list<float>
+  return v.map(fn(x) x * factor end)
 end
 
--- Level 3: 类型 + trait
-trait Greeter
-  fn greet(self) -> string
-end
-
--- Level 4: Agent 编排
-let agent = ai.create("helper", {tools: ["search"]})
+print(scale_vec([1.0, 2.0], factor=3.0))
 ```
-
-| Logo 原则 | Mora 体现 |
-|-----------|-----------|
-| 低门槛 | 无分号、无花括号、自然语言风格 |
-| 渐进复杂度 | 可选类型注解、可选 trait |
-| 可读性 | `task`/`let`/`for`/`if`/`end` |
-| 教育友好 | 简单错误信息、REPL 即时反馈 |
 
 ---
 
-## 9. Smalltalk — 纯 OOP + 消息传递
+## 9. Smalltalk — 统一方法分派与源码级 `trait` / `impl` / `dyn`
 
-**基因**: 一切皆对象、消息传递、镜像
+**基因**：所有核心值（包括 `Tensor`、`Channel`、`TcpStream`、`KVPageAllocator`、`MemoryPool`、用户自定义 `struct`/`enum`）均支持一致的 `.method(...)` 调用与源码级 `trait` / `impl` 扩展。
 
-```smalltalk
-"Smalltalk: 一切都是对象，一切都是消息"
-3 + 4              "向 3 发送 + 消息"
-Array new: 10      "向 Array 发送 new: 消息"
-```
-
-**Mora 继承**:
 ```mora
--- 方法调用：消息传递风格
-let list = [1, 2, 3]
-let upper = list | map(fn(x) = x * 2)   -- 向 list 发送 map 消息
-
--- 链式调用：连续消息传递
-router
-  | route("POST", "/api", handler)
-  | listen("3000")
-
--- 类型即行为（trait 类似 Smalltalk 的协议）
-trait Drawable
-  fn draw(self) -> nil
+trait Describable
+  task summary(self): string
+    return "object"
+  end
 end
+
+struct ModelConfig
+  hidden_size: int = 768
+  layers: int = 12
+end
+
+impl Describable for ModelConfig
+  task summary(self): string
+    return "transformer"
+  end
+end
+
+let cfg = ModelConfig { hidden_size: 1024 }
+let d: dyn Describable = cfg as dyn Describable
+print(d.summary())
 ```
 
-| Smalltalk 原则 | Mora 体现 |
-|----------------|-----------|
-| 消息传递 | 方法调用 `\|` 管道 |
-| 一切皆对象 | 所有值都有方法 |
-| 镜像 | v1.0 计划（运行时反射） |
-| 图像式环境 | REPL + 录制/重放 |
-
 ---
 
-## 基因矩阵
+## 10. 底层系统与运行时原语对照（v0.110.0 核实）
 
-| 语言 | 核心基因 | Mora 中的体现 |
-|------|----------|---------------|
-| **Clojure** | 不可变 | `let` 不可变、深拷贝赋值 |
-| **Common Lisp** | 宏 | `with`/`route`/`observe` 语法块 |
-| **Prolog** | 匹配 | `match` 语句、模式解构 |
-| **Lisp** | 数据=代码 | `eval`/`quote`/`read`/quasiquote + `Value::Code` |
-| **Ballerina** | 云原生 | `Router`/`McpServer`/`route` |
-| **StreamIt** | 流 | `\|` 管道、`stream` 类型 |
-| **APL** | 密度 | 管道链、模板字符串 |
-| **Logo** | 简洁 | 无分号、自然语言风格 |
-| **Smalltalk** | 消息 | 方法调用、链式管道 |
-
----
-
-## Mora 的独特融合
-
-```
-Lisp 的灵魂    ──→  最小语法、代码即数据
-  +
-Smalltalk 的心  ──→  消息传递、一切皆对象
-  +
-Prolog 的脑    ──→  模式匹配、声明式
-  +
-Ballerina 的手  ──→  云原生、网络原语
-  +
-Clojure 的骨   ──→  不可变、函数式
-  +
-StreamIt 的血  ──→  流管道、数据流
-  +
-APL 的密度     ──→  表达力、符号
-  +
-Logo 的温度    ──→  低门槛、渐进复杂度
-  =
-Mora
-```
-
-**Mora = AI-native + 静态类型 + 云原生可观测 + 9 个语言的设计基因**
-
----
-
-*2026-06-28*
-
----
-
-## 10. 原语级借鉴（Primitive-level Influences, v0.75.10 核实）
-
-语言级借鉴（1-9）之外，Mora 的**核心原语**直接映射到成熟系统/概念。
-以下映射对照 `src/mir/handlers.rs` 等实现逐项核实（实现状态截至 v0.75.10）。
-
-| Mora 原语 | 借鉴来源 | 核心机制 | 实现状态 |
-|-----------|----------|----------|----------|
-| `Transaction` / `Rollback` / `Commit` | 数据库 ACID | 补偿事务、undo log | ✅ 实现 — `h_transaction`（handlers.rs）：body 失败 → 执行 compensation → `Err("Transaction rolled back")`；`StepUndo`（pregel/mod.rs）为增量 undo log（Flink 增量 checkpoint 精神的本地形态） |
-| `Send` / `Receive` | Actor Model / CSP | 异步消息传递、channel | ✅ 实现 — `h_send` 写入 dynamic_sends 缓冲 → ADVANCE 投递到 channel（`versions_seen` 版本快照做 delta 注入）；`h_receive` 从 channel 读 |
-| `StreamFor` | 流处理 / 响应式编程 | 增量 token 生成 | ⚠️ 占位 — `h_stream_for` 仅隔离执行 body 一次；「增量 token 流」为设计意图，尚未实现 |
-| `PromptSection` / `DocumentSection` | 文档系统 / 模板引擎 | 结构化内容生成 | ✅ 实现 — 隔离 child_env 执行 body（`h_prompt_section` / `h_document_section`） |
-| `Eval` | 测试框架 / benchmark | 带容差的断言验证 | ✅ 实现 — `h_eval`：`tolerance: Option<f64>`，Float/Int 容差比较（\|g-e\| ≤ tol），失败 Err + 成功 `PASSED`（assert-with-epsilon） |
-| `Observe` / `Span` | 可观测性 (OpenTelemetry) | 分布式追踪 | ✅ 实现 — `h_observe` / `h_span` 走 `run_isolated`（trace vars / span markers 副作用可见，v0.68 修复合并 child_env） |
-| `SkillDef` / `Task` | 工作流编排 / RPA | 声明式技能定义 | ✅ 实现 — `h_skill_def`：name / description / version / requires / tasks / verify → `Dict` + `Value::Task`（`mir_body` 走 `execute`） |
-| `Worker` / `Route` | 微服务 / 服务网格 | 工作单元路由 | ✅ 实现 — `Worker` = `run_isolated`（隔离工作单元）；`Route` 原语在 v0.75.81 删除（死代码），路由改由显式 API `Value::Router` + `.route()`/`.listen()` 方法承担 |
-
-**核实结论**：8 项中 6 项与实现一致；`StreamFor`（增量 token 生成）与 `Route`（路由分发）为已定义语法、尚未实现的设计意图 — 列为后续候选。
-
----
-
-*v0.75.10 addendum*
+| Mora 核心子系统 | 借鉴来源 | 核心机制 | 实现模块（`src/` & `std/`） |
+| :--- | :--- | :--- | :--- |
+| 单遍 Control SSA IR 与优化器 | MLIR / Cranelift SSA | 显式基本块 `BasicBlock`、`ControlInst`、`ControlTerminator`、CopyProp/GVN-CSE/LICM/DCE 与 `MORABC02` 二进制编解码 | `src/mir/control/{ir,lower,verify,opt,codec}.rs` |
+| 堆帧状态机 VM 与定界续延 | OCaml 5 / Chez Scheme | 显式 `Vec<CallFrame>`、`O(1)` 尾调用帧复用、`CapturedFrames` 多发定界续延切片重放 | `src/runtime/vm/engine.rs`、`src/runtime/effect.rs` |
+| 5 项 AI-Native 静态检查 | Dex / Jaxtyping / Koka | 单一 `Span` 追踪 HM 求解器：静态校验 `DType`、`Shape`（符号维度）、`Device`、`Resource`（原位别名）、`Effect` | `src/typeck/hm/{mod,infer,stage3c}.rs` |
+| `TensorComputeDag` 与融合后端 | XLA / PyTorch 2 Inductor / FlashAttention-2 | 4 遍融合（`FusedFlashAttention`/`FusedRmsNormLinear`/`FusedLinearAct`/`FusedElementwise`）、`DagMemoryPlan`、动态 CUDA PTX / Vulkan SPIR-V / Metal MSL / CPU AVX2+NEON 后端 | `src/runtime/{compute_dag,simd_kernels}.rs`、`src/runtime/gpu/{mod,cuda,vulkan,metal}.rs` |
+| `KVPageAllocator` 与 `MemoryPool` | vLLM PagedAttention / CUDA Caching Allocator | 64B 对齐分页 KV 物理池、CoW `fork_seq`、硬字节配额、优先级抢占驱逐、上升沿回差水位线回调与 2 次幂 Slab 复用池 | `src/runtime/{kv_cache,memory_pool}.rs` |
+| 协程调度器与异步 Reactor | Go Runtime / Tokio | `TaskScheduler`、`MoraChannel`（全局 ID 保序加锁公平 `select`）、`TaskContext` 级联取消、`AsyncIoReactor` 非阻塞 TCP | `src/runtime/{scheduler,reactor,fs}.rs` |

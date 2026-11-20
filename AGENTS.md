@@ -62,9 +62,9 @@
 > ### 0.6 上下文实例（v0.78+ ~ v0.110.0 起强制）
 >
 > - **Wave 1（架构解耦与编译器瘦身）**：核心只保留语言原语与 7 个基础内建模块（`json`/`file`/`exec`/`math`/`stats`/`linalg`/`random`），上层应用耦合构造彻底迁出，`BigInt` 独立至 `std/math/bigint`（`mora-std-bigint`）。
-> - **Wave 2（单一 Control SSA 管线、堆帧 VM 与 Go 式云原生并发）**：不做双轨兼容桥，直接收口至 `MirWitness[] → ControlProgram` 单遍 SSA IR、堆帧状态机 VM（`O(1)` 尾调用 + 多发定界续延 `Value::Continuation`）、Tokio `TaskScheduler` / `AsyncIoReactor`、Go 式 `spawn` / 不变 `channel<T>` / 公平 `select` / `context` / `sleep` 与 `FsPolicy` / `CheckedPath` 沙箱隔离。
-> - **Wave 3（精确数值与统一 HM 求解器 → 一等 Tensor 与形状/设备检查）**：Stage 3A 严格分离 `Int`/`Float` 字面量与低位宽后缀（`f16`/`bf16`/`fp8`/`i4`..`i64`）、`**`/`@`/`!` 及单一 `Span` 追踪 HM 约束求解器（`check_program_witnesses`）；Stage 3B 构建一等 `Tensor<DType, Shape, Device>` 与 `grad` 接口。
-> - **Wave 4（AI 原生计算图、动态显存调控与云原生标准库闭环）**：原生 `TensorComputeDag`、VJP/JVP 自动微分、算子融合、`KVPageAllocator` 动态资源调控、`mora build` 单二进制交付及纯 Mora `std/net/http`（含 SSE）与 `std/mcp` 标准库。
+> - **Wave 2（单一 Control SSA 管线、堆帧 VM 与 Go 式云原生并发）**：不做双轨兼容桥，直接收口至 `MirWitness[] → ControlProgram` 单遍 SSA IR、堆帧状态机 VM（`O(1)` 尾调用 + 多发定界续延 `Value::Continuation`）、Tokio `TaskScheduler` / `AsyncIoReactor`、Go 式 `spawn` / 不变 `channel<T>` / 公平 `select` / `context` / `sleep`、非阻塞异步 TCP（`tcp_listen` / `tcp_connect`）与 `FsPolicy` / `CheckedPath` 沙箱隔离。
+> - **Wave 3（精确数值、统一 HM 求解器、一等 Tensor、5 项静态检查与模型语法）**：Stage 3A 严格分离 `Int`/`Float` 字面量与低位宽后缀（`f16`/`bf16`/`fp8`/`i4`..`i64`）、`**`/`@`/`!` 及单一 `Span` 追踪 HM 约束求解器（`check_program_witnesses`）；Stage 3B 构建一等 64B 对齐 `Tensor<DType, Shape, Device>` 与 5 项静态检查（DType/Shape/Device/Resource/Effect）；Stage 3C 落地名义 `struct`/`enum`/`@tag`、源码级 `trait`/`impl`/`dyn Trait`、具名与默认参数、零拷贝多维切片及反向模式 `grad`/`value_and_grad`/`no_grad`。
+> - **Wave 4（AI 原生计算图、硬件 GPU 后端、动态显存调控与云原生标准库闭环）**：原生 `TensorComputeDag`（`trace_dag` 4 遍算子融合 `FusedFlashAttention`/`FusedRmsNormLinear`/`FusedLinearAct`/`FusedElementwise`、`DagMemoryPlan`、`DagPlanCache`）、前向 `jvp` 与多磁带任意阶微分 `grad^n` & HVP、零依赖动态加载 CUDA PTX / Vulkan SPIR-V / Metal MSL / CPU AVX2+NEON 硬件后端、`KVPageAllocator` 与 64B Slab `MemoryPool` 动态资源调控、零源码 `MORABC02` 预编译字节码 `mora build` 单二进制与 `.morac` 直跑，以及纯 Mora `std/net/http`（含 Router/Chunked/Keep-Alive/413/SSE）与 `std/mcp` 标准库。
 >
 > ### 0.7 违反本原则的处理
 >
@@ -233,8 +233,8 @@
 
 ## Project layout
 
-- `src/` — core compiler, unified HM type checker, Control SSA IR, stackful VM, Tokio scheduler/reactor, and binaries (`mora`, `mora-lsp`)
-- `std/` — modular standard library workspace crates (including `std/math/bigint` / `mora-std-bigint`)
+- `src/` — core compiler, unified HM type checker, Control SSA IR (`MORABC02` codec), stackful VM, `TensorComputeDag` & CUDA/Vulkan/Metal/SIMD backends, `KVPageAllocator` & `MemoryPool`, Tokio scheduler/reactor, and binaries (`mora`, `mora-lsp`)
+- `std/` — modular standard libraries (`std/math/bigint` / `mora-std-bigint` Rust crate, pure-Mora `std/net/http.mora` with Router/Chunked/Keep-Alive/SSE, and `std/mcp.mora` with Tools/Resources/Prompts/`Struct::schema()`/Stdio)
 - `tests/` — integration tests + property-based tests (proptest)
 - `examples/` — runnable Mora demo scripts (CI also runs these against the release binary)
 - `docs/` — language spec, influences, learning plan, architecture diagram

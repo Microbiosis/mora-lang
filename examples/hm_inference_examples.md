@@ -156,5 +156,49 @@ print(result)
 
 ---
 
+### 8. First-Class `Tensor<DType, Shape, Device>`, 5 AI-Native Static Checks & Autograd
+
+Mora verifies tensor `DType`, symbolic `Shape` dimensions, `Device` placement (`cpu` / `cuda:N` / `vulkan:N` / `metal:N`), `Resource` aliasing (`tensor_mutate`), and `Effect` purity at compile time, and supports reverse-mode `grad`/`value_and_grad`, forward-mode `jvp`, and higher-order derivatives:
+
+```mora
+let x: Tensor<f64, [2, 3], cpu> = Tensor::ones([2, 3], dtype="f64")
+let w: Tensor<f64, [3, 2], cpu> = Tensor::eye(3)[0..3, 0..2]
+let y: Tensor<f64, [2, 2], cpu> = x @ w
+
+let cubic = fn(t: float) return t ** 3.0 end
+let d1 = grad(cubic)
+let d2 = grad(d1)
+let fwd = jvp(cubic, 2.0, 1.0)
+print(y.shape(), d1(2.0), d2(2.0), fwd)
+```
+
+---
+
+### 9. Nominal `struct`/`enum` with `@tag` Schema, `TensorComputeDag` & Resource Pools
+
+```mora
+struct LayerSpec
+  dim: int = 64 @tag(json="dim", desc="Hidden dimension")
+  eps: float = 1e-5 @tag(json="eps", optional="true")
+end
+
+let a = Tensor::ones([2, 4])
+let b = Tensor::ones([4, 3])
+let c = Tensor::zeros([3])
+let dag = trace_dag(fn(inp, weight, bias)
+  return (inp @ weight + bias).relu()
+end, [a, b, c]).compile()
+
+let kv = kv_allocator(32, 16, 4, 32, "f16", "cpu", 524288)
+kv.alloc_seq("seq-1", 5)
+let pool = memory_pool(1048576, "cpu")
+let buf = pool.zeros([16, 16], "f32")
+pool.release(buf)
+
+print(LayerSpec::schema(), dag.run([a, b, c]).shape(), kv.used_pages(), pool.cached_bytes())
+```
+
+---
+
 **Version**: v0.110.0 (Unified Span-Tracked HM Constraint Solver)  
 **License**: BSD-3-Clause

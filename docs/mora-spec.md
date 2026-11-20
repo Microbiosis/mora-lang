@@ -71,9 +71,10 @@ Mora 是一门 **AI-native 静态类型语言**，核心定位是服务于**大�
 |------|------|
 | **命令式** | `let`/`assign`/`for`/`if` |
 | **函数式** | 闭包、管道 `\|>`、`map`/`filter`/`reduce`、代数效果 `perform`/`handle` |
-| **面向对象** | `trait` / `impl` / `dyn` 运行时抽象（前端声明逐步完善） |
-| **并发与事务** | `parallel` / `worker` / `transaction` / `atom` |
-| **元编程与同像性** | `p"..."` 模板、`macro`、`quote`/`eval`/quasiquote |
+| **名义与特征抽象** | 名义泛型 `struct`（含默认值与 `@tag` 元数据）/ `enum`、源码级 `trait` / `impl` / `dyn Trait` |
+| **计算图与自动微分** | 一等 `Tensor<DType, Shape, Device>`、`grad` / `value_and_grad` / `jvp` / `no_grad`、`trace_dag` 4 遍算子融合、`kv_allocator` / `memory_pool` |
+| **云原生并发与事务** | Go 式 `spawn` / `channel<T>` / `select` / `context` / `sleep`、非阻塞异步 TCP、`parallel` / `worker` / `transaction` / `atom` |
+| **元编程与同像性** | `macro`、`quote` / `eval` / `read` / `macroexpand` / `quasiquote` |
 
 ### 2.2 一切皆表达式
 
@@ -117,14 +118,20 @@ assign x = 20    -- 显式修改
 | **可调用** | `task` | `task name() ... end` |
 | | `closure` | `fn(x) x + 1 end` |
 | **错误** | `result<T, E>` | `Ok(v)` / `Err(e)` |
-| **类型系统** | `trait` | trait 注册原型（运行期支撑） |
-| | `concrete` | impl 注册原型 |
+| **张量与计算图** | `tensor<DType, Shape, Device>` | `Tensor::zeros([m, n])`, `Tensor::from_list(...)`（64B 对齐紧凑存储，支持 `cpu`/`cuda:N`/`vulkan:N`/`metal:N`） |
+| | `compute_dag` | `trace_dag(fn, args)`（4 遍算子融合 + 静态 Buffer 复用 + 硬件 GPU/SIMD 后端） |
+| | `kv_allocator` | `kv_allocator(...)`（PagedAttention 页表、CoW 前缀共享、硬配额、抢占与水位线回调） |
+| | `memory_pool` | `memory_pool(max_bytes, device?)`（64B 对齐 2 次幂 Slab 张量复用池） |
+| **名义与特征系统** | `struct` | `struct Name<T> ... end`（支持字段默认值、`@tag(...)` 编译期元数据与 `Struct::schema()`） |
+| | `enum` | `enum Name<T> ... end`（带载荷代数数据类型与 `Enum::variants()`） |
+| | `trait` / `concrete` | `trait Name<T> ... end` / `impl Trait for Type ... end` |
 | | `union` | `string \| number` |
-| | `dyn Trait` | 动态分派 `as dyn Trait` |
+| | `dyn Trait` | 动态分派 `expr as dyn Trait` |
 | | `arrow` | `fn(x) x + 1 end`（函数类型） |
-| **并发与效果** | `channel<T>` | `channel(cap)`（不变通道） |
+| **并发与网络** | `channel<T>` | `channel(cap)`（不变通道） |
 | | `task_handle<T>` | `spawn expr`（协变任务句柄） |
 | | `context` | `context()`（分层协作取消上下文） |
+| | `tcp_listener` / `tcp_stream` | `tcp_listen(addr)` / `tcp_connect(addr)`（非阻塞异步 TCP） |
 | | `atom` | `atom(0)` |
 | | `compose` | `compose(f, g)` |
 | | `partial` | `partial(fn, args)` |
@@ -155,7 +162,7 @@ task add(a, b)      -- 参数类型推断
 end
 
 task greet(name: string): string   -- 显式注解（注意用 : 不是 ->）
-  return p"Hello, {name}!"
+  return "Hello, " + name
 end
 ```
 
@@ -202,7 +209,7 @@ end
 
 trait Person: Named, Aged    -- 继承
   fn greet(self) -> string
-    return p"I'm {self.name()}, {self.age()} years old"
+    return self.name()
   end
 end
 
@@ -314,6 +321,27 @@ Int(i) ⊑ Float(f) ⟺ i =_exact f        （i 装不下 f64 时恒为 false）
 不变式 (ii) 是旧实现被破坏的那一条：旧路径下 `a > b` 为 false
 而 `a >= b` 为 true（`>=` 的判据是 `≠ Less`，而 f64 舍入后两者相等）。
 
+### 3.7 一等 Tensor、5 项 AI-Native 静态检查、自动微分与计算图 (v0.110.0 Wave 3B/3C & Wave 4)
+
+1. **硬件位宽不擦除与 64 字节对齐存储**（`src/common/dtype.rs`、`src/value/tensor.rs`）：
+   - 原生支持 `f64`、`f32`、`f16`（IEEE 754 binary16）、`bf16`、`fp8` / `fp8_e4m3`、`fp8_e5m2`、`i64`、`i32`、`i16`、`i8`、`i4`（半字节 2 元素/字节紧凑打包）、`u64`、`u32`、`u16`、`u8`、`bool`。
+   - 底层存储 `AlignedByteBuffer` 采用 64 字节缓存行对齐分配；支持零拷贝步幅视图（`transpose`、`reshape`、多维切片 `t[0..4, :, None, ::-1]`）。
+2. **编译期 5 项 AI-Native 静态检查**（`src/typeck/hm/`）：
+   - **DType 检查**：禁止不同精度张量隐式混算，算子输入满足硬件位宽契约。
+   - **Shape 检查**：符号维度合一（`[M, K] @ [K, N] -> [M, N]`）、广播兼容性与静态切片越界拦截。
+   - **Device 检查**：静态追踪设备位置（`cpu`、`cuda:N`、`vulkan:N`、`metal:N`），禁止未显式 `.to_device(...)` 的跨设备混算。
+   - **Resource 检查**：作用域资源配额与自动微分磁带期间的原位修改（`tensor_mutate`）/ 别名安全校验。
+   - **Effect 检查**：封闭效果行包含校验，静态拦截对含原位变异或非纯副作用函数求导。
+3. **反向、前向与高阶自动微分**（`src/runtime/autograd.rs`、`src/runtime/autograd_higher_order.rs`）：
+   - 反向模式：`grad(f, argnums?)`、`value_and_grad(f, argnums?)`、`no_grad ... end`。
+   - 前向模式与高阶微分：`jvp(f, primals, tangents)`、多磁带任意阶微分 `grad(grad(f))` 及精确 Hessian-Vector Product（`jvp(grad(f), x, v)`）。
+4. **计算图算子融合与零依赖硬件 GPU 后端**（`src/runtime/compute_dag.rs`、`src/runtime/gpu/`）：
+   - `trace_dag(fn, example_inputs)` 追踪构建强类型 `TensorComputeDag`，经 `.compile()` 执行 4 遍算子融合（`FusedFlashAttention` 分块在线 Softmax、`FusedRmsNormLinear`、`FusedLinearAct`、`FusedElementwise`）、`DagMemoryPlan` 静态草稿区复用与 `DagPlanCache` 编译缓存。
+   - 零外部编译依赖动态加载硬件驱动：**NVIDIA CUDA Driver API**（PTX ISA 7.0 5 大 `f64` 融合核 + `CudaVramArena`）、**Vulkan 1.0**（纯 Rust SPIR-V 1.0 计算着色器）、**macOS Metal**（运行期 MSL 编译）及 **CPU AVX2+FMA / NEON 多线程分块核**；可通过 `Tensor::devices()` 与 `Tensor::device_info(dev?)` 查询硬件遥测。
+5. **动态显存调控**（`src/runtime/kv_cache.rs`、`src/runtime/memory_pool.rs`）：
+   - `kv_allocator(total_pages, page_tokens, num_heads, head_dim, dtype?, device?, max_bytes?)`：PagedAttention 页表、CoW `fork_seq`、硬字节配额、序列优先级抢占驱逐与无死锁水位线回调。
+   - `memory_pool(max_bytes, device?)`：64 字节对齐 2 次幂分桶 Slab 张量缓存池。
+
 ---
 
 ## 4. 执行
@@ -338,6 +366,7 @@ source → Lexer::scan_tokens → ParserV3::compile (parse_witnesses)
 
 **编译优化控制**：
 - CLI `--opt=0|1|2` 或环境变量 `MORA_OPT=0|1|2`（`0` = 关闭、`1` = Basic、`>=2` = Aggressive）
+- **零源码 `MORABC02` 预编译字节码与单二进制交付**（`src/mir/control/codec.rs`、`src/cli/bundle.rs`）：`mora build <file.mora> [-o <app>]` 与 `mora build <file.mora> --emit-bc [-o <out.morac>]` 在编译期完成主模块与传递 `import` 闭包的解析、HM 静态检查与 SSA 优化，序列化为带 64 位 FNV-1a 校验和的 LEB128 二进制 `ControlProgram` 字节码，运行期零源码、零词法/语法/类型检查开销直接执行。
 
 ### 4.2 入口点
 
@@ -398,7 +427,7 @@ Mora 使用 **引用计数 + 持久化结构 / 词法父链共享**：
 
 - `Value::List(List)` — 分块持久化向量（`src/value/list.rs`），值语义与结构共享
 - `Value::Dict(HashMap<String, Value>)` — 值类型，深拷贝
-- `Value::CoreClosure { env: Arc<Environment>, .. }` — 词法环境由扁平 `HashMap<String, Value>` + `Arc<Environment>` 父链构成（v0.110.0 Wave 2 移除了早期 HAMT `value/persistent.rs` 与 `VectorClock` 耦合）
+- `Value::Closure { env: Arc<Environment>, .. }` — 词法环境由扁平 `HashMap<String, Value>` + `Arc<Environment>` 父链构成（v0.110.0 Wave 2 移除了早期 HAMT `value/persistent.rs` 与 `VectorClock` 耦合）
 
 ### 5.2 所有权语义
 
@@ -529,8 +558,8 @@ end
 let result = match value with
   0 -> "zero"
   1 -> "one"
-  n: number -> p"other: {n}"
-  s: string -> p"string: {s}"
+  n: number -> "number"
+  s: string -> s
   _ -> "unknown"
 end
 ```
@@ -553,8 +582,8 @@ end
 
 -- 嵌套守卫
 let result = match data with
-  {age: age, name: name} when age >= 18 -> p"{name} is adult"
-  {age: age, name: name} when age < 18 -> p"{name} is minor"
+  {age: age, name: name} when age >= 18 -> "adult"
+  {age: age, name: name} when age < 18 -> "minor"
   _ -> "unknown"
 end
 ```
@@ -562,13 +591,10 @@ end
 ### 7.5 列表 rest 模式 (v0.16, Prolog 启发)
 
 ```mora
--- Rest 模式
-let [head, ...tail] = [1, 2, 3, 4]
--- head = 1, tail = [2, 3, 4]
-
--- match 中使用
-match data with
-  [head, ...tail] -> p"head={head}, tail={tail}"
+-- match 中使用 Rest 模式解构首元素与剩余列表
+let data = [1, 2, 3, 4]
+let summary = match data with
+  [head, ...tail] -> "non-empty"
   _ -> "empty"
 end
 ```
@@ -592,21 +618,21 @@ let result = 5 |> double    -- 10
 Mora 支持代数效果（Algebraic Effects），通过 `perform` 产生效果、`handle` 捕获并处理效果：
 
 ```mora
--- 产生效果
-let result = perform "ask" "What is your name?"
+effect Ask(string): string
 
--- 处理效果
-handle "ask"
-  on prompt -> return "Alice"
-end
+let result = handle Ask {
+  perform Ask("What is your name?")
+} {
+  resume("Alice")
+}
 ```
 
 **类型基础**：EffectRow（`EffectRow::Empty` / `EffectRow::Var` / `EffectRow::Cons`），支持行多态合一（row-polymorphic HM unification）。
 
 **语义**：
-- `perform effect_name arg`：产生一个效果，暂停当前计算
-- `handle effect_name on arg -> body end`：注册效果处理器，捕获 `perform` 并执行 handler
-- 单次续延（single-shot continuations）：handler 执行后恢复 `perform` 之后的计算
+- `perform EffectName(arg)`：产生一个效果，捕获当前定界续延并跳转至最近匹配的 `handle`
+- `handle EffectName { body } { handler }`：注册效果处理器，捕获 `perform` 并执行 `handler`
+- 多发定界续延（multi-shot delimited continuations，v0.110.0 Wave 2）：`handler` 内可通过 `resume(v)` 恢复一次或多次续延（`Value::Continuation`）
 - 嵌套 handler：内层 handler 优先匹配
 
 **编译期强制（v0.96）**：效果行在类型检查的**程序边界**断言 —— 顶层表达式的
@@ -682,7 +708,7 @@ task early_return(x: number): string
   if x < 0 then
     return "negative"
   end
-  return p"positive: {x}"
+  return "positive"
 end
 ```
 
@@ -692,10 +718,10 @@ end
 
 ### 8.1 Result 类型
 
-Mora 使用 `result<T, E>` 进行错误处理：
+Mora 使用 `Ok(v)` / `Err(e)` 构造协变 `result<T, E>` 类型进行显式错误处理（由 HM 类型推断器自动推导 `result<T, E>`）：
 
 ```mora
-task divide(a: number, b: number): result<number, string>
+task divide(a: number, b: number)
   if b == 0 then
     return Err("division by zero")
   end
@@ -703,42 +729,33 @@ task divide(a: number, b: number): result<number, string>
 end
 ```
 
-### 8.2 ? 操作符
+### 8.2 错误传播与解构
 
-`?` 操作符用于错误传播：
-
-```mora
-task safe_divide(a: number, b: number): result<number, string>
-  let result = divide(a, b)?
-  return Ok(result)
-end
-```
-
-等价于：
+通过 `match ... with` 对 `Ok(v)` 与 `Err(e)` 分支进行显式解构与传播（后缀 `?` 产生式在语法表中保留，当前版本尚未启用，详见 `tests/spec_ebnf_surface.rs`）：
 
 ```mora
-task safe_divide(a: number, b: number): result<number, string>
-  let result = divide(a, b)
-  match result with
-    Ok(v) -> return Ok(v)
-    Err(e) -> return Err(e)
+task safe_divide(a: number, b: number)
+  let res = divide(a, b)
+  return match res with
+    Ok(v) -> Ok(v)
+    Err(e) -> Err(e)
   end
 end
 ```
 
 ### 8.3 运行时错误
 
-以下情况会触发运行时错误（panic）：
-- 类型不匹配（运行时检查）
-- 整数精确 `i64` 算术溢出
-- 索引越界
-- 未定义变量
-- I/O 或外部命令执行失败（如 `file.*` / `exec.*`）
+以下情况会触发结构化 `MoraError` 诊断（非静默）：
+- 静态或运行期类型/维度/设备不匹配
+- 整数精确 `i64` 或低位宽标量算术溢出
+- 索引或切片越界
+- 未定义变量或跨设备未显式搬运
+- I/O、文件系统沙箱越界（`FsPolicy`）或外部命令执行失败（`file.*` / `exec.*`）
 
 ### 8.4 错误处理最佳实践
 
 ```mora
-task parse_port(s: string): result<number, string>
+task parse_port(s: string)
   if s == "" then
     return Err("empty")
   end
@@ -748,14 +765,8 @@ end
 -- 使用 match 处理 Result
 let res = parse_port("8080")
 match res with
-  Ok(port) -> print(p"Port: {port}")
-  Err(e) -> print(p"Error: {e}")
-end
-
--- 使用 ? 传播
-task resolve_port(raw: string): result<number, string>
-  let port = parse_port(raw)?
-  return Ok(port)
+  Ok(port) -> print(port)
+  Err(e) -> print(e)
 end
 ```
 
@@ -856,18 +867,27 @@ import "path/to/module.mora"
 
 ### 10.2 Export
 
+支持导出 `let`、`task`、`struct`、`enum`、`type`、`trait`、`impl` 与 `macro` 声明，跨模块 `import` 支持菱形依赖缓存与编译期名义类型/标签元数据传播：
+
 ```mora
-export task helper()
-  -- ...
+export struct Endpoint
+  host: string = "127.0.0.1"
+  port: int = 8080
+end
+
+export task helper(): int
+  return 42
 end
 
 export let CONFIG = {debug: true}
 ```
 
-### 10.3 模块路径
+### 10.3 模块路径与内嵌标准库
 
 - 相对路径：`import "./utils.mora"`
 - 绝对路径：`import "/home/user/libs/utils.mora"`
+- 内嵌纯 Mora 标准库：`import "std/net/http"`（HTTP/1.1 Router / Chunked / Keep-Alive / 413 / SSE）与 `import "std/mcp"`（MCP JSON-RPC 2.0 / Tools / Resources / Prompts / `Struct::schema()` / Stdio NDJSON）
+- 独立 Rust 标准库包：`std/math/bigint`（`mora-std-bigint` crate）
 
 ### 10.4 内置模块
 
@@ -887,11 +907,16 @@ export let CONFIG = {debug: true}
 
 ## 11. 元编程
 
-### 11.1 模板字符串
+### 11.1 编译期结构体标签与 Schema 反射 (v0.110.0 Stage 3C)
 
 ```mora
-let name = "Alice"
-let greeting = p"Hello, {name}!"   -- "Hello, Alice!"
+struct ToolInput
+  query: string @tag(json="query", desc="Search keyword")
+  limit: int = 10 @tag(json="limit", optional="true")
+end
+
+let schema = ToolInput::schema()
+let tags = ToolInput::tags()
 ```
 
 ### 11.2 用户自定义宏 (v0.20, Common Lisp 启发)
@@ -1154,6 +1179,31 @@ Mora 支持列表的广播算术操作：
 
 每条返回字典包含 `index`、`cmd`、`stdout`、`stderr`、`exit_code`、`elapsed_ms`、`pid`、`error` 字段；`max_concurrent` 与 `timeout_ms` 须为非负数或 `nil`。
 
+### 12.8 Tensor、自动微分、计算图与显存池原语 (v0.110.0 Wave 3B/3C & Wave 4)
+
+| 构造器 / 原语 | 签名 / 用法 | 说明 |
+| :--- | :--- | :--- |
+| `Tensor::zeros(shape, dtype?, device?)` | `list<int>, string?, string? -> tensor` | 创建全 0 张量（支持命名参数 `dtype="f16", device="cpu"`） |
+| `Tensor::ones` / `Tensor::full` / `Tensor::eye` / `Tensor::arange` / `Tensor::randn` / `Tensor::rand` / `Tensor::from_list` | `... -> tensor` | 张量构造器族 |
+| `Tensor::devices()` / `Tensor::device_info(dev?)` | `-> list<string>` / `string? -> dict` | 枚举可用计算设备（`cpu`/`cuda:0`/`vulkan:0`/`metal:0`）与查询硬件驱动/VRAM/SM 遥测 |
+| `grad(fn, argnums?)` / `value_and_grad(fn, argnums?)` | `closure, ... -> closure` | 反向模式自动微分（VJP），支持高阶嵌套 `grad(grad(f))` |
+| `jvp(fn, primals, tangents)` | `closure, T, T -> (T, T)` | 前向模式自动微分（JVP），可与 `grad` 组合计算精确 HVP |
+| `trace_dag(fn, inputs)` | `closure, list<tensor> -> compute_dag` | 追踪构建 `TensorComputeDag`（支持 `.compile()`、`.run(inputs)`、`.memory_plan()`、`.cache_stats()`、`.backend_info()`） |
+| `kv_allocator(pages, page_tokens, heads, head_dim, dtype?, device?, max_bytes?)` | `... -> kv_allocator` | PagedAttention KV 页分配器（支持 `alloc_seq`、`append_tokens`、`fork_seq`、`evict_lru`、`evict_preempt`、`reclaim_for`、`set_quota`、`on_watermark`） |
+| `memory_pool(max_bytes, device?)` | `int, string? -> memory_pool` | 64B 对齐分桶 Slab 张量缓存池（支持 `alloc`、`zeros`、`full`、`release`、`trim`、`set_quota`、`on_watermark`、`stats`） |
+
+### 12.9 异步 TCP 网络原语 (v0.110.0 Wave 2)
+
+| 函数 / 方法 | 签名 | 说明 |
+| :--- | :--- | :--- |
+| `tcp_listen(addr)` | `string -> tcp_listener` | 绑定非阻塞 TCP 监听器（支持 `.accept(ctx?)`、`.local_addr()`、`.close()`、`.is_closed()`） |
+| `tcp_connect(addr, timeout_ms?, ctx?)` | `string, int?, context? -> tcp_stream` | 建立非阻塞 TCP 连接（支持 `.read`、`.read_bytes`、`.read_line`、`.write`、`.write_bytes`、`.shutdown`、`.close`、`.local_addr`、`.peer_addr`） |
+
+### 12.10 纯 Mora 标准库 `std/net/http` 与 `std/mcp` (v0.110.0 Wave 4)
+
+- `import "std/net/http"`：提供声明式 `http_router`（`:param` 路径参数、`*` 通配、洋葱中间件、自动 `404`/`405+Allow`）、`http_serve_once` / `http_serve_n`、`Transfer-Encoding: chunked` 双向编解码、`max_body_bytes`（超限直接返回 `413 Payload Too Large`）、`Connection: keep-alive` 连接复用与 SSE（`http_sse_open` / `http_sse_send` / `http_read_sse_events`）。
+- `import "std/mcp"`：提供 MCP JSON-RPC 2.0 服务端与客户端，支持 `initialize`、`ping`、`tools/list` & `tools/call`、`resources/list` & `resources/read`、`prompts/list` & `prompts/get`、`mcp_schema_from_struct(Struct::schema())` 自动 JSON Schema 生成与 `-32602` 参数校验、HTTP+SSE 双通道传输及 Stdio NDJSON 行协议（`mcp_serve_stdio_lines` / `mcp_serve_stdio_channels` / `mcp_serve_stdio_stream`）。
+
 ---
 
 ## 13. 形式化
@@ -1415,19 +1465,18 @@ nil == nil                  -- true
 - 转义序列：`\n`, `\t`, `\\`, `\"`
 - 无字符数组概念（字符串是不可变的）
 
-### 16.2 模板字符串
+### 16.2 字符串拼接与格式化
 
 ```mora
 let name = "Alice"
-let age = 30
-let msg = p"Hello, {name}! You are {age} years old."
+let msg = "Hello, " + name + "!"
 ```
 
-花括号 `{}` 内可以是任意表达式：
+数值或结构化数据可通过 `json.stringify(val)` 转为文本：
 
 ```mora
 let x = 10
-let msg = p"Result: {x * 2}"
+let msg = "Result: " + json.stringify(x * 2)
 ```
 
 ### 16.3 字符
@@ -1451,47 +1500,50 @@ let text = json.stringify({name: "Alice"})
 
 ## 17. 安全
 
-### 17.1 沙箱
+### 17.1 文件系统沙箱隔离 (`FsPolicy` & `CheckedPath`, v0.110.0 Wave 2)
 
-当前版本 **无沙箱**。脚本可以：
-- 读写文件系统（`file.*`）
-- 调用外部命令（`exec.parallel`）
-
-v1.0 计划：
-- 权限系统与沙箱边界设计
-- 文件系统访问路径校验（如禁止空字节注入）
-- 最小隐式副作用原则
+Mora 运行时内置显式文件系统边界隔离（`src/runtime/fs.rs`）：
+- 每个 `CoreRuntime` 维护独立的虚拟工作目录 `cwd`（`file.chdir` 仅修改当前运行时的虚拟 `cwd`，绝不调用进程级 `std::env::set_current_dir` 污染并发线程）。
+- 所有 `file.*` 与模块读取路径均经过 `FsPolicy` 与 `CheckedPath` 校验：拦截内嵌 NUL 字节、在配置 `workspace_root` 时解析规范路径（`canonicalize`）并拒绝 `..` 或符号链接越界访问，同时支持只读模式（`read_only`）拦截一切写入/删除操作。
 
 ### 17.2 边界校验与外部进程安全
 
-- `file.*` 内建在路径参数上执行显式 NUL 字节与合法性校验
-- `exec.parallel` 严格校验并发上限 `max_concurrent` 与超时参数 `timeout_ms` 为非负数（包括空命令列表情况）
-- 数值核心对精确 `Int` (`i64`) 运算溢出显式返回错误
+- `file.*` 内建在路径参数上执行显式 NUL 字节与 `FsPolicy` 边界校验
+- `exec.parallel` 基于 `tokio::process::Command` + `Semaphore` 异步受控执行，严格校验并发上限 `max_concurrent` 与超时参数 `timeout_ms` 为非负数
+- JSON 与 LSP 传输层强制执行 `MAX_JSON_DEPTH = 256` 迭代解析上限与 `MAX_CONTENT_LENGTH = 16 MiB` 报文头上限
+- `MORABC02` 字节码加载器强制校验 64 位 FNV-1a 校验和、变长整数边界与 `verify_program` SSA 结构合法性
+- 数值核心对精确 `Int` (`i64`) 与低位宽标量（`i8`..`u64`）运算溢出显式返回错误
 
 ### 17.3 效果隔离与纯函数默认
 
-Mora 不再保留隐式的全局运行期 Hook 或内置配置块，所有外部 I/O、状态捕获与非确定性行为均通过代数效果（`effect` / `perform` / `handle`）显式声明并在调用边界处由处理器（handler）隔离。
+Mora 不保留隐式的全局运行期 Hook 或内置配置块，所有外部 I/O、原位张量变异（`tensor_mutate`）与非确定性行为（`random_*`）均纳入静态效果行（`EffectRow`）追踪，并在调用或求导边界强制校验。
 
 ---
 
-## 18. 互操作
+## 18. 互操作与云原生服务
 
-Mora 定位为面向大模型底层与计算图/算子表达、同时具备云原生属性的静态类型语言；编译器与核心运行时不再硬编码 Web 框架、MCP 服务器或特定 LLM API 客户端，而是通过语言核心原语提供对 HTTP 与 MCP 等服务协议的友好支持：
+Mora 定位为面向大模型底层与计算图/算子表达、同时具备 Go 式云原生属性的静态类型语言；编译器与核心运行时不硬编码特定 Web 框架或 LLM 客户端，而是通过语言核心原语与纯 Mora 标准库 `std/net/http`、`std/mcp` 提供一等服务支持：
 
-- **结构化 JSON 处理**：原生 `json.parse` / `json.stringify` 配合 `match` 与字典解构，直接编解码 JSON-RPC（MCP）与 REST 载荷
-- **代数效果边界**：通过 `effect` / `perform` / `handle` 抽象传输层、认证与超时策略，用户代码可与具体 HTTP/stdio 运行时解耦
-- **函数式路由与处理器组合**：一等闭包、`CoreClosure`、管道 `|>` 与模式匹配天然适合编写请求分发器与中间件
+- **结构化 JSON 与编译期 `@tag` 反射**：原生 `json.parse` / `json.stringify` 配合名义 `struct` 的 `@tag(json=..., desc=..., optional=...)` 与 `Struct::schema()`，零外部依赖自动生成 JSON Schema 与序列化载荷。
+- **Go 式高并发与非阻塞网络 I/O**：`spawn`、`channel<T>`、`select`、`context` 与 `tcp_listen` / `tcp_connect` 直接支撑高并发 HTTP/1.1 Keep-Alive、Chunked 流、SSE 推送与 MCP 服务。
 
-### 18.1 基于模式匹配的服务请求分发示例
+### 18.1 纯 Mora `std/net/http` 与 `std/mcp` 服务示例
 
 ```mora
-let dispatch = fn(method, payload)
-  match method with
-    "tools/list" -> json.stringify({tools: []})
-    "ping" -> json.stringify({ok: true, payload: payload})
-    _ -> json.stringify({error: "unknown method"})
-  end
+import "std/net/http"
+import "std/mcp"
+
+struct EchoInput
+  text: string @tag(json="text", desc="Input text")
 end
+
+let router = http_router()
+let router = http_router_get(router, "/echo/:msg", fn(req)
+  return http_json_response(200, {echo: http_param(req, "msg")})
+end)
+
+let mcp = mcp_server("demo-mcp", "1.0.0")
+let mcp = mcp_register_typed_tool(mcp, "echo", "Echo tool", EchoInput::schema(), fn(args) return {content: args.get("text")} end)
 ```
 
 ### 18.2 外部工具与系统进程协同
@@ -1506,12 +1558,12 @@ let parsed = json.parse(req)
 
 ### 18.3 HTTP / MCP 协议友好特性总结
 
-| 需求 | Mora 核心语言原语 |
-|------|------------------|
-| JSON-RPC / REST 载荷编解码 | `json.parse` / `json.stringify` + `dict` + `match` |
-| 异步/并发请求处理 | `parallel` / `worker` + `transaction` |
-| 传输与状态效果注入 | `effect` / `perform` / `handle` / `atom` |
-| 中间件与组合 | 高阶函数、闭包、`|>`、`compose`、`partial` |
+| 需求 | Mora 核心语言原语与标准库 |
+|------|--------------------------|
+| JSON-RPC / REST 载荷与 Schema | `json.parse` / `json.stringify` + `struct` `@tag` + `Struct::schema()` |
+| 异步高并发与取消传播 | `spawn` / `channel<T>` / `select` / `context` / `tcp_listen` / `tcp_connect` |
+| HTTP/1.1 与流式 SSE | `std/net/http`（`Router`、`chunked`、`keep-alive`、`max_body_bytes` 413 守卫、SSE） |
+| MCP 协议服务与客户端 | `std/mcp`（Tools / Resources / Prompts、HTTP+SSE 与 Stdio NDJSON 传输） |
 
 ### 18.4 JSON 互操作
 
@@ -1530,27 +1582,31 @@ let data = json.parse(json_str)
 ### 19.1 CLI
 
 ```bash
-mora <file.mora>              # 运行脚本
-mora run <file.mora>          # 显式子命令运行脚本
-mora --opt=N <file.mora>      # 指定优化级别运行
-mora --repl                   # 交互式 REPL
-mora --check <file>           # 仅检查/编译校验
-mora install <url>            # 从 URL 安装包
-mora --version                # 版本（或 -v）
-mora --help                   # 帮助（或 -h）
+mora <file.mora>                          # 编译并运行 Mora 源文件
+mora run <file.mora>                      # 显式子命令运行源文件
+mora build <file.mora> [-o <app>]         # 编译为自包含零源码 MORABC02 单二进制可执行文件
+mora build <file.mora> --emit-bc [-o <f>] # 导出预编译 MORABC02 (.morac) SSA 字节码产物
+mora <file.morac>                         # 零解析/零类型检查直接执行预编译 .morac 字节码
+mora --opt=N <file.mora>                  # 指定 SSA 优化级别运行（0=关闭 / 1=基础 / >=2=激进）
+mora --check <file.mora>                  # 仅执行语法与统一 HM 静态类型检查
+mora --repl                               # 启动交互式 REPL
+mora install <url>                        # 从 URL 安装 .mora 脚本至 vendor/
+mora --version                            # 打印版本号（或 -v）
+mora --help                               # 打印 CLI 帮助（或 -h）
 ```
 
-### 19.2 LSP
+### 19.2 LSP (`mora-lsp`)
 
-Mora 提供 Language Server Protocol 支持（`mora-lsp` 二进制）：
+Mora 提供基于 stdio JSON-RPC 2.0 的 Language Server Protocol 实现（`mora-lsp` 二进制），接入统一 HM 推断引擎 `infer_program_types`：
 
-- 诊断（类型错误、语法错误）
-- 悬停信息
-- 代码补全与定义跳转支持
+- 实时语法与带精确 `Span` 的 HM 静态类型诊断（含 `Tensor<DType, Shape, Device>` 维度/设备/效果错误）
+- 悬停类型签名展示（Hover）
+- 关键字、内建函数、模块、`Tensor::*` 与方法补全（Completion）
+- 定义跳转（Go to Definition）、引用查找（References）、符号重命名（Rename）、文档符号（Document Symbols）、格式化（Formatting）、语义高亮（Semantic Tokens）与代码折叠（Folding Ranges）
 
 ### 19.3 基于代数效果的确定性测试
 
-不再内置专用的运行录制回放与 LLM Mock 语法；测试替身与确定性重放通过标准代数效果 `handle ... with ... end` 直接拦截 `perform` 调用实现。
+通过标准代数效果 `handle ... { ... } { ... }` 直接拦截 `perform` 调用或 `random_*` ambient 效果，即可在测试中实现纯函数式替身注入与多分支确定性重放。
 
 ---
 
@@ -1561,52 +1617,26 @@ Mora 提供 Language Server Protocol 支持（`mora-lsp` 二进制）：
 Mora 使用 **语义化版本**（Semantic Versioning）：
 
 ```
-v0.x.y  -- 0.x 阶段，可能有 breaking change
-v1.0.0  -- 首个稳定版本
+v0.x.y  -- 0.x 阶段，架构演进可包含显式记录的 breaking change
+v1.0.0  -- 首个长期稳定版本
 ```
 
 ### 20.2 当前版本
 
-**v0.110.0** — Wave 1 架构解耦与编译器瘦身 + Wave 2 单一 Control SSA IR / 堆帧 VM / Go 式云原生并发与 Tokio 调度底座 + Wave 3 Stage 3A 精确数值字面量、低位宽后缀、`**`/`@`/`!` 与单一 `Span` 追踪 HM 约束求解器。
+**v0.110.0** — 全波次（Wave 1–Wave 4 + P1/P2）架构重铸定版：
+- **Wave 1**：移除越位应用层 DSL 与重依赖，`BigInt` 独立至 `std/math/bigint`（`mora-std-bigint`），核心收敛为 12 个顶层模块与 3 个生产依赖（`libc`/`parking_lot`/`tokio`）。
+- **Wave 2**：统一至单遍 `ControlProgram` SSA IR + 堆帧状态机 VM（`O(1)` TCO + 多发定界续延 `Value::Continuation`）、Tokio `TaskScheduler`/`AsyncIoReactor`、Go 式 `spawn`/`channel<T>`/`select`/`context`/`sleep`、非阻塞异步 TCP（`tcp_listen`/`tcp_connect`）与 `FsPolicy`/`CheckedPath` 文件系统隔离。
+- **Wave 3（Stage 3A / 3B / 3C）**：确立严格 `Int`/`Float` 字面量精度与硬件低位宽后缀（`f16`/`bf16`/`fp8`/`i4`..`i64`）、`**`/`@`/`!`、单一 `Span` 追踪 HM 约束求解器、一等 64B 对齐 `Tensor<DType, Shape, Device>` 与 5 项静态检查（DType/Shape/Device/Resource/Effect）、名义泛型 `struct`/`enum`/`@tag`、源码级 `trait`/`impl`/`dyn Trait`、具名/默认参数、多维零拷贝切片与反向自动微分 `grad`/`value_and_grad`/`no_grad`。
+- **Wave 4（Track 4-1 / 4-2 / 4-3 + P1/P2）**：落地 `TensorComputeDag`（`trace_dag` 4 遍算子融合 `FusedFlashAttention`/`FusedRmsNormLinear`/`FusedLinearAct`/`FusedElementwise`、`DagMemoryPlan` 静态草稿复用、`DagPlanCache`）、前向 `jvp` 与多磁带任意阶微分 `grad^n` & HVP、零依赖动态加载 **CUDA PTX / Vulkan SPIR-V / Metal MSL / CPU AVX2+NEON** 硬件计算后端、PagedAttention `KVPageAllocator`（`kv_allocator`）与 64B Slab `MemoryPool`（`memory_pool`）、纯 Mora `std/net/http`（Router/Chunked/Keep-Alive/413/SSE）与 `std/mcp`（Tools/Resources/Prompts/`Struct::schema()`/Stdio）标准库，以及零源码 `MORABC02` 预编译字节码单二进制 `mora build` 与 `.morac`。
 
-### 20.3 版本历史
+### 20.3 版本演进里程碑
 
-| 版本 | 特性 |
-|------|------|
-| v0.01-v0.20 | 基础解释器与多语言特性探索 |
-| v0.50-v0.51 | Tokio runtime 与统一版本构建 |
-| v0.75 | 单遍编译 (`ParserV3::compile`) + MirWitness |
-| v0.78 | 函数式核心 Stage 1 |
-| v0.80 | 代数效果 (`EffectRow` + `EffectHandler` + `perform`/`handle`) + FP Stage 2 |
-| v0.84 | JSON 类型对称性 (`Int`/`Float` 区分) |
-| v0.86-v0.88 | 同像性 (`eval`/`quote`/`read`/`macroexpand`/`apply`/`car`/`cdr`/`cons`) + Quasiquote |
-| v0.91 | 数学原语 (`math`/`stats`/`linalg`/`random` + 数值方法链) |
-| v0.104.x | `Int` 精确 `i64` 语义统一 |
-| v0.110.0 | **Wave 1 + Wave 2 + Wave 3A**：移除硬编码应用层 DSL 耦合，拆分 `mora-std-bigint`；统一至单遍 Control SSA IR + 堆帧状态机 VM（`O(1)` TCO + 多发定界续延）、Tokio `TaskScheduler`/`AsyncIoReactor`、Go 式 `spawn`/`channel<T>`/`select`/`context`/`sleep`、`FsPolicy`/`CheckedPath` 沙箱；确立严格 `Int`/`Float` 精度、低位宽后缀、`**`/`@`/`!` 与单一 Span 追踪 HM 约束求解器 |
-
-**v0.01-v0.20 历史归档**：
-
-| 版本 | 特性 |
-|------|------|
-| v0.01-v0.05 | 基础解释器与字符串插值 (`p"..."`) |
-| v0.06-v0.07 | 早期内置 HTTP 路由与 MCP 服务原型（v0.110.0 已移除硬编码内建） |
-| v0.08-v0.13 | Trait 系统、泛型与静态类型收敛 |
-| v0.16-v0.20 | `match` 守卫与解构、管道闭包、`compose`/`partial`、Worker/事务/`atom`、宏与反思原语 |
-
-### 20.4 兼容性
-
-- v0.x 版本之间 **不保证** 向后兼容
-- v1.0 后严格遵循语义化版本
-- breaking change 只在主版本号变更时引入
-
-### 20.5 版本路线图
-
-| 版本 | 状态 | 特性 |
-|------|------|------|
-| v0.16-v0.20 | ✅ 已发布 | 核心函数式、模式匹配、并发与宏原语 |
-| v0.75-v0.91 | ✅ 已发布 | 单遍编译、代数效果、同像性、数学/统计/线性代数原语 |
-| v0.110.0 | ✅ 当前 | Wave 1 编译器瘦身 + Wave 2 Control SSA VM 与 Go 式云原生并发 + Wave 3（Stage 3A 精确数值、Stage 3B 一等 `Tensor` 与 5 项静态检查、Stage 3C 名义 `struct`/`enum`/`@tag`、`trait`/`impl`/`dyn`、命名/默认参数、多维切片与反向 `grad`）+ Wave 4（`TensorComputeDag` 与算子融合、前向 `jvp`、`KVPageAllocator`、`mora build` 单二进制与纯 Mora `std/net/http` + `std/mcp`） |
-| v1.0 | 📌 目标 | 大模型底层计算图与算子原语、稳定 API、完整云原生 stdlib 与沙箱 |
+| 阶段 | 核心里程碑 |
+|------|------------|
+| Wave 1 (`v0.110.0`) | 编译器瘦身解耦、剥离旧解释器与重依赖、`std/math/bigint` 独立化 |
+| Wave 2 (`v0.110.0`) | 单一 `ControlProgram` SSA IR、堆帧状态机 VM、Go 式并发与异步 TCP |
+| Wave 3 (`v0.110.0`) | 精确数值塔、一等 `Tensor`、5 项 AI-Native 静态检查、名义 `struct`/`enum`/`trait`/`impl` 与反向 AD |
+| Wave 4 (`v0.110.0`) | `TensorComputeDag` 深度融合、高阶 AD、零依赖 CUDA/Vulkan/Metal/SIMD 后端、`KVPageAllocator`/`MemoryPool`、纯 Mora `std/net/http` & `std/mcp`、`MORABC02` 单二进制构建 |
 
 ---
 
@@ -1622,26 +1652,29 @@ in let loop macro match nil quote return struct task then true
 type with
 ```
 
-说明：`with` 保留为词法关键字，专用于 `match expr with ... end` 模式匹配分支语法（`with` 配置块已于 v0.110.0 移除）。
+说明：`with` 保留为词法关键字，专用于 `match expr with ... end` 模式匹配分支语法。
 
-非关键字但由 parser 按标识符分派的构造（§14.1 第 2 类）：`transaction` `worker` `parallel` `perform` `handle` `effect` `eval` `aggregate` `spawn` `select`。
+由 parser 按标识符+前瞻守卫分派的语句/表达式构造（§14.1 第 2 类）：`assign` `while` `export` `trait` `impl` `transaction` `worker` `parallel` `perform` `handle` `effect` `eval` `aggregate` `spawn` `select` `no_grad`。
 
 ### B. 内置类型完整列表
 
 ```
-string char int float number bool nil list dict task closure result any
-channel task_handle context continuation external
-trait concrete union compose partial atom macro arrow code effect handler
+string char int float number bool nil
+f16 bf16 fp8 fp8_e4m3 fp8_e5m2 f32 f64 i4 i8 i16 i32 i64 u8 u16 u32 u64
+list dict tensor compute_dag kv_allocator memory_pool
+task closure result any
+channel task_handle context tcp_listener tcp_stream continuation external
+struct enum trait concrete union compose partial atom macro arrow code effect handler
 ```
 
 ### C. 运算符优先级
 
 | 优先级 | 运算符 |
 |--------|--------|
-| 1 (高) | `()` `[]` `.` `::` |
+| 1 (高) | `()` `[]` `.` `::` `as dyn` |
 | 2 | `**` (右结合幂运算) |
 | 3 | `!` `not` `-` (一元) |
-| 4 | `*` `/` `%` `@` (矩阵乘/内积) |
+| 4 | `*` `/` `%` `@` (矩阵乘/张量收缩) |
 | 5 | `+` `-` |
 | 6 | `<` `>` `<=` `>=` |
 | 7 | `\|>` (管道) |
@@ -1654,7 +1687,6 @@ trait concrete union compose partial atom macro arrow code effect handler
 ### D. 文件扩展名
 
 - `.mora` — Mora 源文件
+- `.morac` — `mora build --emit-bc` 生成的预编译 `MORABC02` 二进制 `ControlProgram` 字节码文件
 
 ---
-
-*Mora 语言规范 v0.110.0*

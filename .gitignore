@@ -12,9 +12,15 @@ docs/*
 !docs/influences.md
 !docs/learning-plan.md
 !docs/decisions/
+docs/decisions/llm-config-cascade.md
+docs/decisions/circuit-numeric-contract.md
 
 # AI assistant internal files
 CLAUDE.md
+AGENTS_CODE_MODIFICATION.md
+category-icons.md
+local-plugin-hooks.md
+local-plugin-v1.md
 # AGENTS.md 不在 gitignore — 项目级 AI 约束必须入仓（v0.78）
 
 # 临时调研产物 (跨会话遗留)

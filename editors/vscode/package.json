@@ -1,8 +1,8 @@
 {
   "name": "mora",
   "displayName": "Mora Language",
-  "description": "Mora language support: syntax highlighting + LSP-backed diagnostics/hover/completion.",
-  "version": "0.1.0",
+  "description": "Mora language support: syntax highlighting + LSP-backed diagnostics, Span-tracked HM hover/completion, tensors, and concurrency.",
+  "version": "0.110.0",
   "publisher": "Mora contributors",
   "license": "BSD-3-Clause",
   "repository": {

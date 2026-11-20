@@ -13,10 +13,10 @@
 # 在本目录构建
 cd editors/vscode
 npm install -g @vscode/vsce
-vsce package  # 生成 mora-0.1.0.vsix
+vsce package  # 生成 mora-0.110.0.vsix
 
 # 安装到 VS Code
-code --install-extension mora-0.1.0.vsix
+code --install-extension mora-0.110.0.vsix
 ```
 
 ### From source

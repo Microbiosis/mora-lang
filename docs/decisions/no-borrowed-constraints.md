@@ -1,155 +1,34 @@
 # Decision Log: 个人项目约束（不引入借鉴项目硬约束）
 
-**Date**: 2026-08-08
-**Version**: v0.75.93+
+**Date**: 2026-08-08（v0.110.0 校准）  
+**Version**: v0.110.0  
 **Status**: Active
 
 ## 背景
 
-会话中曾生成两份「借石攻玉」报告（参考开源项目 + esolang 家族），
-试图给 Mora 提「发展路径建议」。报告错误地把借鉴项目（Rust / TS /
-Kotlin / Go / Mojo / Zig）的「成功模式」当作 Mora 必须遵守的「标准」：
-
-- 「v1.0 freeze 之前完成所有任务」
-- 「12 个月时间盒硬上限」
-- 「永不 2.0」承诺格式
-- 「6 周 train 模型」
-- 「RFC 流程」
-- 「拒绝自然语言歧义」
-- 「agent-booking 旗舰 demo 必须在 v0.95 前落地」
-- 「Mojo 竞争压力」「Zig 10 年未到 1.0 反面教训」
-- 「12 个动作 / 5 件事 / 4 阶段」
+早期调研参考开源项目（Rust / TypeScript / Kotlin / Go / Mojo / Zig）时，曾出现将外部项目的发布流程或时间盒纪律当作硬约束的倾向。本决策记录明确 Mora 的自治边界。
 
 ## 决策
 
-**所有借鉴项目的「成功模式」与「时间盒纪律」都不作为 Mora 的硬约束。**
+**所有外部项目的「时间盒纪律」与「公司化发布流程」都不作为 Mora 的硬约束；Mora 唯一遵循的硬约束是 `AGENTS.md` §0–§7 确立的工程与架构原则（架构优先、从底层原语完整实现、测试同步、禁止兼容补丁桥）。**
 
-这是**作者个人项目**，不是产品级语言。
+### 1. 不引入外部时间盒或流程枷锁
 
-### 我的角色
+- **不预设截止日**：尊重作者主动拍板的里程碑与节奏，不假设外部窗口期压力。
+- **不保留历史兼容包袱**：在 `0.x` 阶段，定位漂移或双轨冗余模块直接在大版本里程碑（如 `v0.110.0` Wave 1–4）彻底剥离并重铸底层原语，不留空壳兼容桥（`AGENTS.md §6`）。
+- **反保守重构原则**：当架构收口需要跨模块迁移时，从底层原语、类型系统、IR/VM 到标准库与测试一次性完整闭环，而非打局部补丁。
 
-作为 AI 协作：
+## Mora v0.110.0 的核心技术护城河（已在仓内实测验证）
 
-- ✅ **给信息**——借鉴项目怎么做、做了什么取舍
-- ✅ **给选项**——想做 / 不想做 / 改做 / 怎么做都行
-- ✅ **执行作者拍板的方案**——任何决定都执行
-- ❌ ~~把别人的成功模式当 Mora 必须遵守的标准~~
-- ❌ ~~用「时间盒」「承诺格式」约束作者~~
-- ❌ ~~建议「拒绝/不允许」的清单（除非作者问）~~
-
-### 不引入借鉴项目硬约束
-
-#### A. 不引入「时间盒」
-
-**借鉴项目的 12 个月时间盒、6 周 train 模型、10 年未到 1.0 反面教训——都不适用 Mora。**
-
-- 作者个人项目，无产品级时间承诺
-- 用户基线为 0，无「抢窗口」压力
-- 借鉴项目的「完美才能 1.0」陷阱不适用——Mora 作者自决 1.0 时间
-- 「12 个月不可延期」「必发 1.0」等约束不作为 Mora 决策原则
-
-**真实约束**：作者主动拍板时间表时尊重。否则**不假设任何截止日**。
-
-#### B. 不引入「RFC 流程 / 永不 2.0 / train 模型」
-
-**借鉴项目的发布纪律不适用 Mora。**
-
-- Rust RFC 流程 + Go 「永不 2.0」承诺是产品级语言必须的——Mora 不是
-- TS 「1.0 后 18 个月才加控制流分析」节奏——Mora 不必遵循
-- 「v1.0 冻结」「永不破坏兼容」是公司化项目的护城河——个人项目无此需求
-
-**真实约束**：作者主动要求引入流程时尊重。否则**保留 §6「不保证向后兼容」+ 「无正确实现就不留 hook」**原则（这是作者自己的项目原则）。
-
-#### C. 不引入「市场压力」
-
-**Mojo 同期发布 / Zig 10 年未到 1.0 反面 / Kotlin Google 背书拐点——都不适用 Mora。**
-
-- Mora 用户基线为 0，不存在「抢窗口」压力
-- 个人项目无公司化护城河需求
-- 借鉴项目的「采纳拐点 = 平台背书」公式——Mora 无平台
-
-**真实约束**：作者主动制定市场策略时尊重。否则**不假设市场压力**。
-
-#### D. 不引入「借鉴 esolang 浪漫主义」
-
-**Chef 文学化 / Whitespace 隐形 / Brainfuck 极简 / 自然语言派——都不适用 Mora。**
-
-- Mora 是 spec-driven 工程 AI-native 语言
-- 第 11 节借鉴 ORCΛ frame 时间哲学可保留（时间维度原语化）
-- 任何「让代码看起来像别的东西」的诱惑——**拒绝**
-
-**真实约束**：作者主动要求 esolang 元素时尊重。
-
-## 借鉴项目的真实价值（不是约束，是参考）
-
-| 项目 | 提供什么（仅参考） |
-|---|---|
-| Rust | 0.x 阶段可大重构 + RFC 流程（v0.x 想做可做） |
-| TypeScript | spec 跟随 ECMAScript（想做 spec 就做） |
-| Kotlin | 工具链打磨（想打磨就打磨） |
-| Go | 「永不 2.0」承诺（觉得合适才写） |
-| Mojo | 1.0 beta 同期（**没有同期竞争压力**） |
-| Zig | 10 年未到 1.0（Zig 作者的取舍，**不适用 Mora**） |
-
-## 何时重新审视本决策
-
-- 当项目从「作者个人项目」升级为「多人协作 / 公开 beta / 公司化产品」时
-- 当引入外部贡献者并需要明确「决策者」身份时
-- 当社区规模 > 100 用户需要 commitment 框架时
-
-在那之前，**作者说了算**。
-
-## v0.76.11 追加：不要保守政策
-
-**用户指令**（2026-08-11）："不要行使保守政策"
-
-含义：跨 major 升级、跨语言借力、API 破坏面 ≥ 50% 等"保守判断"
-**不应该**成为**拒绝**操作的理由。**实际**破坏面 < 5% 时直接执行；
-5-50% 时单独 commit 适配；≥ 50% 时**主动**启动跨 major 迁移并连续 commit
-而不是无限期等待。
-
-**已执行的反保守案例**（v0.76.07-09）：
-- v0.76.09 评估 "undoc 0.5 → 0.8 跨 3 major" 表面判断为"保守拒绝" → 实际调研 API
-  路径稳定（`DocxParser` / `PptxParser` / `Block::Paragraph` 跨 4 版本未变），**零代码改动**
-  直接升级 → 顺便消除 Mimosa 标记的 transitive `quick-xml 0.37.5` 链
-- v0.76.07 评估 "quick-xml 0.40 → 0.41" + "crossbeam-epoch 0.9.18 → 0.9.20" 为"必须"
-  → 零争议执行
-
-**反保守决策原则**（作者已签字，project-level binding）：
-1. **跨 major 升级不再"按名字归类"为破坏**——按 v0.76.09 哲学：实际破坏面 < 5%
-   跨 3 major 直接升，5-50% 单独 commit，≥ 50% 主动启动迁移
-2. **不预设"不引入借鉴项目硬约束"为"不引入任何借鉴"**——v0.76.01 文档明确区分
-   "硬约束"（时间盒、RFC 流程、Mojo 同期压力）与"参考智慧"（cascade、AIBound、
-   doc() progressive disclosure）——采纳智慧，拒硬约束
-3. **不预设"跨 major = 危险"**——按实际使用面评估（Mora 用 `DocxParser` 而 undoc
-   `ErrorKind` 不影响，跨 3 major 零代码改动）
-4. **不预设"修复 v0.75.87 撤除 = 永不重做"**——v0.76.02 WitnessPattern 5 变体 typeck
-   增量，**按使用面评估后实施**（最小可工作版本）
-5. **不预设"建议级 = 不做"**——架构审查报告 v0.75.90 3 条建议级每次都被重新评估
-
-**关联**：
-- v0.75.93 决策日志 "不引入借鉴项目硬约束"（基础条款）
-- v0.76.01 决策日志 "LLM Config Cascade 草案"（采纳制样板）
-- 架构审查报告 v0.75.90（v0.76.07-09 反保守重新评估）
-- 实际执行案例 v0.76.07-09（quick-xml + crossbeam-epoch + undoc 0.8 跨 3 major 零代码改动）
-
-## Mora 真正的护城河
-
-**已经在仓库里**，**不需要推销**：
-
-- HM Hindley-Milner 类型推断
-- 双向定型叠加层
-- AI 原语（route / observe / record / replay）
-- HTTP / MCP 单二进制
-- LSP
-
-## 相关 commits
-
-- v0.75.87 typeck 根除 match exhaustiveness
-- v0.75.88 sandbox Drop 卡死修复
-- v0.75.89 typeck 模块头注释错说修正
-- v0.75.90 docs「动态」修辞统一
-- v0.75.91 typeck Any/Unknown 拆分
-- v0.75.92 Unknown 显式 fail-fast
-- v0.75.93 mir TypeHint 边界抽离
-- 本决策日志 v2：加入「时间不是约束」
+1. **统一 `Span` 追踪 Hindley-Milner 类型系统与 5 项 AI-Native 静态检查**：
+   - 单一入口 `check_program_witnesses`（`src/typeck/hm/`），编译期强制校验 `DType`、`Shape`（符号维度与广播求解）、`Device`（静态跨设备禁令）、`Resource`（原位修改与别名安全）、`Effect`（封闭效果行包含与自动微分纯度）。
+2. **单遍 `ControlProgram` SSA IR、堆帧状态机 VM 与 `MORABC02` 零源码字节码**：
+   - `MirWitness[] → ControlProgram` 单遍降低、SSA 验证器与优化器（CopyProp / GVN-CSE / LICM / DCE）、显式 `Vec<CallFrame>` 堆帧 VM（`O(1)` 尾调用优化 + 多发定界续延 `Value::Continuation`），以及 `mora build` 零源码 `MORABC02` 单二进制与 `.morac` 预编译字节码直跑。
+3. **原生一等 `Tensor`、`TensorComputeDag` 算子融合、高阶 AD 与零依赖 GPU 驱动后端**：
+   - 64 字节对齐紧凑 `AlignedByteBuffer`（含 `f16`/`bf16`/`fp8`/`i4` 半字节打包）、零拷贝多维步幅切片、反向 `grad`/前向 `jvp`/高阶 `grad^n` & HVP、`trace_dag` 4 遍融合（`FusedFlashAttention`、`FusedRmsNormLinear`、`FusedLinearAct`、`FusedElementwise`）、`DagMemoryPlan` 静态草稿复用，以及零外部编译依赖动态加载的 **CUDA PTX / Vulkan SPIR-V / Metal MSL / CPU AVX2+NEON** 后端。
+4. **大模型显存动态调控原语**：
+   - PagedAttention 风格 `KVPageAllocator`（`kv_allocator`，支持 CoW `fork_seq`、硬字节配额、序列优先级抢占驱逐与无死锁回差水位线回调）与 64B 对齐分桶 Slab `MemoryPool`（`memory_pool`）。
+5. **Go 式云原生并发与纯 Mora `std/net/http` & `std/mcp` 标准库**：
+   - `spawn`、`channel<T>`、`select`、`context`、异步 `tcp_listen`/`tcp_connect` 配合编译期 `@tag` 结构体反射，直接用 Mora 语言自身构建完整的 HTTP/1.1（Router / Chunked / Keep-Alive / 413 / SSE）与 MCP（Tools / Resources / Prompts / `Struct::schema()` / Stdio NDJSON）标准库。
+6. **HM 统一的 `mora-lsp` 语言服务器与编辑器生态**：
+   - 受限 `Content-Length` 与迭代式 RFC 8259 JSON 解析，实时提供张量维度/设备/效果推导悬停、补全、跳转、重命名与格式化。

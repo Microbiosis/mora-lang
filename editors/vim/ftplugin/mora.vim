@@ -14,12 +14,12 @@ setlocal shiftwidth=2
 setlocal softtabstop=2
 setlocal expandtab
 
-" 简易语法高亮（vim 8+）
+" 简易语法高亮（vim 8+，v0.110.0）
 if has('syntax')
     syntax clear
     syntax case ignore
-    syntax keyword moraKeyword let task fn if then end for in while do try catch return parallel match with import export save load read write append true false nil
-    syntax keyword moraType string number bool list dict task closure
+    syntax keyword moraKeyword let assign task fn if then else end for in while loop break continue do return parallel worker transaction compensation commit rollback match with when import export struct enum trait impl dyn as type macro effect perform handle spawn select case timeout default no_grad grad value_and_grad jvp trace_dag quote eval read into and or not true false nil Self
+    syntax keyword moraType string char int float number bool nil f16 bf16 fp8 fp8_e4m3 fp8_e5m2 f32 f64 i4 i8 i16 i32 i64 u8 u16 u32 u64 list dict tensor Tensor compute_dag kv_allocator memory_pool task closure result any channel task_handle context tcp_listener tcp_stream continuation external atom
     syntax match moraComment "\-\-.*$"
     syntax region moraString start='"' end='"'
     syntax match moraNumber "\<\d\+\(\.\d\+\)\?\>"

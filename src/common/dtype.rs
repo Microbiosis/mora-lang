@@ -1075,10 +1075,11 @@ pub enum Device {
     Cpu,
     Cuda(u16),
     Metal(u16),
+    Vulkan(u16),
 }
 
 impl Device {
-    /// Parse a device descriptor (`"cpu"`, `"cuda"`, `"cuda:0"`, `"cuda:1"`, `"metal"`, `"metal:0"`).
+    /// Parse a device descriptor (`"cpu"`, `"cuda"`, `"cuda:0"`, `"metal"`, `"metal:0"`, `"vulkan"`, `"vulkan:0"`).
     pub fn parse(raw: &str) -> Result<Self, String> {
         let s = raw.trim().to_ascii_lowercase();
         if s == "cpu" {
@@ -1104,8 +1105,18 @@ impl Device {
                 .map_err(|_| format!("Invalid Metal device index in '{raw}'"))?;
             return Ok(Self::Metal(idx));
         }
+        if s == "vulkan" {
+            return Ok(Self::Vulkan(0));
+        }
+        if let Some(idx_str) = s.strip_prefix("vulkan:") {
+            let idx = idx_str
+                .trim()
+                .parse::<u16>()
+                .map_err(|_| format!("Invalid Vulkan device index in '{raw}'"))?;
+            return Ok(Self::Vulkan(idx));
+        }
         Err(format!(
-            "Unknown device '{raw}' (expected 'cpu', 'cuda:N', or 'metal:N')"
+            "Unknown device '{raw}' (expected 'cpu', 'cuda:N', 'metal:N', or 'vulkan:N')"
         ))
     }
 }
@@ -1116,6 +1127,7 @@ impl fmt::Display for Device {
             Self::Cpu => write!(f, "cpu"),
             Self::Cuda(id) => write!(f, "cuda:{id}"),
             Self::Metal(id) => write!(f, "metal:{id}"),
+            Self::Vulkan(id) => write!(f, "vulkan:{id}"),
         }
     }
 }

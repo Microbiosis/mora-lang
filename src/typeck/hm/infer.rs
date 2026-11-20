@@ -1068,6 +1068,64 @@ impl HMInference {
                 .strip_prefix("Tensor::")
                 .or_else(|| name.strip_prefix("tensor::"))
             {
+                if assoc == "devices" {
+                    if !args.is_empty() || !named_args.is_empty() {
+                        return Err(vec![TypeError::ArityMismatch {
+                            expected: 0,
+                            actual: args.len() + named_args.len(),
+                            span,
+                        }]);
+                    }
+                    return Ok((
+                        Type::List(Box::new(Type::String)),
+                        crate::mir::effect::EffectRow::Empty,
+                    ));
+                }
+                if assoc == "device_info" {
+                    let total = args.len() + named_args.len();
+                    if total > 1 {
+                        return Err(vec![TypeError::ArityMismatch {
+                            expected: 1,
+                            actual: total,
+                            span,
+                        }]);
+                    }
+                    let mut acc_row = crate::mir::effect::EffectRow::Empty;
+                    for a in args {
+                        let (ty, row) = self.infer_expr(a)?;
+                        acc_row = self.merge_rows(acc_row, row, a.span);
+                        self.constraints.push(SpannedConstraint::new(
+                            Constraint::Subtype {
+                                sub: Box::new(ty),
+                                sup: Box::new(Type::Union(vec![Type::String, Type::Nil])),
+                            },
+                            a.span,
+                        ));
+                    }
+                    for (k, a) in named_args {
+                        if k != "device" {
+                            return Err(vec![TypeError::UnificationFailure {
+                                expected: "valid keyword argument 'device' for Tensor::device_info"
+                                    .to_string(),
+                                got: format!("unknown keyword argument '{k}'"),
+                                span: Some(a.span),
+                            }]);
+                        }
+                        let (ty, row) = self.infer_expr(a)?;
+                        acc_row = self.merge_rows(acc_row, row, a.span);
+                        self.constraints.push(SpannedConstraint::new(
+                            Constraint::Subtype {
+                                sub: Box::new(ty),
+                                sup: Box::new(Type::Union(vec![Type::String, Type::Nil])),
+                            },
+                            a.span,
+                        ));
+                    }
+                    return Ok((
+                        Type::Dict(Box::new(Type::String), Box::new(Type::String)),
+                        acc_row,
+                    ));
+                }
                 return self.infer_tensor_constructor_call(assoc, args, named_args, span);
             }
         }

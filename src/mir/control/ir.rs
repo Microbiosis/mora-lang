@@ -90,6 +90,20 @@ impl SymbolTable {
     pub fn is_empty(&self) -> bool {
         self.names.is_empty()
     }
+
+    /// Borrow the ordered slice of interned symbol names for deterministic binary serialization.
+    pub(crate) fn as_slice(&self) -> &[String] {
+        &self.names
+    }
+
+    /// Reconstruct a [`SymbolTable`] preserving exact [`SymId`] ordering from serialized names.
+    pub(crate) fn from_names(names: Vec<String>) -> Self {
+        let mut index = HashMap::with_capacity(names.len());
+        for (i, name) in names.iter().enumerate() {
+            index.insert(name.clone(), SymId(i as u32));
+        }
+        Self { names, index }
+    }
 }
 
 /// Exhaustive compile-time IDs for Mora's built-in free functions.

@@ -3,6 +3,7 @@
 //! Pipeline:
 //! `MirWitness[] -> control::lower::lower_program -> ControlProgram -> control::opt::optimize_program`
 
+pub mod codec;
 pub mod ir;
 pub mod lower;
 pub mod opt;

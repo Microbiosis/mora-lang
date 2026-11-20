@@ -132,6 +132,14 @@ const STAGE3B_TYPES_AND_CTORS: &[(&str, &str)] = &[
         "Tensor::from_list",
         "Tensor::from_list(data, dtype?, device?, requires_grad?)",
     ),
+    (
+        "Tensor::devices",
+        "Tensor::devices() -> list<string> of available execution devices (cpu, cuda:N, vulkan:N, metal:N)",
+    ),
+    (
+        "Tensor::device_info",
+        "Tensor::device_info(device?) -> dict<string, string> hardware telemetry",
+    ),
 ];
 
 pub fn completion_v3(docs: &HashMap<String, DocumentState>, params: &Value) -> Value {

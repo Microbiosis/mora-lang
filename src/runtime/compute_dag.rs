@@ -344,6 +344,7 @@ impl DeviceBackend for EmulatedDeviceBackend {
             Device::Cpu => "cpu",
             Device::Cuda(_) => "cuda(host-emulated)",
             Device::Metal(_) => "metal(host-emulated)",
+            Device::Vulkan(_) => "vulkan(host-emulated)",
         }
     }
 
@@ -467,13 +468,22 @@ impl DeviceBackend for EmulatedDeviceBackend {
 }
 
 /// Resolve the [`DeviceBackend`] responsible for executing kernels on `device`.
+/// Prefers live hardware GPU drivers (`CUDA` / `Metal` / `Vulkan`) when detected at runtime,
+/// falling back cleanly to `EmulatedDeviceBackend` on CPU-only hosts or when
+/// `MORA_FORCE_CPU_EMULATION=1` is set.
 pub fn backend_for_device(device: &Device) -> Arc<dyn DeviceBackend> {
     match device {
         Device::Cpu => Arc::new(CpuDeviceBackend),
-        other => Arc::new(EmulatedDeviceBackend {
-            device: other.clone(),
-            cpu: CpuDeviceBackend,
-        }),
+        other => {
+            if let Some(hw) = crate::runtime::gpu::resolve_hardware_backend(other) {
+                hw
+            } else {
+                Arc::new(EmulatedDeviceBackend {
+                    device: other.clone(),
+                    cpu: CpuDeviceBackend,
+                })
+            }
+        }
     }
 }
 

@@ -12,8 +12,8 @@
 
 ## Highlights
 
-- **AI-native numeric, tensor & compute foundation** — strict `Int` (`i64`, overflow-checked) vs `Float` (`f64`) literals with hardware low-bitwidth `DType` suffixes (`f16`, `bf16`, `fp8`, `fp8_e5m2`, `f32`, `f64`, `i4`..`i64`, `u8`..`u64`, `bool`), 64-byte aligned compact `Tensor<DType, Shape, Device>` with zero-copy strided multi-dim slicing (`t[0..4, :, -1]`, `t[..., None]`), native matrix/tensor contraction `@` and power `**`, higher-order reverse/forward AD (`grad`/`value_and_grad`/`jvp`/`no_grad`, HVP), `TensorComputeDag` 4-pass fusion (`FusedFlashAttention`, `FusedRmsNormLinear`, `FusedLinearAct`, `FusedElementwise`) with runtime-dispatched AVX2+FMA/NEON multi-threaded kernels & `DagPlanCache`/`DagWorkspace`, PagedAttention `KVPageAllocator` (`kv_allocator` with byte quotas, priority preemption & watermark callbacks) + 64-byte aligned slab `MemoryPool` (`memory_pool`), scalar/tensor math (`math.*`, `stats.*`, `linalg.*`, `random.*`), and modular std workspace crates (`std/math/bigint`, pure-Mora `std/net/http` with Router/Chunked/Keep-Alive/SSE, and `std/mcp` with HTTP+SSE/Stdio/`prompts`/`Struct::schema()`).
-- **Single-pass Control SSA compiler, stackful VM & `mora build`** — Lexer → iterative Pratt `ParserV3::compile` → `MirWitness[]` + `ControlProgram` SSA IR (`verify_program`) → SSA optimization (`--opt=0/1/2` or `MORA_OPT`: CopyProp, GVN-CSE, LICM, DCE) → heap-framed stackful VM (`runtime::vm`) with `O(1)` tail-call optimization (100,000+ frames) and `mora build <file> -o <bin>` self-contained single-binary bundling.
+- **AI-native numeric, tensor & compute foundation** — strict `Int` (`i64`, overflow-checked) vs `Float` (`f64`) literals with hardware low-bitwidth `DType` suffixes (`f16`, `bf16`, `fp8`, `fp8_e5m2`, `f32`, `f64`, `i4`..`i64`, `u8`..`u64`, `bool`), 64-byte aligned compact `Tensor<DType, Shape, Device>` (`cpu`/`cuda:N`/`vulkan:N`/`metal:N`, `Tensor::devices()`, `Tensor::device_info()`) with zero-copy strided multi-dim slicing (`t[0..4, :, -1]`, `t[..., None]`), native matrix/tensor contraction `@` and power `**`, higher-order reverse/forward AD (`grad`/`value_and_grad`/`jvp`/`no_grad`, HVP), `TensorComputeDag` 4-pass fusion (`FusedFlashAttention`, `FusedRmsNormLinear`, `FusedLinearAct`, `FusedElementwise`) backed by zero-dependency native hardware GPU `DeviceBackend`s (dynamic CUDA Driver API + PTX ISA 7.0 `f64` kernels & VRAM slab arena, Vulkan 1.0 + pure-Rust SPIR-V 1.0 compute shaders, macOS Metal MSL) plus runtime-dispatched AVX2+FMA/NEON multi-threaded CPU kernels & `DagPlanCache`/`DagWorkspace`, PagedAttention `KVPageAllocator` (`kv_allocator` with byte quotas, priority preemption & watermark callbacks) + 64-byte aligned slab `MemoryPool` (`memory_pool`), scalar/tensor math (`math.*`, `stats.*`, `linalg.*`, `random.*`), and modular std workspace crates (`std/math/bigint`, pure-Mora `std/net/http` with Router/Chunked/Keep-Alive/SSE, and `std/mcp` with HTTP+SSE/Stdio/`prompts`/`Struct::schema()`).
+- **Single-pass Control SSA compiler, `MORABC02` AOT bytecode & stackful VM** — Lexer → iterative Pratt `ParserV3::compile` → `MirWitness[]` + `ControlProgram` SSA IR (`verify_program`) → SSA optimization (`--opt=0/1/2` or `MORA_OPT`: CopyProp, GVN-CSE, LICM, DCE) → heap-framed stackful VM (`runtime::vm`) with `O(1)` tail-call optimization (100,000+ frames), zero-source precompiled `MORABC02` single-binary builds (`mora build <file> -o <bin>`) and standalone `.morac` AOT bytecode artifacts (`mora build <file> --emit-bc` / `mora app.morac`).
 - **Unified Span-tracked Hindley-Milner type system** — single constraint solver (`src/typeck/check_mir.rs` + `src/typeck/hm/`) delivering 5 AI-native static checks (`DType`, `Shape`, `Device`, `Resource`, `Effect`), nominal generic `struct` (with defaults & compile-time `@tag(...)`) / payload `enum`, source-level `trait`/`impl`/`dyn Trait`, default & named keyword arguments, rigid multi-character generic parameters (`<T, Dtype>`), ML Value Restriction, effect-row subsumption, covariant `result<T, E>` & `task_handle<T>`, invariant `channel<T>`, fail-closed `unknown`, and cross-module `import` verification.
 - **Go-style cloud-native concurrency & Tokio runtime** — first-class `spawn`, typed invariant `channel<T>` (unbuffered rendezvous & bounded FIFO), fair multi-arm `select` (`case recv`/`send`/`timeout`/`default`), hierarchical cooperative cancellation `context` (`task_handle<T>`), cancellable `sleep`, multi-threaded `TaskScheduler`, non-blocking `AsyncIoReactor` (`tcp_listen` / `tcp_connect` / `tcp_listener` / `tcp_stream`), and `FsPolicy` / `CheckedPath` filesystem confinement with isolated per-runtime virtual `cwd`.
 - **Algebraic effects, dynamic dispatch & homoiconic metaprogramming** — `perform` / `handle` with multi-shot delimited continuations (`resume`, `Value::Continuation`), source-level `trait` / `impl` & `dyn` trait dispatch (`as dyn`, default methods, supertraits), `HostObject` (`Value::External(Arc<dyn HostObject>)`) for opaque stateful host objects, chunked persistent `Value::List`, lexical `Environment` (`HashMap` + `Arc<Environment>` parent chain), atoms (`atom` / `swap` / `deref`), typed pattern matching with guards, and Lisp-heritage homoiconicity (`macro`, `quote`, `quasiquote`, `eval`).
@@ -45,16 +45,18 @@ cargo build --release     # builds target/release/mora and target/release/mora-l
 ## Quick start
 
 ```bash
-mora script.mora          # run a script
-mora run script.mora      # explicit run subcommand
-mora build script.mora -o app  # compile into a self-contained single binary
-mora --opt=1 script.mora  # SSA optimization: 0=off / 1=basic / >=2=aggressive
-mora --check script.mora  # type check only
-mora --repl               # interactive REPL
-mora install <url>        # install a .mora script into vendor/
-mora --version            # print version
-mora --help               # print CLI help
-mora-lsp                  # language server (stdio JSON-RPC)
+mora script.mora                       # run a script
+mora run script.mora                   # explicit run subcommand
+mora build script.mora -o app          # compile into a zero-source MORABC02 single binary
+mora build script.mora --emit-bc -o a.morac  # emit precompiled .morac SSA bytecode artifact
+mora a.morac                           # execute .morac bytecode directly (zero parse/typeck)
+mora --opt=1 script.mora               # SSA optimization: 0=off / 1=basic / >=2=aggressive
+mora --check script.mora               # type check only
+mora --repl                            # interactive REPL
+mora install <url>                     # install a .mora script into vendor/
+mora --version                         # print version
+mora --help                            # print CLI help
+mora-lsp                               # language server (stdio JSON-RPC)
 ```
 
 ## Language at a glance

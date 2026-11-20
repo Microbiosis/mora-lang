@@ -1842,6 +1842,8 @@ pub fn call_tensor_associated_named(
         "eye" => &["n", "m", "dtype", "device", "requires_grad"],
         "arange" => &["start", "end", "step", "dtype", "device", "requires_grad"],
         "from_list" => &["data", "dtype", "device", "requires_grad"],
+        "devices" => &[],
+        "device_info" => &["device"],
         _ => {
             return Err(MoraError::Runtime(format!(
                 "Tensor has no associated function 'Tensor::{assoc}'"
@@ -1958,6 +1960,35 @@ pub fn call_tensor_associated(
     core: &mut CoreRuntime,
 ) -> MoraResult<Value> {
     match assoc {
+        "devices" => {
+            if !args.is_empty() {
+                return Err(MoraError::Runtime(format!(
+                    "Tensor::devices() expects 0 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let devs: Vec<Value> = crate::runtime::gpu::list_hardware_devices()
+                .into_iter()
+                .map(|info| Value::String(info.device.to_string()))
+                .collect();
+            Ok(Value::List(devs.into()))
+        }
+        "device_info" => {
+            if args.len() > 1 {
+                return Err(MoraError::Runtime(format!(
+                    "Tensor::device_info(device?) expects 0..=1 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let dev = parse_optional_device(args.first(), "Tensor::device_info")?;
+            let info = crate::runtime::gpu::hardware_device_info(&dev);
+            let map: std::collections::HashMap<String, Value> = info
+                .to_string_map()
+                .into_iter()
+                .map(|(k, v)| (k, Value::String(v)))
+                .collect();
+            Ok(Value::Dict(map))
+        }
         "zeros" => {
             let shape_val = args.first().ok_or_else(|| {
                 MoraError::Runtime(

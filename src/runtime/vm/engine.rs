@@ -1823,49 +1823,45 @@ impl<'a> VmEngine<'a> {
                 StepOutcome::Yielded
             }
             ControlInst::Import { path } => {
-                let source = if let Some(s) = self.core.bundled_modules.get(&path) {
-                    s.clone()
-                } else if let Some(std_src) = crate::resolve_std_module(&path) {
-                    std_src.to_string()
+                let child_prog = if let Some(precompiled) =
+                    self.core.precompiled_modules.get(&path).cloned()
+                {
+                    precompiled
                 } else {
-                    let checked = match self.core.fs_context().resolve_path(&path, "import") {
-                        Ok(p) => p,
-                        Err(e) => return StepOutcome::Err(e),
+                    let source = if let Some(std_src) = crate::resolve_std_module(&path) {
+                        std_src.to_string()
+                    } else {
+                        let checked = match self.core.fs_context().resolve_path(&path, "import") {
+                            Ok(p) => p,
+                            Err(e) => return StepOutcome::Err(e),
+                        };
+                        let ctx = self.core.task_context.as_ref();
+                        match self.core.reactor().run_fs(ctx, move || {
+                            std::fs::read_to_string(checked.as_path()).map_err(MoraError::from)
+                        }) {
+                            Ok(s) => s,
+                            Err(e) => return StepOutcome::Err(e.with_prefix("import error: ")),
+                        }
                     };
-                    let ctx = self.core.task_context.as_ref();
-                    match self.core.reactor().run_fs(ctx, move || {
-                        std::fs::read_to_string(checked.as_path()).map_err(MoraError::from)
-                    }) {
-                        Ok(s) => s,
-                        Err(e) => return StepOutcome::Err(e.with_prefix("import error: ")),
-                    }
-                };
-                let mods_opt = if self.core.bundled_modules.is_empty() {
-                    None
-                } else {
-                    Some(self.core.bundled_modules.as_ref())
-                };
-                let (mut child_prog, witnesses) =
-                    match ParserV3::compile_with_modules(&source, mods_opt) {
+                    let (mut compiled, witnesses) = match ParserV3::compile(&source) {
                         Ok(v) => v,
                         Err(e) => return StepOutcome::Err(e),
                     };
-                let type_errs = crate::typeck::check_mir::check_program_witnesses_with_modules(
-                    &witnesses, mods_opt,
-                );
-                if !type_errs.is_empty() {
-                    let msg = type_errs
-                        .iter()
-                        .map(|e| format!("line {}: {}", e.line, e.message))
-                        .collect::<Vec<_>>()
-                        .join("; ");
-                    return StepOutcome::Err(MoraError::Typeck(format!(
-                        "import '{}' type error(s): {}",
-                        path, msg
-                    )));
-                }
-                optimize_program(&mut child_prog, OptLevel::from_env());
-                let child_prog = Arc::new(child_prog);
+                    let type_errs = crate::typeck::check_mir::check_program_witnesses(&witnesses);
+                    if !type_errs.is_empty() {
+                        let msg = type_errs
+                            .iter()
+                            .map(|e| format!("line {}: {}", e.line, e.message))
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        return StepOutcome::Err(MoraError::Typeck(format!(
+                            "import '{}' type error(s): {}",
+                            path, msg
+                        )));
+                    }
+                    optimize_program(&mut compiled, OptLevel::from_env());
+                    Arc::new(compiled)
+                };
                 let entry = child_prog.entry;
                 let child_globals = super::continuation::init_globals(&child_prog);
                 let child_frame = match materialize_frame(

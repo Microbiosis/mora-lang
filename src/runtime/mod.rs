@@ -13,6 +13,8 @@ pub mod core;
 pub use core::{CoreRuntime, EngineShared};
 // v0.110.0: 文件系统隔离策略、独立 virtual_cwd 与 CheckedPath 凭证
 pub mod fs;
+// Wave 4 P2-2: Native hardware GPU drivers (CUDA PTX / Vulkan SPIR-V / Metal MSL)
+pub(crate) mod gpu;
 // Wave 4: PagedAttention-style dynamic KV-cache resource allocator & general MemoryPool
 pub mod kv_cache;
 pub mod memory_pool;

@@ -1854,7 +1854,11 @@ fn resolve_compute_dag_method(
             }
             let dev = dag.output_device();
             let backend = crate::runtime::compute_dag::backend_for_device(&dev);
+            let hw = crate::runtime::gpu::hardware_device_info(&dev);
             let mut m = std::collections::HashMap::new();
+            for (k, v) in hw.to_string_map() {
+                m.insert(k, Value::String(v));
+            }
             m.insert("device".to_string(), Value::String(dev.to_string()));
             m.insert(
                 "backend".to_string(),

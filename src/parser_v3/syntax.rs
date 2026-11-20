@@ -662,6 +662,26 @@ impl ParserV3 {
                         };
                         Some(DeviceType::Concrete(Device::Metal(idx)))
                     }
+                    "vulkan" => {
+                        let idx = if self.match_token_exact(TokenType::Colon) {
+                            match self.peek()?.token_type {
+                                TokenType::Int(n) if (0..=u16::MAX as i64).contains(&n) => {
+                                    self.advance();
+                                    n as u16
+                                }
+                                _ => {
+                                    eprintln!(
+                                        "Parse error: expected non-negative device index after 'vulkan:' at line {}",
+                                        self.current_line()
+                                    );
+                                    return None;
+                                }
+                            }
+                        } else {
+                            0
+                        };
+                        Some(DeviceType::Concrete(Device::Vulkan(idx)))
+                    }
                     _ => {
                         let stored = self
                             .generic_params

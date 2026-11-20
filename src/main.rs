@@ -55,7 +55,7 @@ fn dispatch() -> i32 {
                 println!("  mora --check <file>        Type check only");
                 println!("  mora run <file.mora>       Run a script (explicit form)");
                 println!(
-                    "  mora build <file.mora>     Compile a script into a standalone binary [-o <out>]"
+                    "  mora build <file.mora>     Compile a script into an AOT MORABC02 standalone binary [--emit-bc] [-o <out>]"
                 );
                 println!("  mora install <url>         Install a package from a URL");
                 println!();
@@ -227,6 +227,13 @@ fn run_file(path: &str, opt_level: Option<mora::mir::control::OptLevel>) {
     // 路径不存在/无权限/是目录时打印 Rust panic 与回溯，退出码 101，
     // 与 typecheck 的 exit(2)、解析错误的 exit(2) 都不一致）。
     mora::cli::reject_option_as_path(path);
+    // P2-1: Direct zero-parse execution for precompiled MORABC02 `.morac` bytecode packages.
+    if let Some(code) = mora::cli::bundle::try_run_bytecode_file(Path::new(path)) {
+        if code != 0 {
+            process::exit(code);
+        }
+        return;
+    }
     let source = match mora::cli::read_source(Path::new(path)) {
         Ok(s) => s,
         Err(e) => {
@@ -308,14 +315,20 @@ fn run_repl() {
 
 fn run_build(rest: &[String], opt_level: Option<mora::mir::control::OptLevel>) {
     if rest.is_empty() {
-        eprintln!("Usage: mora build <file.mora> [-o <output>]");
+        eprintln!("Usage: mora build <file.mora> [--emit-bc] [-o <output>]");
         process::exit(1);
     }
     let mut entry: Option<&str> = None;
     let mut output: Option<&str> = None;
+    let mut emit_bc = false;
     let mut i = 0usize;
     while i < rest.len() {
         let arg = &rest[i];
+        if arg == "--emit-bc" || arg == "--bytecode" {
+            emit_bc = true;
+            i += 1;
+            continue;
+        }
         if arg == "-o" || arg == "--out" || arg == "--output" {
             let Some(val) = rest.get(i + 1) else {
                 eprintln!("mora build: expected output path after '{arg}'");
@@ -342,7 +355,7 @@ fn run_build(rest: &[String], opt_level: Option<mora::mir::control::OptLevel>) {
         i += 1;
     }
     let Some(entry_str) = entry else {
-        eprintln!("Usage: mora build <file.mora> [-o <output>]");
+        eprintln!("Usage: mora build <file.mora> [--emit-bc] [-o <output>]");
         process::exit(1);
     };
     let entry_path = Path::new(entry_str);
@@ -351,16 +364,30 @@ fn run_build(rest: &[String], opt_level: Option<mora::mir::control::OptLevel>) {
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("app");
-        if cfg!(windows) {
+        if emit_bc {
+            format!("{stem}.morac")
+        } else if cfg!(windows) {
             format!("{stem}.exe")
         } else {
             stem.to_string()
         }
     };
     let out_path = Path::new(output.unwrap_or(&default_out));
-    match mora::cli::bundle::build_single_binary(entry_path, out_path, opt_level) {
+    let res = if emit_bc {
+        mora::cli::bundle::build_bytecode_file(entry_path, out_path, opt_level)
+    } else {
+        mora::cli::bundle::build_single_binary(entry_path, out_path, opt_level)
+    };
+    match res {
         Ok(()) => {
-            println!("Built standalone executable -> {}", out_path.display());
+            if emit_bc {
+                println!("Built AOT MORABC02 bytecode -> {}", out_path.display());
+            } else {
+                println!(
+                    "Built AOT MORABC02 standalone executable -> {}",
+                    out_path.display()
+                );
+            }
         }
         Err(e) => {
             eprintln!("{}: {}", entry_str, e);

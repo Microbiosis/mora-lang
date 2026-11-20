@@ -97,8 +97,9 @@ pub struct CoreRuntime {
     pub(crate) trait_defaults: Arc<HashMap<(String, String), (Value, bool)>>,
     /// Wave 3 Stage 3C: Per-runtime reverse-mode automatic differentiation context (`grad` / `no_grad`).
     pub(crate) autograd: AutogradContext,
-    /// Wave 4: Virtual module source table embedded by `mora build` single-binary compilation.
-    pub(crate) bundled_modules: Arc<HashMap<String, String>>,
+    /// Wave 4 P2-1: Precompiled & verified SSA `ControlProgram` modules embedded by `mora build`
+    /// (`MORABC02` bytecode / `.morac` packages) for O(1) zero-parse runtime `import`.
+    pub(crate) precompiled_modules: Arc<HashMap<String, Arc<crate::mir::control::ControlProgram>>>,
 }
 
 fn default_environment() -> Environment {
@@ -152,7 +153,7 @@ impl Default for CoreRuntime {
             trait_impl_pairs: Arc::new(HashSet::new()),
             trait_defaults: Arc::new(HashMap::new()),
             autograd: AutogradContext::new(),
-            bundled_modules: Arc::new(HashMap::new()),
+            precompiled_modules: Arc::new(HashMap::new()),
         }
     }
 }
@@ -200,9 +201,12 @@ impl CoreRuntime {
         &mut self.fs_context
     }
 
-    /// Attach bundled import module sources (used by `mora build` standalone executables).
-    pub fn with_bundled_modules(mut self, modules: HashMap<String, String>) -> Self {
-        self.bundled_modules = Arc::new(modules);
+    /// Attach precompiled & verified SSA `ControlProgram` modules (used by `MORABC02` bundles/`.morac`).
+    pub fn with_precompiled_modules(
+        mut self,
+        modules: HashMap<String, Arc<crate::mir::control::ControlProgram>>,
+    ) -> Self {
+        self.precompiled_modules = Arc::new(modules);
         self
     }
 

@@ -25,16 +25,20 @@
 //! （论据均按实际代码逐处撰写，不是模板）。本判据把这条要求固化：
 //! 将来新增 `unsafe` 而忘了写论据，立刻变红并点名文件:行号。
 //!
-//! **豁免两类**（它们不是 `unsafe` 块，不需要 SAFETY）：
+//! **豁免三类**（它们不是 `unsafe` 块，不需要 SAFETY）：
 //! - `unsafe extern "C" { … }` / `unsafe extern "system" { … }` —— **声明**，不执行；
-//! - `fn … -> unsafe extern "C" fn(…)` —— `unsafe` 属于**返回类型**。
+//! - `fn … -> unsafe extern "C" fn(…)` —— `unsafe` 属于**返回类型**；
+//! - `type … = unsafe extern "C" fn(…)` / `unsafe extern "system" fn(…)` —— 函数指针**类型别名**，不执行。
 
 use std::path::{Path, PathBuf};
 
-/// 一行是不是「`unsafe extern` 声明」或「返回类型里的 unsafe」。
+/// 一行是不是「`unsafe extern` 声明」或「函数指针类型签名里的 unsafe」。
 fn is_exempt(line: &str) -> bool {
     let t = line.trim_start();
-    t.starts_with("unsafe extern") || t.contains("-> unsafe extern") || t.contains("-> unsafe fn")
+    t.starts_with("unsafe extern")
+        || t.contains("-> unsafe extern")
+        || t.contains("-> unsafe fn")
+        || t.contains("= unsafe extern")
 }
 
 fn collect_files(root: &Path) -> Vec<PathBuf> {

@@ -80,7 +80,9 @@ fn mora(dir: &Path, args: &[&str]) -> (String, i32) {
 /// 这句话在「文件确实存在」时出现，就是**归因错误** —— 本文件的核心判据。
 fn blames_a_missing_file(out: &str) -> bool {
     out.contains("系统找不到指定的文件")
+        || out.contains("The system cannot find the file specified")
         || out.contains("No such file")
+        || out.contains("(os error 2)")
         || out.contains("failed to read --")
 }
 

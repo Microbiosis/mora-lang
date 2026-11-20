@@ -5,7 +5,13 @@
 *.tmp.*
 .worktrees/
 .mora/
-docs/
+docs/*
+!docs/README.md
+!docs/mora-spec.md
+!docs/architecture-diagram.md
+!docs/influences.md
+!docs/learning-plan.md
+!docs/decisions/
 
 # AI assistant internal files
 CLAUDE.md

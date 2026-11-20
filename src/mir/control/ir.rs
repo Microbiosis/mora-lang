@@ -109,9 +109,12 @@ pub enum BuiltinFnId {
     Eval,
     Float,
     Gensym,
+    Grad,
     Int,
     Into,
     IsInstance,
+    Jvp,
+    KvAllocator,
     Len,
     Macroexpand,
     MergeWith,
@@ -125,9 +128,13 @@ pub enum BuiltinFnId {
     Str,
     Swap,
     Tail,
+    TcpConnect,
+    TcpListen,
     Tensor,
+    TraceDag,
     TypeOf,
     Uncurry,
+    ValueAndGrad,
 }
 
 impl BuiltinFnId {
@@ -148,9 +155,12 @@ impl BuiltinFnId {
             "eval" => Some(Self::Eval),
             "float" => Some(Self::Float),
             "gensym" => Some(Self::Gensym),
+            "grad" => Some(Self::Grad),
             "int" => Some(Self::Int),
             "into" => Some(Self::Into),
             "is_instance" => Some(Self::IsInstance),
+            "jvp" => Some(Self::Jvp),
+            "kv_allocator" => Some(Self::KvAllocator),
             "len" => Some(Self::Len),
             "macroexpand" => Some(Self::Macroexpand),
             "merge_with" => Some(Self::MergeWith),
@@ -164,9 +174,13 @@ impl BuiltinFnId {
             "str" => Some(Self::Str),
             "swap" => Some(Self::Swap),
             "tail" => Some(Self::Tail),
+            "tcp_connect" => Some(Self::TcpConnect),
+            "tcp_listen" => Some(Self::TcpListen),
             "tensor" => Some(Self::Tensor),
+            "trace_dag" => Some(Self::TraceDag),
             "type_of" => Some(Self::TypeOf),
             "uncurry" => Some(Self::Uncurry),
+            "value_and_grad" => Some(Self::ValueAndGrad),
             _ => None,
         }
     }
@@ -188,9 +202,12 @@ impl BuiltinFnId {
             Self::Eval => "eval",
             Self::Float => "float",
             Self::Gensym => "gensym",
+            Self::Grad => "grad",
             Self::Int => "int",
             Self::Into => "into",
             Self::IsInstance => "is_instance",
+            Self::Jvp => "jvp",
+            Self::KvAllocator => "kv_allocator",
             Self::Len => "len",
             Self::Macroexpand => "macroexpand",
             Self::MergeWith => "merge_with",
@@ -204,9 +221,13 @@ impl BuiltinFnId {
             Self::Str => "str",
             Self::Swap => "swap",
             Self::Tail => "tail",
+            Self::TcpConnect => "tcp_connect",
+            Self::TcpListen => "tcp_listen",
             Self::Tensor => "tensor",
+            Self::TraceDag => "trace_dag",
             Self::TypeOf => "type_of",
             Self::Uncurry => "uncurry",
+            Self::ValueAndGrad => "value_and_grad",
         }
     }
 }
@@ -236,6 +257,8 @@ pub enum ControlConst {
     Char(char),
     BuiltinFn(BuiltinFnId),
     BuiltinModule(BuiltinKind),
+    /// Wave 3 Stage 3C: Internal sentinel instructing callee prologue to evaluate its default arg.
+    MissingArg,
 }
 
 impl ControlConst {
@@ -258,6 +281,7 @@ impl ControlConst {
                 _ => BuiltinKind::FreeFn(id.name()),
             }),
             Self::BuiltinModule(kind) => Value::Builtin(*kind),
+            Self::MissingArg => Value::MissingArg,
         }
     }
 }
@@ -284,6 +308,10 @@ pub enum FunctionKind {
     Worker,
     ParallelSeq,
     SelectArm,
+    NoGradBody,
+    TraitDefault,
+    ImplMethod,
+    DefaultArg,
 }
 
 /// How a closure/sub-function captures a variable from its enclosing lexical frame.
@@ -310,6 +338,7 @@ pub enum GlobalKind {
     Macro(FnId),
     Enum,
     Struct,
+    Trait,
     TypeAlias,
 }
 
@@ -381,6 +410,58 @@ pub enum CompiledPattern {
         ty_name: String,
         inner: Box<CompiledPattern>,
     },
+    /// Wave 3 Stage 3C: Enum variant pattern (`Enum::Variant(p1, p2)`).
+    Variant {
+        enum_name: Option<String>,
+        variant: String,
+        fields: Vec<CompiledPattern>,
+    },
+    /// Wave 3 Stage 3C: Nominal struct destructuring pattern (`Point { x: a, .. }`).
+    Struct {
+        name: String,
+        fields: Vec<(String, CompiledPattern)>,
+        rest: bool,
+    },
+}
+
+/// Wave 3 Stage 3C: Compiled slice axis for `ControlInst::TensorSlice`.
+#[derive(Debug, Clone)]
+pub enum ControlSliceAxis {
+    Index(VReg),
+    Range {
+        start: Option<VReg>,
+        stop: Option<VReg>,
+        step: Option<VReg>,
+    },
+    Ellipsis,
+    NewAxis,
+}
+
+/// Wave 3 Stage 3C: Compiled struct field descriptor in `ControlInst::RegisterStruct`.
+#[derive(Debug, Clone)]
+pub struct ControlStructField {
+    pub name: SymId,
+    pub type_name: String,
+    pub default_fn: Option<FnId>,
+    pub tags: Vec<(String, String)>,
+}
+
+/// Wave 3 Stage 3C: Compiled trait method descriptor in `ControlInst::RegisterTrait`.
+#[derive(Debug, Clone)]
+pub struct ControlTraitMethod {
+    pub name: SymId,
+    pub params: Vec<(SymId, Option<String>)>,
+    pub return_type: Option<String>,
+    pub has_self: bool,
+    pub default_fn: Option<FnId>,
+}
+
+/// Wave 3 Stage 3C: Compiled impl method descriptor in `ControlInst::RegisterImpl`.
+#[derive(Debug, Clone)]
+pub struct ControlImplMethod {
+    pub name: SymId,
+    pub fn_id: FnId,
+    pub has_self: bool,
 }
 
 /// One segment inside `ControlInst::Parallel`.
@@ -398,11 +479,13 @@ pub enum ControlSpawnTarget {
     Call {
         target: CalleeTarget,
         args: Vec<VReg>,
+        named_args: Vec<(SymId, VReg)>,
     },
     MethodCall {
         receiver: VReg,
         method: SymId,
         args: Vec<VReg>,
+        named_args: Vec<(SymId, VReg)>,
     },
     Callable(VReg),
 }
@@ -458,6 +541,8 @@ pub enum ControlInst {
     // Slot / global storage operations
     LoadLocal(VReg, LocalSlot),
     StoreLocal(LocalSlot, VReg),
+    /// Wave 3 Stage 3C: Sets `dst` to `Bool(true)` iff `local` holds `Value::MissingArg`.
+    IsMissingArg(VReg, LocalSlot),
     LoadUpvalue(VReg, UpvalueSlot),
     StoreUpvalue(UpvalueSlot, VReg),
     LoadGlobal(VReg, GlobalSlot),
@@ -471,22 +556,31 @@ pub enum ControlInst {
     // Fallible / call / runtime operations
     Index(VReg, VReg, VReg),
     IndexAssign(VReg, VReg, VReg, VReg),
+    /// Wave 3 Stage 3C: Multi-dimensional zero-copy tensor slice view.
+    TensorSlice {
+        dst: VReg,
+        target: VReg,
+        axes: Vec<ControlSliceAxis>,
+    },
     Call {
         dst: VReg,
         target: CalleeTarget,
         args: Vec<VReg>,
+        named_args: Vec<(SymId, VReg)>,
     },
     ModuleCall {
         dst: VReg,
         module: BuiltinKind,
         method: SymId,
         args: Vec<VReg>,
+        named_args: Vec<(SymId, VReg)>,
     },
     MethodCall {
         dst: VReg,
         receiver: VReg,
         method: SymId,
         args: Vec<VReg>,
+        named_args: Vec<(SymId, VReg)>,
     },
     Pipe {
         dst: VReg,
@@ -528,6 +622,12 @@ pub enum ControlInst {
         dst: VReg,
         arms: Vec<ControlSelectArm>,
     },
+    /// Wave 3 Stage 3C: Execute `body_fn` with autograd tape recording suppressed.
+    NoGrad {
+        dst: VReg,
+        body_fn: FnId,
+        body_captures: Vec<CaptureSource>,
+    },
     Import {
         path: String,
     },
@@ -548,13 +648,29 @@ pub enum ControlInst {
     },
     RegisterEnum {
         name: SymId,
-        variants: Vec<SymId>,
+        type_params: Vec<SymId>,
+        variants: Vec<(SymId, Vec<String>)>,
         dst: Option<GlobalSlot>,
     },
     RegisterStruct {
         name: SymId,
-        fields: Vec<(SymId, String)>,
+        type_params: Vec<SymId>,
+        fields: Vec<ControlStructField>,
         dst: Option<GlobalSlot>,
+    },
+    RegisterTrait {
+        name: SymId,
+        type_params: Vec<SymId>,
+        parents: Vec<SymId>,
+        methods: Vec<ControlTraitMethod>,
+        dst: Option<GlobalSlot>,
+    },
+    RegisterImpl {
+        trait_name: Option<SymId>,
+        trait_generics: Vec<String>,
+        target_type: SymId,
+        target_generics: Vec<String>,
+        methods: Vec<ControlImplMethod>,
     },
     RegisterMacro {
         name: SymId,
@@ -586,11 +702,13 @@ impl ControlInst {
             | Self::MakeClosure { dst: d, .. }
             | Self::MakeDynTrait { dst: d, .. }
             | Self::LoadLocal(d, _)
+            | Self::IsMissingArg(d, _)
             | Self::LoadUpvalue(d, _)
             | Self::LoadGlobal(d, _)
             | Self::LoadDyn(d, _)
             | Self::Index(d, _, _)
             | Self::IndexAssign(d, _, _, _)
+            | Self::TensorSlice { dst: d, .. }
             | Self::Call { dst: d, .. }
             | Self::ModuleCall { dst: d, .. }
             | Self::MethodCall { dst: d, .. }
@@ -601,6 +719,7 @@ impl ControlInst {
             | Self::Parallel { dst: d, .. }
             | Self::Spawn { dst: d, .. }
             | Self::Select { dst: d, .. }
+            | Self::NoGrad { dst: d, .. }
             | Self::Assert(d, _) => Some(*d),
             Self::StoreLocal(..)
             | Self::StoreUpvalue(..)
@@ -616,6 +735,8 @@ impl ControlInst {
             | Self::RegisterTypeAlias { .. }
             | Self::RegisterEnum { .. }
             | Self::RegisterStruct { .. }
+            | Self::RegisterTrait { .. }
+            | Self::RegisterImpl { .. }
             | Self::RegisterMacro { .. }
             | Self::RegisterTask { .. }
             | Self::KeepAlive(..) => None,
@@ -628,6 +749,7 @@ impl ControlInst {
             Self::Const(..)
             | Self::MakeClosure { .. }
             | Self::LoadLocal(..)
+            | Self::IsMissingArg(..)
             | Self::LoadUpvalue(..)
             | Self::LoadGlobal(..)
             | Self::LoadDyn(..)
@@ -639,11 +761,14 @@ impl ControlInst {
             | Self::RegisterTypeAlias { .. }
             | Self::RegisterEnum { .. }
             | Self::RegisterStruct { .. }
+            | Self::RegisterTrait { .. }
+            | Self::RegisterImpl { .. }
             | Self::RegisterMacro { .. }
             | Self::RegisterTask { .. }
             | Self::Handle { .. }
             | Self::Transaction { .. }
-            | Self::Parallel { .. } => Vec::new(),
+            | Self::Parallel { .. }
+            | Self::NoGrad { .. } => Vec::new(),
             Self::Copy(_, s)
             | Self::Unary(_, _, s)
             | Self::MakeDynTrait { src: s, .. }
@@ -659,6 +784,27 @@ impl ControlInst {
                 vec![*l, *r]
             }
             Self::IndexAssign(_, obj, idx, val) => vec![*obj, *idx, *val],
+            Self::TensorSlice { target, axes, .. } => {
+                let mut out = vec![*target];
+                for ax in axes {
+                    match ax {
+                        ControlSliceAxis::Index(r) => out.push(*r),
+                        ControlSliceAxis::Range { start, stop, step } => {
+                            if let Some(r) = start {
+                                out.push(*r);
+                            }
+                            if let Some(r) = stop {
+                                out.push(*r);
+                            }
+                            if let Some(r) = step {
+                                out.push(*r);
+                            }
+                        }
+                        ControlSliceAxis::Ellipsis | ControlSliceAxis::NewAxis => {}
+                    }
+                }
+                out
+            }
             Self::ListLit(_, items) => items.clone(),
             Self::DictLit(_, pairs) => pairs.iter().map(|(_, r)| *r).collect(),
             Self::Quasiquote(_, segs) => segs
@@ -668,18 +814,36 @@ impl ControlInst {
                     ControlQqSegment::Unquote(r) | ControlQqSegment::UnquoteSplice(r) => Some(*r),
                 })
                 .collect(),
-            Self::Call { target, args, .. } => {
+            Self::Call {
+                target,
+                args,
+                named_args,
+                ..
+            } => {
                 let mut out = Vec::new();
                 if let CalleeTarget::Value(v) = target {
                     out.push(*v);
                 }
                 out.extend_from_slice(args);
+                out.extend(named_args.iter().map(|(_, r)| *r));
                 out
             }
-            Self::ModuleCall { args, .. } => args.clone(),
-            Self::MethodCall { receiver, args, .. } => {
+            Self::ModuleCall {
+                args, named_args, ..
+            } => {
+                let mut out = args.clone();
+                out.extend(named_args.iter().map(|(_, r)| *r));
+                out
+            }
+            Self::MethodCall {
+                receiver,
+                args,
+                named_args,
+                ..
+            } => {
                 let mut out = vec![*receiver];
                 out.extend_from_slice(args);
+                out.extend(named_args.iter().map(|(_, r)| *r));
                 out
             }
             Self::EvalAssert { given, expects, .. } => {
@@ -690,15 +854,26 @@ impl ControlInst {
             Self::Spawn { target, .. } => {
                 let mut out = Vec::new();
                 match target {
-                    ControlSpawnTarget::Call { target, args } => {
+                    ControlSpawnTarget::Call {
+                        target,
+                        args,
+                        named_args,
+                    } => {
                         if let CalleeTarget::Value(v) = target {
                             out.push(*v);
                         }
                         out.extend_from_slice(args);
+                        out.extend(named_args.iter().map(|(_, r)| *r));
                     }
-                    ControlSpawnTarget::MethodCall { receiver, args, .. } => {
+                    ControlSpawnTarget::MethodCall {
+                        receiver,
+                        args,
+                        named_args,
+                        ..
+                    } => {
                         out.push(*receiver);
                         out.extend_from_slice(args);
+                        out.extend(named_args.iter().map(|(_, r)| *r));
                     }
                     ControlSpawnTarget::Callable(v) => out.push(*v),
                 }
@@ -727,13 +902,15 @@ impl ControlInst {
         match self {
             Self::Const(d, _)
             | Self::LoadLocal(d, _)
+            | Self::IsMissingArg(d, _)
             | Self::LoadUpvalue(d, _)
             | Self::LoadGlobal(d, _)
             | Self::LoadDyn(d, _)
             | Self::MakeClosure { dst: d, .. }
             | Self::Handle { dst: d, .. }
             | Self::Transaction { dst: d, .. }
-            | Self::Parallel { dst: d, .. } => {
+            | Self::Parallel { dst: d, .. }
+            | Self::NoGrad { dst: d, .. } => {
                 *d = f(*d);
             }
             Self::Copy(d, s)
@@ -763,6 +940,27 @@ impl ControlInst {
                 *o = f(*o);
                 *i = f(*i);
                 *v = f(*v);
+            }
+            Self::TensorSlice { dst, target, axes } => {
+                *dst = f(*dst);
+                *target = f(*target);
+                for ax in axes {
+                    match ax {
+                        ControlSliceAxis::Index(r) => *r = f(*r),
+                        ControlSliceAxis::Range { start, stop, step } => {
+                            if let Some(r) = start {
+                                *r = f(*r);
+                            }
+                            if let Some(r) = stop {
+                                *r = f(*r);
+                            }
+                            if let Some(r) = step {
+                                *r = f(*r);
+                            }
+                        }
+                        ControlSliceAxis::Ellipsis | ControlSliceAxis::NewAxis => {}
+                    }
+                }
             }
             Self::ListLit(d, items) => {
                 *d = f(*d);
@@ -799,7 +997,12 @@ impl ControlInst {
                 *dst_ok = f(*dst_ok);
                 *val = f(*val);
             }
-            Self::Call { dst, target, args } => {
+            Self::Call {
+                dst,
+                target,
+                args,
+                named_args,
+            } => {
                 *dst = f(*dst);
                 if let CalleeTarget::Value(v) = target {
                     *v = f(*v);
@@ -807,10 +1010,21 @@ impl ControlInst {
                 for a in args {
                     *a = f(*a);
                 }
+                for (_, a) in named_args {
+                    *a = f(*a);
+                }
             }
-            Self::ModuleCall { dst, args, .. } => {
+            Self::ModuleCall {
+                dst,
+                args,
+                named_args,
+                ..
+            } => {
                 *dst = f(*dst);
                 for a in args {
+                    *a = f(*a);
+                }
+                for (_, a) in named_args {
                     *a = f(*a);
                 }
             }
@@ -818,11 +1032,15 @@ impl ControlInst {
                 dst,
                 receiver,
                 args,
+                named_args,
                 ..
             } => {
                 *dst = f(*dst);
                 *receiver = f(*receiver);
                 for a in args {
+                    *a = f(*a);
+                }
+                for (_, a) in named_args {
                     *a = f(*a);
                 }
             }
@@ -835,17 +1053,32 @@ impl ControlInst {
             Self::Spawn { dst, target } => {
                 *dst = f(*dst);
                 match target {
-                    ControlSpawnTarget::Call { target, args } => {
+                    ControlSpawnTarget::Call {
+                        target,
+                        args,
+                        named_args,
+                    } => {
                         if let CalleeTarget::Value(v) = target {
                             *v = f(*v);
                         }
                         for a in args {
                             *a = f(*a);
                         }
+                        for (_, a) in named_args {
+                            *a = f(*a);
+                        }
                     }
-                    ControlSpawnTarget::MethodCall { receiver, args, .. } => {
+                    ControlSpawnTarget::MethodCall {
+                        receiver,
+                        args,
+                        named_args,
+                        ..
+                    } => {
                         *receiver = f(*receiver);
                         for a in args {
+                            *a = f(*a);
+                        }
+                        for (_, a) in named_args {
                             *a = f(*a);
                         }
                     }
@@ -874,6 +1107,8 @@ impl ControlInst {
             | Self::RegisterTypeAlias { .. }
             | Self::RegisterEnum { .. }
             | Self::RegisterStruct { .. }
+            | Self::RegisterTrait { .. }
+            | Self::RegisterImpl { .. }
             | Self::RegisterMacro { .. }
             | Self::RegisterTask { .. } => {}
         }
@@ -889,29 +1124,19 @@ impl ControlInst {
             | Self::DictLit(..)
             | Self::MakeDynTrait { .. } => Purity::Pure,
             Self::Unary(_, UnaryOp::Neg, _) => Purity::Fallible,
-            // Numeric ops can trap on type error, division by zero, or i64 overflow;
-            // addition of floats is pure only when infallible, so classify Binary conservatively
-            // unless folded on concrete valid constants. Wait: pure integer/float arithmetic on
-            // non-trapping ops still traps on invalid runtime types/div-zero! Keep Div/Mod fallible;
-            // keep others Pure-only-when-proven or Fallible unless used! Actually let's separate clearly:
-            // Pure = Const, Copy, Unary, ListLit, DictLit, MakeDynTrait, MatchPattern (without Assign).
-            // Div/Mod/Index/IndexAssign/Quasiquote are Fallible; calls/stores/loads are Effectful!
             Self::Binary(_, _, op, _) => match op {
-                // Float/Int arith can overflow/type-mismatch -> Fallible! (LICM won't speculate
-                // a throwing expr out of a 0-trip loop, while GVN can share dominated occurrences
-                // ONLY if post-dominated or safe — wait: keep Binary non-speculative in LICM!)
                 BinaryOp::Div | BinaryOp::Mod => Purity::Fallible,
-                // Wait: in dynamically typed or partially typed IR, Add/Sub/Mul/Equal/etc. on mismatching
-                // runtime types also return Err! Only fold concrete constants; mark as Fallible so
-                // neither DCE drops a trapping op nor LICM speculates a throwing op across 0-trip loop!
                 _ => Purity::Fallible,
             },
-            Self::Index(..) | Self::IndexAssign(..) | Self::Quasiquote(..) | Self::Assert(..) => {
-                Purity::Fallible
-            }
+            Self::Index(..)
+            | Self::IndexAssign(..)
+            | Self::TensorSlice { .. }
+            | Self::Quasiquote(..)
+            | Self::Assert(..) => Purity::Fallible,
             Self::MatchPattern { .. }
             | Self::MakeClosure { .. }
             | Self::LoadLocal(..)
+            | Self::IsMissingArg(..)
             | Self::StoreLocal(..)
             | Self::LoadUpvalue(..)
             | Self::StoreUpvalue(..)
@@ -931,6 +1156,7 @@ impl ControlInst {
             | Self::Parallel { .. }
             | Self::Spawn { .. }
             | Self::Select { .. }
+            | Self::NoGrad { .. }
             | Self::Import { .. }
             | Self::EvalAssert { .. }
             | Self::Commit
@@ -938,6 +1164,8 @@ impl ControlInst {
             | Self::RegisterTypeAlias { .. }
             | Self::RegisterEnum { .. }
             | Self::RegisterStruct { .. }
+            | Self::RegisterTrait { .. }
+            | Self::RegisterImpl { .. }
             | Self::RegisterMacro { .. }
             | Self::RegisterTask { .. }
             | Self::KeepAlive(..) => Purity::Effectful,
@@ -1081,6 +1309,9 @@ pub struct ControlFunction {
     pub name: Option<SymId>,
     pub kind: FunctionKind,
     pub params: Vec<SymId>,
+    /// Wave 3 Stage 3C: `param_has_default[i] == true` when parameter `i` has a default initializer
+    /// lowered into the entry prologue via `IsMissingArg`.
+    pub param_has_default: Vec<bool>,
     pub upvalues: Vec<UpvalueDesc>,
     /// For `LocalSlot(i)`: true if an inner closure/handler captures it as a shared mutable cell.
     pub shared_locals: Vec<bool>,
@@ -1443,7 +1674,9 @@ fn verify_inst_slots(
     n_globals: usize,
 ) -> MoraResult<()> {
     match inst {
-        ControlInst::LoadLocal(_, l) | ControlInst::StoreLocal(l, _) => {
+        ControlInst::LoadLocal(_, l)
+        | ControlInst::IsMissingArg(_, l)
+        | ControlInst::StoreLocal(l, _) => {
             if l.0 >= func.n_locals {
                 return Err(MoraError::Parse(format!(
                     "fn {:?}: local slot {:?} >= n_locals {}",
@@ -1506,6 +1739,48 @@ fn verify_inst_slots(
                 "fn {:?}: task fn {:?} OOB",
                 func.id, fn_id
             )));
+        }
+        ControlInst::NoGrad { body_fn, .. } => {
+            if (body_fn.0 as usize) >= n_funcs {
+                return Err(MoraError::Parse(format!(
+                    "fn {:?}: no_grad body fn {:?} OOB",
+                    func.id, body_fn
+                )));
+            }
+        }
+        ControlInst::RegisterStruct { fields, .. } => {
+            for f in fields {
+                if let Some(df) = f.default_fn
+                    && (df.0 as usize) >= n_funcs
+                {
+                    return Err(MoraError::Parse(format!(
+                        "fn {:?}: struct field default fn {:?} OOB",
+                        func.id, df
+                    )));
+                }
+            }
+        }
+        ControlInst::RegisterTrait { methods, .. } => {
+            for m in methods {
+                if let Some(df) = m.default_fn
+                    && (df.0 as usize) >= n_funcs
+                {
+                    return Err(MoraError::Parse(format!(
+                        "fn {:?}: trait default fn {:?} OOB",
+                        func.id, df
+                    )));
+                }
+            }
+        }
+        ControlInst::RegisterImpl { methods, .. } => {
+            for m in methods {
+                if (m.fn_id.0 as usize) >= n_funcs {
+                    return Err(MoraError::Parse(format!(
+                        "fn {:?}: impl method fn {:?} OOB",
+                        func.id, m.fn_id
+                    )));
+                }
+            }
         }
         ControlInst::Select { arms, .. } => {
             for arm in arms {

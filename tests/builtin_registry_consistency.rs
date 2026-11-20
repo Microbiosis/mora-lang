@@ -83,7 +83,14 @@ fn probe_source(name: &str) -> Option<&'static str> {
         "channel" => "let v: string = channel(1)\n",
         "context" => "let v: string = context()\n",
         "sleep" => "let v: string = sleep(0)\n",
+        "tcp_listen" => "let v: string = tcp_listen(\"127.0.0.1:0\")\n",
+        "tcp_connect" => "let v: string = tcp_connect(\"127.0.0.1:0\")\n",
         "tensor" => "let v: string = tensor([1.0, 2.0])\n",
+        "grad" => "let v: string = grad(fn(x: float) x end)\n",
+        "value_and_grad" => "let v: string = value_and_grad(fn(x: float) x end)\n",
+        "jvp" => "let v: string = jvp(fn(x: float) x end, 1.0, 1.0)\n",
+        "trace_dag" => "let v: string = trace_dag(fn(x) x * 2.0 end, tensor([1.0]))\n",
+        "kv_allocator" => "let v: string = kv_allocator(4, 4, 2, 4)\n",
         // 返回类型随回调/元素变化 ⇒ 无法用固定探针判「被拒」，见 LOOSE。
         "car" | "cdr" | "cons" | "uncurry" | "apply" | "into" | "swap" | "compose" | "partial"
         | "merge_with" | "tail" | "macroexpand" | "curry" => "let v = NAME_PLACEHOLDER\n",
@@ -111,7 +118,14 @@ const CONCRETE_RETURN: &[&str] = &[
     "channel",
     "context",
     "sleep",
+    "tcp_listen",
+    "tcp_connect",
     "tensor",
+    "grad",
+    "value_and_grad",
+    "jvp",
+    "trace_dag",
+    "kv_allocator",
 ];
 
 /// 把探针里的占位符换成真实调用。

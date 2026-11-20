@@ -27,6 +27,7 @@ use crate::common::{
 };
 use crate::error::{MoraError, MoraResult};
 use crate::runtime::CoreRuntime;
+use crate::runtime::autograd::{AutogradContext, TapeNodeId, TapeOp};
 use crate::value::Value;
 use crate::value::list::List;
 
@@ -384,6 +385,21 @@ pub struct Tensor {
     pub device: Device,
     pub requires_grad: bool,
     pub is_view: bool,
+    /// Stage 3C: Optional active reverse-mode autograd tape node `(tape_id, node_idx)`.
+    pub grad_node: Option<TapeNodeId>,
+}
+
+/// Wave 3 Stage 3C: Runtime axis specification for zero-copy multi-dimensional slicing `t[0..4, :, -1]`.
+#[derive(Debug, Clone, Copy)]
+pub enum RuntimeSliceAxis {
+    Index(isize),
+    Range {
+        start: Option<isize>,
+        stop: Option<isize>,
+        step: Option<isize>,
+    },
+    Ellipsis,
+    NewAxis,
 }
 
 /// Compute contiguous row-major (C-order) strides for `shape`.
@@ -476,6 +492,7 @@ impl Tensor {
             device,
             requires_grad,
             is_view: false,
+            grad_node: None,
         }))
     }
 
@@ -506,6 +523,7 @@ impl Tensor {
             device,
             requires_grad,
             is_view: false,
+            grad_node: None,
         }))
     }
 
@@ -526,6 +544,7 @@ impl Tensor {
             device,
             requires_grad,
             is_view: false,
+            grad_node: None,
         }))
     }
 
@@ -556,6 +575,7 @@ impl Tensor {
             device,
             requires_grad,
             is_view: false,
+            grad_node: None,
         }))
     }
 
@@ -816,6 +836,7 @@ impl Tensor {
             device: self.device.clone(),
             requires_grad: self.requires_grad,
             is_view: true,
+            grad_node: None,
         }))
     }
 
@@ -840,6 +861,7 @@ impl Tensor {
                 device: self.device.clone(),
                 requires_grad: self.requires_grad,
                 is_view: true,
+                grad_node: None,
             }));
         }
         let vals = self.to_flat_values();
@@ -885,6 +907,19 @@ impl Tensor {
     pub fn with_grad(self: &Arc<Self>, flag: bool) -> Arc<Self> {
         let mut cloned = (**self).clone();
         cloned.requires_grad = flag;
+        if !flag {
+            cloned.grad_node = None;
+        }
+        Arc::new(cloned)
+    }
+
+    /// Return a copy of this tensor attached to an active autograd tape node.
+    pub fn with_grad_node(self: &Arc<Self>, node: Option<TapeNodeId>) -> Arc<Self> {
+        let mut cloned = (**self).clone();
+        cloned.grad_node = node;
+        if node.is_some() {
+            cloned.requires_grad = true;
+        }
         Arc::new(cloned)
     }
 
@@ -1085,38 +1120,332 @@ impl Tensor {
         )
     }
 
-    /// Index along axis 0 (`t[idx]`): returns an exact scalar `Value` for 1D tensors or a
-    /// zero-copy strided `(rank - 1)`-dimensional view `Value::Tensor` for ND (`rank >= 2`).
-    pub fn index_axis0(&self, idx: usize) -> MoraResult<Value> {
+    /// Index along axis 0 (`t[idx]`): supports negative indices and optional autograd tracking.
+    pub fn index_axis0_tracked(
+        &self,
+        raw_idx: isize,
+        autograd: Option<&mut AutogradContext>,
+    ) -> MoraResult<Value> {
         if self.shape.is_empty() {
             return Err(MoraError::Runtime(
                 "cannot index a 0-dimensional scalar tensor".to_string(),
             ));
         }
-        let dim0 = self.shape[0];
-        if idx >= dim0 {
+        let dim0 = self.shape[0] as isize;
+        let idx = if raw_idx < 0 { raw_idx + dim0 } else { raw_idx };
+        if idx < 0 || idx >= dim0 {
             return Err(MoraError::Runtime(format!(
                 "tensor index {} out of bounds for axis 0 with size {}",
-                idx, dim0
+                raw_idx, dim0
             )));
         }
+        let idx_u = idx as usize;
         let stride0 = self.strides[0];
-        let base = (self.offset as isize) + (idx as isize) * stride0;
+        let base = (self.offset as isize) + (idx_u as isize) * stride0;
+        let tracked_src = autograd
+            .as_ref()
+            .and_then(|ag| ag.active_node_index(self.grad_node));
+
         if self.shape.len() == 1 {
+            if let (Some(ag), Some(src_node)) = (autograd, tracked_src) {
+                let val = self.storage.data.read().get_f64(base as usize);
+                let node = ag.record(
+                    TapeOp::Gather {
+                        a: src_node,
+                        src_numel: self.numel(),
+                        src_flat_indices: vec![idx_u],
+                    },
+                    Vec::new(),
+                    self.dtype,
+                    self.device.clone(),
+                );
+                let out =
+                    Tensor::from_raw(vec![val], Vec::new(), self.dtype, self.device.clone(), true)?;
+                return Ok(Value::Tensor(out.with_grad_node(node)));
+            }
             let guard = self.storage.data.read();
             Ok(guard.get_value(base as usize))
         } else {
+            let new_shape = self.shape[1..].to_vec();
+            let grad_node = if let (Some(ag), Some(src_node)) = (autograd, tracked_src) {
+                let row_size: usize = new_shape.iter().copied().product::<usize>().max(1);
+                let start_flat = idx_u * row_size;
+                let indices: Vec<usize> = (start_flat..start_flat + row_size).collect();
+                ag.record(
+                    TapeOp::Gather {
+                        a: src_node,
+                        src_numel: self.numel(),
+                        src_flat_indices: indices,
+                    },
+                    new_shape.clone(),
+                    self.dtype,
+                    self.device.clone(),
+                )
+            } else {
+                None
+            };
             Ok(Value::Tensor(Arc::new(Self {
                 storage: Arc::clone(&self.storage),
-                shape: self.shape[1..].to_vec(),
+                shape: new_shape,
                 strides: self.strides[1..].to_vec(),
                 offset: base as usize,
                 dtype: self.dtype,
                 device: self.device.clone(),
-                requires_grad: self.requires_grad,
+                requires_grad: grad_node.is_some() || self.requires_grad,
                 is_view: true,
+                grad_node,
             })))
         }
+    }
+
+    /// Stage 3C: Zero-copy multi-dimensional strided slicing `t[0..4, :, -1]`, `t[1:5:2, ..., None]`.
+    pub fn slice_nd(
+        &self,
+        axes: &[RuntimeSliceAxis],
+        autograd: Option<&mut AutogradContext>,
+    ) -> MoraResult<Value> {
+        // Count non-NewAxis / non-Ellipsis consumed input axes and validate at most one Ellipsis.
+        let mut ellipsis_pos: Option<usize> = None;
+        let mut consumed_axes = 0usize;
+        for (i, ax) in axes.iter().enumerate() {
+            match ax {
+                RuntimeSliceAxis::Ellipsis => {
+                    if ellipsis_pos.is_some() {
+                        return Err(MoraError::Runtime(
+                            "Tensor slice cannot contain more than one ellipsis (`...`)"
+                                .to_string(),
+                        ));
+                    }
+                    ellipsis_pos = Some(i);
+                }
+                RuntimeSliceAxis::NewAxis => {}
+                RuntimeSliceAxis::Index(_) | RuntimeSliceAxis::Range { .. } => {
+                    consumed_axes += 1;
+                }
+            }
+        }
+        let rank = self.shape.len();
+        if consumed_axes > rank {
+            return Err(MoraError::Runtime(format!(
+                "Tensor slice has {} axis specifiers for a {}D tensor (shape {:?})",
+                consumed_axes, rank, self.shape
+            )));
+        }
+
+        // Expand Ellipsis and trailing implicit full slices.
+        let mut expanded: Vec<RuntimeSliceAxis> = Vec::with_capacity(axes.len() + rank);
+        let fill_count = rank - consumed_axes;
+        for (i, &ax) in axes.iter().enumerate() {
+            if Some(i) == ellipsis_pos {
+                for _ in 0..fill_count {
+                    expanded.push(RuntimeSliceAxis::Range {
+                        start: None,
+                        stop: None,
+                        step: None,
+                    });
+                }
+            } else {
+                expanded.push(ax);
+            }
+        }
+        if ellipsis_pos.is_none() {
+            for _ in 0..fill_count {
+                expanded.push(RuntimeSliceAxis::Range {
+                    start: None,
+                    stop: None,
+                    step: None,
+                });
+            }
+        }
+
+        // Track per-input-axis coordinate mapping for exact autograd Gather indices.
+        enum AxisMap {
+            Fixed(usize),
+            Linear {
+                out_axis: usize,
+                start: isize,
+                step: isize,
+            },
+        }
+        let mut axis_maps: Vec<AxisMap> = Vec::with_capacity(rank);
+        let mut new_offset = self.offset as isize;
+        let mut new_shape: Vec<usize> = Vec::new();
+        let mut new_strides: Vec<isize> = Vec::new();
+        let mut in_axis = 0usize;
+
+        for ax in expanded {
+            match ax {
+                RuntimeSliceAxis::NewAxis => {
+                    new_shape.push(1);
+                    new_strides.push(0);
+                }
+                RuntimeSliceAxis::Index(raw_i) => {
+                    let dim = self.shape[in_axis] as isize;
+                    let idx = if raw_i < 0 { raw_i + dim } else { raw_i };
+                    if idx < 0 || idx >= dim {
+                        return Err(MoraError::Runtime(format!(
+                            "Tensor slice index {} out of bounds for axis {} with size {}",
+                            raw_i, in_axis, dim
+                        )));
+                    }
+                    new_offset += idx * self.strides[in_axis];
+                    axis_maps.push(AxisMap::Fixed(idx as usize));
+                    in_axis += 1;
+                }
+                RuntimeSliceAxis::Range { start, stop, step } => {
+                    let dim = self.shape[in_axis] as isize;
+                    let step = step.unwrap_or(1);
+                    if step == 0 {
+                        return Err(MoraError::Runtime(
+                            "Tensor slice step cannot be zero".to_string(),
+                        ));
+                    }
+                    let (s, len) = if step > 0 {
+                        let mut s = start.unwrap_or(0);
+                        if s < 0 {
+                            s += dim;
+                        }
+                        s = s.clamp(0, dim);
+                        let mut e = stop.unwrap_or(dim);
+                        if e < 0 {
+                            e += dim;
+                        }
+                        e = e.clamp(0, dim);
+                        let len = if e > s {
+                            ((e - s - 1) / step + 1) as usize
+                        } else {
+                            0
+                        };
+                        (s, len)
+                    } else {
+                        let mut s = start.unwrap_or(dim - 1);
+                        if s < 0 {
+                            s += dim;
+                        }
+                        s = s.clamp(-1, dim - 1);
+                        let e = match stop {
+                            Some(mut v) => {
+                                if v < 0 {
+                                    v += dim;
+                                }
+                                v.clamp(-1, dim - 1)
+                            }
+                            None => -1,
+                        };
+                        let len = if s > e {
+                            ((s - e - 1) / (-step) + 1) as usize
+                        } else {
+                            0
+                        };
+                        (s, len)
+                    };
+                    if len == 0 {
+                        return Err(MoraError::Runtime(format!(
+                            "Tensor slice produces empty dimension (size 0) on axis {}",
+                            in_axis
+                        )));
+                    }
+                    let out_axis = new_shape.len();
+                    new_offset += s * self.strides[in_axis];
+                    new_shape.push(len);
+                    new_strides.push(self.strides[in_axis] * step);
+                    axis_maps.push(AxisMap::Linear {
+                        out_axis,
+                        start: s,
+                        step,
+                    });
+                    in_axis += 1;
+                }
+                RuntimeSliceAxis::Ellipsis => unreachable!("ellipsis already expanded"),
+            }
+        }
+
+        let tracked_src = autograd
+            .as_ref()
+            .and_then(|ag| ag.active_node_index(self.grad_node));
+
+        let build_gather_indices = || -> Vec<usize> {
+            let out_numel: usize = new_shape.iter().copied().product::<usize>().max(1);
+            let orig_c_strides = contiguous_strides(&self.shape);
+            let mut out_coords = vec![0usize; new_shape.len()];
+            let mut indices = Vec::with_capacity(out_numel);
+            for mut lin in 0..out_numel {
+                for a in (0..new_shape.len()).rev() {
+                    out_coords[a] = lin % new_shape[a];
+                    lin /= new_shape[a];
+                }
+                let mut src_flat = 0usize;
+                for (in_a, am) in axis_maps.iter().enumerate() {
+                    let src_c = match *am {
+                        AxisMap::Fixed(c) => c,
+                        AxisMap::Linear {
+                            out_axis,
+                            start,
+                            step,
+                        } => (start + (out_coords[out_axis] as isize) * step) as usize,
+                    };
+                    src_flat += src_c * (orig_c_strides[in_a] as usize);
+                }
+                indices.push(src_flat);
+            }
+            indices
+        };
+
+        if new_shape.is_empty() {
+            if let (Some(ag), Some(src_node)) = (autograd, tracked_src) {
+                let indices = build_gather_indices();
+                let val = self.storage.data.read().get_f64(new_offset as usize);
+                let node = ag.record(
+                    TapeOp::Gather {
+                        a: src_node,
+                        src_numel: self.numel(),
+                        src_flat_indices: indices,
+                    },
+                    Vec::new(),
+                    self.dtype,
+                    self.device.clone(),
+                );
+                let out =
+                    Tensor::from_raw(vec![val], Vec::new(), self.dtype, self.device.clone(), true)?;
+                return Ok(Value::Tensor(out.with_grad_node(node)));
+            }
+            let guard = self.storage.data.read();
+            return Ok(guard.get_value(new_offset as usize));
+        }
+
+        let grad_node = if let (Some(ag), Some(src_node)) = (autograd, tracked_src) {
+            let indices = build_gather_indices();
+            ag.record(
+                TapeOp::Gather {
+                    a: src_node,
+                    src_numel: self.numel(),
+                    src_flat_indices: indices,
+                },
+                new_shape.clone(),
+                self.dtype,
+                self.device.clone(),
+            )
+        } else {
+            None
+        };
+
+        Ok(Value::Tensor(Arc::new(Self {
+            storage: Arc::clone(&self.storage),
+            shape: new_shape,
+            strides: new_strides,
+            offset: new_offset as usize,
+            dtype: self.dtype,
+            device: self.device.clone(),
+            requires_grad: grad_node.is_some() || self.requires_grad,
+            is_view: true,
+            grad_node,
+        })))
+    }
+
+    /// Index along axis 0 (`t[idx]`): returns an exact scalar `Value` for 1D tensors or a
+    /// zero-copy strided `(rank - 1)`-dimensional view `Value::Tensor` for ND (`rank >= 2`).
+    pub fn index_axis0(&self, idx: usize) -> MoraResult<Value> {
+        self.index_axis0_tracked(idx as isize, None)
     }
 
     /// In-place elementwise tensor addition `self += other`.
@@ -1255,6 +1584,165 @@ fn parse_num_arg(val: &Value, fn_name: &str) -> MoraResult<f64> {
             "{fn_name}: expected a number, got {}",
             crate::flow::type_name(other)
         ))),
+    }
+}
+
+/// Reorder positional + keyword arguments (`dtype`, `device`, `requires_grad`, etc.) onto
+/// a canonical positional parameter table for tensor constructors.
+fn reorder_tensor_kwargs(
+    fn_name: &str,
+    param_names: &[&str],
+    args: &[Value],
+    named: &[(String, Value)],
+) -> MoraResult<Vec<Value>> {
+    if named.is_empty() {
+        return Ok(args.to_vec());
+    }
+    if args.len() > param_names.len() {
+        return Err(MoraError::Runtime(format!(
+            "{fn_name}: too many positional arguments ({}, max {})",
+            args.len(),
+            param_names.len()
+        )));
+    }
+    let mut slots: Vec<Option<Value>> = vec![None; param_names.len()];
+    for (i, v) in args.iter().enumerate() {
+        slots[i] = Some(v.clone());
+    }
+    for (k, v) in named {
+        let Some(pos) = param_names.iter().position(|&p| p == k.as_str()) else {
+            return Err(MoraError::Runtime(format!(
+                "{fn_name}: unknown keyword argument '{k}'"
+            )));
+        };
+        if slots[pos].is_some() {
+            return Err(MoraError::Runtime(format!(
+                "{fn_name}: multiple values for argument '{k}'"
+            )));
+        }
+        slots[pos] = Some(v.clone());
+    }
+    while matches!(slots.last(), Some(None)) {
+        slots.pop();
+    }
+    Ok(slots.into_iter().map(|o| o.unwrap_or(Value::Nil)).collect())
+}
+
+/// Dispatch `tensor(data, dtype=..., device=..., requires_grad=...)` with optional keyword args.
+pub fn call_builtin_tensor_named(args: &[Value], named: &[(String, Value)]) -> MoraResult<Value> {
+    let reordered = reorder_tensor_kwargs(
+        "tensor",
+        &["data", "dtype", "device", "requires_grad"],
+        args,
+        named,
+    )?;
+    call_builtin_tensor(&reordered)
+}
+
+/// Dispatch `Tensor::<assoc>(args..., kw=val...)` with optional keyword args.
+pub fn call_tensor_associated_named(
+    assoc: &str,
+    args: &[Value],
+    named: &[(String, Value)],
+    core: &mut CoreRuntime,
+) -> MoraResult<Value> {
+    if named.is_empty() {
+        return call_tensor_associated(assoc, args, core);
+    }
+    let params: &[&str] = match assoc {
+        "zeros" | "ones" | "randn" | "rand" => &["shape", "dtype", "device", "requires_grad"],
+        "full" => &["shape", "value", "dtype", "device", "requires_grad"],
+        "eye" => &["n", "m", "dtype", "device", "requires_grad"],
+        "arange" => &["start", "end", "step", "dtype", "device", "requires_grad"],
+        "from_list" => &["data", "dtype", "device", "requires_grad"],
+        _ => {
+            return Err(MoraError::Runtime(format!(
+                "Tensor has no associated function 'Tensor::{assoc}'"
+            )));
+        }
+    };
+    let reordered = reorder_tensor_kwargs(&format!("Tensor::{assoc}"), params, args, named)?;
+    match assoc {
+        "eye" => {
+            let n_val = reordered
+                .first()
+                .filter(|v| !matches!(v, Value::Nil))
+                .ok_or_else(|| {
+                    MoraError::Runtime(
+                        "Tensor::eye(n, m?, dtype?, device?, requires_grad?) requires 'n'"
+                            .to_string(),
+                    )
+                })?;
+            let n = parse_num_arg(n_val, "Tensor::eye")? as usize;
+            let m = match reordered.get(1) {
+                None | Some(Value::Nil) => n,
+                Some(v) => parse_num_arg(v, "Tensor::eye")? as usize,
+            };
+            let dtype =
+                parse_optional_dtype(reordered.get(2), "Tensor::eye")?.unwrap_or(DType::F64);
+            let device = parse_optional_device(reordered.get(3), "Tensor::eye")?;
+            let requires_grad = parse_optional_bool(reordered.get(4), "Tensor::eye")?;
+            Ok(Value::Tensor(Tensor::eye(
+                n,
+                m,
+                dtype,
+                device,
+                requires_grad,
+            )?))
+        }
+        "arange" => {
+            let s_val = reordered.first().filter(|v| !matches!(v, Value::Nil));
+            let e_val = reordered.get(1).filter(|v| !matches!(v, Value::Nil));
+            let step_val = reordered.get(2).filter(|v| !matches!(v, Value::Nil));
+            let (start, end, all_ints) = match (s_val, e_val) {
+                (Some(s), Some(e)) => (
+                    parse_num_arg(s, "Tensor::arange")?,
+                    parse_num_arg(e, "Tensor::arange")?,
+                    matches!(s, Value::Int(_)) && matches!(e, Value::Int(_)),
+                ),
+                (Some(e), None) => (
+                    0.0,
+                    parse_num_arg(e, "Tensor::arange")?,
+                    matches!(e, Value::Int(_)),
+                ),
+                (None, Some(e)) => (
+                    0.0,
+                    parse_num_arg(e, "Tensor::arange")?,
+                    matches!(e, Value::Int(_)),
+                ),
+                (None, None) => {
+                    return Err(MoraError::Runtime(
+                        "Tensor::arange(start, end?, step?, dtype?, device?, requires_grad?) requires at least 'start' or 'end'"
+                            .to_string(),
+                    ));
+                }
+            };
+            let (step, step_is_int) = match step_val {
+                Some(v) => (
+                    parse_num_arg(v, "Tensor::arange")?,
+                    matches!(v, Value::Int(_)),
+                ),
+                None => (1.0, true),
+            };
+            let default_dt = if all_ints && step_is_int {
+                DType::I64
+            } else {
+                DType::F64
+            };
+            let dtype =
+                parse_optional_dtype(reordered.get(3), "Tensor::arange")?.unwrap_or(default_dt);
+            let device = parse_optional_device(reordered.get(4), "Tensor::arange")?;
+            let requires_grad = parse_optional_bool(reordered.get(5), "Tensor::arange")?;
+            Ok(Value::Tensor(Tensor::arange(
+                start,
+                end,
+                step,
+                dtype,
+                device,
+                requires_grad,
+            )?))
+        }
+        _ => call_tensor_associated(assoc, &reordered, core),
     }
 }
 
@@ -1462,6 +1950,19 @@ pub fn call_tensor_associated(
 
 /// Dispatch `t.<method>(args...)` instance method calls on [`Value::Tensor`].
 pub fn call_tensor_method(t: &Arc<Tensor>, method: &str, args: &[Value]) -> MoraResult<Value> {
+    call_tensor_method_tracked(t, method, args, None)
+}
+
+/// Dispatch `t.<method>(args...)` on [`Value::Tensor`] with optional reverse-mode autograd tracking.
+pub fn call_tensor_method_tracked(
+    t: &Arc<Tensor>,
+    method: &str,
+    args: &[Value],
+    mut autograd: Option<&mut AutogradContext>,
+) -> MoraResult<Value> {
+    let tracked_src = autograd
+        .as_ref()
+        .and_then(|ag| ag.active_node_index(t.grad_node));
     match method {
         "shape" => Ok(Value::List(
             t.shape
@@ -1477,7 +1978,19 @@ pub fn call_tensor_method(t: &Arc<Tensor>, method: &str, args: &[Value]) -> Mora
         "dtype" => Ok(Value::String(t.dtype.short_name().to_string())),
         "device" => Ok(Value::String(t.device.to_string())),
         "is_contiguous" => Ok(Value::Bool(t.is_contiguous())),
-        "contiguous" => Ok(Value::Tensor(t.contiguous()?)),
+        "contiguous" => {
+            let out = t.contiguous()?;
+            if let (Some(ag), Some(src)) = (autograd.as_deref_mut(), tracked_src) {
+                let node = ag.record(
+                    TapeOp::Identity { a: src },
+                    out.shape.clone(),
+                    out.dtype,
+                    out.device.clone(),
+                );
+                return Ok(Value::Tensor(out.with_grad_node(node)));
+            }
+            Ok(Value::Tensor(out))
+        }
         "requires_grad" => Ok(Value::Bool(t.requires_grad)),
         "with_grad" => {
             let enabled = match args.first() {
@@ -1490,9 +2003,7 @@ pub fn call_tensor_method(t: &Arc<Tensor>, method: &str, args: &[Value]) -> Mora
                     )));
                 }
             };
-            let mut cloned = (**t).clone();
-            cloned.requires_grad = enabled;
-            Ok(Value::Tensor(Arc::new(cloned)))
+            Ok(Value::Tensor(t.with_grad(enabled)))
         }
         "reshape" => {
             if args.is_empty() {
@@ -1516,7 +2027,20 @@ pub fn call_tensor_method(t: &Arc<Tensor>, method: &str, args: &[Value]) -> Mora
                 }
                 dims
             };
-            Ok(Value::Tensor(t.reshape(new_shape)?))
+            let out = t.reshape(new_shape)?;
+            if let (Some(ag), Some(src)) = (autograd.as_deref_mut(), tracked_src) {
+                let node = ag.record(
+                    TapeOp::Reshape {
+                        a: src,
+                        orig_shape: t.shape.clone(),
+                    },
+                    out.shape.clone(),
+                    out.dtype,
+                    out.device.clone(),
+                );
+                return Ok(Value::Tensor(out.with_grad_node(node)));
+            }
+            Ok(Value::Tensor(out))
         }
         "transpose" => {
             let d0 = match args.first() {
@@ -1527,7 +2051,25 @@ pub fn call_tensor_method(t: &Arc<Tensor>, method: &str, args: &[Value]) -> Mora
                 None | Some(Value::Nil) => None,
                 Some(v) => Some(parse_num_arg(v, "Tensor.transpose")? as usize),
             };
-            Ok(Value::Tensor(t.transpose(d0, d1)?))
+            let rank = t.shape.len();
+            let eff_d0 = d0.unwrap_or_else(|| rank.saturating_sub(2));
+            let eff_d1 = d1.unwrap_or_else(|| rank.saturating_sub(1));
+            let out = t.transpose(d0, d1)?;
+            if let (Some(ag), Some(src)) = (autograd.as_deref_mut(), tracked_src) {
+                let node = ag.record(
+                    TapeOp::Transpose {
+                        a: src,
+                        dim0: eff_d0,
+                        dim1: eff_d1,
+                        orig_shape: t.shape.clone(),
+                    },
+                    out.shape.clone(),
+                    out.dtype,
+                    out.device.clone(),
+                );
+                return Ok(Value::Tensor(out.with_grad_node(node)));
+            }
+            Ok(Value::Tensor(out))
         }
         "to_dtype" => {
             let Some(Value::String(s)) = args.first() else {
@@ -1538,7 +2080,17 @@ pub fn call_tensor_method(t: &Arc<Tensor>, method: &str, args: &[Value]) -> Mora
             let dt = DType::from_name(s).ok_or_else(|| {
                 MoraError::Runtime(format!("Tensor.to_dtype: unknown dtype '{s}'"))
             })?;
-            Ok(Value::Tensor(t.to_dtype(dt)?))
+            let out = t.to_dtype(dt)?;
+            if let (Some(ag), Some(src)) = (autograd.as_deref_mut(), tracked_src) {
+                let node = ag.record(
+                    TapeOp::Identity { a: src },
+                    out.shape.clone(),
+                    out.dtype,
+                    out.device.clone(),
+                );
+                return Ok(Value::Tensor(out.with_grad_node(node)));
+            }
+            Ok(Value::Tensor(out))
         }
         "to_device" => {
             let Some(Value::String(s)) = args.first() else {
@@ -1547,7 +2099,17 @@ pub fn call_tensor_method(t: &Arc<Tensor>, method: &str, args: &[Value]) -> Mora
                 ));
             };
             let dev = Device::parse(s).map_err(MoraError::Runtime)?;
-            Ok(Value::Tensor(t.to_device(dev)?))
+            let out = t.to_device(dev)?;
+            if let (Some(ag), Some(src)) = (autograd.as_deref_mut(), tracked_src) {
+                let node = ag.record(
+                    TapeOp::Identity { a: src },
+                    out.shape.clone(),
+                    out.dtype,
+                    out.device.clone(),
+                );
+                return Ok(Value::Tensor(out.with_grad_node(node)));
+            }
+            Ok(Value::Tensor(out))
         }
         "to" => {
             let Some(Value::String(first)) = args.first() else {
@@ -1569,6 +2131,15 @@ pub fn call_tensor_method(t: &Arc<Tensor>, method: &str, args: &[Value]) -> Mora
                     let dev = Device::parse(second).map_err(MoraError::Runtime)?;
                     cur = cur.to_device(dev)?;
                 }
+            }
+            if let (Some(ag), Some(src)) = (autograd.as_deref_mut(), tracked_src) {
+                let node = ag.record(
+                    TapeOp::Identity { a: src },
+                    cur.shape.clone(),
+                    cur.dtype,
+                    cur.device.clone(),
+                );
+                return Ok(Value::Tensor(cur.with_grad_node(node)));
             }
             Ok(Value::Tensor(cur))
         }
@@ -1610,6 +2181,19 @@ pub fn call_tensor_method(t: &Arc<Tensor>, method: &str, args: &[Value]) -> Mora
         "sum" => {
             let flat = t.to_flat_vec();
             let s: f64 = flat.iter().sum();
+            if let (Some(ag), Some(src)) = (autograd.as_deref_mut(), tracked_src) {
+                let node = ag.record(
+                    TapeOp::Sum {
+                        a: src,
+                        a_shape: t.shape.clone(),
+                    },
+                    Vec::new(),
+                    t.dtype,
+                    t.device.clone(),
+                );
+                let out = Tensor::from_raw(vec![s], Vec::new(), t.dtype, t.device.clone(), true)?;
+                return Ok(Value::Tensor(out.with_grad_node(node)));
+            }
             Ok(scalar_value_for_dtype(s, t.dtype))
         }
         "mean" => {
@@ -1625,6 +2209,19 @@ pub fn call_tensor_method(t: &Arc<Tensor>, method: &str, args: &[Value]) -> Mora
             } else {
                 DType::F64
             };
+            if let (Some(ag), Some(src)) = (autograd.as_deref_mut(), tracked_src) {
+                let node = ag.record(
+                    TapeOp::Mean {
+                        a: src,
+                        a_shape: t.shape.clone(),
+                    },
+                    Vec::new(),
+                    dt,
+                    t.device.clone(),
+                );
+                let out = Tensor::from_raw(vec![m], Vec::new(), dt, t.device.clone(), true)?;
+                return Ok(Value::Tensor(out.with_grad_node(node)));
+            }
             Ok(scalar_value_for_dtype(m, dt))
         }
         "max" => {
@@ -1657,38 +2254,189 @@ pub fn call_tensor_method(t: &Arc<Tensor>, method: &str, args: &[Value]) -> Mora
             }
             Ok(t.get_linear_value(0))
         }
-        "abs" => Ok(Value::Tensor(t.map_unary(|x| x.abs())?)),
-        "sqrt" => Ok(Value::Tensor(t.map_unary(|x| x.sqrt())?)),
-        "exp" => Ok(Value::Tensor(t.map_unary(|x| x.exp())?)),
-        "ln" => Ok(Value::Tensor(t.map_unary(|x| x.ln())?)),
-        "relu" => Ok(Value::Tensor(t.map_unary(|x| x.max(0.0))?)),
-        "gelu" => Ok(Value::Tensor(t.map_unary(|x| {
-            let c = (2.0 / std::f64::consts::PI).sqrt();
-            0.5 * x * (1.0 + (c * (x + 0.044715 * x.powi(3))).tanh())
-        })?)),
-        "silu" => Ok(Value::Tensor(t.map_unary(|x| x / (1.0 + (-x).exp()))?)),
-        "tanh" => Ok(Value::Tensor(t.map_unary(|x| x.tanh())?)),
-        "sigmoid" => Ok(Value::Tensor(t.map_unary(|x| 1.0 / (1.0 + (-x).exp()))?)),
-        "softmax" => Ok(Value::Tensor(t.softmax()?)),
+        "abs" | "sqrt" | "exp" | "ln" | "relu" | "gelu" | "silu" | "tanh" | "sigmoid" => {
+            eval_tensor_math_unary_tracked(t, method, autograd)
+        }
+        "softmax" => {
+            let out = t.softmax()?;
+            if let (Some(ag), Some(src)) = (autograd.as_deref_mut(), tracked_src) {
+                let last_dim = t.shape.last().copied().unwrap_or(1);
+                let node = ag.record(
+                    TapeOp::Softmax {
+                        a: src,
+                        out_vals: out.to_flat_vec(),
+                        last_dim,
+                    },
+                    out.shape.clone(),
+                    out.dtype,
+                    out.device.clone(),
+                );
+                return Ok(Value::Tensor(out.with_grad_node(node)));
+            }
+            Ok(Value::Tensor(out))
+        }
         "rms_norm" => {
             let eps = match args.first() {
                 None | Some(Value::Nil) => 1e-5,
                 Some(v) => parse_num_arg(v, "Tensor.rms_norm")?,
             };
-            Ok(Value::Tensor(t.rms_norm(eps)?))
+            let out = t.rms_norm(eps)?;
+            if let (Some(ag), Some(src)) = (autograd.as_deref_mut(), tracked_src) {
+                let last_dim = t.shape.last().copied().unwrap_or(1);
+                let node = ag.record(
+                    TapeOp::RmsNorm {
+                        a: src,
+                        a_vals: t.to_flat_vec(),
+                        last_dim,
+                        eps,
+                    },
+                    out.shape.clone(),
+                    out.dtype,
+                    out.device.clone(),
+                );
+                return Ok(Value::Tensor(out.with_grad_node(node)));
+            }
+            Ok(Value::Tensor(out))
         }
         "layer_norm" => {
             let eps = match args.first() {
                 None | Some(Value::Nil) => 1e-5,
                 Some(v) => parse_num_arg(v, "Tensor.layer_norm")?,
             };
-            Ok(Value::Tensor(t.layer_norm(eps)?))
+            let out = t.layer_norm(eps)?;
+            if let (Some(ag), Some(src)) = (autograd, tracked_src) {
+                let last_dim = t.shape.last().copied().unwrap_or(1);
+                let node = ag.record(
+                    TapeOp::LayerNorm {
+                        a: src,
+                        a_vals: t.to_flat_vec(),
+                        last_dim,
+                        eps,
+                    },
+                    out.shape.clone(),
+                    out.dtype,
+                    out.device.clone(),
+                );
+                return Ok(Value::Tensor(out.with_grad_node(node)));
+            }
+            Ok(Value::Tensor(out))
         }
         "to_list" => Ok(t.to_nested_list()),
         _ => Err(MoraError::Runtime(format!(
             "Tensor has no method: {method}"
         ))),
     }
+}
+
+/// Evaluate unary mathematical / activation functions on a [`Tensor`] with optional autograd tracking.
+pub fn eval_tensor_math_unary_tracked(
+    t: &Arc<Tensor>,
+    op: &str,
+    autograd: Option<&mut AutogradContext>,
+) -> MoraResult<Value> {
+    let tracked_src = autograd
+        .as_ref()
+        .and_then(|ag| ag.active_node_index(t.grad_node));
+    let out = match op {
+        "abs" => t.map_unary(|x| x.abs())?,
+        "sqrt" => t.map_unary(|x| x.sqrt())?,
+        "exp" => t.map_unary(|x| x.exp())?,
+        "ln" | "log" => t.map_unary(|x| x.ln())?,
+        "sin" => t.map_unary(|x| x.sin())?,
+        "cos" => t.map_unary(|x| x.cos())?,
+        "relu" => t.map_unary(|x| x.max(0.0))?,
+        "gelu" => t.map_unary(|x| {
+            let c = (2.0 / std::f64::consts::PI).sqrt();
+            0.5 * x * (1.0 + (c * (x + 0.044715 * x.powi(3))).tanh())
+        })?,
+        "silu" => t.map_unary(|x| x / (1.0 + (-x).exp()))?,
+        "tanh" => t.map_unary(|x| x.tanh())?,
+        "sigmoid" => t.map_unary(|x| 1.0 / (1.0 + (-x).exp()))?,
+        other => {
+            return Err(MoraError::Runtime(format!(
+                "Tensor has no unary math operation '{other}'"
+            )));
+        }
+    };
+    if let (Some(ag), Some(src)) = (autograd, tracked_src) {
+        let tape_op = match op {
+            "abs" => TapeOp::Abs {
+                a: src,
+                a_vals: t.to_flat_vec(),
+            },
+            "sqrt" => TapeOp::Sqrt {
+                a: src,
+                out_vals: out.to_flat_vec(),
+            },
+            "exp" => TapeOp::Exp {
+                a: src,
+                out_vals: out.to_flat_vec(),
+            },
+            "ln" | "log" => TapeOp::Ln {
+                a: src,
+                a_vals: t.to_flat_vec(),
+            },
+            "sin" => TapeOp::Sin {
+                a: src,
+                a_vals: t.to_flat_vec(),
+            },
+            "cos" => TapeOp::Cos {
+                a: src,
+                a_vals: t.to_flat_vec(),
+            },
+            "relu" => TapeOp::Relu {
+                a: src,
+                a_vals: t.to_flat_vec(),
+            },
+            "gelu" => TapeOp::Gelu {
+                a: src,
+                a_vals: t.to_flat_vec(),
+            },
+            "silu" => TapeOp::Silu {
+                a: src,
+                a_vals: t.to_flat_vec(),
+            },
+            "tanh" => TapeOp::Tanh {
+                a: src,
+                out_vals: out.to_flat_vec(),
+            },
+            "sigmoid" => TapeOp::Sigmoid {
+                a: src,
+                out_vals: out.to_flat_vec(),
+            },
+            _ => unreachable!(),
+        };
+        let node = ag.record(tape_op, out.shape.clone(), out.dtype, out.device.clone());
+        return Ok(Value::Tensor(out.with_grad_node(node)));
+    }
+    Ok(Value::Tensor(out))
+}
+
+/// Evaluate unary `-tensor` with optional autograd tracking.
+pub fn eval_tensor_neg_tracked(
+    t: &Arc<Tensor>,
+    autograd: Option<&mut AutogradContext>,
+) -> MoraResult<Value> {
+    if t.dtype.is_unsigned_int() || t.dtype.is_bool() {
+        return Err(MoraError::Runtime(format!(
+            "cannot negate Tensor<{}> (unsigned or bool dtype)",
+            t.dtype
+        )));
+    }
+    let out = t.map_unary(|x| -x)?;
+    let tracked_src = autograd
+        .as_ref()
+        .and_then(|ag| ag.active_node_index(t.grad_node));
+    if let (Some(ag), Some(src)) = (autograd, tracked_src) {
+        let node = ag.record(
+            TapeOp::Neg { a: src },
+            out.shape.clone(),
+            out.dtype,
+            out.device.clone(),
+        );
+        return Ok(Value::Tensor(out.with_grad_node(node)));
+    }
+    Ok(Value::Tensor(out))
 }
 
 impl PartialEq for Tensor {
@@ -1805,8 +2553,19 @@ fn apply_scalar_op(op: &BinaryOp, a: f64, b: f64, dtype: DType) -> MoraResult<f6
 
 /// Evaluate binary operator `op` when at least one operand is [`Value::Tensor`].
 pub fn eval_tensor_binary(op: &BinaryOp, left: &Value, right: &Value) -> MoraResult<Value> {
+    eval_tensor_binary_tracked(op, left, right, None)
+}
+
+/// Evaluate binary operator `op` when at least one operand is [`Value::Tensor`],
+/// recording reverse-mode autograd nodes when an active tape is recording.
+pub fn eval_tensor_binary_tracked(
+    op: &BinaryOp,
+    left: &Value,
+    right: &Value,
+    mut autograd: Option<&mut AutogradContext>,
+) -> MoraResult<Value> {
     if matches!(op, BinaryOp::MatMul) {
-        return eval_tensor_matmul(left, right);
+        return eval_tensor_matmul_tracked(left, right, autograd);
     }
 
     match (left, right) {
@@ -1831,14 +2590,91 @@ pub fn eval_tensor_binary(op: &BinaryOp, left: &Value, right: &Value) -> MoraRes
                 let vb = read_broadcast_elem(b, &out_shape, idx);
                 out.push(apply_scalar_op(op, va, vb, a.dtype)?);
             }
+            let na = autograd
+                .as_ref()
+                .and_then(|ag| ag.active_node_index(a.grad_node));
+            let nb = autograd
+                .as_ref()
+                .and_then(|ag| ag.active_node_index(b.grad_node));
+            let grad_node = if (na.is_some() || nb.is_some())
+                && let Some(ag) = autograd.as_deref_mut()
+            {
+                let tape_op = match op {
+                    BinaryOp::Add => Some(TapeOp::Add {
+                        a: na,
+                        b: nb,
+                        a_const: if na.is_none() {
+                            Some(a.to_flat_vec())
+                        } else {
+                            None
+                        },
+                        b_const: if nb.is_none() {
+                            Some(b.to_flat_vec())
+                        } else {
+                            None
+                        },
+                        a_shape: a.shape.clone(),
+                        b_shape: b.shape.clone(),
+                    }),
+                    BinaryOp::Sub => Some(TapeOp::Sub {
+                        a: na,
+                        b: nb,
+                        a_const: if na.is_none() {
+                            Some(a.to_flat_vec())
+                        } else {
+                            None
+                        },
+                        b_const: if nb.is_none() {
+                            Some(b.to_flat_vec())
+                        } else {
+                            None
+                        },
+                        a_shape: a.shape.clone(),
+                        b_shape: b.shape.clone(),
+                    }),
+                    BinaryOp::Mul => Some(TapeOp::Mul {
+                        a: na,
+                        b: nb,
+                        a_vals: a.to_flat_vec(),
+                        b_vals: b.to_flat_vec(),
+                        a_shape: a.shape.clone(),
+                        b_shape: b.shape.clone(),
+                    }),
+                    BinaryOp::Div => Some(TapeOp::Div {
+                        a: na,
+                        b: nb,
+                        a_vals: a.to_flat_vec(),
+                        b_vals: b.to_flat_vec(),
+                        a_shape: a.shape.clone(),
+                        b_shape: b.shape.clone(),
+                    }),
+                    BinaryOp::Pow => Some(TapeOp::Pow {
+                        a: na,
+                        b: nb,
+                        a_vals: a.to_flat_vec(),
+                        b_vals: b.to_flat_vec(),
+                        out_vals: out.clone(),
+                        a_shape: a.shape.clone(),
+                        b_shape: b.shape.clone(),
+                    }),
+                    _ => None,
+                };
+                tape_op.and_then(|op| ag.record(op, out_shape.clone(), a.dtype, a.device.clone()))
+            } else {
+                None
+            };
             let t = Tensor::from_raw(
                 out,
                 out_shape,
                 a.dtype,
                 a.device.clone(),
-                a.requires_grad || b.requires_grad,
+                grad_node.is_some() || a.requires_grad || b.requires_grad,
             )?;
-            Ok(Value::Tensor(t))
+            Ok(Value::Tensor(if grad_node.is_some() {
+                t.with_grad_node(grad_node)
+            } else {
+                t
+            }))
         }
         (Value::Tensor(t), scalar) => {
             let Some((s_dt, s_val)) = scalar_val_dtype_and_f64(scalar) else {
@@ -1857,16 +2693,58 @@ pub fn eval_tensor_binary(op: &BinaryOp, left: &Value, right: &Value) -> MoraRes
             }
             let flat = t.to_flat_vec();
             let mut out = Vec::with_capacity(flat.len());
-            for v in flat {
+            for &v in &flat {
                 out.push(apply_scalar_op(op, v, s_val, t.dtype)?);
             }
-            Ok(Value::Tensor(Tensor::from_raw(
+            let na = autograd
+                .as_ref()
+                .and_then(|ag| ag.active_node_index(t.grad_node));
+            let grad_node = if let (Some(ag), Some(ia)) = (autograd.as_deref_mut(), na) {
+                let tape_op = match op {
+                    BinaryOp::Add => Some(TapeOp::AddScalar {
+                        a: ia,
+                        scalar: s_val,
+                    }),
+                    BinaryOp::Sub => Some(TapeOp::SubScalar {
+                        a: ia,
+                        scalar: s_val,
+                        reversed: false,
+                    }),
+                    BinaryOp::Mul => Some(TapeOp::MulScalar {
+                        a: ia,
+                        scalar: s_val,
+                    }),
+                    BinaryOp::Div => Some(TapeOp::DivScalar {
+                        a: ia,
+                        scalar: s_val,
+                        reversed: false,
+                        a_vals: flat,
+                    }),
+                    BinaryOp::Pow => Some(TapeOp::PowScalar {
+                        a: ia,
+                        scalar: s_val,
+                        reversed: false,
+                        a_vals: flat,
+                        out_vals: out.clone(),
+                    }),
+                    _ => None,
+                };
+                tape_op.and_then(|op| ag.record(op, t.shape.clone(), t.dtype, t.device.clone()))
+            } else {
+                None
+            };
+            let res = Tensor::from_raw(
                 out,
                 t.shape.clone(),
                 t.dtype,
                 t.device.clone(),
-                t.requires_grad,
-            )?))
+                grad_node.is_some() || t.requires_grad,
+            )?;
+            Ok(Value::Tensor(if grad_node.is_some() {
+                res.with_grad_node(grad_node)
+            } else {
+                res
+            }))
         }
         (scalar, Value::Tensor(t)) => {
             let Some((s_dt, s_val)) = scalar_val_dtype_and_f64(scalar) else {
@@ -1885,16 +2763,58 @@ pub fn eval_tensor_binary(op: &BinaryOp, left: &Value, right: &Value) -> MoraRes
             }
             let flat = t.to_flat_vec();
             let mut out = Vec::with_capacity(flat.len());
-            for v in flat {
+            for &v in &flat {
                 out.push(apply_scalar_op(op, s_val, v, t.dtype)?);
             }
-            Ok(Value::Tensor(Tensor::from_raw(
+            let na = autograd
+                .as_ref()
+                .and_then(|ag| ag.active_node_index(t.grad_node));
+            let grad_node = if let (Some(ag), Some(ia)) = (autograd, na) {
+                let tape_op = match op {
+                    BinaryOp::Add => Some(TapeOp::AddScalar {
+                        a: ia,
+                        scalar: s_val,
+                    }),
+                    BinaryOp::Sub => Some(TapeOp::SubScalar {
+                        a: ia,
+                        scalar: s_val,
+                        reversed: true,
+                    }),
+                    BinaryOp::Mul => Some(TapeOp::MulScalar {
+                        a: ia,
+                        scalar: s_val,
+                    }),
+                    BinaryOp::Div => Some(TapeOp::DivScalar {
+                        a: ia,
+                        scalar: s_val,
+                        reversed: true,
+                        a_vals: flat,
+                    }),
+                    BinaryOp::Pow => Some(TapeOp::PowScalar {
+                        a: ia,
+                        scalar: s_val,
+                        reversed: true,
+                        a_vals: flat,
+                        out_vals: out.clone(),
+                    }),
+                    _ => None,
+                };
+                tape_op.and_then(|op| ag.record(op, t.shape.clone(), t.dtype, t.device.clone()))
+            } else {
+                None
+            };
+            let res = Tensor::from_raw(
                 out,
                 t.shape.clone(),
                 t.dtype,
                 t.device.clone(),
-                t.requires_grad,
-            )?))
+                grad_node.is_some() || t.requires_grad,
+            )?;
+            Ok(Value::Tensor(if grad_node.is_some() {
+                res.with_grad_node(grad_node)
+            } else {
+                res
+            }))
         }
         _ => Err(MoraError::Runtime(format!(
             "Unsupported tensor binary operands: {} {:?} {}",
@@ -1907,6 +2827,15 @@ pub fn eval_tensor_binary(op: &BinaryOp, left: &Value, right: &Value) -> MoraRes
 
 /// Evaluate matrix/tensor contraction (`@`) for 1D, 2D, and batched ND [`Tensor`]s.
 pub fn eval_tensor_matmul(left: &Value, right: &Value) -> MoraResult<Value> {
+    eval_tensor_matmul_tracked(left, right, None)
+}
+
+/// Evaluate matrix/tensor contraction (`@`) with optional reverse-mode autograd tape recording.
+pub fn eval_tensor_matmul_tracked(
+    left: &Value,
+    right: &Value,
+    mut autograd: Option<&mut AutogradContext>,
+) -> MoraResult<Value> {
     let (Value::Tensor(a), Value::Tensor(b)) = (left, right) else {
         return Err(MoraError::Runtime(format!(
             "Tensor matmul (@) requires two tensors, got {} @ {}",
@@ -1935,10 +2864,48 @@ pub fn eval_tensor_matmul(left: &Value, right: &Value) -> MoraResult<Value> {
 
     let dt = a.dtype;
     let dev = a.device.clone();
-    let req_grad = a.requires_grad || b.requires_grad;
+    let na = autograd
+        .as_ref()
+        .and_then(|ag| ag.active_node_index(a.grad_node));
+    let nb = autograd
+        .as_ref()
+        .and_then(|ag| ag.active_node_index(b.grad_node));
+    let tracked = na.is_some() || nb.is_some();
+    let req_grad = tracked || a.requires_grad || b.requires_grad;
+
+    let attach = |out_data: Vec<f64>,
+                  out_shape: Vec<usize>,
+                  fa: Vec<f64>,
+                  fb: Vec<f64>,
+                  ag_opt: Option<&mut AutogradContext>|
+     -> MoraResult<Value> {
+        let grad_node = if tracked && let Some(ag) = ag_opt {
+            ag.record(
+                TapeOp::MatMul {
+                    a: na,
+                    b: nb,
+                    a_vals: fa,
+                    b_vals: fb,
+                    a_shape: a.shape.clone(),
+                    b_shape: b.shape.clone(),
+                },
+                out_shape.clone(),
+                dt,
+                dev.clone(),
+            )
+        } else {
+            None
+        };
+        let t = Tensor::from_raw(out_data, out_shape, dt, dev.clone(), req_grad)?;
+        Ok(Value::Tensor(if grad_node.is_some() {
+            t.with_grad_node(grad_node)
+        } else {
+            t
+        }))
+    };
 
     match (a.shape.as_slice(), b.shape.as_slice()) {
-        // 1D @ 1D -> scalar dot product
+        // 1D @ 1D -> scalar dot product (0-D tracked Tensor when recording autograd)
         ([k1], [k2]) => {
             if k1 != k2 {
                 return Err(MoraError::Runtime(format!(
@@ -1948,6 +2915,9 @@ pub fn eval_tensor_matmul(left: &Value, right: &Value) -> MoraResult<Value> {
             let fa = a.to_flat_vec();
             let fb = b.to_flat_vec();
             let sum: f64 = fa.iter().zip(fb.iter()).map(|(x, y)| x * y).sum();
+            if tracked && autograd.is_some() {
+                return attach(vec![sum], Vec::new(), fa, fb, autograd.as_deref_mut());
+            }
             Ok(scalar_value_for_dtype(sum, dt))
         }
         // 2D @ 1D -> [M, K] @ [K] -> [M]
@@ -1967,13 +2937,7 @@ pub fn eval_tensor_matmul(left: &Value, right: &Value) -> MoraResult<Value> {
                 }
                 out[i] = quantize_for_dtype(acc, dt);
             }
-            Ok(Value::Tensor(Tensor::from_raw(
-                out,
-                vec![*m],
-                dt,
-                dev,
-                req_grad,
-            )?))
+            attach(out, vec![*m], fa, fb, autograd.as_deref_mut())
         }
         // 1D @ 2D -> [K] @ [K, N] -> [N]
         ([k1], [k2, n]) => {
@@ -1992,13 +2956,7 @@ pub fn eval_tensor_matmul(left: &Value, right: &Value) -> MoraResult<Value> {
                 }
                 out[j] = quantize_for_dtype(acc, dt);
             }
-            Ok(Value::Tensor(Tensor::from_raw(
-                out,
-                vec![*n],
-                dt,
-                dev,
-                req_grad,
-            )?))
+            attach(out, vec![*n], fa, fb, autograd.as_deref_mut())
         }
         // 2D @ 2D -> [M, K] @ [K, N] -> [M, N]
         ([m, k1], [k2, n]) => {
@@ -2019,13 +2977,7 @@ pub fn eval_tensor_matmul(left: &Value, right: &Value) -> MoraResult<Value> {
                     out[i * *n + j] = quantize_for_dtype(acc, dt);
                 }
             }
-            Ok(Value::Tensor(Tensor::from_raw(
-                out,
-                vec![*m, *n],
-                dt,
-                dev,
-                req_grad,
-            )?))
+            attach(out, vec![*m, *n], fa, fb, autograd.as_deref_mut())
         }
         // Batched ND @ ND (rank >= 2 on both sides, at least one >= 3)
         (sa, sb) if sa.len() >= 2 && sb.len() >= 2 => {
@@ -2049,13 +3001,33 @@ pub fn eval_tensor_matmul(left: &Value, right: &Value) -> MoraResult<Value> {
             let mat_a_stride = m * k1;
             let mat_b_stride = k2 * n;
             let mat_out_stride = m * n;
-            let count_a = fa.len() / mat_a_stride;
-            let count_b = fb.len() / mat_b_stride;
+
+            let map_batch = |mut b_lin: usize, target_batch: &[usize]| -> usize {
+                if target_batch.is_empty() {
+                    return 0;
+                }
+                let rdiff = batch_shape.len() - target_batch.len();
+                let mut idx = 0usize;
+                let mut stride = 1usize;
+                for i in (0..batch_shape.len()).rev() {
+                    let dim = batch_shape[i];
+                    let coord = b_lin % dim;
+                    b_lin /= dim;
+                    if i >= rdiff {
+                        let ta = i - rdiff;
+                        let td = target_batch[ta];
+                        let tc = if td == 1 { 0 } else { coord };
+                        idx += tc * stride;
+                        stride *= td;
+                    }
+                }
+                idx
+            };
 
             let mut out = vec![0.0; batch_count * mat_out_stride];
             for b_idx in 0..batch_count {
-                let a_base = (b_idx % count_a) * mat_a_stride;
-                let b_base = (b_idx % count_b) * mat_b_stride;
+                let a_base = map_batch(b_idx, batch_a) * mat_a_stride;
+                let b_base = map_batch(b_idx, batch_b) * mat_b_stride;
                 let out_base = b_idx * mat_out_stride;
                 for i in 0..m {
                     for j in 0..n {
@@ -2070,9 +3042,7 @@ pub fn eval_tensor_matmul(left: &Value, right: &Value) -> MoraResult<Value> {
             let mut full_shape = batch_shape;
             full_shape.push(m);
             full_shape.push(n);
-            Ok(Value::Tensor(Tensor::from_raw(
-                out, full_shape, dt, dev, req_grad,
-            )?))
+            attach(out, full_shape, fa, fb, autograd)
         }
         (sa, sb) => Err(MoraError::Runtime(format!(
             "Tensor matmul (@) unsupported shapes: {:?} @ {:?}",

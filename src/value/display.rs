@@ -129,7 +129,90 @@ impl std::fmt::Display for Value {
             Value::Context(ctx) => {
                 write!(f, "<context cancelled={}>", ctx.status().is_err())
             }
+            Value::TcpListener(l) => {
+                write!(
+                    f,
+                    "<tcp_listener addr={} closed={}>",
+                    l.local_addr(),
+                    l.is_closed()
+                )
+            }
+            Value::TcpStream(s) => {
+                write!(
+                    f,
+                    "<tcp_stream peer={} closed={}>",
+                    s.peer_addr(),
+                    s.is_closed()
+                )
+            }
+            Value::ComputeDag(dag) => {
+                write!(
+                    f,
+                    "<compute_dag nodes={} fused={} opt={}>",
+                    dag.node_count(),
+                    dag.fused_count(),
+                    dag.fused
+                )
+            }
+            Value::KVAllocator(kv) => {
+                write!(
+                    f,
+                    "<kv_allocator pages={}/{} dtype={} device={}>",
+                    kv.used_pages(),
+                    kv.total_pages,
+                    kv.dtype.short_name(),
+                    kv.device
+                )
+            }
             Value::Tensor(t) => write!(f, "{t}"),
+            Value::StructType(def) => write!(f, "<struct {}>", def.name),
+            Value::StructInstance {
+                type_name,
+                fields,
+                field_order,
+                ..
+            } => {
+                write!(f, "{type_name} {{ ")?;
+                for (i, fname) in field_order.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{fname}: ")?;
+                    if let Some(v) = fields.get(fname) {
+                        fmt_inner(f, v, 1)?;
+                    } else {
+                        write!(f, "nil")?;
+                    }
+                }
+                write!(f, " }}")
+            }
+            Value::EnumType(def) => write!(f, "<enum {}>", def.name),
+            Value::EnumVariant {
+                enum_name,
+                variant,
+                payload,
+            } => {
+                if payload.is_empty() {
+                    write!(f, "{enum_name}::{variant}")
+                } else {
+                    write!(f, "{enum_name}::{variant}(")?;
+                    for (i, v) in payload.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        fmt_inner(f, v, 1)?;
+                    }
+                    write!(f, ")")
+                }
+            }
+            Value::GradFn { return_value, .. } => {
+                if *return_value {
+                    write!(f, "<value_and_grad>")
+                } else {
+                    write!(f, "<grad>")
+                }
+            }
+            Value::MissingArg => write!(f, "<missing_arg>"),
         }
     }
 }

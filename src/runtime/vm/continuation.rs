@@ -183,6 +183,34 @@ pub enum CombinatorFrame {
     },
     /// `swap(atom, f)` writeback awaiting `f(old)` return value.
     Swap { atom: Arc<Mutex<Value>> },
+    /// Wave 3 Stage 3C: Reverse-mode autograd wrapper around a differentiated function call.
+    AutogradEval {
+        tape_id: u64,
+        leaf_nodes: Vec<usize>,
+        /// `Some(dt)` if the original input was a scalar float/ScalarValue (unwrap 0-D grad tensor back to scalar);
+        /// `None` if the original input was a `Value::Tensor`.
+        scalar_flags: Vec<Option<crate::common::DType>>,
+        return_value: bool,
+    },
+    /// Wave 4: Forward-mode JVP evaluation (`jvp(f, primals, tangents)`).
+    JvpEval {
+        tape_id: u64,
+        leaf_nodes: Vec<usize>,
+        leaf_tangents: Vec<Arc<crate::value::tensor::Tensor>>,
+        scalar_out_dtype: Option<crate::common::DType>,
+    },
+    /// Wave 4: Compute graph tracing wrapper (`trace_dag(f, example_inputs...)`).
+    TraceDagEval {
+        tape_id: u64,
+        leaf_nodes: Vec<usize>,
+    },
+    /// Wave 3 Stage 3C: Evaluates omitted `struct` field default initializers on the VM stack.
+    StructInit {
+        def: Arc<crate::value::StructDefRuntime>,
+        fields: HashMap<String, Value>,
+        pending_defaults: Vec<(String, FnId)>,
+        current_field: String,
+    },
 }
 
 /// Snapshot & compensation state for `ControlInst::Transaction`.
@@ -234,6 +262,8 @@ pub enum CallFrame {
     Parallel(ParallelFrame),
     /// Wraps propagated errors with a diagnostic prefix (e.g. macro invocation errors).
     ErrorContext { prefix: String },
+    /// Wave 3 Stage 3C: Restores `autograd.no_grad_depth` on normal return or error unwind.
+    NoGradGuard,
 }
 
 /// Multi-shot delimited continuation captured up to the matching [`HandleBarrierState`].
@@ -349,29 +379,42 @@ pub fn materialize_frame(
     upvalues: Arc<Vec<UpvalueValue>>,
     args: &[Value],
 ) -> MoraResult<ScriptFrame> {
+    materialize_frame_named(program, func_id, globals, upvalues, args, &[])
+}
+
+/// Construct a new [`ScriptFrame`] with positional + optional named keyword arguments,
+/// reordering named arguments into parameter slots and populating omitted defaulted parameters
+/// with [`Value::MissingArg`] for the callee's entry prologue.
+pub fn materialize_frame_named(
+    program: Arc<ControlProgram>,
+    func_id: FnId,
+    globals: ModuleGlobals,
+    upvalues: Arc<Vec<UpvalueValue>>,
+    args: &[Value],
+    named_args: &[(String, Value)],
+) -> MoraResult<ScriptFrame> {
     let (locals, regs, block_id) = {
         let func = program.func(func_id);
-        match func.kind {
-            FunctionKind::Task => {
-                if args.len() != func.params.len() {
-                    return Err(MoraError::Runtime(format!(
-                        "task expects {} args, got {}",
-                        func.params.len(),
-                        args.len()
-                    )));
-                }
-            }
-            FunctionKind::Closure => {
-                if args.len() != func.params.len() {
-                    return Err(MoraError::Runtime(format!(
-                        "closure expects {} args, got {}",
-                        func.params.len(),
-                        args.len()
-                    )));
-                }
-            }
-            FunctionKind::Macro => {
-                if args.len() != func.params.len() {
+        let needs_arity_check = matches!(
+            func.kind,
+            FunctionKind::Task
+                | FunctionKind::Closure
+                | FunctionKind::Macro
+                | FunctionKind::ImplMethod
+                | FunctionKind::TraitDefault
+        );
+        let kind_label = match func.kind {
+            FunctionKind::Task => "task",
+            FunctionKind::Closure => "closure",
+            FunctionKind::Macro => "macro",
+            FunctionKind::ImplMethod | FunctionKind::TraitDefault => "method",
+            _ => "function",
+        };
+
+        let resolved_args: Vec<Value> = if needs_arity_check {
+            let n_params = func.params.len();
+            if args.len() > n_params {
+                if func.kind == FunctionKind::Macro {
                     let mname = func
                         .name
                         .map(|s| program.symbols.resolve(s))
@@ -379,20 +422,76 @@ pub fn materialize_frame(
                     return Err(MoraError::Runtime(format!(
                         "macro '{}' expects {} args, got {}",
                         mname,
-                        func.params.len(),
+                        n_params,
                         args.len()
                     )));
                 }
+                return Err(MoraError::Runtime(format!(
+                    "{kind_label} expects {} args, got {}",
+                    n_params,
+                    args.len()
+                )));
             }
-            FunctionKind::Main
-            | FunctionKind::HandleBody
-            | FunctionKind::HandleHandler
-            | FunctionKind::TransactionBody
-            | FunctionKind::TransactionComp
-            | FunctionKind::Worker
-            | FunctionKind::ParallelSeq
-            | FunctionKind::SelectArm => {}
-        }
+            if named_args.is_empty() && args.len() == n_params {
+                args.to_vec()
+            } else {
+                let mut slots: Vec<Option<Value>> = vec![None; n_params];
+                for (i, v) in args.iter().enumerate() {
+                    slots[i] = Some(v.clone());
+                }
+                for (kw, val) in named_args {
+                    let pos = func
+                        .params
+                        .iter()
+                        .position(|&sym| program.symbols.resolve(sym) == kw.as_str());
+                    let Some(idx) = pos else {
+                        return Err(MoraError::Runtime(format!(
+                            "{kind_label} got an unexpected keyword argument '{kw}'"
+                        )));
+                    };
+                    if slots[idx].is_some() {
+                        return Err(MoraError::Runtime(format!(
+                            "{kind_label} got multiple values for argument '{kw}'"
+                        )));
+                    }
+                    slots[idx] = Some(val.clone());
+                }
+                let mut out = Vec::with_capacity(n_params);
+                for (idx, slot) in slots.into_iter().enumerate() {
+                    if let Some(v) = slot {
+                        out.push(v);
+                    } else if func.param_has_default.get(idx).copied().unwrap_or(false) {
+                        out.push(Value::MissingArg);
+                    } else if named_args.is_empty() {
+                        if func.kind == FunctionKind::Macro {
+                            let mname = func
+                                .name
+                                .map(|s| program.symbols.resolve(s))
+                                .unwrap_or("<macro>");
+                            return Err(MoraError::Runtime(format!(
+                                "macro '{}' expects {} args, got {}",
+                                mname,
+                                n_params,
+                                args.len()
+                            )));
+                        }
+                        return Err(MoraError::Runtime(format!(
+                            "{kind_label} expects {} args, got {}",
+                            n_params,
+                            args.len()
+                        )));
+                    } else {
+                        let pname = program.symbols.resolve(func.params[idx]);
+                        return Err(MoraError::Runtime(format!(
+                            "{kind_label} missing required argument '{pname}'"
+                        )));
+                    }
+                }
+                out
+            }
+        } else {
+            args.to_vec()
+        };
 
         let n_locals = func.n_locals as usize;
         let mut locals = Vec::with_capacity(n_locals);
@@ -404,7 +503,7 @@ pub fn materialize_frame(
             }
         }
 
-        for (slot_idx, val) in args.iter().enumerate() {
+        for (slot_idx, val) in resolved_args.iter().enumerate() {
             if slot_idx < locals.len() {
                 locals[slot_idx].set(val.clone());
             }

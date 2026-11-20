@@ -105,8 +105,8 @@ fn as_dyn_coercion_produces_trait_object() {
         "`1 as dyn Foo` 必须通过 typeck"
     );
     assert!(
-        typeck("let x = 1 as dyn Foo<number>\nprint(1)\n").is_err(),
-        "`as dyn` 不支持泛型 —— 这是**当前事实**，前端若补上泛型请改本测试"
+        typeck("let x = 1 as dyn Foo<number>\nprint(1)\n").is_ok(),
+        "Stage 3C 已补上 `as dyn Trait<T>` 泛型实参解析"
     );
 }
 /// v0.104.6 D83：`MirInst::DynTrait` 把 `for_type` **硬编码成空串**。
@@ -170,15 +170,16 @@ fn dyn_trait_object_records_concrete_type() {
 ///   （`1 as dyn Foo<number>` → `Failed to parse`）——
 ///   即 `dyn T` 标注支持泛型、`as dyn T` 不支持，两者不同源
 #[test]
-fn trait_and_impl_definitions_are_still_unparseable() {
-    // 本测试**不**断言它们失败（那是另一种锁法），只记录现状。
-    // 一旦前端落地，这里会开始编译/解析成功，届时应把本测试改写成
-    // 「trait/impl 定义可用」的正向断言。
-    let trait_def = typeck("trait Greet\n  hi\nend\ntask main()\n  print(1)\nend\n");
-    let impl_def = typeck("impl Greet for P\nend\ntask main()\n  print(1)\nend\n");
+fn trait_and_impl_definitions_typecheck_end_to_end() {
+    let src = "trait Greet\n  task greet(self): string\nend\nimpl Greet for int\n  task greet(self): string\n    return \"hi\"\n  end\nend\nlet x: dyn Greet = 1\nprint(x.greet())\n";
     assert!(
-        trait_def.is_err() && impl_def.is_err(),
-        "若 trait / impl 定义已能解析，说明前端已落地 —— 请改写本测试为正向断言，\
-         并检查 `infer_let_typed` 的 dyn 强制转换是否还需要"
+        typeck(src).is_ok(),
+        "Stage 3C 已实现源码级 trait / impl 与 dyn Trait 静态校验，实得: {:?}",
+        typeck(src)
+    );
+    let bad = "trait Greet\n  task greet(self): string\nend\nlet x: dyn Greet = 1\n";
+    assert!(
+        typeck(bad).is_err(),
+        "未实现 Greet 的类型强制转换为 `dyn Greet` 应被静态拒绝"
     );
 }

@@ -55,6 +55,91 @@ impl ParserV3 {
                 }
                 return None;
             }
+            // Stage 3C: Enum variant pattern `Enum::Variant` or `Enum::Variant(p1, p2)`
+            if let Some(next) = self.tokens.get(self.current + 1)
+                && next.token_type == TokenType::ColonColon
+            {
+                let enum_name = name.clone();
+                self.advance(); // enum_name
+                self.advance(); // '::'
+                let variant = self.consume_identifier("Expected variant name after '::'")?;
+                let mut fields = Vec::new();
+                if self.match_token_exact(TokenType::LParen) {
+                    while !self.check(&TokenType::RParen) && !self.is_at_end() {
+                        fields.push(self.parse_pattern()?);
+                        if !self.match_token_exact(TokenType::Comma) {
+                            break;
+                        }
+                    }
+                    self.consume(TokenType::RParen, "Expected ')' after variant pattern")?;
+                }
+                return Some(crate::mir::witness::WitnessPattern::Variant {
+                    enum_name: Some(enum_name),
+                    variant,
+                    fields,
+                });
+            }
+            // Stage 3C: Nominal struct pattern `Point { x: a, y, .. }`
+            if let Some(next) = self.tokens.get(self.current + 1)
+                && next.token_type == TokenType::LBrace
+                && (self.declared_type_names.contains(name.as_str())
+                    || name.chars().next().is_some_and(|c| c.is_uppercase()))
+            {
+                let struct_name = name.clone();
+                self.advance(); // struct_name
+                self.advance(); // '{'
+                let mut fields = Vec::new();
+                let mut rest = false;
+                loop {
+                    if self.match_token_exact(TokenType::RBrace) {
+                        break;
+                    }
+                    if self.check(&TokenType::DotDot) || self.check(&TokenType::DotDotDot) {
+                        self.advance();
+                        rest = true;
+                        self.consume(TokenType::RBrace, "Expected '}' after struct rest pattern")?;
+                        break;
+                    }
+                    let key = self.consume_identifier("Expected struct field name")?;
+                    let pat = if self.match_token_exact(TokenType::Colon) {
+                        self.parse_pattern()?
+                    } else {
+                        crate::mir::witness::WitnessPattern::Variable(key.clone())
+                    };
+                    fields.push((key, pat));
+                    if !self.match_token_exact(TokenType::Comma) {
+                        self.consume(TokenType::RBrace, "Expected '}' after struct pattern")?;
+                        break;
+                    }
+                }
+                return Some(crate::mir::witness::WitnessPattern::Struct {
+                    name: struct_name,
+                    fields,
+                    rest,
+                });
+            }
+            // Stage 3C: Unqualified payload variant pattern `Some(x)` (uppercase identifier + '(')
+            if let Some(next) = self.tokens.get(self.current + 1)
+                && next.token_type == TokenType::LParen
+                && name.chars().next().is_some_and(|c| c.is_uppercase())
+            {
+                let variant = name.clone();
+                self.advance(); // variant
+                self.advance(); // '('
+                let mut fields = Vec::new();
+                while !self.check(&TokenType::RParen) && !self.is_at_end() {
+                    fields.push(self.parse_pattern()?);
+                    if !self.match_token_exact(TokenType::Comma) {
+                        break;
+                    }
+                }
+                self.consume(TokenType::RParen, "Expected ')' after variant pattern")?;
+                return Some(crate::mir::witness::WitnessPattern::Variant {
+                    enum_name: None,
+                    variant,
+                    fields,
+                });
+            }
             let name = self.consume_identifier("Expected pattern")?;
             return Some(crate::mir::witness::WitnessPattern::Variable(name));
         }
@@ -299,7 +384,15 @@ impl ParserV3 {
                 self.advance();
                 Some(Type::Nil)
             }
+            TokenType::Self_ => {
+                self.advance();
+                Some(Type::Trait {
+                    name: "Self".to_string(),
+                    generics: Vec::new(),
+                })
+            }
             TokenType::Identifier(name) => {
+                let orig_name = name.clone();
                 let lower = name.to_lowercase();
                 if matches!(
                     self.tokens.get(self.current + 1).map(|t| &t.token_type),
@@ -342,6 +435,13 @@ impl ParserV3 {
                             Some(Type::Dict(Box::new(k), Box::new(v)))
                         }
                         other => {
+                            if self.declared_type_names.contains(orig_name.as_str()) {
+                                return Some(Type::Concrete {
+                                    name: orig_name,
+                                    generics: args,
+                                    traits: Vec::new(),
+                                });
+                            }
                             eprintln!(
                                 "Parse error: unsupported generic type annotation '{}' at line {}",
                                 other,
@@ -373,6 +473,10 @@ impl ParserV3 {
                     "bool" => Type::Bool,
                     "nil" => Type::Nil,
                     "context" => Type::Context,
+                    "tcp_listener" | "tcplistener" => Type::TcpListener,
+                    "tcp_stream" | "tcpstream" => Type::TcpStream,
+                    "compute_dag" | "computedag" => Type::ComputeDag,
+                    "kv_allocator" | "kvallocator" => Type::KVAllocator,
                     "channel" => Type::Channel(Box::new(Type::Any)),
                     "task_handle" | "taskhandle" => Type::TaskHandle(Box::new(Type::Any)),
                     "tensor" => Type::any_tensor(),

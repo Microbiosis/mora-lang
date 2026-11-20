@@ -13,6 +13,13 @@ use mora::typeck::format_error;
 /// 编译与优化管线入口位于 `mora::cli::compile_and_opt`；
 /// 本文件提供 run_file / run_check / run_repl 与 CLI dispatch。
 fn main() {
+    if let Some(bundle) = mora::cli::bundle::try_load_embedded_bundle() {
+        let code = mora::cli::bundle::run_bundled_program(bundle);
+        if code != 0 {
+            process::exit(code);
+        }
+        return;
+    }
     // v0.110.0 W2.3: Iterative Pratt expression parsing (emit_pratt_w / emit_unary_w)
     // and the heap-framed stackful VM (VmEngine) eliminate recursive expression/frame
     // OS-stack explosion, running directly on the default OS thread stack while enforcing
@@ -47,6 +54,9 @@ fn dispatch() -> i32 {
                 println!("  mora --repl                Interactive REPL");
                 println!("  mora --check <file>        Type check only");
                 println!("  mora run <file.mora>       Run a script (explicit form)");
+                println!(
+                    "  mora build <file.mora>     Compile a script into a standalone binary [-o <out>]"
+                );
                 println!("  mora install <url>         Install a package from a URL");
                 println!();
                 println!("  mora --version             Show version");
@@ -104,6 +114,9 @@ fn dispatch() -> i32 {
                 process::exit(1);
             }
             run_file(&args[2], opt_level);
+        }
+        "build" => {
+            run_build(&args[2..], opt_level);
         }
         _ => run_file(&args[1], opt_level),
     }
@@ -291,4 +304,67 @@ fn run_check(path: &str) {
 
 fn run_repl() {
     mora::cli::repl::run_repl();
+}
+
+fn run_build(rest: &[String], opt_level: Option<mora::mir::control::OptLevel>) {
+    if rest.is_empty() {
+        eprintln!("Usage: mora build <file.mora> [-o <output>]");
+        process::exit(1);
+    }
+    let mut entry: Option<&str> = None;
+    let mut output: Option<&str> = None;
+    let mut i = 0usize;
+    while i < rest.len() {
+        let arg = &rest[i];
+        if arg == "-o" || arg == "--out" || arg == "--output" {
+            let Some(val) = rest.get(i + 1) else {
+                eprintln!("mora build: expected output path after '{arg}'");
+                process::exit(1);
+            };
+            output = Some(val.as_str());
+            i += 2;
+            continue;
+        }
+        if let Some(val) = arg.strip_prefix("--output=") {
+            output = Some(val);
+            i += 1;
+            continue;
+        }
+        if arg.starts_with('-') {
+            eprintln!("mora build: unknown option '{arg}'");
+            process::exit(2);
+        }
+        if entry.is_some() {
+            eprintln!("mora build: unexpected extra argument '{arg}'");
+            process::exit(1);
+        }
+        entry = Some(arg.as_str());
+        i += 1;
+    }
+    let Some(entry_str) = entry else {
+        eprintln!("Usage: mora build <file.mora> [-o <output>]");
+        process::exit(1);
+    };
+    let entry_path = Path::new(entry_str);
+    let default_out = {
+        let stem = entry_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("app");
+        if cfg!(windows) {
+            format!("{stem}.exe")
+        } else {
+            stem.to_string()
+        }
+    };
+    let out_path = Path::new(output.unwrap_or(&default_out));
+    match mora::cli::bundle::build_single_binary(entry_path, out_path, opt_level) {
+        Ok(()) => {
+            println!("Built standalone executable -> {}", out_path.display());
+        }
+        Err(e) => {
+            eprintln!("{}: {}", entry_str, e);
+            process::exit(2);
+        }
+    }
 }

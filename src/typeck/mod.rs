@@ -250,6 +250,14 @@ pub enum Type {
     TaskHandle(Box<Type>),
     /// Wave 2: Cooperative cancellation & deadline context (`context`).
     Context,
+    /// Wave 2: Non-blocking async TCP listener (`tcp_listener`).
+    TcpListener,
+    /// Wave 2: Non-blocking async TCP stream (`tcp_stream`).
+    TcpStream,
+    /// Wave 4: Native fused tensor compute graph (`compute_dag`).
+    ComputeDag,
+    /// Wave 4: Paged KV-cache dynamic resource allocator (`kv_allocator`).
+    KVAllocator,
     /// Stage 3B: Distinct low-bitwidth / hardware-precision scalar type (`f32`, `f16`, `bf16`, `fp8`, `i32`, `i16`, `i8`, `i4`, `u64`, `u32`, `u16`, `u8`).
     /// Canonical 64-bit `i64` is `Type::Int` and `f64` is `Type::Float`.
     Scalar(crate::common::DType),
@@ -340,8 +348,36 @@ impl Type {
                 let parts: Vec<String> = types.iter().map(|t| t.name()).collect();
                 format!("({})", parts.join(", "))
             }
-            Type::Trait { .. } => "trait".to_string(),
-            Type::Concrete { .. } => "concrete".to_string(),
+            Type::Trait { name, generics } => {
+                if generics.is_empty() {
+                    name.clone()
+                } else {
+                    format!(
+                        "{}<{}>",
+                        name,
+                        generics
+                            .iter()
+                            .map(|g| g.name())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                }
+            }
+            Type::Concrete { name, generics, .. } => {
+                if generics.is_empty() {
+                    name.clone()
+                } else {
+                    format!(
+                        "{}<{}>",
+                        name,
+                        generics
+                            .iter()
+                            .map(|g| g.name())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                }
+            }
             Type::TraitObject {
                 trait_name,
                 generics,
@@ -396,6 +432,10 @@ impl Type {
             Type::Channel(t) => format!("channel<{}>", t.name()),
             Type::TaskHandle(t) => format!("task_handle<{}>", t.name()),
             Type::Context => "context".to_string(),
+            Type::TcpListener => "tcp_listener".to_string(),
+            Type::TcpStream => "tcp_stream".to_string(),
+            Type::ComputeDag => "compute_dag".to_string(),
+            Type::KVAllocator => "kv_allocator".to_string(),
             Type::Scalar(dt) => dt.canonical_type_name().to_string(),
             Type::Tensor {
                 dtype,
@@ -434,6 +474,10 @@ impl Type {
             "channel" => Type::Channel(Box::new(Type::Union(vec![]))),
             "task_handle" | "taskhandle" => Type::TaskHandle(Box::new(Type::Union(vec![]))),
             "context" => Type::Context,
+            "tcp_listener" | "tcplistener" => Type::TcpListener,
+            "tcp_stream" | "tcpstream" => Type::TcpStream,
+            "compute_dag" | "computedag" => Type::ComputeDag,
+            "kv_allocator" | "kvallocator" => Type::KVAllocator,
             "tensor" | "Tensor" => Type::any_tensor(),
             "task" => Type::Task,
             "closure" => Type::Closure,
@@ -666,6 +710,24 @@ impl Type {
             return false;
         }
         if let (
+            Type::Concrete {
+                name: a,
+                generics: ga,
+                ..
+            },
+            Type::Concrete {
+                name: b,
+                generics: gb,
+                ..
+            },
+        ) = (self, expected)
+        {
+            if a != b || ga.len() != gb.len() {
+                return false;
+            }
+            return ga.iter().zip(gb.iter()).all(|(x, y)| x.compatible_with(y));
+        }
+        if let (
             Type::Trait {
                 name: a,
                 generics: ga,
@@ -807,6 +869,24 @@ impl Type {
             (Type::Nil, Type::Nil) => return true,
             (Type::Nil, _) | (_, Type::Nil) => return false,
             _ => {}
+        }
+        if let (
+            Type::Concrete {
+                name: a,
+                generics: ga,
+                ..
+            },
+            Type::Concrete {
+                name: b,
+                generics: gb,
+                ..
+            },
+        ) = (self, super_ty)
+        {
+            if a != b || ga.len() != gb.len() {
+                return false;
+            }
+            return ga.iter().zip(gb.iter()).all(|(x, y)| x.subtype_of(y));
         }
         if let (Type::Concrete { traits, .. }, Type::Trait { .. }) = (self, super_ty) {
             return traits.iter().any(|t| t.subtype_of(super_ty));

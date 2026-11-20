@@ -47,10 +47,42 @@ const PRODUCTIONS: &[(&str, &str)] = &[
         "handle_stmt",
         "let g = \"i\"\nhandle Ai {\n  g = perform Ai(\"hi\")\n} {\n  \"mocked:\" + __arg0\n}\n",
     ),
-    // statement 联合式之外、仍未接进前端的 trait / impl + parallel
+    // v0.110.0 Wave 2 / Stage 3C：parallel / trait / impl / struct / enum / select / spawn / no_grad / slice 全部接入前端
     ("parallel", "parallel\n  print(1)\nend\n"),
-    ("trait", "trait T\n  print(1)\nend\n"),
-    ("impl", "impl T\n  print(1)\nend\n"),
+    ("trait", "trait T\n  task f(self): int\nend\n"),
+    (
+        "impl",
+        "trait T\n  task f(self): int\nend\nimpl T for int\n  task f(self): int\n    return self\n  end\nend\n",
+    ),
+    (
+        "while_stmt",
+        "let i = 0\nwhile i < 1\n  assign i = i + 1\nend\n",
+    ),
+    ("type_alias_stmt", "type Num = int\nlet x: Num = 1\n"),
+    (
+        "struct_stmt",
+        "struct Point<T>\n  x: T\n  y: int = 0 @tag(json=\"y,omitempty\")\nend\n",
+    ),
+    ("enum_stmt", "enum Maybe<T>\n  Just(T)\n  Nothing\nend\n"),
+    ("effect_stmt", "effect Log(string): nil\n"),
+    ("export_stmt", "export let answer = 42\n"),
+    (
+        "select_stmt",
+        "let ch = channel(1)\nselect\n  default -> print(1)\nend\n",
+    ),
+    (
+        "spawn_expr",
+        "task work(): int\n  return 1\nend\nlet h = spawn work()\n",
+    ),
+    ("no_grad_expr", "let y = no_grad\n  1.0 + 2.0\nend\n"),
+    (
+        "tensor_slice",
+        "let t = Tensor::zeros([4, 4])\nlet s = t[0..2, :, None]\n",
+    ),
+    (
+        "default_and_named_args",
+        "task lin(x: int, w: int, b: int = 1): int\n  return x * w + b\nend\nlet r = lin(2, w=3)\n",
+    ),
     // 表达式类
     ("closure", "let f = fn(x) x + 1\nprint(f(1))\n"),
     ("pipe", "print([1, 2, 3] |> len())\n"),
@@ -104,16 +136,24 @@ const PRODUCTIONS: &[(&str, &str)] = &[
         "pattern_dict",
         "let r = match {a: 9} with\n  {a: k} -> k\n  _ -> 0\nend\nprint(r)\n",
     ),
+    (
+        "pattern_variant",
+        "enum Maybe\n  Just(int)\n  Nothing\nend\nlet x = Maybe::Just(1)\nlet r = match x with\n  Maybe::Just(v) -> v\n  Maybe::Nothing -> 0\nend\nprint(r)\n",
+    ),
+    (
+        "pattern_struct",
+        "struct Pt\n  x: int\nend\nlet p = Pt(1)\nlet r = match p with\n  Pt { x: a } -> a\nend\nprint(r)\n",
+    ),
 ];
 /// 主断言：把全部结果**打印出来并列出失败清单**。
 ///
 /// 这不是「全绿即可」的测试 —— 它是**普查报告**：
-/// 失败项就是 spec 承诺但实现不支持的语法（D108 的 `handle_stmt` 已修，
-/// 若这里再出现同类，说明还有未修的）。
+/// 失败项就是 spec 承诺但实现不支持的语法（D108 的 `handle_stmt` 及
+/// v0.110.0 Stage 3C 的 `trait`/`impl` 均已闭环）。
 #[test]
 fn d109_spec_production_minimal_instances() {
-    // D109 之后**没有任何**产生式不可解析 —— 下表是实测结果。
-    const EXPECTED_UNPARSEABLE: &[&str] = &["trait", "impl"];
+    // v0.110.0 起 §14.2 全部产生式（含 trait / impl / struct / enum / select / spawn / no_grad / slice）均可解析。
+    const EXPECTED_UNPARSEABLE: &[&str] = &[];
 
     let mut unparseable: Vec<String> = Vec::new();
     let mut report = Vec::new();
@@ -139,19 +179,36 @@ fn d109_spec_production_minimal_instances() {
     assert_eq!(report.len(), PRODUCTIONS.len());
 }
 
-/// D109 / v0.110.0 的 spec 侧校验：联合式不得引用 `trait_stmt` / `impl_stmt` /
-/// 已移除的 `with_stmt` / `observe_stmt` / `model_stmt`，且 `parallel_stmt` 必须定义。
+/// D109 / v0.110.0 的 spec 侧校验：已移除的 `with_stmt` / `observe_stmt` / `model_stmt` / `prompt`
+/// 不得残留，且 Wave 2 / Stage 3C 新增产生式（含 `parallel_stmt` / `trait_stmt` / `impl_stmt` /
+/// `struct_stmt` / `enum_stmt` / `select_stmt` / `spawn_expr` / `no_grad_expr` / `tensor_slice`）必须有定义。
 #[test]
 fn d109_spec_union_and_missing_productions() {
     let text = std::fs::read_to_string("docs/mora-spec.md").expect("读 docs/mora-spec.md");
-    let union = text
-        .lines()
-        .find(|l| l.trim_start().starts_with("statement   ="))
+    let stmt_start = text
+        .find("statement   =")
         .expect("spec §14.2 里找不到 statement 联合式");
-    assert!(
-        !union.contains("trait_stmt") && !union.contains("impl_stmt"),
-        "statement 联合式不得引用 trait_stmt / impl_stmt（既无产生式也不可解析）。\n实际：{union}"
-    );
+    let stmt_end = text[stmt_start..]
+        .find(';')
+        .expect("statement 联合式缺少分号终止");
+    let stmt_union = &text[stmt_start..stmt_start + stmt_end];
+    for expected in [
+        "parallel_stmt",
+        "struct_stmt",
+        "enum_stmt",
+        "trait_stmt",
+        "impl_stmt",
+        "select_stmt",
+        "while_stmt",
+        "export_stmt",
+        "effect_stmt",
+        "type_alias_stmt",
+    ] {
+        assert!(
+            stmt_union.contains(expected),
+            "statement 联合式缺少 `{expected}`。\n实际：{stmt_union}"
+        );
+    }
     assert!(
         !text.contains("observe_stmt")
             && !text.contains("with_stmt")
@@ -159,8 +216,20 @@ fn d109_spec_union_and_missing_productions() {
             && !text.contains("prompt      ="),
         "v0.110.0 已移除 observe_stmt / with_stmt / model_stmt / prompt，spec §14.2 不应再保留"
     );
-    assert!(
-        text.contains("parallel_stmt = \"parallel\""),
-        "parallel_stmt 缺产生式（曾被联合式引用）"
-    );
+    for prod in [
+        "parallel_stmt = \"parallel\"",
+        "struct_stmt = \"struct\"",
+        "enum_stmt   = \"enum\"",
+        "trait_stmt  = \"trait\"",
+        "impl_stmt   = \"impl\"",
+        "select_stmt = \"select\"",
+        "spawn_expr  = \"spawn\"",
+        "no_grad_expr = \"no_grad\"",
+        "tensor_slice = expr \"[\"",
+    ] {
+        assert!(
+            text.contains(prod),
+            "docs/mora-spec.md §14.2 缺少产生式 `{prod}`"
+        );
+    }
 }

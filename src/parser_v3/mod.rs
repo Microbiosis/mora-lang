@@ -6,7 +6,6 @@
 use crate::common::{BinaryOp, Literal, Span};
 use crate::error::{MoraError, MoraResult};
 use crate::lexer::{Token, TokenType};
-use crate::mir::Param;
 use crate::mir::witness::{MirWitness, WitnessKind, WitnessParam};
 
 mod emit;
@@ -178,8 +177,12 @@ pub struct ParserV3 {
     /// 若函数体解析后未清，后续无关标注会把同名当类型变量（由
     /// `tests/generic_functions.rs` 的「泛型名不泄漏」一条兜住）。
     generic_params: Vec<String>,
-    /// User-declared nominal or alias type names (`type`, `enum`, `struct`) visible in annotations.
+    /// User-declared nominal or alias type names (`type`, `enum`, `struct`, `trait`) visible in annotations.
     declared_type_names: std::collections::HashSet<String>,
+    /// Stage 3C: When true, `emit_pratt_w` stops before `@tag(` so `x: int = 0 @tag(...)` parses cleanly.
+    in_struct_field_default: bool,
+    /// Wave 4: Optional bundled module map for single-binary (`mora build`) import pre-scanning.
+    virtual_modules: Option<std::collections::HashMap<String, String>>,
 }
 
 impl ParserV3 {
@@ -190,6 +193,8 @@ impl ParserV3 {
             diag: None,
             generic_params: Vec::new(),
             declared_type_names: std::collections::HashSet::new(),
+            in_struct_field_default: false,
+            virtual_modules: None,
             scope: ParserScope {
                 is_program_top: true,
                 parse_loop_depth: 0,
@@ -223,6 +228,13 @@ impl ParserV3 {
     /// W2.3: 仅运行词法 + 深度闸 + 语法分析产出 `MirWitness` 列表（不执行 lowering）。
     /// LSP / `mora --check` / REPL / `eval` 动态绑定降维使用此入口避免无谓重降或误报。
     pub fn parse_witnesses(source: &str) -> MoraResult<Vec<crate::mir::witness::MirWitness>> {
+        Self::parse_witnesses_with_modules(source, None)
+    }
+
+    pub fn parse_witnesses_with_modules(
+        source: &str,
+        virtual_modules: Option<&std::collections::HashMap<String, String>>,
+    ) -> MoraResult<Vec<crate::mir::witness::MirWitness>> {
         use crate::lexer::Lexer;
         // 空输入或仅含注释的输入 → 显式 Err（与 proptest 期望对齐：
         // 成功编译必须产生非空 body，否则 prop_assert 失败）。
@@ -255,6 +267,7 @@ impl ParserV3 {
             )));
         }
         let mut parser = ParserV3::new(tokens, source);
+        parser.virtual_modules = virtual_modules.cloned();
         let emitted = parser.emit_program();
         // v0.104.6 D413：语义诊断**优先于**泛化的解析失败。
         if let Some(d) = parser.diag.clone() {
@@ -286,7 +299,17 @@ impl ParserV3 {
         crate::mir::control::ControlProgram,
         Vec<crate::mir::witness::MirWitness>,
     )> {
-        let witnesses = Self::parse_witnesses(source)?;
+        Self::compile_with_modules(source, None)
+    }
+
+    pub fn compile_with_modules(
+        source: &str,
+        virtual_modules: Option<&std::collections::HashMap<String, String>>,
+    ) -> MoraResult<(
+        crate::mir::control::ControlProgram,
+        Vec<crate::mir::witness::MirWitness>,
+    )> {
+        let witnesses = Self::parse_witnesses_with_modules(source, virtual_modules)?;
         // W2.3: 单一路径直出 ControlProgram（retired 9-layer FCFG/SSA/VM）。
         let prog = crate::mir::control::lower_program(&witnesses)?;
         Ok((prog, witnesses))

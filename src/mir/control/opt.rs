@@ -110,13 +110,13 @@ fn const_key(c: &ControlConst) -> Option<ConstKey> {
         ControlConst::String(s) => Some(ConstKey::String(s.clone())),
         ControlConst::Char(ch) => Some(ConstKey::Char(*ch)),
         ControlConst::BuiltinFn(id) => Some(ConstKey::BuiltinFn(*id)),
-        ControlConst::BuiltinModule(_) => None,
+        ControlConst::BuiltinModule(_) | ControlConst::MissingArg => None,
     }
 }
 
 fn const_is_truthy(c: &ControlConst) -> bool {
     match c {
-        ControlConst::Nil => false,
+        ControlConst::Nil | ControlConst::MissingArg => false,
         ControlConst::Bool(b) => *b,
         ControlConst::Int(i) => *i != 0,
         ControlConst::Float(f) => *f != 0.0 && !f.is_nan(),

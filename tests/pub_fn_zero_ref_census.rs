@@ -139,7 +139,6 @@ fn d386_representative_zero_reference_functions() {
         "is_moved",
         "is_borrowed_mut",
         "into_value",
-        "reversed",
         "sorted_by_key",
         "to_mut_vec",
         // typeck

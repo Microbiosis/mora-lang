@@ -89,14 +89,27 @@ fn walk_witness_kind<F: FnMut(&MirWitness)>(kind: &WitnessKind, visit: &mut F) {
         }
         WitnessKind::Commit | WitnessKind::Rollback => {}
         WitnessKind::Spawn { target } => match target {
-            crate::mir::witness::WitnessSpawnTarget::Call { args, .. } => {
+            crate::mir::witness::WitnessSpawnTarget::Call {
+                args, named_args, ..
+            } => {
                 for arg in args {
                     walk_witness(arg, visit);
                 }
+                for (_, arg) in named_args {
+                    walk_witness(arg, visit);
+                }
             }
-            crate::mir::witness::WitnessSpawnTarget::MethodCall { receiver, args, .. } => {
+            crate::mir::witness::WitnessSpawnTarget::MethodCall {
+                receiver,
+                args,
+                named_args,
+                ..
+            } => {
                 walk_witness(receiver, visit);
                 for arg in args {
+                    walk_witness(arg, visit);
+                }
+                for (_, arg) in named_args {
                     walk_witness(arg, visit);
                 }
             }
@@ -133,14 +146,27 @@ fn walk_witness_kind<F: FnMut(&MirWitness)>(kind: &WitnessKind, visit: &mut F) {
             walk_witness(left, visit);
             walk_witness(right, visit);
         }
-        WitnessKind::Call { args, .. } => {
+        WitnessKind::Call {
+            args, named_args, ..
+        } => {
             for arg in args {
                 walk_witness(arg, visit);
             }
+            for (_, arg) in named_args {
+                walk_witness(arg, visit);
+            }
         }
-        WitnessKind::MethodCall { receiver, args, .. } => {
+        WitnessKind::MethodCall {
+            receiver,
+            args,
+            named_args,
+            ..
+        } => {
             walk_witness(receiver, visit);
             for arg in args {
+                walk_witness(arg, visit);
+            }
+            for (_, arg) in named_args {
                 walk_witness(arg, visit);
             }
         }
@@ -204,9 +230,59 @@ fn walk_witness_kind<F: FnMut(&MirWitness)>(kind: &WitnessKind, visit: &mut F) {
             walk_witness(index, visit);
             walk_witness(value, visit);
         }
+        WitnessKind::TensorSlice { target, axes } => {
+            walk_witness(target, visit);
+            for ax in axes {
+                match ax {
+                    crate::mir::witness::WitnessSliceAxis::Index(w) => walk_witness(w, visit),
+                    crate::mir::witness::WitnessSliceAxis::Range { start, stop, step } => {
+                        if let Some(w) = start {
+                            walk_witness(w, visit);
+                        }
+                        if let Some(w) = stop {
+                            walk_witness(w, visit);
+                        }
+                        if let Some(w) = step {
+                            walk_witness(w, visit);
+                        }
+                    }
+                    crate::mir::witness::WitnessSliceAxis::Ellipsis
+                    | crate::mir::witness::WitnessSliceAxis::NewAxis => {}
+                }
+            }
+        }
+        WitnessKind::NoGrad { body } => walk_witness(body, visit),
+        WitnessKind::StructDef { fields, .. } => {
+            for f in fields {
+                if let Some(d) = &f.default {
+                    walk_witness(d, visit);
+                }
+            }
+        }
+        WitnessKind::TraitDef { methods, .. } => {
+            for m in methods {
+                for p in &m.params {
+                    if let Some(d) = &p.default {
+                        walk_witness(d, visit);
+                    }
+                }
+                if let Some(body) = &m.default_body {
+                    walk_witness(body, visit);
+                }
+            }
+        }
+        WitnessKind::ImplDef { methods, .. } => {
+            for m in methods {
+                for p in &m.params {
+                    if let Some(d) = &p.default {
+                        walk_witness(d, visit);
+                    }
+                }
+                walk_witness(&m.body, visit);
+            }
+        }
         WitnessKind::TypeAlias { .. }
         | WitnessKind::EnumDef { .. }
-        | WitnessKind::StructDef { .. }
         | WitnessKind::Import(_)
         | WitnessKind::MacroDef { .. }
         | WitnessKind::EffectSig { .. }

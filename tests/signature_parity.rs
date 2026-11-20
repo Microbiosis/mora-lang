@@ -115,7 +115,16 @@ fn call_for(name: &str) -> Option<&'static str> {
         "channel" => "channel(1)",
         "context" => "context()",
         "sleep" => "sleep(1)",
+        "tcp_listen" => "tcp_listen(\"127.0.0.1:0\")",
+        "tcp_connect" => {
+            "fn() let l = tcp_listen(\"127.0.0.1:0\")\nlet s = tcp_connect(l.local_addr())\nl.close()\nreturn s end()"
+        }
         "tensor" => "tensor([1.0, 2.0])",
+        "grad" => "grad(fn(x) x end)",
+        "value_and_grad" => "value_and_grad(fn(x) x end)",
+        "jvp" => "jvp(fn(x) x end, 1.0, 1.0)",
+        "trace_dag" => "trace_dag(fn(x) x * 2.0 end, tensor([1.0]))",
+        "kv_allocator" => "kv_allocator(4, 4, 2, 4)",
         // domain prefix 模块 / 宏展开，无独立固定返回值语义
         "math" | "stats" | "linalg" | "macroexpand" => return None,
         _ => return None,

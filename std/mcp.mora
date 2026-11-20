@@ -1,0 +1,192 @@
+-- Pure-Mora Model Context Protocol (MCP) Standard Library (`std/mcp`)
+-- Implements JSON-RPC 2.0 MCP server (initialize, ping, tools/list, tools/call,
+-- resources/list, resources/read) over HTTP + SSE using `std/net/http`.
+
+import "std/net/http"
+
+export struct McpTool
+  name: string
+  description: string
+  schema: dict<string, any>
+  handler: any
+end
+
+export struct McpResource
+  uri: string
+  name: string
+  description: string
+  mime_type: string = "text/plain"
+  reader: any
+end
+
+export struct McpServer
+  name: string = "mora-mcp"
+  version: string = "0.1.0"
+  tools: dict<string, McpTool>
+  resources: dict<string, McpResource>
+end
+
+export task server(name: string = "mora-mcp", version: string = "0.1.0"): McpServer
+  let t: dict<string, McpTool> = {}
+  let r: dict<string, McpResource> = {}
+  return McpServer(name=name, version=version, tools=t, resources=r)
+end
+
+task rpc_ok(id: any, result: any): string
+  let env_obj: dict<string, any> = {}
+  assign env_obj = env_obj.set("jsonrpc", "2.0").set("id", id).set("result", result)
+  return json.stringify(env_obj)
+end
+
+task rpc_err(id: any, code: int, message: string): string
+  let err_obj: dict<string, any> = {}
+  assign err_obj = err_obj.set("code", code).set("message", message)
+  let env_obj: dict<string, any> = {}
+  assign env_obj = env_obj.set("jsonrpc", "2.0").set("id", id).set("error", err_obj)
+  return json.stringify(env_obj)
+end
+
+export impl McpServer
+  task tool(self, name: string, description: string, schema: dict<string, any>, handler: any): McpServer
+    let t = McpTool(name=name, description=description, schema=schema, handler=handler)
+    let next_tools = self.tools.set(name, t)
+    return McpServer(name=self.name, version=self.version, tools=next_tools, resources=self.resources)
+  end
+
+  task resource(self, uri: string, name: string, description: string, mime_type: string, reader: any): McpServer
+    let res = McpResource(uri=uri, name=name, description=description, mime_type=mime_type, reader=reader)
+    let next_res = self.resources.set(uri, res)
+    return McpServer(name=self.name, version=self.version, tools=self.tools, resources=next_res)
+  end
+
+  task handle_jsonrpc(self, raw_json: string): string
+    let parsed = raw_json.json()
+    let err = parsed.get("err")
+    if err != nil then
+      return rpc_err(nil, -32700, "Parse error: " + str(err))
+    end
+    let req = parsed.get("ok")
+    let id = req.get("id")
+    let method = req.get("method")
+    let params = req.get("params")
+    if method == nil then
+      return rpc_err(id, -32600, "Invalid Request: missing method")
+    end
+
+    if method == "initialize" then
+      let empty_obj: dict<string, any> = {}
+      let caps: dict<string, any> = {"tools": empty_obj, "resources": empty_obj}
+      let info: dict<string, string> = {"name": self.name, "version": self.version}
+      let res_obj: dict<string, any> = {}
+      assign res_obj = res_obj.set("protocolVersion", "2024-11-05").set("capabilities", caps).set("serverInfo", info)
+      return rpc_ok(id, res_obj)
+    end
+    if method == "notifications/initialized" then
+      return ""
+    end
+    if method == "ping" then
+      let empty: dict<string, any> = {}
+      return rpc_ok(id, empty)
+    end
+    if method == "tools/list" then
+      let list_out: list<any> = []
+      for tname in self.tools.keys()
+        let tool = self.tools.get(tname)
+        if tool != nil then
+          let entry: dict<string, any> = {}
+          assign entry = entry.set("name", tool.name).set("description", tool.description).set("inputSchema", tool.schema)
+          assign list_out = list_out.push(entry)
+        end
+      end
+      return rpc_ok(id, {"tools": list_out})
+    end
+    if method == "tools/call" then
+      if params == nil then
+        return rpc_err(id, -32602, "Invalid params: missing params")
+      end
+      let tname = params.get("name")
+      let targs = params.get("arguments")
+      if targs == nil then
+        let empty_args: dict<string, any> = {}
+        assign targs = empty_args
+      end
+      let tool = self.tools.get(str(tname))
+      if tool == nil then
+        return rpc_err(id, -32602, "Unknown tool: " + str(tname))
+      end
+      let fn_handler = tool.handler
+      let result_val = fn_handler(targs)
+      let text_out = if type_of(result_val) == "string" then str(result_val) else json.stringify(result_val) end
+      let content_item: dict<string, any> = {"type": "text", "text": text_out}
+      let call_out: dict<string, any> = {}
+      assign call_out = call_out.set("content", [content_item]).set("isError", false)
+      return rpc_ok(id, call_out)
+    end
+    if method == "resources/list" then
+      let rlist: list<any> = []
+      for ruri in self.resources.keys()
+        let r = self.resources.get(ruri)
+        if r != nil then
+          let entry: dict<string, any> = {"uri": r.uri, "name": r.name, "description": r.description, "mimeType": r.mime_type}
+          assign rlist = rlist.push(entry)
+        end
+      end
+      return rpc_ok(id, {"resources": rlist})
+    end
+    if method == "resources/read" then
+      if params == nil then
+        return rpc_err(id, -32602, "Invalid params: missing params")
+      end
+      let ruri = params.get("uri")
+      let r = self.resources.get(str(ruri))
+      if r == nil then
+        return rpc_err(id, -32602, "Unknown resource: " + str(ruri))
+      end
+      let rfn = r.reader
+      let text_val = str(rfn(r.uri))
+      let item: dict<string, any> = {"uri": r.uri, "mimeType": r.mime_type, "text": text_val}
+      return rpc_ok(id, {"contents": [item]})
+    end
+    return rpc_err(id, -32601, "Method not found: " + str(method))
+  end
+
+  task dispatch_http(self, req: HttpRequest, stream: tcp_stream): any
+    if req.path == "/health" and req.method == "GET" then
+      return json_response(200, {"status": "ok", "server": self.name, "version": self.version})
+    end
+    if req.path == "/sse" and req.method == "GET" then
+      sse_start(stream)
+      sse_send(stream, "endpoint", "/mcp", "1")
+      return nil
+    end
+    if req.path == "/mcp" and req.method == "POST" then
+      let reply = self.handle_jsonrpc(req.body)
+      if reply == "" then
+        return response(204, "", "text/plain")
+      end
+      let hdrs: dict<string, string> = {"Content-Type": "application/json; charset=utf-8"}
+      return HttpResponse(status=200, headers=hdrs, body=reply)
+    end
+    return json_response(404, {"error": "not found", "path": req.path})
+  end
+
+  task serve_listener(self, listener: tcp_listener, max_requests: int = 0, ctx: any = nil): int
+    let handler = fn(req: HttpRequest, stream: tcp_stream) self.dispatch_http(req, stream) end
+    return serve_listener(listener, handler, max_requests, ctx)
+  end
+
+  task serve_http(self, addr: string, max_requests: int = 0, ctx: any = nil): int
+    let listener = tcp_listen(addr)
+    let n = self.serve_listener(listener, max_requests, ctx)
+    listener.close()
+    return n
+  end
+end
+
+export task call_http(addr: string, method: string, params: dict<string, any>, id: int = 1): dict<string, any>
+  let req_obj: dict<string, any> = {}
+  assign req_obj = req_obj.set("jsonrpc", "2.0").set("id", id).set("method", method).set("params", params)
+  let payload = json.stringify(req_obj)
+  let resp = post(addr, "/mcp", payload, "application/json", 5000)
+  return json.parse(resp.body)
+end

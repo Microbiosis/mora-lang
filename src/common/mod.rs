@@ -79,16 +79,34 @@ pub struct GenericParam {
     pub span: Span,
 }
 
-/// 枚举变体
+/// 枚举变体（支持无载荷与多载荷变体）
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnumVariant {
     pub name: String,
-    pub data: Option<String>,
+    pub payload_types: Vec<String>,
 }
 
-/// 结构体字段
+/// 结构体字段（支持默认值标记与编译期 `@tag(...)` 元数据）
 #[derive(Debug, Clone, PartialEq)]
 pub struct StructField {
     pub name: String,
     pub type_hint: String,
+    pub has_default: bool,
+    pub tags: Vec<(String, String)>,
+}
+
+/// 编译期结构体完整元信息（供 `Struct::schema()` / `std/json` / `std/mcp` 消费）
+#[derive(Debug, Clone, PartialEq)]
+pub struct StructDefInfo {
+    pub name: String,
+    pub type_params: Vec<String>,
+    pub fields: Vec<StructField>,
+}
+
+/// 编译期枚举完整元信息
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumDefInfo {
+    pub name: String,
+    pub type_params: Vec<String>,
+    pub variants: Vec<EnumVariant>,
 }

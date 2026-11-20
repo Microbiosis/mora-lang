@@ -87,6 +87,17 @@ const STATEMENT_CASES: &[(&str, &str, &str)] = &[
     ("worker_stmt", "worker w\n  1\nend\n", "OK:Nil"),
     ("transaction_stmt", "transaction\n  1\nend\n", "OK:Nil"),
     ("macro_stmt", "macro m(x)\n  x\nend\n", "OK:Nil"),
+    (
+        "trait_stmt",
+        "trait Greeter\n  task greet(self): string\nend\n",
+        "OK:Nil",
+    ),
+    (
+        "impl_stmt",
+        "trait Greeter\n  task greet(self): string\nend\nimpl Greeter for int\n  task greet(self): string\n    return \"hi\"\n  end\nend\n",
+        "OK:Nil",
+    ),
+    ("no_grad_stmt", "no_grad\n  1 + 2\nend\n", "OK:Int(3)"),
 ];
 
 /// spec §14.2 `expr` 的 10 种形式（BigInt / `p"..."` Prompt 字面量已在 v0.110.0 移除）。
@@ -196,48 +207,6 @@ fn question_operator_is_still_unimplemented() {
     );
 }
 
-// ─────────────────────────────────────────────────────────────────────
-// `trait` / `impl`：spec 有、运行期有、前端没有
-// ─────────────────────────────────────────────────────────────────────
-
-/// `trait_stmt` / `impl_stmt` 在 spec 的 EBNF 里（:1230-1231），
-/// §13.3 还有完整的 trait 检查规则（`T-TraitDispatch`）。运行期那一侧也齐全：
-/// `MirInst::TraitDef` / `ImplDef`、`Node::TraitDef` / `ImplDef`、
-/// `h_trait_def` / `h_impl_def` / `dispatch_trait_method` 全部存在并被派发。
-///
-/// **但前端从未写过**：实测 `src/lexer.rs` 的关键字表有 `fn`（:733）与
-/// `dyn`（:748），**没有 `trait`、没有 `impl`**；`src/parser_v3/**` 对
-/// `"trait"` / `"impl"` 的引用数为 **0**。全仓唯一「构造」
-/// `Node::TraitDef` 的地方是 `typeck/annotate.rs:335`，那是对**已有**节点
-/// 的重映射，不是来源。
-///
-/// 即：整条 trait 管线**端到端源码不可达**。`tests/mir_trait.rs` 从 v0.55 起
-/// 就在注释里绕开它（「parser 对 trait / impl / skill 的实际语法尚不完全」），
-/// 并改用 `task main` 验证「base 编译与执行链路」—— 也就是说该测试**并不
-/// 覆盖 trait 本身**。
-///
-/// **这不是「文档化了却坏掉」的缺陷，是一整项缺失的前端功能。** 补它要先定
-/// 语法（方法签名怎么写、泛型参数、`for` 关键字、默认方法体），属语言设计
-/// 决定，未擅自做。
-///
-/// 本测试记录当前状态：它断言的是「**确实不可达**」这一事实。将来实现了，
-/// 本测试会失败并提示把 trait/impl 用例补进 `STATEMENT_CASES`。
-#[test]
-fn trait_and_impl_are_source_unreachable() {
-    for src in [
-        "trait Greeter\n  fn greet(self) -> String\nend\n",
-        "impl Greeter for String\n  fn greet(self) -> String\n    \"hi\"\n  end\nend\n",
-    ] {
-        let got = pipe(src);
-        assert!(
-            got.starts_with("COMPILE-ERR"),
-            "trait/impl 目前前端不可达（lexer 无 `trait`/`impl` 关键字，parser_v3 零引用）。\
-             若已实现，请把 trait_stmt / impl_stmt 补进 STATEMENT_CASES 并删除本测试。\
-             实得（src={src:?}）：{got}"
-        );
-    }
-}
-
 /// v0.104.6 D41：spec §14.2 说**所有**块体都是 `{ statement }`，而
 /// `statement` 含 23 项产生式 —— 按字面读，**声明类语句也可以嵌套**在任何
 /// 块体里。实现只支持它们在**顶层**。
@@ -325,10 +294,12 @@ fn trait_machinery_exists_on_the_runtime_side() {
         "T".to_string(),
         TraitInfo {
             name: "T".to_string(),
+            type_params: Vec::new(),
             parents: Vec::new(),
             methods: vec![TraitMethodSig {
                 name: "m".to_string(),
                 has_self: true,
+                has_default: false,
                 params: Vec::new(),
                 return_type: None,
             }],

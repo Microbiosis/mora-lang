@@ -19,7 +19,7 @@ All notable changes to Mora will be documented in this file.
   - 核心运行时数值类型聚焦精确 `Int` (`i64`) 与 `Float` (`f64`)
   - 任意精度整数 `BigInt`（及 `999n` 核心字面量耦合）移出核心语言运行时，独立拆分至 workspace crate `mora-std-bigint`（对应标准库规划 `std/math/bigint`）
 - **保留的核心与内建模块集合**：
-  - 保留核心 FP 与元编程原语：`CoreClosure`、`CoreMacro`、`match ... with ... end`、`p"..."` 模板字符串、`tail` 尾递归、`merge_with` / `parallel` / `worker` / `transaction`、`Cons`/`car`/`cdr`、`atom`/`deref`/`swap`、`quote`/`read`/`eval`/`macroexpand`/`apply`/`into`/`curry`/`compose`/`partial`/`uncurry`
+  - 保留核心 FP 与元编程原语：`match ... with ... end`、`tail` 尾递归、`merge_with` / `parallel` / `worker` / `transaction`、`Cons`/`car`/`cdr`、`atom`/`deref`/`swap`、`quote`/`quasiquote`/`read`/`eval`/`macroexpand`/`apply`/`into`/`curry`/`compose`/`partial`/`uncurry`
   - 保留 Hindley-Milner 类型推导与代数效果（`effect` / `perform` / `handle`）
   - `value::MODULE_OBJECTS` 收敛为 7 个核心内建模块：`json`、`file`、`exec`、`math`、`stats`、`linalg`、`random`
 - **文档与测试套件同步**：
@@ -42,6 +42,7 @@ All notable changes to Mora will be documented in this file.
   - 彻底解散 `src/interpreter/` 目录与 `Interpreter` 门面：域函数与纯方法分派收敛至 `src/runtime/builtins/`，交互式 REPL 独立至 `src/cli/repl.rs`，同步迁移全仓 11 个集成测试文件
   - 端到端实现 Go 式并发原语：`Value::{Channel, TaskHandle, Context}`、`MoraChannel`（无缓冲 rendezvous 与有界 FIFO，`select_arms` 全局 ID 保序加锁公平多路选择）、`channel` / `context` / `sleep` 内建、上下文式 `spawn` / `select` (`case` / `timeout` / `default`) 语法及 `ControlInst::{Spawn, Select}`、`Type::{Channel, TaskHandle, Context}`（`Channel<T>` 严格不变、`TaskHandle<T>` 协变）与 HM 类型检查
   - 将 `src/lsp/providers/{hover,completion}.rs` 接入统一 HM 引擎 `typeck::check_mir::infer_program_types`，补齐 `RUNTIME_BUILTIN_NAMES`、`MODULE_OBJECTS` 与完整关键字清单，同步更新 `tests/lsp_hover_annotations.rs` 并保持显式类型标注与未解决回落 `<inferred>` 的诚实语义
+  - 暴露一等非阻塞异步 TCP 原语（`MoraTcpListener` / `MoraTcpStream`、`Value::{TcpListener, TcpStream}`、`Type::{TcpListener, TcpStream}`、`tcp_listen(addr)`、`tcp_connect(addr, timeout_ms?, ctx?)` 及 `.accept(ctx?)` / `.read` / `.read_bytes` / `.read_line` / `.write` / `.write_bytes` / `.shutdown` / `.close` / `.local_addr` / `.peer_addr`），支持 `TaskContext` 协作取消与 `channel<tcp_stream>`/`spawn`/`select` 组合（新增 `tests/w2_tcp_networking.rs`）
 
 ### Wave 3 Stage 3A 数值字面量精度、运算符完备性与统一 HM 约束求解器
 
@@ -69,6 +70,33 @@ All notable changes to Mora will be documented in this file.
   - 将 `src/runtime/builtins/exec.rs` 统一切换至 `tokio::process::Command` + `tokio::sync::Semaphore` + `tokio::task::JoinSet`（经 `AsyncIoReactor` 调度，彻底移除手工 `std::thread` 与自制 `Condvar` 信号量）
   - 在 `src/error.rs` 增加 `MoraError::Spanned`、`with_span`、`span`、`from_type_error` / `from_type_errors` 统一带 `Span` 诊断边界
   - 归档过时文档 `docs/nine-layer-ir.md -> docs/_archive/nine-layer-ir.md`，并同步修复 35 个 CLI 集成测试对新版启动横幅（`并发与抽象`）的 stderr 过滤规则
+
+### Wave 3 Stage 3C 名义类型、`trait`/`impl`、命名/默认参数、多维切片与反向自动微分
+
+- **名义 `struct` / `enum` / `@tag` 与类型化模式匹配**：
+  - 支持带默认值与 `@tag(key="val")` 元数据的 `struct`、泛型 `enum` 多载荷变体、`Struct::new`/`from_dict`/`schema`/`tags`/`fields`、`Enum::variants()`、`to_dict()` / `json()`（含 `omitempty`、字段重命名、`-` 跳过）以及 `Struct { ... }` / `Enum::Variant(...)` 解构匹配与静态校验。
+- **源码级 `trait` / `impl` / `dyn Trait`**：
+  - 前端、`ControlProgram` IR（`RegisterTrait`/`RegisterImpl`）与 HM 求解器打通 `trait Name<T>: Parent ... end`（含默认方法与超特征环检测）、`impl Trait for Target` / 固有 `impl Target`（含内建类型扩展）及 `dyn Trait` 强制转换静态实现校验。
+- **Python 式默认参数与命名关键字参数**：
+  - `task`、闭包、`impl` 方法、结构体构造与 `Tensor::*` 构造器支持 `name=expr` 关键字参数与默认参数惰性求值（`ControlInst::IsMissingArg`），编译期与 HM 求解器同步校验未知关键字、重复参数与缺失必选参数。
+- **多维零拷贝 `TensorSlice` 与反向自动微分 `grad` / `value_and_grad` / `no_grad`**：
+  - 支持 `t[0..2, :, -1]`、`t[..., None]`、`t[::-1]` 零拷贝步幅切片与静态形状/步长校验。
+  - 新增 `src/runtime/autograd.rs`（`AutogradContext` / `AutogradTape` Wengert 反向 VJP 引擎），端到端支持标量与 Tensor 反向微分、`argnums` 与 `no_grad ... end` 上下文隔离，并在 HM 求解器静态禁止对含 `tensor_mutate` 原地变更或非浮点签名函数求导（新增 `tests/stage3c_traits_structs_slices_autograd.rs`）。
+- **规范与测试收口**：
+  - 同步 `docs/mora-spec.md` §14.2 EBNF 至 Wave 2/3C/4 全量正式文法（含 `struct`/`enum`/`@tag`、`trait`/`impl`、`select`/`spawn`、`no_grad`、`tensor_slice`、默认与命名参数及变体/结构体模式），清零 `tests/spec_ebnf_census.rs` 中 `EXPECTED_UNPARSEABLE` 豁免列表，并清理 `src/mir/hint.rs`、`README.md`、`CHANGELOG.md` 遗留表述。
+
+### Wave 4 AI 原生计算图、显存页调度、纯 Mora HTTP/MCP 标准库与 `mora build` 单二进制
+
+- **原生 `TensorComputeDag`、算子融合、`DeviceBackend` 与前向 `jvp`（`tests/w4_compute_dag_jvp_fusion.rs`）**：
+  - 新增 `src/runtime/compute_dag.rs`：`DeviceBackend`（`CpuDeviceBackend` + 多设备模拟后端）、`TensorComputeDag` 图捕获（`trace_dag`）、`FusedLinearAct`（`MatMul + BiasAdd + Act`）与 `FusedElementwise` 算子融合及 DCE、`run()` 执行与 `to_dot()` 导出。
+  - 在 `src/runtime/autograd.rs` 补齐前向模式雅可比向量积 `AutogradTape::forward_jvp` 与一等内建 `jvp(f, primals, tangents)`（支持异构参数列表及标量/张量静态校验）。
+- **动态显存 KV-Cache 资源调度 `KVPageAllocator`（`tests/w4_kv_cache_allocator.rs`）**：
+  - 新增 `src/runtime/kv_cache.rs`：实现基于 64 字节对齐紧凑物理页池的 `kv_allocator(total_pages, page_tokens, num_heads, head_dim, dtype?, device?)`，支持 `alloc_seq`/`append_tokens`/零拷贝 `fork_seq` + 写时复制（CoW）分裂/`write_kv`/`read_kv`/`free_seq`/`evict_lru`/`stats`/`utilization`/`bytes_used`。
+- **纯 Mora `std/net/http`（含 SSE）与 `std/mcp` 标准库（`tests/w4_std_http_and_mcp.rs`）**：
+  - 升级 `src/typeck/imports.rs` 支持跨模块 `export` `struct`/`enum`/`trait`/`impl`/参数规范与菱形缓存传播，并在 `src/parser_v3/emit.rs` 预扫描导入名义类型，内嵌 `std/net/http.mora`（HTTP/1.1 服务端/路由/客户端 + SSE）与 `std/mcp.mora`（MCP JSON-RPC 2.0 + HTTP/SSE）。
+  - 修复 `src/typeck/hm/infer.rs` 中开放元变量与 `nil` 判等（`x == nil` / `x != nil`）错误坍缩为 `Type::Nil` 的边界问题。
+- **`mora build` 单二进制静态交付（`tests/w4_mora_build_single_binary.rs`）**：
+  - 新增 `src/cli/bundle.rs` 与 `mora build <file.mora> [-o <output>]`：编译期完成传递 `import` 闭包打包、HM 全量静态检查与 SSA 优化，生成带 `MORABUNDLE01` 校验尾部的独立单二进制可执行程序。
 
 ## [Unreleased] — 历史提交记录（`Int` 语义统一 + D468–D491）
 

@@ -180,6 +180,7 @@ fn dummy_program(
             name: None,
             kind: FunctionKind::Main,
             params: Vec::new(),
+            param_has_default: Vec::new(),
             upvalues: Vec::new(),
             shared_locals: Vec::new(),
             local_names: Vec::new(),

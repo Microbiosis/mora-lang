@@ -15,17 +15,18 @@ use std::collections::{HashMap, HashSet};
 use crate::common::Literal;
 use crate::error::{MoraError, MoraResult};
 use crate::mir::witness::{
-    BuiltinOp, MirWitness, WitnessCallee, WitnessKind, WitnessPattern, WitnessSelectArm,
-    WitnessSpawnTarget,
+    BuiltinOp, MirWitness, WitnessCallee, WitnessKind, WitnessParam, WitnessPattern,
+    WitnessSelectArm, WitnessSliceAxis, WitnessSpawnTarget,
 };
 use crate::value::BuiltinKind;
 
 use super::ir::{
     BasicBlock, BlockId, BuiltinFnId, CalleeTarget, CaptureSource, CompiledPattern, ControlConst,
-    ControlFunction, ControlInst, ControlProgram, ControlQqSegment, ControlSelectArm,
-    ControlSpawnTarget, ControlTerminator, FnId, FunctionKind, GlobalKind, GlobalMeta, GlobalSlot,
-    LocalSlot, ParallelSegment, PatternTarget, SymId, SymbolTable, UnaryOp, UpvalueDesc,
-    UpvalueSlot, VReg, verify_program,
+    ControlFunction, ControlImplMethod, ControlInst, ControlProgram, ControlQqSegment,
+    ControlSelectArm, ControlSliceAxis, ControlSpawnTarget, ControlStructField, ControlTerminator,
+    ControlTraitMethod, FnId, FunctionKind, GlobalKind, GlobalMeta, GlobalSlot, LocalSlot,
+    ParallelSegment, PatternTarget, SymId, SymbolTable, UnaryOp, UpvalueDesc, UpvalueSlot, VReg,
+    verify_program,
 };
 
 /// Outcome of lowering a statement/expression inside the current basic block.
@@ -53,6 +54,9 @@ struct ProgramLowerer {
     /// `(parent_fn, child_fn)` edges recorded to propagate `shared = true` flags
     /// uniformly after all functions finish lowering.
     parent_edges: Vec<(FnId, FnId)>,
+    /// Stage 3C: Parameter signature `(name, has_default)` of pre-scanned top-level tasks
+    /// for compile-time static keyword reordering and default argument slot filling.
+    task_param_specs: HashMap<FnId, Vec<(String, bool)>>,
 }
 
 impl ProgramLowerer {
@@ -64,6 +68,7 @@ impl ProgramLowerer {
             global_by_name: HashMap::new(),
             dyn_names: dyn_names.iter().cloned().collect(),
             parent_edges: Vec::new(),
+            task_param_specs: HashMap::new(),
         }
     }
 
@@ -78,6 +83,7 @@ impl ProgramLowerer {
             name: None,
             kind: FunctionKind::Closure,
             params: Vec::new(),
+            param_has_default: Vec::new(),
             upvalues: Vec::new(),
             shared_locals: Vec::new(),
             local_names: Vec::new(),
@@ -121,13 +127,23 @@ impl ProgramLowerer {
 
     fn pre_scan_stmt(&mut self, w: &MirWitness) {
         match &w.kind {
-            WitnessKind::FnDef { name, .. } => {
+            WitnessKind::FnDef { name, params, .. } => {
                 if let Some(&existing) = self.global_by_name.get(name)
-                    && let GlobalKind::Task(_) = self.globals[existing.0 as usize].kind
+                    && let GlobalKind::Task(fn_id) = self.globals[existing.0 as usize].kind
                 {
+                    let specs = params
+                        .iter()
+                        .map(|p| (p.name.clone(), p.default.is_some()))
+                        .collect();
+                    self.task_param_specs.insert(fn_id, specs);
                     return;
                 }
                 let fn_id = self.reserve_fn();
+                let specs = params
+                    .iter()
+                    .map(|p| (p.name.clone(), p.default.is_some()))
+                    .collect();
+                self.task_param_specs.insert(fn_id, specs);
                 self.alloc_global(name, GlobalKind::Task(fn_id));
             }
             WitnessKind::MacroDef { name, .. } => {
@@ -144,6 +160,9 @@ impl ProgramLowerer {
             }
             WitnessKind::StructDef { name, .. } => {
                 self.alloc_global(name, GlobalKind::Struct);
+            }
+            WitnessKind::TraitDef { name, .. } => {
+                self.alloc_global(name, GlobalKind::Trait);
             }
             WitnessKind::TypeAlias { name, .. } => {
                 self.alloc_global(name, GlobalKind::TypeAlias);
@@ -255,6 +274,7 @@ struct FuncScope {
     kind: FunctionKind,
     name_sym: Option<SymId>,
     param_syms: Vec<SymId>,
+    param_has_default: Vec<bool>,
     blocks: Vec<BasicBlock>,
     cur_bb: BlockId,
     next_reg: u32,
@@ -289,6 +309,7 @@ impl FuncScope {
             kind,
             name_sym,
             param_syms: Vec::with_capacity(params.len()),
+            param_has_default: vec![false; params.len()],
             blocks: vec![BasicBlock {
                 id: BlockId(0),
                 params: Vec::new(),
@@ -426,6 +447,7 @@ impl FuncScope {
             name: self.name_sym,
             kind: self.kind,
             params: self.param_syms,
+            param_has_default: self.param_has_default,
             upvalues: self.upvalues,
             shared_locals: self.shared_locals,
             local_names: self.local_names.clone(),
@@ -664,16 +686,17 @@ impl ScopeStack {
         dst
     }
 
-    /// Lower a nested callable (`FnDef`, `Closure`, `HandleBody`, `HandleHandler`,
-    /// `TransactionBody`, `TransactionComp`, `Worker`, `ParallelSeq`).
+    /// Lower a nested callable whose parameters may carry default initializer expressions.
+    /// Emits `IsMissingArg` entry prologue branches so omitted/named-arg defaults evaluate
+    /// lazily in the callee's own lexical scope.
     #[allow(clippy::too_many_arguments)]
-    fn lower_child_fn(
+    fn lower_child_fn_with_params(
         &mut self,
         prog: &mut ProgramLowerer,
         existing_fn_id: Option<FnId>,
         kind: FunctionKind,
         name: Option<&str>,
-        params: &[String],
+        params: &[WitnessParam],
         body: &MirWitness,
         handler_setup: Option<(&str, usize)>,
         capture_parent: bool,
@@ -684,7 +707,9 @@ impl ScopeStack {
         };
         let parent_id = self.current_mut().fn_id;
         let name_sym = name.map(|n| prog.intern(n));
-        let mut child = FuncScope::new(fn_id, kind, name_sym, params, prog);
+        let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
+        let mut child = FuncScope::new(fn_id, kind, name_sym, &param_names, prog);
+        child.param_has_default = params.iter().map(|p| p.default.is_some()).collect();
 
         if let Some((k_param, arg_count)) = handler_setup {
             let arg_slots: Vec<Option<LocalSlot>> = (0..arg_count)
@@ -701,11 +726,48 @@ impl ScopeStack {
             }
         }
 
+        let emit_default_prologue = |stack: &mut ScopeStack,
+                                     prog: &mut ProgramLowerer|
+         -> MoraResult<bool> {
+            for (idx, wp) in params.iter().enumerate() {
+                if let Some(default_w) = &wp.default {
+                    let slot = LocalSlot(idx as u16);
+                    let is_missing = stack.current_mut().alloc_reg();
+                    stack
+                        .current_mut()
+                        .emit(ControlInst::IsMissingArg(is_missing, slot));
+                    let (eval_bb, _) = stack.current_mut().new_block(0);
+                    let (cont_bb, _) = stack.current_mut().new_block(0);
+                    stack.current_mut().terminate(ControlTerminator::Branch {
+                        cond: is_missing,
+                        then_bb: eval_bb,
+                        then_args: Vec::new(),
+                        else_bb: cont_bb,
+                        else_args: Vec::new(),
+                    });
+                    stack.current_mut().switch_to(eval_bb);
+                    if let FlowState::Active(def_reg) = lower_expr(stack, prog, default_w, false)? {
+                        stack
+                            .current_mut()
+                            .emit(ControlInst::StoreLocal(slot, def_reg));
+                        stack.current_mut().terminate(ControlTerminator::Jump {
+                            target: cont_bb,
+                            args: Vec::new(),
+                        });
+                    }
+                    stack.current_mut().switch_to(cont_bb);
+                }
+            }
+            Ok(true)
+        };
+
         if !capture_parent {
-            // Top-level `task` / `macro`: runs in a clean top-level scope stack (can read globals,
-            // cannot capture `<main>` locals). Temporarily swap `self.frames` with just `[child]`.
             let saved = std::mem::take(&mut self.frames);
             self.frames.push(child);
+            if let Err(e) = emit_default_prologue(self, prog) {
+                self.frames = saved;
+                return Err(e);
+            }
             match lower_expr(self, prog, body, true) {
                 Ok(FlowState::Active(r)) => self
                     .current_mut()
@@ -723,6 +785,10 @@ impl ScopeStack {
         }
 
         self.frames.push(child);
+        if let Err(e) = emit_default_prologue(self, prog) {
+            self.frames.pop();
+            return Err(e);
+        }
         match lower_expr(self, prog, body, true) {
             Ok(FlowState::Active(r)) => self
                 .current_mut()
@@ -738,6 +804,39 @@ impl ScopeStack {
         prog.functions[fn_id.0 as usize] = finished.finish();
         prog.parent_edges.push((parent_id, fn_id));
         Ok((fn_id, captures))
+    }
+
+    /// Lower a nested callable with plain parameter names (no defaults).
+    #[allow(clippy::too_many_arguments)]
+    fn lower_child_fn(
+        &mut self,
+        prog: &mut ProgramLowerer,
+        existing_fn_id: Option<FnId>,
+        kind: FunctionKind,
+        name: Option<&str>,
+        params: &[String],
+        body: &MirWitness,
+        handler_setup: Option<(&str, usize)>,
+        capture_parent: bool,
+    ) -> MoraResult<(FnId, Vec<CaptureSource>)> {
+        let wparams: Vec<WitnessParam> = params
+            .iter()
+            .map(|n| WitnessParam {
+                name: n.clone(),
+                type_hint: None,
+                default: None,
+            })
+            .collect();
+        self.lower_child_fn_with_params(
+            prog,
+            existing_fn_id,
+            kind,
+            name,
+            &wparams,
+            body,
+            handler_setup,
+            capture_parent,
+        )
     }
 }
 
@@ -792,7 +891,11 @@ fn is_empty_or_nil(w: &MirWitness) -> bool {
 fn uses_identifier(w: &MirWitness, target: &str) -> bool {
     match &w.kind {
         WitnessKind::Variable(name) => name == target,
-        WitnessKind::Call { callee, args } => {
+        WitnessKind::Call {
+            callee,
+            args,
+            named_args,
+        } => {
             let hit = match callee {
                 WitnessCallee::Name(n) | WitnessCallee::Var(n) => n == target,
                 WitnessCallee::Method(obj, _) => obj == target,
@@ -800,6 +903,7 @@ fn uses_identifier(w: &MirWitness, target: &str) -> bool {
                 WitnessCallee::Builtin(_) => false,
             };
             hit || args.iter().any(|a| uses_identifier(a, target))
+                || named_args.iter().any(|(_, a)| uses_identifier(a, target))
         }
         WitnessKind::Assign { target: t, value } => t == target || uses_identifier(value, target),
         WitnessKind::Closure { params, body, .. } => {
@@ -961,6 +1065,26 @@ fn compile_pattern(
             ty_name: name.clone(),
             inner: Box::new(compile_pattern(stack, prog, pattern)),
         },
+        WitnessPattern::Variant {
+            enum_name,
+            variant,
+            fields,
+        } => CompiledPattern::Variant {
+            enum_name: enum_name.clone(),
+            variant: variant.clone(),
+            fields: fields
+                .iter()
+                .map(|p| compile_pattern(stack, prog, p))
+                .collect(),
+        },
+        WitnessPattern::Struct { name, fields, rest } => CompiledPattern::Struct {
+            name: name.clone(),
+            fields: fields
+                .iter()
+                .map(|(k, p)| (k.clone(), compile_pattern(stack, prog, p)))
+                .collect(),
+            rest: *rest,
+        },
     }
 }
 
@@ -1010,10 +1134,12 @@ fn lower_expr_chain(
             kind: BuiltinKind,
             method: &'w str,
             arg_count: usize,
+            named_keys: Vec<&'w str>,
         },
         EmitMethodCall {
             method: &'w str,
             arg_count: usize,
+            named_keys: Vec<&'w str>,
         },
         StartShortCircuit {
             right: &'w MirWitness,
@@ -1057,14 +1183,16 @@ fn lower_expr_chain(
                 WitnessKind::Call {
                     callee: WitnessCallee::Builtin(BuiltinOp::Neg),
                     args,
-                } if args.len() == 1 => {
+                    named_args,
+                } if args.len() == 1 && named_args.is_empty() => {
                     tasks.push(ChainTask::EmitUnary { op: UnaryOp::Neg });
                     tasks.push(ChainTask::Eval(&args[0]));
                 }
                 WitnessKind::Call {
                     callee: WitnessCallee::Builtin(BuiltinOp::Not),
                     args,
-                } if args.len() == 1 => {
+                    named_args,
+                } if args.len() == 1 && named_args.is_empty() => {
                     tasks.push(ChainTask::EmitUnary { op: UnaryOp::Not });
                     tasks.push(ChainTask::Eval(&args[0]));
                 }
@@ -1098,7 +1226,10 @@ fn lower_expr_chain(
                     receiver,
                     method,
                     args,
+                    named_args,
                 } => {
+                    let named_keys: Vec<&str> =
+                        named_args.iter().map(|(k, _)| k.as_str()).collect();
                     if let WitnessKind::Variable(mod_name) = &receiver.kind
                         && stack.resolve_binding(prog, mod_name, false).is_none()
                         && let Some(kind) = module_object_by_name(mod_name)
@@ -1107,7 +1238,11 @@ fn lower_expr_chain(
                             kind,
                             method,
                             arg_count: args.len(),
+                            named_keys,
                         });
+                        for (_, v) in named_args.iter().rev() {
+                            tasks.push(ChainTask::Eval(v));
+                        }
                         for a in args.iter().rev() {
                             tasks.push(ChainTask::Eval(a));
                         }
@@ -1115,7 +1250,11 @@ fn lower_expr_chain(
                         tasks.push(ChainTask::EmitMethodCall {
                             method,
                             arg_count: args.len(),
+                            named_keys,
                         });
+                        for (_, v) in named_args.iter().rev() {
+                            tasks.push(ChainTask::Eval(v));
+                        }
                         for a in args.iter().rev() {
                             tasks.push(ChainTask::Eval(a));
                         }
@@ -1159,7 +1298,15 @@ fn lower_expr_chain(
                 kind,
                 method,
                 arg_count,
+                named_keys,
             } => {
+                let named_start = vals.len() - named_keys.len();
+                let named_vals: Vec<VReg> = vals.drain(named_start..).collect();
+                let named_args: Vec<(SymId, VReg)> = named_keys
+                    .into_iter()
+                    .zip(named_vals)
+                    .map(|(k, r)| (prog.intern(k), r))
+                    .collect();
                 let start = vals.len() - arg_count;
                 let arg_regs: Vec<VReg> = vals.drain(start..).collect();
                 let dst = stack.current_mut().alloc_reg();
@@ -1169,10 +1316,22 @@ fn lower_expr_chain(
                     module: kind,
                     method: method_sym,
                     args: arg_regs,
+                    named_args,
                 });
                 vals.push(dst);
             }
-            ChainTask::EmitMethodCall { method, arg_count } => {
+            ChainTask::EmitMethodCall {
+                method,
+                arg_count,
+                named_keys,
+            } => {
+                let named_start = vals.len() - named_keys.len();
+                let named_vals: Vec<VReg> = vals.drain(named_start..).collect();
+                let named_args: Vec<(SymId, VReg)> = named_keys
+                    .into_iter()
+                    .zip(named_vals)
+                    .map(|(k, r)| (prog.intern(k), r))
+                    .collect();
                 let start = vals.len() - arg_count;
                 let arg_regs: Vec<VReg> = vals.drain(start..).collect();
                 let recv_reg = vals.pop().expect("method receiver reg present");
@@ -1183,6 +1342,7 @@ fn lower_expr_chain(
                     receiver: recv_reg,
                     method: method_sym,
                     args: arg_regs,
+                    named_args,
                 });
                 vals.push(dst);
             }
@@ -1269,7 +1429,8 @@ fn lower_expr(
         WitnessKind::Call {
             callee: WitnessCallee::Builtin(BuiltinOp::Neg | BuiltinOp::Not),
             args,
-        } if args.len() == 1
+            named_args,
+        } if args.len() == 1 && named_args.is_empty()
     ) {
         return lower_expr_chain(stack, prog, w);
     }
@@ -1381,16 +1542,19 @@ fn lower_expr_single(
             Ok(FlowState::Active(dst))
         }
 
-        WitnessKind::Call { callee, args } => lower_call(stack, prog, callee, args, in_tail),
+        WitnessKind::Call {
+            callee,
+            args,
+            named_args,
+        } => lower_call(stack, prog, callee, args, named_args, in_tail),
 
         WitnessKind::Closure { params, body, .. } => {
-            let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
-            let (fn_id, captures) = stack.lower_child_fn(
+            let (fn_id, captures) = stack.lower_child_fn_with_params(
                 prog,
                 None,
                 FunctionKind::Closure,
                 None,
-                &param_names,
+                params,
                 body,
                 None,
                 true,
@@ -1420,12 +1584,19 @@ fn lower_expr_single(
                     GlobalKind::Task(id) => Some(id),
                     _ => None,
                 };
-                let (fn_id, _) = stack.lower_child_fn(
+                if let Some(id) = existing_id {
+                    let specs = params
+                        .iter()
+                        .map(|p| (p.name.clone(), p.default.is_some()))
+                        .collect();
+                    prog.task_param_specs.insert(id, specs);
+                }
+                let (fn_id, _) = stack.lower_child_fn_with_params(
                     prog,
                     existing_id,
                     FunctionKind::Task,
                     Some(name),
-                    &param_names,
+                    params,
                     body,
                     None,
                     false,
@@ -1441,12 +1612,12 @@ fn lower_expr_single(
                 Ok(FlowState::Active(stack.current_mut().emit_nil()))
             } else {
                 // Nested `task` inside another function behaves like a captured local binding.
-                let (fn_id, captures) = stack.lower_child_fn(
+                let (fn_id, captures) = stack.lower_child_fn_with_params(
                     prog,
                     None,
                     FunctionKind::Closure,
                     Some(name),
-                    &param_names,
+                    params,
                     body,
                     None,
                     true,
@@ -1672,9 +1843,24 @@ fn lower_expr_single(
             Ok(FlowState::Active(stack.current_mut().emit_nil()))
         }
 
-        WitnessKind::EnumDef { name, variants } => {
+        WitnessKind::EnumDef {
+            name,
+            type_params,
+            variants,
+        } => {
             let sym = prog.intern(name);
-            let vsyms = variants.iter().map(|v| prog.intern(v)).collect();
+            let tp_syms = type_params.iter().map(|t| prog.intern(t)).collect();
+            let vdescs = variants
+                .iter()
+                .map(|v| {
+                    let payload_names = v
+                        .payload_types
+                        .iter()
+                        .map(|h| h.to_type().name().to_string())
+                        .collect();
+                    (prog.intern(&v.name), payload_names)
+                })
+                .collect();
             let slot = if stack.current_mut().kind == FunctionKind::Main {
                 Some(prog.alloc_global(name, GlobalKind::Enum))
             } else {
@@ -1682,18 +1868,44 @@ fn lower_expr_single(
             };
             stack.current_mut().emit(ControlInst::RegisterEnum {
                 name: sym,
-                variants: vsyms,
+                type_params: tp_syms,
+                variants: vdescs,
                 dst: slot,
             });
             Ok(FlowState::Active(stack.current_mut().emit_nil()))
         }
 
-        WitnessKind::StructDef { name, fields } => {
+        WitnessKind::StructDef {
+            name,
+            type_params,
+            fields,
+        } => {
             let sym = prog.intern(name);
-            let field_descs = fields
-                .iter()
-                .map(|(fname, hint)| (prog.intern(fname), hint.to_type().name().to_string()))
-                .collect();
+            let tp_syms = type_params.iter().map(|t| prog.intern(t)).collect();
+            let mut field_descs = Vec::with_capacity(fields.len());
+            for f in fields {
+                let default_fn = if let Some(def_w) = &f.default {
+                    let (df_id, _) = stack.lower_child_fn(
+                        prog,
+                        None,
+                        FunctionKind::DefaultArg,
+                        Some(&format!("{name}::default_{}", f.name)),
+                        &[],
+                        def_w,
+                        None,
+                        false,
+                    )?;
+                    Some(df_id)
+                } else {
+                    None
+                };
+                field_descs.push(ControlStructField {
+                    name: prog.intern(&f.name),
+                    type_name: f.type_hint.to_type().name().to_string(),
+                    default_fn,
+                    tags: f.tags.clone(),
+                });
+            }
             let slot = if stack.current_mut().kind == FunctionKind::Main {
                 Some(prog.alloc_global(name, GlobalKind::Struct))
             } else {
@@ -1701,10 +1913,192 @@ fn lower_expr_single(
             };
             stack.current_mut().emit(ControlInst::RegisterStruct {
                 name: sym,
+                type_params: tp_syms,
                 fields: field_descs,
                 dst: slot,
             });
             Ok(FlowState::Active(stack.current_mut().emit_nil()))
+        }
+
+        WitnessKind::TraitDef {
+            name,
+            type_params,
+            parents,
+            methods,
+        } => {
+            let sym = prog.intern(name);
+            let tp_syms = type_params.iter().map(|t| prog.intern(t)).collect();
+            let parent_syms = parents.iter().map(|p| prog.intern(p)).collect();
+            let mut compiled_methods = Vec::with_capacity(methods.len());
+            for m in methods {
+                let default_fn = if let Some(body_w) = &m.default_body {
+                    let (df_id, _) = stack.lower_child_fn_with_params(
+                        prog,
+                        None,
+                        FunctionKind::TraitDefault,
+                        Some(&format!("{name}::{}", m.name)),
+                        &m.params,
+                        body_w,
+                        None,
+                        false,
+                    )?;
+                    Some(df_id)
+                } else {
+                    None
+                };
+                let params = m
+                    .params
+                    .iter()
+                    .map(|p| {
+                        (
+                            prog.intern(&p.name),
+                            p.type_hint.as_ref().map(|h| h.to_type().name()),
+                        )
+                    })
+                    .collect();
+                compiled_methods.push(ControlTraitMethod {
+                    name: prog.intern(&m.name),
+                    params,
+                    return_type: m.return_type.as_ref().map(|h| h.to_type().name()),
+                    has_self: m.has_self,
+                    default_fn,
+                });
+            }
+            let slot = if stack.current_mut().kind == FunctionKind::Main {
+                Some(prog.alloc_global(name, GlobalKind::Trait))
+            } else {
+                None
+            };
+            stack.current_mut().emit(ControlInst::RegisterTrait {
+                name: sym,
+                type_params: tp_syms,
+                parents: parent_syms,
+                methods: compiled_methods,
+                dst: slot,
+            });
+            Ok(FlowState::Active(stack.current_mut().emit_nil()))
+        }
+
+        WitnessKind::ImplDef {
+            trait_name,
+            trait_generics,
+            target_type,
+            target_generics,
+            methods,
+            ..
+        } => {
+            let trait_sym = trait_name.as_ref().map(|t| prog.intern(t));
+            let target_sym = prog.intern(target_type);
+            let t_gens: Vec<String> = trait_generics.iter().map(|g| g.to_type().name()).collect();
+            let tgt_gens: Vec<String> =
+                target_generics.iter().map(|g| g.to_type().name()).collect();
+            let mut compiled_methods = Vec::with_capacity(methods.len());
+            for m in methods {
+                let label = match trait_name {
+                    Some(tr) => format!("impl<{tr} for {target_type}>::{}", m.name),
+                    None => format!("impl<{target_type}>::{}", m.name),
+                };
+                let (fn_id, _) = stack.lower_child_fn_with_params(
+                    prog,
+                    None,
+                    FunctionKind::ImplMethod,
+                    Some(&label),
+                    &m.params,
+                    &m.body,
+                    None,
+                    false,
+                )?;
+                compiled_methods.push(ControlImplMethod {
+                    name: prog.intern(&m.name),
+                    fn_id,
+                    has_self: m.has_self,
+                });
+            }
+            stack.current_mut().emit(ControlInst::RegisterImpl {
+                trait_name: trait_sym,
+                trait_generics: t_gens,
+                target_type: target_sym,
+                target_generics: tgt_gens,
+                methods: compiled_methods,
+            });
+            Ok(FlowState::Active(stack.current_mut().emit_nil()))
+        }
+
+        WitnessKind::TensorSlice { target, axes } => {
+            let tgt_reg = match lower_expr(stack, prog, target, false)? {
+                FlowState::Active(r) => r,
+                FlowState::Terminated => return Ok(FlowState::Terminated),
+            };
+            let mut compiled_axes = Vec::with_capacity(axes.len());
+            for ax in axes {
+                let c_ax = match ax {
+                    WitnessSliceAxis::Index(e) => match lower_expr(stack, prog, e, false)? {
+                        FlowState::Active(r) => ControlSliceAxis::Index(r),
+                        FlowState::Terminated => return Ok(FlowState::Terminated),
+                    },
+                    WitnessSliceAxis::Range { start, stop, step } => {
+                        let s_r = if let Some(e) = start {
+                            match lower_expr(stack, prog, e, false)? {
+                                FlowState::Active(r) => Some(r),
+                                FlowState::Terminated => return Ok(FlowState::Terminated),
+                            }
+                        } else {
+                            None
+                        };
+                        let e_r = if let Some(e) = stop {
+                            match lower_expr(stack, prog, e, false)? {
+                                FlowState::Active(r) => Some(r),
+                                FlowState::Terminated => return Ok(FlowState::Terminated),
+                            }
+                        } else {
+                            None
+                        };
+                        let st_r = if let Some(e) = step {
+                            match lower_expr(stack, prog, e, false)? {
+                                FlowState::Active(r) => Some(r),
+                                FlowState::Terminated => return Ok(FlowState::Terminated),
+                            }
+                        } else {
+                            None
+                        };
+                        ControlSliceAxis::Range {
+                            start: s_r,
+                            stop: e_r,
+                            step: st_r,
+                        }
+                    }
+                    WitnessSliceAxis::Ellipsis => ControlSliceAxis::Ellipsis,
+                    WitnessSliceAxis::NewAxis => ControlSliceAxis::NewAxis,
+                };
+                compiled_axes.push(c_ax);
+            }
+            let dst = stack.current_mut().alloc_reg();
+            stack.current_mut().emit(ControlInst::TensorSlice {
+                dst,
+                target: tgt_reg,
+                axes: compiled_axes,
+            });
+            Ok(FlowState::Active(dst))
+        }
+
+        WitnessKind::NoGrad { body } => {
+            let (body_fn, body_captures) = stack.lower_child_fn(
+                prog,
+                None,
+                FunctionKind::NoGradBody,
+                None,
+                &[],
+                body,
+                None,
+                true,
+            )?;
+            let dst = stack.current_mut().alloc_reg();
+            stack.current_mut().emit(ControlInst::NoGrad {
+                dst,
+                body_fn,
+                body_captures,
+            });
+            Ok(FlowState::Active(dst))
         }
 
         WitnessKind::MacroDef { name, params, body } => {
@@ -1946,6 +2340,7 @@ fn lower_spawn(
             receiver,
             method,
             args,
+            named_args,
         } => {
             let recv_reg = match lower_expr(stack, prog, receiver, false)? {
                 FlowState::Active(r) => r,
@@ -1958,13 +2353,25 @@ fn lower_spawn(
                     FlowState::Terminated => return Ok(FlowState::Terminated),
                 }
             }
+            let mut named_regs = Vec::with_capacity(named_args.len());
+            for (k, v) in named_args {
+                match lower_expr(stack, prog, v, false)? {
+                    FlowState::Active(r) => named_regs.push((prog.intern(k), r)),
+                    FlowState::Terminated => return Ok(FlowState::Terminated),
+                }
+            }
             ControlSpawnTarget::MethodCall {
                 receiver: recv_reg,
                 method: prog.intern(method),
                 args: arg_regs,
+                named_args: named_regs,
             }
         }
-        WitnessSpawnTarget::Call { callee, args } => {
+        WitnessSpawnTarget::Call {
+            callee,
+            args,
+            named_args,
+        } => {
             if let WitnessCallee::Method(obj, method) = callee {
                 let recv_reg = if args.is_empty() {
                     stack.emit_read_var(prog, obj)
@@ -1982,10 +2389,18 @@ fn lower_spawn(
                         FlowState::Terminated => return Ok(FlowState::Terminated),
                     }
                 }
+                let mut named_regs = Vec::with_capacity(named_args.len());
+                for (k, v) in named_args {
+                    match lower_expr(stack, prog, v, false)? {
+                        FlowState::Active(r) => named_regs.push((prog.intern(k), r)),
+                        FlowState::Terminated => return Ok(FlowState::Terminated),
+                    }
+                }
                 ControlSpawnTarget::MethodCall {
                     receiver: recv_reg,
                     method: prog.intern(method),
                     args: arg_regs,
+                    named_args: named_regs,
                 }
             } else {
                 let Some(resolved) = resolve_callee_target(stack, prog, callee)? else {
@@ -2003,9 +2418,17 @@ fn lower_spawn(
                         FlowState::Terminated => return Ok(FlowState::Terminated),
                     }
                 }
+                let mut named_regs = Vec::with_capacity(named_args.len());
+                for (k, v) in named_args {
+                    match lower_expr(stack, prog, v, false)? {
+                        FlowState::Active(r) => named_regs.push((prog.intern(k), r)),
+                        FlowState::Terminated => return Ok(FlowState::Terminated),
+                    }
+                }
                 ControlSpawnTarget::Call {
                     target: ct,
                     args: arg_regs,
+                    named_args: named_regs,
                 }
             }
         }
@@ -2139,11 +2562,13 @@ fn lower_call(
     prog: &mut ProgramLowerer,
     callee: &WitnessCallee,
     args: &[MirWitness],
+    named_args: &[(String, MirWitness)],
     in_tail: bool,
 ) -> MoraResult<FlowState> {
     // Handle `[]` index expression encoded by parser.
     if matches!(callee, WitnessCallee::Name(n) | WitnessCallee::Var(n) if n == "[]")
         && args.len() == 2
+        && named_args.is_empty()
     {
         let obj = match lower_expr(stack, prog, &args[0], false)? {
             FlowState::Active(r) => r,
@@ -2177,6 +2602,13 @@ fn lower_call(
                 FlowState::Terminated => return Ok(FlowState::Terminated),
             }
         }
+        let mut named_regs = Vec::with_capacity(named_args.len());
+        for (k, v) in named_args {
+            match lower_expr(stack, prog, v, false)? {
+                FlowState::Active(r) => named_regs.push((prog.intern(k), r)),
+                FlowState::Terminated => return Ok(FlowState::Terminated),
+            }
+        }
         let dst = stack.current_mut().alloc_reg();
         let method_sym = prog.intern(method);
         stack.current_mut().emit(ControlInst::MethodCall {
@@ -2184,6 +2616,7 @@ fn lower_call(
             receiver: recv_reg,
             method: method_sym,
             args: arg_regs,
+            named_args: named_regs,
         });
         return Ok(FlowState::Active(dst));
     }
@@ -2196,6 +2629,13 @@ fn lower_call(
     for a in args {
         match lower_expr(stack, prog, a, false)? {
             FlowState::Active(r) => arg_regs.push(r),
+            FlowState::Terminated => return Ok(FlowState::Terminated),
+        }
+    }
+    let mut named_regs: Vec<(String, VReg)> = Vec::with_capacity(named_args.len());
+    for (k, v) in named_args {
+        match lower_expr(stack, prog, v, false)? {
+            FlowState::Active(r) => named_regs.push((k.clone(), r)),
             FlowState::Terminated => return Ok(FlowState::Terminated),
         }
     }
@@ -2233,13 +2673,76 @@ fn lower_call(
             Ok(FlowState::Active(dst))
         }
         ResolvedCallee::Target(target) => {
+            // Stage 3C: Compile-time static keyword reordering & default slot filling
+            // for statically resolved `CalleeTarget::Fn(fn_id)` calls.
+            let (final_args, final_named) = if let CalleeTarget::Fn(fn_id) = target
+                && let Some(param_specs) = prog.task_param_specs.get(&fn_id).cloned()
+                && (!named_regs.is_empty()
+                    || (arg_regs.len() < param_specs.len()
+                        && param_specs[arg_regs.len()..]
+                            .iter()
+                            .all(|(_, has_def)| *has_def)))
+            {
+                let mut slots: Vec<Option<VReg>> = vec![None; param_specs.len()];
+                if arg_regs.len() > param_specs.len() {
+                    // Let runtime arity diagnostic handle too-many positional args consistently.
+                    let sym_named = named_regs
+                        .into_iter()
+                        .map(|(k, r)| (prog.intern(&k), r))
+                        .collect();
+                    (arg_regs, sym_named)
+                } else {
+                    for (i, r) in arg_regs.into_iter().enumerate() {
+                        slots[i] = Some(r);
+                    }
+                    for (kw, r) in named_regs {
+                        let Some(idx) = param_specs.iter().position(|(pname, _)| pname == &kw)
+                        else {
+                            return Err(MoraError::Parse(format!(
+                                "unknown keyword argument '{}' in call",
+                                kw
+                            )));
+                        };
+                        if slots[idx].is_some() {
+                            return Err(MoraError::Parse(format!(
+                                "multiple values provided for parameter '{}'",
+                                kw
+                            )));
+                        }
+                        slots[idx] = Some(r);
+                    }
+                    let mut out_args = Vec::with_capacity(param_specs.len());
+                    for (idx, (pname, has_def)) in param_specs.iter().enumerate() {
+                        if let Some(r) = slots[idx] {
+                            out_args.push(r);
+                        } else if *has_def {
+                            let missing = stack.current_mut().emit_const(ControlConst::MissingArg);
+                            out_args.push(missing);
+                        } else {
+                            return Err(MoraError::Parse(format!(
+                                "missing required argument '{}'",
+                                pname
+                            )));
+                        }
+                    }
+                    (out_args, Vec::new())
+                }
+            } else {
+                let sym_named = named_regs
+                    .into_iter()
+                    .map(|(k, r)| (prog.intern(&k), r))
+                    .collect();
+                (arg_regs, sym_named)
+            };
+
             let can_tail_call = in_tail
+                && final_named.is_empty()
                 && stack.current_mut().kind != FunctionKind::Main
                 && !matches!(target, CalleeTarget::Builtin(_));
             if can_tail_call {
                 stack.current_mut().terminate(ControlTerminator::TailCall {
                     target,
-                    args: arg_regs,
+                    args: final_args,
                 });
                 return Ok(FlowState::Terminated);
             }
@@ -2247,7 +2750,8 @@ fn lower_call(
             stack.current_mut().emit(ControlInst::Call {
                 dst,
                 target,
-                args: arg_regs,
+                args: final_args,
+                named_args: final_named,
             });
             Ok(FlowState::Active(dst))
         }
@@ -2396,6 +2900,7 @@ fn lower_for_loop(
         dst: len_reg,
         target: CalleeTarget::Builtin(BuiltinFnId::Len),
         args: vec![iter_reg],
+        named_args: Vec::new(),
     });
     let zero_reg = stack.current_mut().emit_const(ControlConst::Int(0));
     let one_reg = stack.current_mut().emit_const(ControlConst::Int(1));

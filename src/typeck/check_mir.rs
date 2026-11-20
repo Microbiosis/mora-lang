@@ -24,8 +24,15 @@ use super::hm::TypeError as HmError;
 /// HM infer_program，仅在前后插入双向预扫 + 重复错误过滤。
 /// v0.75.87: match exhaustiveness 检查已根除（保留 HM 推理路径）。
 pub fn check_program_witnesses(witnesses: &[crate::mir::witness::MirWitness]) -> Vec<TypeError> {
+    check_program_witnesses_with_modules(witnesses, None)
+}
+
+pub fn check_program_witnesses_with_modules(
+    witnesses: &[crate::mir::witness::MirWitness],
+    virtual_modules: Option<&std::collections::HashMap<String, String>>,
+) -> Vec<TypeError> {
     let mut hm = HMInference::new();
-    check_program_witnesses_inner(witnesses, &mut hm)
+    check_program_witnesses_inner(witnesses, &mut hm, virtual_modules)
 }
 
 /// Resolved HM type summary produced alongside diagnostics for LSP hover/completion.
@@ -40,7 +47,7 @@ pub struct InferredProgramInfo {
 /// Run HM inference across `witnesses` and return both diagnostics and resolved HM types.
 pub fn infer_program_types(witnesses: &[crate::mir::witness::MirWitness]) -> InferredProgramInfo {
     let mut hm = HMInference::new();
-    let diagnostics = check_program_witnesses_inner(witnesses, &mut hm);
+    let diagnostics = check_program_witnesses_inner(witnesses, &mut hm, None);
     let env_types = hm
         .env
         .all_bindings()
@@ -74,6 +81,7 @@ pub fn lookup_builtin_or_module_type(name: &str) -> Option<super::Type> {
 fn check_program_witnesses_inner(
     witnesses: &[crate::mir::witness::MirWitness],
     hm: &mut HMInference,
+    virtual_modules: Option<&std::collections::HashMap<String, String>>,
 ) -> Vec<TypeError> {
     use std::collections::HashSet;
     let mut errors: Vec<TypeError> = Vec::new();
@@ -82,14 +90,13 @@ fn check_program_witnesses_inner(
     // v0.98: effect 签名随 import 双通道注册
     let mut visited: HashSet<std::path::PathBuf> = HashSet::new();
     let mut import_errors: Vec<TypeError> = Vec::new();
-    let imported =
-        super::imports::collect_imported_symbols(witnesses, &mut visited, &mut import_errors);
-    for (name, ty) in imported.env_bindings {
-        hm.env.add(name, ty);
-    }
-    for (label, sig) in imported.effect_signatures {
-        hm.effect_signatures.insert(label, sig);
-    }
+    let imported = super::imports::collect_imported_symbols_with_modules(
+        witnesses,
+        &mut visited,
+        &mut import_errors,
+        virtual_modules,
+    );
+    imported.apply_to_hm(hm);
     errors.extend(import_errors);
 
     errors.extend(hm.infer_program(witnesses).into_iter().map(hm_to_external));
@@ -329,6 +336,7 @@ mod tests {
             kind: WitnessKind::Call {
                 callee: WitnessCallee::Var("x".to_string()),
                 args: vec![lit(1)],
+                named_args: Vec::new(),
             },
             span: Span::default(),
         };

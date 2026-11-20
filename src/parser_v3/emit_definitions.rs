@@ -108,19 +108,25 @@ impl ParserV3 {
         // coercion，把 plain value 包装为 Value::TraitObject（§3.5 spec 承诺）。
         // v0.104.6 D474：原先是 (reg, witness) 二元组（reg 供
         // `MirInst::DynTrait` 发射）；parser 只产 witness 后降为单值。
-        let final_v_w =
-            if let Some(crate::typeck::Type::TraitObject { trait_name, .. }) = type_hint.clone() {
-                MirWitness {
-                    kind: WitnessKind::DynTrait {
-                        expr: Box::new(v_w),
-                        trait_name,
-                        generics: Vec::new(),
-                    },
-                    span,
-                }
-            } else {
-                v_w
-            };
+        let final_v_w = if let Some(crate::typeck::Type::TraitObject {
+            trait_name,
+            generics,
+        }) = type_hint.clone()
+        {
+            MirWitness {
+                kind: WitnessKind::DynTrait {
+                    expr: Box::new(v_w),
+                    trait_name,
+                    generics: generics
+                        .into_iter()
+                        .map(crate::mir::hint::TypeHint::from_type)
+                        .collect(),
+                },
+                span,
+            }
+        } else {
+            v_w
+        };
         // init_body = Nil（与 lower LetBinding 一致：Const(Nil) → Assign → Var）
         let nil_w = MirWitness {
             kind: WitnessKind::Literal(Literal::Nil(span)),
@@ -169,53 +175,134 @@ impl ParserV3 {
         })
     }
 
-    pub(super) fn emit_fn_def_w(&mut self) -> Option<MirWitness> {
-        let span = self.span_of_current();
-        self.advance(); // 'task'
-        let name = self.consume_identifier("Expected task name")?;
-        // v0.104.6：进入泛型作用域前先存旧值（供退出时还原）。
-        let saved_generic = std::mem::take(&mut self.generic_params);
-        // v0.104.6：泛型声明子句 `task f<T, U>(…)`。它把类型参数写入
-        // `self.generic_params`，随后形参/返回标注据此把裸名认作 `Type::TypeVar`。
-        let type_params = self.parse_generic_clause()?;
-        self.consume(TokenType::LParen, "Expected '(' after task name")?;
-        // v0.104.6：形参类型标注 —— `task f(a: number, b: string): Ret`。
-        //
-        // 此前形参循环只收裸标识符，遇 `:` 直接 break ⇒ `Expected ')' after
-        // parameters`（README「Type checking」节的示例曾因此整块无法解析）。
-        // 承载位与消费端**本就存在**：`WitnessParam.type_hint`（witness.rs:446）
-        // 与 `bidirectional.rs:193-202`（Phase A' 把形参 type_hint 绑进 HM 环境
-        // 并做 subtype 检查）—— 缺的只是 parser 把标注填进 `type_hint` 这一步。
-        //
-        // 裸形参 `task f(x)` 行为不变（`type_hint: None`，与此前等价）。
-        let mut params: Vec<(String, Option<crate::mir::hint::TypeHint>)> = Vec::new();
+    /// Shared parameter list parser for `task`, `fn` closures, `trait` methods, and `impl` methods.
+    /// Supports optional `: Type` annotations and Python-style `= default_expr` defaults,
+    /// enforcing that no required parameter may follow a defaulted parameter.
+    pub(super) fn parse_witness_params(
+        &mut self,
+        allow_self: bool,
+        strict_names: bool,
+    ) -> Option<(Vec<WitnessParam>, bool)> {
+        let mut params: Vec<WitnessParam> = Vec::new();
+        let mut has_self = false;
+        let mut seen_default = false;
         while !self.check(&TokenType::RParen) && !self.is_at_end() {
-            if let Some(p) = self.consume_identifier("Expected parameter name") {
-                let hint = if self.match_token_exact(TokenType::Colon) {
-                    Some(crate::mir::hint::TypeHint::from_type(
-                        self.parse_type_annotation()?,
-                    ))
-                } else {
-                    None
-                };
-                params.push((p, hint));
+            let pname = if allow_self
+                && params.is_empty()
+                && matches!(
+                    self.peek().map(|t| &t.token_type),
+                    Some(TokenType::Identifier(s)) if s == "self"
+                ) {
+                self.advance();
+                has_self = true;
+                "self".to_string()
+            } else if strict_names {
+                self.consume_plain_identifier("Expected parameter name")?
+            } else {
+                self.consume_identifier("Expected parameter name")?
+            };
+
+            if params.iter().any(|p| p.name == pname) {
+                let msg = format!(
+                    "Parse error: duplicate parameter '{}' at line {}",
+                    pname,
+                    self.current_line()
+                );
+                eprintln!("{msg}");
+                self.diag = Some(msg);
+                return None;
             }
+
+            let type_hint = if self.match_token_exact(TokenType::Colon) {
+                Some(crate::mir::hint::TypeHint::from_type(
+                    self.parse_type_annotation()?,
+                ))
+            } else {
+                None
+            };
+
+            let default = if self.match_token_exact(TokenType::Assign) {
+                if pname == "self" {
+                    let msg = format!(
+                        "Parse error: 'self' parameter cannot have a default value at line {}",
+                        self.current_line()
+                    );
+                    eprintln!("{msg}");
+                    self.diag = Some(msg);
+                    return None;
+                }
+                seen_default = true;
+                Some(self.emit_expr_w()?)
+            } else {
+                if seen_default {
+                    let msg = format!(
+                        "Parse error: non-default parameter '{}' follows default parameter at line {}",
+                        pname,
+                        self.current_line()
+                    );
+                    eprintln!("{msg}");
+                    self.diag = Some(msg);
+                    return None;
+                }
+                None
+            };
+
+            params.push(WitnessParam {
+                name: pname,
+                type_hint,
+                default,
+            });
             if !self.match_token(&[TokenType::Comma]) {
                 break;
             }
         }
-        self.consume(TokenType::RParen, "Expected ')' after parameters")?;
-        // v0.104.6：返回类型标注 `): Ret` —— `FnDef.return_type` 位本就存在，
-        // 但此前写死 None（`emit_fn_def_w` 不消费尾随标注）。无 `:` 时保持 None，
-        // 行为不变。
+        Some((params, has_self))
+    }
+
+    pub(super) fn emit_fn_def_w(&mut self) -> Option<MirWitness> {
+        let span = self.span_of_current();
+        self.advance(); // 'task'
+        let name = self.consume_identifier("Expected task name")?;
+        let saved_generic = std::mem::take(&mut self.generic_params);
+        let type_params = match self.parse_generic_clause() {
+            Some(tp) => tp,
+            None => {
+                self.generic_params = saved_generic;
+                return None;
+            }
+        };
+        if self
+            .consume(TokenType::LParen, "Expected '(' after task name")
+            .is_none()
+        {
+            self.generic_params = saved_generic;
+            return None;
+        }
+        let w_params = match self.parse_witness_params(false, false) {
+            Some((ps, _)) => ps,
+            None => {
+                self.generic_params = saved_generic;
+                return None;
+            }
+        };
+        if self
+            .consume(TokenType::RParen, "Expected ')' after parameters")
+            .is_none()
+        {
+            self.generic_params = saved_generic;
+            return None;
+        }
         let return_type = if self.match_token_exact(TokenType::Colon) {
-            Some(crate::mir::hint::TypeHint::from_type(
-                self.parse_type_annotation()?,
-            ))
+            match self.parse_type_annotation() {
+                Some(t) => Some(crate::mir::hint::TypeHint::from_type(t)),
+                None => {
+                    self.generic_params = saved_generic;
+                    return None;
+                }
+            }
         } else {
             None
         };
-        // 子上下文：函数体是独立作用域（`is_program_top = false`, `parse_loop_depth = 0`）
         let body_res = self.in_nested_scope(|this| {
             let body_w = if this.match_token_exact(TokenType::Newline) {
                 let mut stmt_wits = Vec::new();
@@ -228,7 +315,6 @@ impl ParserV3 {
                 this.consume(TokenType::End, "Expected 'end' after task body")?;
                 Self::block_witness(stmt_wits, span)
             } else if this.check(&TokenType::End) {
-                // Empty body: `task main() end`
                 MirWitness {
                     kind: WitnessKind::Literal(Literal::Nil(span)),
                     span,
@@ -238,18 +324,8 @@ impl ParserV3 {
             };
             Some(body_w)
         });
-        // 退出泛型作用域 —— 必须在体解析**之后**、且**无论成败**都执行，
-        // 否则 `generic_params` 泄漏到后续无关标注，把同名误当类型变量。
         self.generic_params = saved_generic;
         let body_w = body_res?;
-        let w_params = params
-            .iter()
-            .map(|(n, hint)| WitnessParam {
-                name: n.clone(),
-                type_hint: hint.clone(),
-                default: None,
-            })
-            .collect();
         Some(MirWitness {
             kind: WitnessKind::FnDef {
                 name,
@@ -396,29 +472,75 @@ impl ParserV3 {
         self.advance(); // 'enum'
         let name = self.consume_identifier("Expected enum name")?;
         self.declared_type_names.insert(name.clone());
-        let mut variants = Vec::new();
+        let saved_generic = std::mem::take(&mut self.generic_params);
+        let type_params = match self.parse_generic_clause() {
+            Some(tp) => tp,
+            None => {
+                self.generic_params = saved_generic;
+                return None;
+            }
+        };
+        let mut variants: Vec<crate::mir::witness::WitnessEnumVariant> = Vec::new();
         while !self.check(&TokenType::End) && !self.is_at_end() {
             while self.match_token(&[TokenType::Newline]) {}
             if self.check(&TokenType::End) {
                 break;
             }
-            // v0.104.6 D46：保证进度（见 struct 块同处说明）
             let before = self.current;
-            match self.consume_identifier("Expected variant name") {
-                Some(v) => variants.push(v),
-                // v0.104.6 D46：**此前根本没有 else 分支** —— 变体名解析失败时
-                // 既不 push 也不 advance，循环条件恒真 → **死循环**，且
-                // `consume_identifier` 每次都重打 "Expected variant name" 刷屏。
-                // 实测 `enum E / A / @@@ / B / end` 挂死 >8s。
+            let vspan = self.span_of_current();
+            let vname = match self.consume_identifier("Expected variant name") {
+                Some(v) => v,
                 None => {
+                    self.generic_params = saved_generic;
                     eprintln!(
                         "Parse error: unparsable enum variant (line {})",
                         self.current_line()
                     );
                     return None;
                 }
+            };
+            if variants.iter().any(|v| v.name == vname) {
+                let msg = format!(
+                    "Parse error: duplicate enum variant '{}' in '{}' (line {})",
+                    vname,
+                    name,
+                    self.current_line()
+                );
+                eprintln!("{msg}");
+                self.diag = Some(msg);
+                self.generic_params = saved_generic;
+                return None;
             }
+            let mut payload_types = Vec::new();
+            if self.match_token_exact(TokenType::LParen) {
+                while !self.check(&TokenType::RParen) && !self.is_at_end() {
+                    match self.parse_type_annotation() {
+                        Some(ty) => payload_types.push(crate::mir::hint::TypeHint::from_type(ty)),
+                        None => {
+                            self.generic_params = saved_generic;
+                            return None;
+                        }
+                    }
+                    if !self.match_token(&[TokenType::Comma]) {
+                        break;
+                    }
+                }
+                if self
+                    .consume(TokenType::RParen, "Expected ')' after enum variant payload")
+                    .is_none()
+                {
+                    self.generic_params = saved_generic;
+                    return None;
+                }
+            }
+            let _ = self.match_token(&[TokenType::Comma]);
+            variants.push(crate::mir::witness::WitnessEnumVariant {
+                name: vname,
+                payload_types,
+                span: vspan,
+            });
             if self.current == before {
+                self.generic_params = saved_generic;
                 eprintln!(
                     "Parse error: parser made no progress in enum block (line {})",
                     self.current_line()
@@ -426,18 +548,122 @@ impl ParserV3 {
                 return None;
             }
         }
+        self.generic_params = saved_generic;
         self.consume(TokenType::End, "Expected 'end' after enum")?;
-        let _evs: Vec<crate::common::EnumVariant> = variants
-            .iter()
-            .map(|v| crate::common::EnumVariant {
-                name: v.clone(),
-                data: None,
-            })
-            .collect();
         Some(MirWitness {
-            kind: WitnessKind::EnumDef { name, variants },
+            kind: WitnessKind::EnumDef {
+                name,
+                type_params,
+                variants,
+            },
             span,
         })
+    }
+
+    /// Parse compile-time field tag metadata `@tag(key="val", flag, ...)` inside a `struct` field.
+    fn parse_struct_field_tags(&mut self, tags: &mut Vec<(String, String)>) -> Option<()> {
+        self.advance(); // '@'
+        match self.peek().map(|t| &t.token_type) {
+            Some(TokenType::Identifier(s)) if s == "tag" => {
+                self.advance();
+            }
+            _ => {
+                let msg = format!(
+                    "Parse error: expected '@tag(...)' metadata on struct field at line {}",
+                    self.current_line()
+                );
+                eprintln!("{msg}");
+                self.diag = Some(msg);
+                return None;
+            }
+        }
+        self.consume(TokenType::LParen, "Expected '(' after '@tag'")?;
+        while !self.check(&TokenType::RParen) && !self.is_at_end() {
+            let key = self.consume_identifier("Expected tag key name inside '@tag(...)'")?;
+            if key.trim().is_empty() {
+                let msg = format!(
+                    "Parse error: empty tag key inside '@tag(...)' at line {}",
+                    self.current_line()
+                );
+                eprintln!("{msg}");
+                self.diag = Some(msg);
+                return None;
+            }
+            let value = if self.match_token_exact(TokenType::Assign) {
+                match self.peek().cloned() {
+                    Some(Token {
+                        token_type: TokenType::String(s),
+                        ..
+                    }) => {
+                        self.advance();
+                        s
+                    }
+                    Some(Token {
+                        token_type: TokenType::Int(n),
+                        ..
+                    }) => {
+                        self.advance();
+                        n.to_string()
+                    }
+                    Some(Token {
+                        token_type: TokenType::Float(f),
+                        ..
+                    }) => {
+                        self.advance();
+                        f.to_string()
+                    }
+                    Some(Token {
+                        token_type: TokenType::True,
+                        ..
+                    }) => {
+                        self.advance();
+                        "true".to_string()
+                    }
+                    Some(Token {
+                        token_type: TokenType::False,
+                        ..
+                    }) => {
+                        self.advance();
+                        "false".to_string()
+                    }
+                    Some(Token {
+                        token_type: TokenType::Identifier(id),
+                        ..
+                    }) => {
+                        self.advance();
+                        id
+                    }
+                    _ => {
+                        let msg = format!(
+                            "Parse error: expected literal value for tag '{}' at line {}",
+                            key,
+                            self.current_line()
+                        );
+                        eprintln!("{msg}");
+                        self.diag = Some(msg);
+                        return None;
+                    }
+                }
+            } else {
+                "true".to_string()
+            };
+            if tags.iter().any(|(k, _)| k == &key) {
+                let msg = format!(
+                    "Parse error: duplicate @tag key '{}' on struct field at line {}",
+                    key,
+                    self.current_line()
+                );
+                eprintln!("{msg}");
+                self.diag = Some(msg);
+                return None;
+            }
+            tags.push((key, value));
+            if !self.match_token(&[TokenType::Comma]) {
+                break;
+            }
+        }
+        self.consume(TokenType::RParen, "Expected ')' after '@tag(...)'")?;
+        Some(())
     }
 
     pub(super) fn emit_struct_def_w(&mut self) -> Option<MirWitness> {
@@ -445,44 +671,110 @@ impl ParserV3 {
         self.advance(); // 'struct'
         let name = self.consume_identifier("Expected struct name")?;
         self.declared_type_names.insert(name.clone());
-        let mut fields = Vec::new();
+        let saved_generic = std::mem::take(&mut self.generic_params);
+        let type_params = match self.parse_generic_clause() {
+            Some(tp) => tp,
+            None => {
+                self.generic_params = saved_generic;
+                return None;
+            }
+        };
+        let mut fields: Vec<crate::mir::witness::WitnessStructField> = Vec::new();
         while !self.check(&TokenType::End) && !self.is_at_end() {
             while self.match_token(&[TokenType::Newline]) {}
             if self.check(&TokenType::End) {
                 break;
             }
-            // v0.104.6 D46：保证进度（见 enum 块同处说明）
             let before = self.current;
-            match self.consume_identifier("Expected field name") {
-                Some(fname) => {
-                    self.consume(TokenType::Colon, "Expected ':' after field name")?;
-                    // 类型标注解析失败时此前是**静默丢字段**（`if let Some(..)`
-                    // 落空即什么都不做），用户以为 `x: T` 声明成功了。
-                    // 改为报错。
-                    match self.parse_type_annotation() {
-                        Some(ftype) => fields.push((fname, ftype)),
-                        None => {
-                            eprintln!(
-                                "Parse error: unparsable type annotation for field \
-                                 `{fname}` (line {})",
-                                self.current_line()
-                            );
-                            return None;
-                        }
-                    }
-                }
-                // v0.104.6 D46：此前是 `self.advance()` —— 静默跳过整行，
-                // 程序继续跑并 exit 0（实测 `struct S / @@@ / x: Int / end`
-                // 正常执行、退出码 0）。且错误被重复打印 3~4 遍（循环每次重试）。
+            let fspan = self.span_of_current();
+            let fname = match self.consume_identifier("Expected field name") {
+                Some(n) => n,
                 None => {
+                    self.generic_params = saved_generic;
                     eprintln!(
                         "Parse error: unparsable field name in struct block (line {})",
                         self.current_line()
                     );
                     return None;
                 }
+            };
+            if fields.iter().any(|f| f.name == fname) {
+                let msg = format!(
+                    "Parse error: duplicate field '{}' in struct '{}' (line {})",
+                    fname,
+                    name,
+                    self.current_line()
+                );
+                eprintln!("{msg}");
+                self.diag = Some(msg);
+                self.generic_params = saved_generic;
+                return None;
             }
+            if self
+                .consume(TokenType::Colon, "Expected ':' after field name")
+                .is_none()
+            {
+                self.generic_params = saved_generic;
+                return None;
+            }
+            let ftype = match self.parse_type_annotation() {
+                Some(t) => t,
+                None => {
+                    self.generic_params = saved_generic;
+                    eprintln!(
+                        "Parse error: unparsable type annotation for field \
+                         `{fname}` (line {})",
+                        self.current_line()
+                    );
+                    return None;
+                }
+            };
+            let mut default_expr: Option<MirWitness> = None;
+            let mut tags: Vec<(String, String)> = Vec::new();
+            // Accept optional `= default_expr` and `@tag(...)` in either order.
+            loop {
+                if self.check(&TokenType::At) {
+                    if self.parse_struct_field_tags(&mut tags).is_none() {
+                        self.generic_params = saved_generic;
+                        return None;
+                    }
+                } else if self.match_token_exact(TokenType::Assign) {
+                    if default_expr.is_some() {
+                        let msg = format!(
+                            "Parse error: duplicate default value for field '{}' at line {}",
+                            fname,
+                            self.current_line()
+                        );
+                        eprintln!("{msg}");
+                        self.diag = Some(msg);
+                        self.generic_params = saved_generic;
+                        return None;
+                    }
+                    let prev_flag = self.in_struct_field_default;
+                    self.in_struct_field_default = true;
+                    let expr_res = self.emit_expr_w();
+                    self.in_struct_field_default = prev_flag;
+                    match expr_res {
+                        Some(e) => default_expr = Some(e),
+                        None => {
+                            self.generic_params = saved_generic;
+                            return None;
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+            let _ = self.match_token(&[TokenType::Comma]);
+            fields.push(crate::mir::witness::WitnessStructField {
+                name: fname,
+                type_hint: crate::mir::hint::TypeHint::from_type(ftype),
+                default: default_expr,
+                tags,
+                span: fspan,
+            });
             if self.current == before {
+                self.generic_params = saved_generic;
                 eprintln!(
                     "Parse error: parser made no progress in struct block (line {})",
                     self.current_line()
@@ -490,21 +782,405 @@ impl ParserV3 {
                 return None;
             }
         }
+        self.generic_params = saved_generic;
         self.consume(TokenType::End, "Expected 'end' after struct")?;
-        let _sfs: Vec<crate::common::StructField> = fields
-            .iter()
-            .map(|(fname, ftype)| crate::common::StructField {
-                name: fname.clone(),
-                type_hint: ftype.name(),
-            })
-            .collect();
         Some(MirWitness {
             kind: WitnessKind::StructDef {
                 name,
-                fields: fields
-                    .into_iter()
-                    .map(|(n, t)| (n, crate::mir::hint::TypeHint::from_type(t)))
-                    .collect(),
+                type_params,
+                fields,
+            },
+            span,
+        })
+    }
+
+    /// Stage 3C: Parse `trait Name<T>: Parent1, Parent2 ... end`.
+    pub(super) fn emit_trait_def_w(&mut self) -> Option<MirWitness> {
+        let span = self.span_of_current();
+        self.advance(); // 'trait'
+        let name = self.consume_identifier("Expected trait name after 'trait'")?;
+        self.declared_type_names.insert(name.clone());
+        let saved_generic = std::mem::take(&mut self.generic_params);
+        let type_params = match self.parse_generic_clause() {
+            Some(tp) => tp,
+            None => {
+                self.generic_params = saved_generic;
+                return None;
+            }
+        };
+        let mut parents = Vec::new();
+        if self.match_token_exact(TokenType::Colon) {
+            loop {
+                match self.consume_identifier("Expected parent trait name after ':'") {
+                    Some(p) => parents.push(p),
+                    None => {
+                        self.generic_params = saved_generic;
+                        return None;
+                    }
+                }
+                if !self.match_token(&[TokenType::Comma]) {
+                    break;
+                }
+            }
+        }
+        let mut methods: Vec<crate::mir::witness::WitnessTraitMethod> = Vec::new();
+        while !self.check(&TokenType::End) && !self.is_at_end() {
+            while self.match_token(&[TokenType::Newline]) {}
+            if self.check(&TokenType::End) {
+                break;
+            }
+            let before = self.current;
+            let mspan = self.span_of_current();
+            if !self.match_token(&[TokenType::Fn, TokenType::Task]) {
+                let msg = format!(
+                    "Parse error: expected 'fn' or 'task' method declaration inside trait '{}' at line {}",
+                    name,
+                    self.current_line()
+                );
+                eprintln!("{msg}");
+                self.diag = Some(msg);
+                self.generic_params = saved_generic;
+                return None;
+            }
+            let mname = match self.consume_identifier("Expected method name in trait") {
+                Some(n) => n,
+                None => {
+                    self.generic_params = saved_generic;
+                    return None;
+                }
+            };
+            let outer_generics = self.generic_params.clone();
+            let method_type_params = match self.parse_generic_clause() {
+                Some(mtp) => {
+                    let mut combined = outer_generics.clone();
+                    for tp in &mtp {
+                        if !combined.contains(tp) {
+                            combined.push(tp.clone());
+                        }
+                    }
+                    self.generic_params = combined;
+                    mtp
+                }
+                None => {
+                    self.generic_params = saved_generic;
+                    return None;
+                }
+            };
+            if self
+                .consume(TokenType::LParen, "Expected '(' after trait method name")
+                .is_none()
+            {
+                self.generic_params = saved_generic;
+                return None;
+            }
+            let (params, has_self) = match self.parse_witness_params(true, false) {
+                Some(v) => v,
+                None => {
+                    self.generic_params = saved_generic;
+                    return None;
+                }
+            };
+            if self
+                .consume(TokenType::RParen, "Expected ')' after trait method params")
+                .is_none()
+            {
+                self.generic_params = saved_generic;
+                return None;
+            }
+            let return_type = if self.match_token(&[TokenType::Arrow, TokenType::Colon]) {
+                match self.parse_type_annotation() {
+                    Some(t) => Some(crate::mir::hint::TypeHint::from_type(t)),
+                    None => {
+                        self.generic_params = saved_generic;
+                        return None;
+                    }
+                }
+            } else {
+                None
+            };
+            while self.match_token(&[TokenType::Newline]) {}
+            let default_body = if self.check(&TokenType::Fn)
+                || self.check(&TokenType::Task)
+                || self.check(&TokenType::End)
+            {
+                None
+            } else {
+                let body_res = self.in_nested_scope(|this| {
+                    let mut stmts = Vec::new();
+                    while !this.check(&TokenType::End) && !this.is_at_end() {
+                        let w = this.emit_statement_expr_w()?;
+                        stmts.push(w);
+                        while this.match_token(&[TokenType::Newline]) {}
+                    }
+                    this.consume(
+                        TokenType::End,
+                        "Expected 'end' after trait default method body",
+                    )?;
+                    Some(Self::block_witness(stmts, mspan))
+                });
+                match body_res {
+                    Some(b) => Some(b),
+                    None => {
+                        self.generic_params = saved_generic;
+                        return None;
+                    }
+                }
+            };
+            self.generic_params = outer_generics;
+            methods.push(crate::mir::witness::WitnessTraitMethod {
+                name: mname,
+                type_params: method_type_params,
+                params,
+                return_type,
+                default_body,
+                has_self,
+                span: mspan,
+            });
+            if self.current == before {
+                self.generic_params = saved_generic;
+                return None;
+            }
+        }
+        self.generic_params = saved_generic;
+        self.consume(TokenType::End, "Expected 'end' after trait definition")?;
+        Some(MirWitness {
+            kind: WitnessKind::TraitDef {
+                name,
+                type_params,
+                parents,
+                methods,
+            },
+            span,
+        })
+    }
+
+    /// Parse a type header `Name<Arg1, Arg2>` inside `impl ...`, collecting implicit generic
+    /// type parameters (such as `T` in `impl Container<T> for list<T>`) into `self.generic_params`.
+    fn parse_impl_header_type(
+        &mut self,
+        collected_type_params: &mut Vec<String>,
+    ) -> Option<(String, Vec<crate::mir::hint::TypeHint>)> {
+        let name = self.consume_identifier("Expected type or trait name in 'impl'")?;
+        let mut generics = Vec::new();
+        if self.match_token(&[TokenType::Less]) {
+            loop {
+                // Allow introducing implicit single-identifier generic vars like `T` in `impl Container<T> for list<T>`.
+                if let Some(Token {
+                    token_type: TokenType::Identifier(id),
+                    ..
+                }) = self.peek().cloned()
+                {
+                    let lower = id.to_lowercase();
+                    let is_builtin = matches!(
+                        lower.as_str(),
+                        "int"
+                            | "float"
+                            | "number"
+                            | "string"
+                            | "char"
+                            | "bool"
+                            | "nil"
+                            | "any"
+                            | "unknown"
+                            | "context"
+                            | "channel"
+                            | "task_handle"
+                            | "taskhandle"
+                            | "tensor"
+                            | "list"
+                            | "dict"
+                    ) || crate::common::DType::from_name(&lower).is_some()
+                        || self.declared_type_names.contains(id.as_str());
+                    let is_followed_by_less = matches!(
+                        self.tokens.get(self.current + 1).map(|t| &t.token_type),
+                        Some(TokenType::Less)
+                    );
+                    if !is_builtin && !is_followed_by_less {
+                        if !self.generic_params.contains(&id) {
+                            self.generic_params.push(id.clone());
+                        }
+                        if !collected_type_params.contains(&id) {
+                            collected_type_params.push(id.clone());
+                        }
+                    }
+                }
+                let ty = self.parse_type_annotation()?;
+                generics.push(crate::mir::hint::TypeHint::from_type(ty));
+                if !self.match_token(&[TokenType::Comma]) {
+                    break;
+                }
+            }
+            self.consume(
+                TokenType::Greater,
+                "Expected '>' in impl header type arguments",
+            )?;
+        }
+        Some((name, generics))
+    }
+
+    /// Stage 3C: Parse `impl<T> Trait<T> for Target<T> ... end` or inherent `impl Target<T> ... end`.
+    pub(super) fn emit_impl_def_w(&mut self) -> Option<MirWitness> {
+        let span = self.span_of_current();
+        self.advance(); // 'impl'
+        let saved_generic = std::mem::take(&mut self.generic_params);
+        let mut type_params = match self.parse_generic_clause() {
+            Some(tp) => tp,
+            None => {
+                self.generic_params = saved_generic;
+                return None;
+            }
+        };
+        let (first_name, first_generics) = match self.parse_impl_header_type(&mut type_params) {
+            Some(v) => v,
+            None => {
+                self.generic_params = saved_generic;
+                return None;
+            }
+        };
+        let (trait_name, trait_generics, target_type, target_generics) =
+            if self.match_token_exact(TokenType::For) {
+                let (tgt_name, tgt_gens) = match self.parse_impl_header_type(&mut type_params) {
+                    Some(v) => v,
+                    None => {
+                        self.generic_params = saved_generic;
+                        return None;
+                    }
+                };
+                (Some(first_name), first_generics, tgt_name, tgt_gens)
+            } else {
+                (None, Vec::new(), first_name, first_generics)
+            };
+
+        let mut methods: Vec<crate::mir::witness::WitnessImplMethod> = Vec::new();
+        while !self.check(&TokenType::End) && !self.is_at_end() {
+            while self.match_token(&[TokenType::Newline]) {}
+            if self.check(&TokenType::End) {
+                break;
+            }
+            let before = self.current;
+            let mspan = self.span_of_current();
+            if !self.match_token(&[TokenType::Fn, TokenType::Task]) {
+                let msg = format!(
+                    "Parse error: expected 'fn' or 'task' method implementation inside impl block at line {}",
+                    self.current_line()
+                );
+                eprintln!("{msg}");
+                self.diag = Some(msg);
+                self.generic_params = saved_generic;
+                return None;
+            }
+            let mname = match self.consume_identifier("Expected method name in impl block") {
+                Some(n) => n,
+                None => {
+                    self.generic_params = saved_generic;
+                    return None;
+                }
+            };
+            let outer_generics = self.generic_params.clone();
+            let method_type_params = match self.parse_generic_clause() {
+                Some(mtp) => {
+                    let mut combined = outer_generics.clone();
+                    for tp in &mtp {
+                        if !combined.contains(tp) {
+                            combined.push(tp.clone());
+                        }
+                    }
+                    self.generic_params = combined;
+                    mtp
+                }
+                None => {
+                    self.generic_params = saved_generic;
+                    return None;
+                }
+            };
+            if self
+                .consume(TokenType::LParen, "Expected '(' after impl method name")
+                .is_none()
+            {
+                self.generic_params = saved_generic;
+                return None;
+            }
+            let (params, has_self) = match self.parse_witness_params(true, false) {
+                Some(v) => v,
+                None => {
+                    self.generic_params = saved_generic;
+                    return None;
+                }
+            };
+            if self
+                .consume(TokenType::RParen, "Expected ')' after impl method params")
+                .is_none()
+            {
+                self.generic_params = saved_generic;
+                return None;
+            }
+            let return_type = if self.match_token(&[TokenType::Arrow, TokenType::Colon]) {
+                match self.parse_type_annotation() {
+                    Some(t) => Some(crate::mir::hint::TypeHint::from_type(t)),
+                    None => {
+                        self.generic_params = saved_generic;
+                        return None;
+                    }
+                }
+            } else {
+                None
+            };
+            let body_res = self.in_nested_scope(|this| {
+                let body_w = if this.match_token_exact(TokenType::Newline) {
+                    let mut stmts = Vec::new();
+                    while this.match_token(&[TokenType::Newline]) {}
+                    while !this.check(&TokenType::End) && !this.is_at_end() {
+                        let w = this.emit_statement_expr_w()?;
+                        stmts.push(w);
+                        while this.match_token(&[TokenType::Newline]) {}
+                    }
+                    this.consume(TokenType::End, "Expected 'end' after impl method body")?;
+                    Self::block_witness(stmts, mspan)
+                } else if this.check(&TokenType::End) {
+                    this.advance();
+                    MirWitness {
+                        kind: WitnessKind::Literal(Literal::Nil(mspan)),
+                        span: mspan,
+                    }
+                } else {
+                    let expr = this.emit_expr_w()?;
+                    this.match_token_exact(TokenType::End);
+                    expr
+                };
+                Some(body_w)
+            });
+            self.generic_params = outer_generics;
+            let body = match body_res {
+                Some(b) => b,
+                None => {
+                    self.generic_params = saved_generic;
+                    return None;
+                }
+            };
+            methods.push(crate::mir::witness::WitnessImplMethod {
+                name: mname,
+                type_params: method_type_params,
+                params,
+                return_type,
+                body,
+                has_self,
+                span: mspan,
+            });
+            if self.current == before {
+                self.generic_params = saved_generic;
+                return None;
+            }
+        }
+        self.generic_params = saved_generic;
+        self.consume(TokenType::End, "Expected 'end' after impl block")?;
+        Some(MirWitness {
+            kind: WitnessKind::ImplDef {
+                type_params,
+                trait_name,
+                trait_generics,
+                target_type,
+                target_generics,
+                methods,
             },
             span,
         })

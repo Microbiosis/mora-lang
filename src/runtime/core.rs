@@ -3,16 +3,17 @@
 //! v0.110.0 瘦身：彻底剥离 `tool_registry` / `current_ai_config` / `config_stack`
 //! （Agent/AI 配置残留），并将原 `RegistryRuntime` 中存活的 `trait_registry` 并入 CoreRuntime。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
 use crate::common::trait_info::TraitInfo;
 use crate::error::MoraResult;
+use crate::runtime::autograd::AutogradContext;
 use crate::runtime::fs::FsContext;
 use crate::runtime::reactor::AsyncIoReactor;
 use crate::runtime::scheduler::{TaskContext, TaskScheduler};
-use crate::value::{Environment, MergeStrategy};
+use crate::value::{EnumDefRuntime, Environment, MergeStrategy, StructDefRuntime, Value};
 
 /// Shared immutable process-level services across tasks and spawned VM workers.
 pub struct EngineShared {
@@ -47,6 +48,9 @@ impl Default for EngineShared {
     }
 }
 
+type TraitImplMethodMap = HashMap<(String, String, String), (Value, bool)>;
+type InherentMethodMap = HashMap<(String, String), (Value, bool)>;
+
 /// 语言执行必需的薄核心。
 #[derive(Clone)]
 pub struct CoreRuntime {
@@ -66,6 +70,22 @@ pub struct CoreRuntime {
     pub(crate) task_context: Option<TaskContext>,
     /// Wave 2 W2.5: Filesystem confinement policy and isolated virtual working directory.
     pub(crate) fs_context: FsContext,
+    /// Wave 3 Stage 3C: Nominal struct runtime descriptors (`StructName -> StructDefRuntime`).
+    pub(crate) struct_registry: Arc<HashMap<String, Arc<StructDefRuntime>>>,
+    /// Wave 3 Stage 3C: Nominal enum runtime descriptors (`EnumName -> EnumDefRuntime`).
+    pub(crate) enum_registry: Arc<HashMap<String, Arc<EnumDefRuntime>>>,
+    /// Wave 3 Stage 3C: Inherent `impl TargetType` methods `(target_type, method_name) -> (Value, has_self)`.
+    pub(crate) inherent_methods: Arc<InherentMethodMap>,
+    /// Wave 3 Stage 3C: Trait `impl Trait for TargetType` methods `(trait_name, target_type, method_name) -> (Value, has_self)`.
+    pub(crate) trait_impls: Arc<TraitImplMethodMap>,
+    /// Wave 3 Stage 3C: Registered `(trait_name, target_type)` impl pairs (supports empty default-only impls).
+    pub(crate) trait_impl_pairs: Arc<HashSet<(String, String)>>,
+    /// Wave 3 Stage 3C: Trait default method implementations `(trait_name, method_name) -> (Value, has_self)`.
+    pub(crate) trait_defaults: Arc<HashMap<(String, String), (Value, bool)>>,
+    /// Wave 3 Stage 3C: Per-runtime reverse-mode automatic differentiation context (`grad` / `no_grad`).
+    pub(crate) autograd: AutogradContext,
+    /// Wave 4: Virtual module source table embedded by `mora build` single-binary compilation.
+    pub(crate) bundled_modules: Arc<HashMap<String, String>>,
 }
 
 fn default_environment() -> Environment {
@@ -112,6 +132,14 @@ impl Default for CoreRuntime {
             shared: Arc::new(EngineShared::new()),
             task_context: None,
             fs_context: FsContext::unrestricted(),
+            struct_registry: Arc::new(HashMap::new()),
+            enum_registry: Arc::new(HashMap::new()),
+            inherent_methods: Arc::new(HashMap::new()),
+            trait_impls: Arc::new(HashMap::new()),
+            trait_impl_pairs: Arc::new(HashSet::new()),
+            trait_defaults: Arc::new(HashMap::new()),
+            autograd: AutogradContext::new(),
+            bundled_modules: Arc::new(HashMap::new()),
         }
     }
 }
@@ -159,6 +187,12 @@ impl CoreRuntime {
         &mut self.fs_context
     }
 
+    /// Attach bundled import module sources (used by `mora build` standalone executables).
+    pub fn with_bundled_modules(mut self, modules: HashMap<String, String>) -> Self {
+        self.bundled_modules = Arc::new(modules);
+        self
+    }
+
     /// Check cooperative cancellation or deadline expiry if a [`TaskContext`] is attached.
     pub fn check_cancelled(&self) -> MoraResult<()> {
         match &self.task_context {
@@ -173,6 +207,68 @@ impl CoreRuntime {
         map.insert(name, info);
         self.trait_registry = Arc::new(map);
     }
+
+    /// Register a nominal struct runtime descriptor.
+    pub fn register_struct_def(&mut self, def: Arc<StructDefRuntime>) {
+        let mut map = (*self.struct_registry).clone();
+        map.insert(def.name.clone(), def);
+        self.struct_registry = Arc::new(map);
+    }
+
+    /// Register a nominal enum runtime descriptor.
+    pub fn register_enum_def(&mut self, def: Arc<EnumDefRuntime>) {
+        let mut map = (*self.enum_registry).clone();
+        map.insert(def.name.clone(), def);
+        self.enum_registry = Arc::new(map);
+    }
+
+    /// Register an inherent `impl TargetType` method.
+    pub fn register_inherent_method(
+        &mut self,
+        target_type: String,
+        method: String,
+        func: Value,
+        has_self: bool,
+    ) {
+        let mut map = (*self.inherent_methods).clone();
+        map.insert((target_type, method), (func, has_self));
+        self.inherent_methods = Arc::new(map);
+    }
+
+    /// Register a `(trait_name, target_type)` impl pair (supports empty default-only impls).
+    pub fn register_trait_impl_pair(&mut self, trait_name: String, target_type: String) {
+        let mut set = (*self.trait_impl_pairs).clone();
+        set.insert((trait_name, target_type));
+        self.trait_impl_pairs = Arc::new(set);
+    }
+
+    /// Register a trait `impl Trait for TargetType` method.
+    pub fn register_trait_impl_method(
+        &mut self,
+        trait_name: String,
+        target_type: String,
+        method: String,
+        func: Value,
+        has_self: bool,
+    ) {
+        self.register_trait_impl_pair(trait_name.clone(), target_type.clone());
+        let mut map = (*self.trait_impls).clone();
+        map.insert((trait_name, target_type, method), (func, has_self));
+        self.trait_impls = Arc::new(map);
+    }
+
+    /// Register a trait default method body.
+    pub fn register_trait_default_method(
+        &mut self,
+        trait_name: String,
+        method: String,
+        func: Value,
+        has_self: bool,
+    ) {
+        let mut map = (*self.trait_defaults).clone();
+        map.insert((trait_name, method), (func, has_self));
+        self.trait_defaults = Arc::new(map);
+    }
 }
 
 #[cfg(test)]
@@ -183,6 +279,7 @@ mod tests {
     fn make_trait_info() -> TraitInfo {
         TraitInfo {
             name: "T".to_string(),
+            type_params: Vec::new(),
             parents: Vec::new(),
             methods: Vec::new(),
         }

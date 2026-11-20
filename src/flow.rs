@@ -116,21 +116,21 @@ pub fn is_pipe_method(name: &str) -> bool {
 
 /// Evaluate unary arithmetic negation (`-x`) preserving exact scalar/tensor `DType`.
 pub fn eval_unary_neg(val: &Value) -> Result<Value, MoraError> {
+    eval_unary_neg_tracked(val, None)
+}
+
+/// Evaluate unary arithmetic negation (`-x`) with optional reverse-mode autograd tracking.
+pub fn eval_unary_neg_tracked(
+    val: &Value,
+    autograd: Option<&mut crate::runtime::autograd::AutogradContext>,
+) -> Result<Value, MoraError> {
     match val {
         Value::Int(n) => n.checked_neg().map(Value::Int).ok_or_else(|| {
             MoraError::Runtime("integer overflow in unary negation of i64::MIN".to_string())
         }),
         Value::Float(f) => Ok(Value::Float(-*f)),
         Value::Scalar(s) => s.neg().map(Value::Scalar).map_err(MoraError::Runtime),
-        Value::Tensor(t) => {
-            if t.dtype.is_unsigned_int() || t.dtype.is_bool() {
-                return Err(MoraError::Runtime(format!(
-                    "cannot negate Tensor<{}> (unsigned or bool dtype)",
-                    t.dtype
-                )));
-            }
-            Ok(Value::Tensor(t.map_unary(|x| -x)?))
-        }
+        Value::Tensor(t) => crate::value::tensor::eval_tensor_neg_tracked(t, autograd),
         other => Err(MoraError::Runtime(format!(
             "cannot negate value of type {}",
             type_name(other)
@@ -138,7 +138,28 @@ pub fn eval_unary_neg(val: &Value) -> Result<Value, MoraError> {
     }
 }
 
+/// Unwrap a 0-D scalar tensor or scalar value to a comparable scalar [`Value`] for
+/// branch comparisons inside `grad(f)` (e.g. `if x > 0.0 then ... else ... end`).
+fn scalar_for_zero_d_cmp(v: &Value) -> Option<Value> {
+    match v {
+        Value::Tensor(t) if t.shape.is_empty() => Some(Value::Float(t.get_linear(0))),
+        Value::Int(n) => Some(Value::Int(*n)),
+        Value::Float(f) => Some(Value::Float(*f)),
+        Value::Scalar(s) => Some(Value::Float(s.as_f64())),
+        _ => None,
+    }
+}
+
 pub fn eval_binary(left: Value, op: &BinaryOp, right: Value) -> Result<Value, MoraError> {
+    eval_binary_tracked(left, op, right, None)
+}
+
+pub fn eval_binary_tracked(
+    left: Value,
+    op: &BinaryOp,
+    right: Value,
+    autograd: Option<&mut crate::runtime::autograd::AutogradContext>,
+) -> Result<Value, MoraError> {
     if matches!(&left, Value::Tensor(_)) || matches!(&right, Value::Tensor(_)) {
         match op {
             BinaryOp::Add
@@ -148,11 +169,33 @@ pub fn eval_binary(left: Value, op: &BinaryOp, right: Value) -> Result<Value, Mo
             | BinaryOp::Mod
             | BinaryOp::Pow
             | BinaryOp::MatMul => {
-                return crate::value::tensor::eval_tensor_binary(op, &left, &right);
+                return crate::value::tensor::eval_tensor_binary_tracked(
+                    op, &left, &right, autograd,
+                );
             }
-            BinaryOp::Equal => return Ok(Value::Bool(values_equal(&left, &right))),
-            BinaryOp::NotEqual => return Ok(Value::Bool(!values_equal(&left, &right))),
-            _ => {}
+            BinaryOp::Equal => {
+                if let (Some(ls), Some(rs)) =
+                    (scalar_for_zero_d_cmp(&left), scalar_for_zero_d_cmp(&right))
+                {
+                    return Ok(Value::Bool(values_equal(&ls, &rs)));
+                }
+                return Ok(Value::Bool(values_equal(&left, &right)));
+            }
+            BinaryOp::NotEqual => {
+                if let (Some(ls), Some(rs)) =
+                    (scalar_for_zero_d_cmp(&left), scalar_for_zero_d_cmp(&right))
+                {
+                    return Ok(Value::Bool(!values_equal(&ls, &rs)));
+                }
+                return Ok(Value::Bool(!values_equal(&left, &right)));
+            }
+            BinaryOp::Greater | BinaryOp::Less | BinaryOp::GreaterEqual | BinaryOp::LessEqual => {
+                if let (Some(ls), Some(rs)) =
+                    (scalar_for_zero_d_cmp(&left), scalar_for_zero_d_cmp(&right))
+                {
+                    return numeric::eval_order(op, &ls, &rs);
+                }
+            }
         }
     }
     if matches!(&left, Value::Scalar(_)) || matches!(&right, Value::Scalar(_)) {
@@ -531,6 +574,44 @@ pub fn values_equal(a: &Value, b: &Value) -> bool {
         }
         (Value::Tensor(a), Value::Tensor(b)) => a == b,
         (Value::Scalar(a), Value::Scalar(b)) => a == b,
+        (
+            Value::StructInstance {
+                type_name: ta,
+                fields: fa,
+                ..
+            },
+            Value::StructInstance {
+                type_name: tb,
+                fields: fb,
+                ..
+            },
+        ) => {
+            ta == tb
+                && fa.len() == fb.len()
+                && fa
+                    .iter()
+                    .all(|(k, va)| fb.get(k).is_some_and(|vb| container_elem_eq(va, vb)))
+        }
+        (
+            Value::EnumVariant {
+                enum_name: ea,
+                variant: va,
+                payload: pa,
+            },
+            Value::EnumVariant {
+                enum_name: eb,
+                variant: vb,
+                payload: pb,
+            },
+        ) => {
+            ea == eb
+                && va == vb
+                && pa.len() == pb.len()
+                && pa
+                    .iter()
+                    .zip(pb.iter())
+                    .all(|(x, y)| container_elem_eq(x, y))
+        }
         // Conversation 不支持相等比较——比较引用无意义
         _ => false,
     }
@@ -656,7 +737,27 @@ pub fn type_name(value: &Value) -> &'static str {
         Value::Channel(_) => "channel",
         Value::TaskHandle(_) => "task_handle",
         Value::Context(_) => "context",
+        Value::TcpListener(_) => "tcp_listener",
+        Value::TcpStream(_) => "tcp_stream",
+        Value::ComputeDag(_) => "compute_dag",
+        Value::KVAllocator(_) => "kv_allocator",
         Value::Tensor(_) => "tensor",
+        Value::StructType(_) => "struct_type",
+        Value::StructInstance { .. } => "struct",
+        Value::EnumType(_) => "enum_type",
+        Value::EnumVariant { .. } => "enum",
+        Value::GradFn { .. } => "closure",
+        Value::MissingArg => "nil",
+    }
+}
+
+/// Dynamic nominal type name (`Point` for struct instances, `Option` for enum variants,
+/// built-in type name otherwise). Used by `type_of`, `is_instance`, `dyn Trait`, and method dispatch.
+pub fn dynamic_type_name(value: &Value) -> String {
+    match value {
+        Value::StructInstance { type_name, .. } => type_name.clone(),
+        Value::EnumVariant { enum_name, .. } => enum_name.clone(),
+        other => type_name(other).to_string(),
     }
 }
 

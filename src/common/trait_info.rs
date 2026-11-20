@@ -20,6 +20,7 @@
 #[derive(Clone, Debug)]
 pub struct TraitInfo {
     pub name: String,
+    pub type_params: Vec<String>,
     pub parents: Vec<String>,
     pub methods: Vec<TraitMethodSig>,
 }
@@ -32,6 +33,8 @@ pub struct TraitMethodSig {
     pub return_type: Option<String>,
     /// 第一个参数是否为 `self`（决定 dispatch 时是否传 receiver.clone()）
     pub has_self: bool,
+    /// Stage 3C: 该方法是否在 trait 定义中提供默认实现体
+    pub has_default: bool,
 }
 
 /// v0.09: 注册 impl method 时用的 key（含泛型签名）

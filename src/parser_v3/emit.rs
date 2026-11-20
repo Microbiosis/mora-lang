@@ -1,5 +1,8 @@
 use super::*;
 
+type ParsedArgList = (Vec<MirWitness>, Vec<(String, MirWitness)>);
+type SliceStopStep = (Option<Box<MirWitness>>, Option<Box<MirWitness>>);
+
 impl ParserV3 {
     /// v0.75.40: 顶层语句循环 — emit 每条语句 + 顶层 witness。
     pub(super) fn emit_program(&mut self) -> crate::error::MoraResult<()> {
@@ -64,6 +67,16 @@ impl ParserV3 {
             }
             TokenType::Identifier(ref s) if s == "select" && self.is_select_form() => {
                 self.emit_select_w()
+            }
+            // Wave 3 Stage 3C: source-level `trait`, `impl`, and `no_grad`
+            TokenType::Identifier(ref s) if s == "trait" && self.is_trait_form() => {
+                self.emit_trait_def_w()
+            }
+            TokenType::Identifier(ref s) if s == "impl" && self.is_impl_form() => {
+                self.emit_impl_def_w()
+            }
+            TokenType::Identifier(ref s) if s == "no_grad" && self.is_no_grad_form() => {
+                self.emit_no_grad_w()
             }
             // v0.75.81: 事务家族 + eval 断言（顶层同嵌套分发）
             // v0.104: `assign` 并入本组 —— 它是 spec §14.2 的一等语句
@@ -223,11 +236,13 @@ impl ParserV3 {
                         WitnessKind::Call {
                             callee: crate::mir::witness::WitnessCallee::Name(method),
                             args,
+                            named_args,
                         } => MirWitness {
                             kind: WitnessKind::MethodCall {
                                 receiver: Box::new(lhs),
                                 method,
                                 args,
+                                named_args,
                             },
                             span,
                         },
@@ -283,6 +298,19 @@ impl ParserV3 {
             }
             if let Some(op) = this.consume_binary_op(&[TokenType::Minus, TokenType::Plus]) {
                 return Some(InfixOp::AddSub(op));
+            }
+            if this.in_struct_field_default
+                && this.check(&TokenType::At)
+                && matches!(
+                    this.tokens.get(this.current + 1).map(|t| &t.token_type),
+                    Some(TokenType::Identifier(s)) if s == "tag"
+                )
+                && matches!(
+                    this.tokens.get(this.current + 2).map(|t| &t.token_type),
+                    Some(TokenType::LParen)
+                )
+            {
+                return None;
             }
             if let Some(op) = this.consume_binary_op(&[
                 TokenType::Star,
@@ -371,6 +399,7 @@ impl ParserV3 {
                                 crate::mir::witness::BuiltinOp::Not,
                             ),
                             args: vec![expr],
+                            named_args: Vec::new(),
                         },
                         span,
                     }
@@ -420,6 +449,7 @@ impl ParserV3 {
                                 crate::mir::witness::BuiltinOp::Neg,
                             ),
                             args: vec![expr],
+                            named_args: Vec::new(),
                         },
                         span,
                     },
@@ -474,15 +504,16 @@ impl ParserV3 {
             if self.match_token_exact(TokenType::ColonColon) {
                 let assoc = self.consume_identifier("Expected associated function after '::'")?;
                 let full = format!("{}::{}", type_name, assoc);
-                let arg_wits = if self.match_token_exact(TokenType::LParen) {
+                let (arg_wits, named_args) = if self.match_token_exact(TokenType::LParen) {
                     self.emit_arg_list_w()?
                 } else {
-                    Vec::new()
+                    (Vec::new(), Vec::new())
                 };
                 let w = MirWitness {
                     kind: WitnessKind::Call {
                         callee: crate::mir::witness::WitnessCallee::Name(full),
                         args: arg_wits,
+                        named_args,
                     },
                     span,
                 };
@@ -496,11 +527,12 @@ impl ParserV3 {
             let span = self.span_of_current();
             self.advance();
             if self.match_token_exact(TokenType::LParen) {
-                let arg_wits = self.emit_arg_list_w()?;
+                let (arg_wits, named_args) = self.emit_arg_list_w()?;
                 let w = MirWitness {
                     kind: WitnessKind::Call {
                         callee: crate::mir::witness::WitnessCallee::Name(name),
                         args: arg_wits,
+                        named_args,
                     },
                     span,
                 };
@@ -514,8 +546,8 @@ impl ParserV3 {
         self.emit_call_tail_w(callee_w)
     }
 
-    /// 后缀链（witness 嵌套版）：方法调用 obj.m(args) / 索引 obj[idx] /
-    /// **值调用 `f(…)(…)`**（v0.104.6 补齐 D123 留下的缺口）。
+    /// 后缀链（witness 嵌套版）：方法调用 obj.m(args) / 索引与多维切片 obj[idx, ...] /
+    /// 值调用 `f(…)(…)`。
     fn emit_call_tail_w(&mut self, mut callee_w: MirWitness) -> Option<MirWitness> {
         loop {
             if self.match_token_exact(TokenType::Dot) {
@@ -523,60 +555,34 @@ impl ParserV3 {
                 let method_name = self.consume_identifier("Expected method name")?;
                 let span = self.span_of_current();
                 let mut arg_wits = Vec::new();
+                let mut named_args = Vec::new();
                 if self.match_token_exact(TokenType::LParen) {
-                    let aw = self.emit_arg_list_w()?;
+                    let (aw, na) = self.emit_arg_list_w()?;
                     arg_wits = aw;
+                    named_args = na;
                 }
                 callee_w = MirWitness {
                     kind: WitnessKind::MethodCall {
                         receiver: Box::new(callee_w),
                         method: method_name,
                         args: arg_wits,
+                        named_args,
                     },
                     span,
                 };
             } else if self.match_token_exact(TokenType::LBracket) {
                 self.check_unnegated_typed_int(&callee_w)?;
-                // Indexing: obj[idx]
                 let span = self.span_of_current();
-                let idx_w = self.emit_expr_w()?;
-                self.consume(TokenType::RBracket, "Expected ']' after index")?;
-                callee_w = MirWitness {
-                    kind: WitnessKind::Call {
-                        callee: crate::mir::witness::WitnessCallee::Name("[]".to_string()),
-                        args: vec![callee_w, idx_w],
-                    },
-                    span,
-                };
+                callee_w = self.emit_index_or_slice_w(callee_w, span)?;
             } else if self.match_token_exact(TokenType::LParen) {
                 self.check_unnegated_typed_int(&callee_w)?;
-                // v0.104.6 D123 **补齐能力**（此前是硬报错，见下方沿革）。
-                //
-                // D123 当时只做了「消除静默」：`mk(1)(2)` 修复前会算出 `2.0`
-                // 而不是 `3.0`（退出码 0、零诊断），于是先把该形态改成明确失败。
-                // 但那只是**止血**——真正的缺口是 `call` 的被调用者被钉死成
-                // `IDENTIFIER`，EBNF 没有 `postfix` 产生式。现在补上：
-                // 被调用者可以是任意已求值表达式，实参任意个。
-                //
-                // 形状：把 `callee_reg` 装进一个 1 元素的 callee witness 容器，
-                // 发 `CallValue`，再把结果接回 `callee_reg` 继续走后缀链
-                // （`f(x)(1).g()` 能继续链下去）。
-                //
-                // ⚠ 必须用 `match_token_exact`（**消费** `(`）而非 `check`
-                // （只窥视）：`emit_arg_list_w` 假定当前位置就停在 `(` 上。
-                // 写成 `check` 会让实参表从 `(` 开始解析，把 `(args)` 吃成
-                // 一个括号表达式，随后 `consume(RParen)` 必然失败
-                // —— 症状是莫名其妙的 `Expected ')'`。
                 let span = self.span_of_current();
-                let arg_wits = self.emit_arg_list_w()?;
-                // witness 侧用 `Evaluated` 承载被调用者 —— typeck 的
-                // `hm/infer.rs` 与 `hm/mod.rs` 已有该分支（含「立即调用的
-                // 闭包：body 效果在调用点发生」规则），`witness_to_fcfg`
-                // 也会把它降成 `Node::Call { callee_name: None }`。
+                let (arg_wits, named_args) = self.emit_arg_list_w()?;
                 callee_w = MirWitness {
                     kind: WitnessKind::Call {
                         callee: crate::mir::witness::WitnessCallee::Evaluated(Box::new(callee_w)),
                         args: arg_wits,
+                        named_args,
                     },
                     span,
                 };
@@ -587,19 +593,173 @@ impl ParserV3 {
         Some(callee_w)
     }
 
-    fn emit_arg_list_w(&mut self) -> Option<Vec<MirWitness>> {
+    /// Parse optional `stop` and `:step` after an opening `:` or `..` inside a slice axis.
+    fn parse_slice_stop_step(&mut self) -> Option<SliceStopStep> {
+        let stop = if self.check(&TokenType::Colon)
+            || self.check(&TokenType::Comma)
+            || self.check(&TokenType::RBracket)
+        {
+            None
+        } else {
+            Some(Box::new(self.emit_expr_w()?))
+        };
+        let step = if self.match_token_exact(TokenType::Colon) {
+            if self.check(&TokenType::Comma) || self.check(&TokenType::RBracket) {
+                None
+            } else {
+                Some(Box::new(self.emit_expr_w()?))
+            }
+        } else {
+            None
+        };
+        Some((stop, step))
+    }
+
+    /// Parse single indexing `obj[idx]` OR multi-dimensional tensor slicing `t[0..4, :, -1]`,
+    /// `t[1:4:2, ..., None]`. Single plain index lowers to existing `[]` call for full
+    /// list/dict/string compatibility; multi-axis or slice specs emit `WitnessKind::TensorSlice`.
+    fn emit_index_or_slice_w(&mut self, target: MirWitness, span: Span) -> Option<MirWitness> {
+        use crate::mir::witness::WitnessSliceAxis;
+        let mut axes: Vec<WitnessSliceAxis> = Vec::new();
+        while !self.check(&TokenType::RBracket) && !self.is_at_end() {
+            let axis = if self.match_token_exact(TokenType::DotDotDot) {
+                WitnessSliceAxis::Ellipsis
+            } else if matches!(
+                self.peek().map(|t| &t.token_type),
+                Some(TokenType::Identifier(s)) if s == "None"
+            ) && matches!(
+                self.tokens.get(self.current + 1).map(|t| &t.token_type),
+                Some(TokenType::Comma | TokenType::RBracket)
+            ) {
+                self.advance();
+                WitnessSliceAxis::NewAxis
+            } else if self.match_token_exact(TokenType::ColonColon) {
+                let step = if self.check(&TokenType::Comma) || self.check(&TokenType::RBracket) {
+                    None
+                } else {
+                    Some(Box::new(self.emit_expr_w()?))
+                };
+                WitnessSliceAxis::Range {
+                    start: None,
+                    stop: None,
+                    step,
+                }
+            } else if self.match_token(&[TokenType::Colon, TokenType::DotDot]) {
+                let (stop, step) = self.parse_slice_stop_step()?;
+                WitnessSliceAxis::Range {
+                    start: None,
+                    stop,
+                    step,
+                }
+            } else {
+                let start_expr = self.emit_expr_w()?;
+                if self.match_token_exact(TokenType::ColonColon) {
+                    let step = if self.check(&TokenType::Comma) || self.check(&TokenType::RBracket)
+                    {
+                        None
+                    } else {
+                        Some(Box::new(self.emit_expr_w()?))
+                    };
+                    WitnessSliceAxis::Range {
+                        start: Some(Box::new(start_expr)),
+                        stop: None,
+                        step,
+                    }
+                } else if self.match_token(&[TokenType::Colon, TokenType::DotDot]) {
+                    let (stop, step) = self.parse_slice_stop_step()?;
+                    WitnessSliceAxis::Range {
+                        start: Some(Box::new(start_expr)),
+                        stop,
+                        step,
+                    }
+                } else {
+                    WitnessSliceAxis::Index(Box::new(start_expr))
+                }
+            };
+            axes.push(axis);
+            if !self.match_token(&[TokenType::Comma]) {
+                break;
+            }
+        }
+        self.consume(TokenType::RBracket, "Expected ']' after index or slice")?;
+        if axes.is_empty() {
+            let msg = format!(
+                "Parse error: empty index expression `[]` at line {}",
+                self.current_line()
+            );
+            eprintln!("{msg}");
+            self.diag = Some(msg);
+            return None;
+        }
+        if axes.len() == 1 && matches!(axes.first(), Some(WitnessSliceAxis::Index(_))) {
+            let Some(WitnessSliceAxis::Index(idx_w)) = axes.pop() else {
+                unreachable!("verified Index axis");
+            };
+            return Some(MirWitness {
+                kind: WitnessKind::Call {
+                    callee: crate::mir::witness::WitnessCallee::Name("[]".to_string()),
+                    args: vec![target, *idx_w],
+                    named_args: Vec::new(),
+                },
+                span,
+            });
+        }
+        Some(MirWitness {
+            kind: WitnessKind::TensorSlice {
+                target: Box::new(target),
+                axes,
+            },
+            span,
+        })
+    }
+
+    /// Parse positional arguments followed by optional Python-style keyword arguments `name = expr`.
+    fn emit_arg_list_w(&mut self) -> Option<ParsedArgList> {
         let mut wits = Vec::new();
+        let mut named: Vec<(String, MirWitness)> = Vec::new();
         while !self.check(&TokenType::RParen) && !self.is_at_end() {
-            // v0.87: 参数解析失败必须传播（禁止静默丢弃失败的参数，否则
-            // fn(x) x + 1 作为参数时会被吞掉，导致零参数调用）。
-            let w = self.emit_expr_w()?;
-            wits.push(w);
+            if let Some(Token {
+                token_type: TokenType::Identifier(kw_name),
+                ..
+            }) = self.peek().cloned()
+                && matches!(
+                    self.tokens.get(self.current + 1).map(|t| &t.token_type),
+                    Some(TokenType::Assign)
+                )
+            {
+                if named.iter().any(|(k, _)| k == &kw_name) {
+                    let msg = format!(
+                        "Parse error: duplicate keyword argument '{}' at line {}",
+                        kw_name,
+                        self.current_line()
+                    );
+                    eprintln!("{msg}");
+                    self.diag = Some(msg);
+                    return None;
+                }
+                self.advance(); // kw_name
+                self.advance(); // '='
+                let val_w = self.emit_expr_w()?;
+                named.push((kw_name, val_w));
+            } else {
+                if !named.is_empty() {
+                    let msg = format!(
+                        "Parse error: positional argument cannot follow keyword argument at line {}",
+                        self.current_line()
+                    );
+                    eprintln!("{msg}");
+                    self.diag = Some(msg);
+                    return None;
+                }
+                let w = self.emit_expr_w()?;
+                wits.push(w);
+            }
             if !self.match_token(&[TokenType::Comma]) {
                 break;
             }
         }
         self.consume(TokenType::RParen, "Expected ')'")?;
-        Some(wits)
+        Some((wits, named))
     }
 
     /// 主表达式 — 镜像 parse_primary。
@@ -611,6 +771,9 @@ impl ParserV3 {
         }
         if self.is_select_form() {
             return self.emit_select_w();
+        }
+        if self.is_no_grad_form() {
+            return self.emit_no_grad_w();
         }
         let token = self.peek().cloned()?;
         let span = crate::common::Span::new(token.line, token.column);
@@ -750,34 +913,20 @@ impl ParserV3 {
                     self.generic_params = saved_generic;
                     return None;
                 }
-                let mut params = Vec::new();
-                while !self.check(&TokenType::RParen) && !self.is_at_end() {
-                    // v0.104.6 D354：闭包参数是**声明位**，走严格版。
-                    // `fn(if) … end` 修前 exit 0 声明成功，但参数**永远引用不到**。
-                    if let Some(p) = self.consume_plain_identifier("Expected parameter name") {
-                        // v0.104.6：形参类型标注 `fn(x: number) … end`。
-                        // 承载位 `Param.type_hint`（orchestrate::Param，存
-                        // 原始 `typeck::Type`）与消费端（下方转
-                        // `WitnessParam.type_hint`，再由 bidirectional.rs
-                        // Phase A 绑进 HM 环境做 subtype 检查）本就存在，
-                        // 此前只是从不填值 ⇒ 遇 `:` 直接
-                        // `Expected ')' after parameters`。裸形参仍为 None。
-                        let type_hint = if self.match_token_exact(TokenType::Colon) {
-                            Some(self.parse_type_annotation()?)
-                        } else {
-                            None
-                        };
-                        params.push(Param {
-                            name: p,
-                            type_hint,
-                            default: None,
-                        });
+                let param_wits = match self.parse_witness_params(false, true) {
+                    Some((ps, _)) => ps,
+                    None => {
+                        self.generic_params = saved_generic;
+                        return None;
                     }
-                    if !self.match_token(&[TokenType::Comma]) {
-                        break;
-                    }
+                };
+                if self
+                    .consume(TokenType::RParen, "Expected ')' after parameters")
+                    .is_none()
+                {
+                    self.generic_params = saved_generic;
+                    return None;
                 }
-                self.consume(TokenType::RParen, "Expected ')' after parameters")?;
                 // 子上下文：闭包体是独立作用域（`is_program_top = false`, `parse_loop_depth = 0`）
                 let body_res = self.in_nested_scope(|this| {
                     if this.match_token_exact(TokenType::FatArrow)
@@ -795,17 +944,6 @@ impl ParserV3 {
                 // 避免 `generic_params` 泄漏到后续无关标注。
                 self.generic_params = saved_generic;
                 let body_w = body_res?;
-                let param_wits: Vec<crate::mir::witness::WitnessParam> = params
-                    .iter()
-                    .map(|p| crate::mir::witness::WitnessParam {
-                        name: p.name.clone(),
-                        type_hint: p
-                            .type_hint
-                            .clone()
-                            .map(crate::mir::hint::TypeHint::from_type),
-                        default: None,
-                    })
-                    .collect();
 
                 MirWitness {
                     kind: WitnessKind::Closure {
@@ -882,6 +1020,7 @@ impl ParserV3 {
                     kind: WitnessKind::Literal(Literal::String(quoted_text.to_string(), span)),
                     span,
                 }],
+                named_args: Vec::new(),
             },
             span,
         };
@@ -1164,10 +1303,71 @@ impl ParserV3 {
             },
             None => self.consume_identifier("Expected import path")?,
         };
+        let mut visited = std::collections::HashSet::new();
+        self.prepopulate_imported_type_names(&path, &mut visited);
         Some(MirWitness {
             kind: WitnessKind::Import(path),
             span,
         })
+    }
+
+    /// Pre-register exported nominal type names (`struct`/`enum`/`trait`/`type`) from an
+    /// imported module so caller type annotations (`x: HttpRequest`) parse in a single pass.
+    fn prepopulate_imported_type_names(
+        &mut self,
+        path: &str,
+        visited: &mut std::collections::HashSet<String>,
+    ) {
+        if !visited.insert(path.to_string()) {
+            return;
+        }
+        let src = if let Some(s) = self
+            .virtual_modules
+            .as_ref()
+            .and_then(|m| m.get(path))
+            .cloned()
+        {
+            s
+        } else if let Some(s) = crate::resolve_std_module(path) {
+            s.to_string()
+        } else if let Ok(s) = std::fs::read_to_string(path) {
+            s
+        } else {
+            return;
+        };
+        let toks = crate::lexer::Lexer::new(&src).scan_tokens();
+        let mut i = 0usize;
+        while i < toks.len() {
+            match &toks[i].token_type {
+                TokenType::Import => {
+                    if let Some(tok) = toks.get(i + 1)
+                        && let TokenType::String(sub) = &tok.token_type
+                    {
+                        self.prepopulate_imported_type_names(sub, visited);
+                        i += 2;
+                        continue;
+                    }
+                }
+                TokenType::Identifier(s) if s == "export" => {
+                    if let (Some(kind_tok), Some(name_tok)) = (toks.get(i + 1), toks.get(i + 2)) {
+                        let is_type_decl = matches!(
+                            &kind_tok.token_type,
+                            TokenType::Struct | TokenType::Enum | TokenType::Type
+                        ) || matches!(
+                            &kind_tok.token_type,
+                            TokenType::Identifier(s) if s == "trait"
+                        );
+                        if is_type_decl && let TokenType::Identifier(name) = &name_tok.token_type {
+                            self.declared_type_names.insert(name.clone());
+                            i += 3;
+                            continue;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
     }
 
     /// v0.80: perform Effect(arg1, arg2, ...) 解析。
@@ -1650,6 +1850,10 @@ impl ParserV3 {
             TokenType::Identifier(ref s) if s == "select" && self.is_select_form() => {
                 self.emit_select_w()
             }
+            // Wave 3 Stage 3C: `no_grad` autograd suppression block
+            TokenType::Identifier(ref s) if s == "no_grad" && self.is_no_grad_form() => {
+                self.emit_no_grad_w()
+            }
             TokenType::Identifier(n) if n == "commit" => {
                 let span = self.span_of_current();
                 self.advance(); // 'commit'
@@ -2080,12 +2284,23 @@ impl ParserV3 {
             if self.check(&TokenType::Dyn) {
                 self.advance(); // 'dyn'
                 let trait_name = self.consume_identifier("Expected trait name after 'dyn'")?;
+                let mut generics = Vec::new();
+                if self.match_token(&[TokenType::Less]) {
+                    loop {
+                        let ty = self.parse_type_annotation()?;
+                        generics.push(crate::mir::hint::TypeHint::from_type(ty));
+                        if !self.match_token(&[TokenType::Comma]) {
+                            break;
+                        }
+                    }
+                    self.consume(TokenType::Greater, "Expected '>' after dyn trait generics")?;
+                }
                 let span = src_w.span;
                 return Some(MirWitness {
                     kind: WitnessKind::DynTrait {
                         expr: Box::new(src_w),
                         trait_name,
-                        generics: Vec::new(),
+                        generics,
                     },
                     span,
                 });
@@ -2175,14 +2390,15 @@ impl ParserV3 {
             TokenType::Enum => self.emit_enum_def_w(),
             TokenType::Type => self.emit_type_alias_w(),
             TokenType::Macro => self.emit_macro_def_w(),
+            TokenType::Identifier(ref s) if s == "trait" && self.is_trait_form() => {
+                self.emit_trait_def_w()
+            }
+            TokenType::Identifier(ref s) if s == "impl" && self.is_impl_form() => {
+                self.emit_impl_def_w()
+            }
             _ => return None,
         }?;
         let names = Self::exported_names_of(&decl);
-        // v0.103: 单遍编译路径必须**在此 emit ExportMark 指令** —— 生产主路径
-        // 是 ParserV3::compile（直接产出 MirInst），lower.rs 的 Export 分支只
-        // 服务旧的 witness 路径。缺这一步时 typeck 静态可见（读 witness 的
-        // export 名集），但运行时环境导出集为空 → import 后调用报
-        // "Undefined function or task"。
         for _n in &names {}
         Some(MirWitness {
             kind: WitnessKind::Export {
@@ -2201,6 +2417,7 @@ impl ParserV3 {
             | WitnessKind::FnDef { name, .. }
             | WitnessKind::StructDef { name, .. }
             | WitnessKind::EnumDef { name, .. }
+            | WitnessKind::TraitDef { name, .. }
             | WitnessKind::TypeAlias { name, .. }
             | WitnessKind::MacroDef { name, .. } => vec![name.clone()],
             // Sequence 可含多条声明（`export` 后跟块）—— 收集全部
@@ -2209,6 +2426,68 @@ impl ParserV3 {
             }
             _ => Vec::new(),
         }
+    }
+
+    /// Stage 3C: Contextual lookahead for `trait Name ... end` (preserves `let trait = 1`).
+    fn is_trait_form(&self) -> bool {
+        let Some(tok) = self.peek() else {
+            return false;
+        };
+        if !matches!(&tok.token_type, TokenType::Identifier(s) if s == "trait") {
+            return false;
+        }
+        matches!(
+            self.tokens.get(self.current + 1).map(|t| &t.token_type),
+            Some(TokenType::Identifier(_))
+        )
+    }
+
+    /// Stage 3C: Contextual lookahead for `impl<T> ...` or `impl Name ... end`.
+    fn is_impl_form(&self) -> bool {
+        let Some(tok) = self.peek() else {
+            return false;
+        };
+        if !matches!(&tok.token_type, TokenType::Identifier(s) if s == "impl") {
+            return false;
+        }
+        matches!(
+            self.tokens.get(self.current + 1).map(|t| &t.token_type),
+            Some(TokenType::Identifier(_) | TokenType::Less)
+        )
+    }
+
+    /// Stage 3C: Contextual lookahead for `no_grad ... end` / `no_grad do ... end` / `no_grad { ... }`.
+    fn is_no_grad_form(&self) -> bool {
+        let Some(tok) = self.peek() else {
+            return false;
+        };
+        if !matches!(&tok.token_type, TokenType::Identifier(s) if s == "no_grad") {
+            return false;
+        }
+        matches!(
+            self.tokens.get(self.current + 1).map(|t| &t.token_type),
+            Some(TokenType::Newline | TokenType::Do | TokenType::LBrace)
+        )
+    }
+
+    /// Stage 3C: Parse `no_grad ... end` / `no_grad do ... end` / `no_grad { ... }`.
+    fn emit_no_grad_w(&mut self) -> Option<MirWitness> {
+        let span = self.span_of_current();
+        self.advance(); // consume 'no_grad'
+        let body = if self.check(&TokenType::LBrace) {
+            self.in_nested_scope(|this| this.emit_block_w())?
+        } else {
+            let _ = self.match_token_exact(TokenType::Do);
+            while self.match_token(&[TokenType::Newline]) {}
+            let stmts = self.emit_end_delimited_body_w("no_grad")?;
+            Self::block_witness(stmts, span)
+        };
+        Some(MirWitness {
+            kind: WitnessKind::NoGrad {
+                body: Box::new(body),
+            },
+            span,
+        })
     }
 
     fn is_spawn_form(&self) -> bool {
@@ -2301,15 +2580,25 @@ impl ParserV3 {
             let mut expr = self.emit_expr_w()?;
             let kind = std::mem::replace(&mut expr.kind, WitnessKind::Commit);
             match kind {
-                WitnessKind::Call { callee, args } => WitnessSpawnTarget::Call { callee, args },
+                WitnessKind::Call {
+                    callee,
+                    args,
+                    named_args,
+                } => WitnessSpawnTarget::Call {
+                    callee,
+                    args,
+                    named_args,
+                },
                 WitnessKind::MethodCall {
                     receiver,
                     method,
                     args,
+                    named_args,
                 } => WitnessSpawnTarget::MethodCall {
                     receiver,
                     method,
                     args,
+                    named_args,
                 },
                 other => WitnessSpawnTarget::Expr(Box::new(MirWitness {
                     kind: other,
@@ -2410,6 +2699,7 @@ impl ParserV3 {
                     receiver,
                     method,
                     args,
+                    named_args,
                 } = kind
                 else {
                     eprintln!(
@@ -2418,7 +2708,7 @@ impl ParserV3 {
                     );
                     return None;
                 };
-                if method != "recv" || !args.is_empty() {
+                if method != "recv" || !args.is_empty() || !named_args.is_empty() {
                     eprintln!(
                         "Parse error: select binding arm must call '.recv()' with no arguments (line {})",
                         self.current_line()
@@ -2463,7 +2753,8 @@ impl ParserV3 {
                         receiver,
                         method,
                         mut args,
-                    } if method == "send" && args.len() == 1 => {
+                        named_args,
+                    } if method == "send" && args.len() == 1 && named_args.is_empty() => {
                         let value = Box::new(args.remove(0));
                         let body = self.emit_select_arm_body()?;
                         WitnessSelectArm::Send {
@@ -2476,7 +2767,8 @@ impl ParserV3 {
                         receiver,
                         method,
                         args,
-                    } if method == "recv" && args.is_empty() => {
+                        named_args,
+                    } if method == "recv" && args.is_empty() && named_args.is_empty() => {
                         let body = self.emit_select_arm_body()?;
                         WitnessSelectArm::Recv {
                             binding: None,

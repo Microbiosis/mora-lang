@@ -133,6 +133,85 @@ impl BuiltinKind {
     }
 }
 
+/// Wave 3 Stage 3C: Runtime descriptor for one field of a nominal `struct`.
+#[derive(Debug, Clone)]
+pub struct StructFieldRuntime {
+    pub name: String,
+    pub type_name: String,
+    pub default_fn: Option<crate::mir::control::FnId>,
+    pub tags: Vec<(String, String)>,
+}
+
+/// Wave 3 Stage 3C: Runtime metadata and default-initializer program handle for a `struct`.
+#[derive(Debug, Clone)]
+pub struct StructDefRuntime {
+    pub name: String,
+    pub type_params: Vec<String>,
+    pub fields: Vec<StructFieldRuntime>,
+    pub program: std::sync::Arc<crate::mir::control::ControlProgram>,
+    pub globals: crate::runtime::vm::ModuleGlobals,
+}
+
+impl StructDefRuntime {
+    /// Build a structured Mora `Value::Dict` schema describing this struct and its compile-time `@tag` metadata.
+    pub fn to_schema_value(&self) -> Value {
+        let field_vals: Vec<Value> = self
+            .fields
+            .iter()
+            .map(|f| {
+                let mut fdict = HashMap::new();
+                fdict.insert("name".to_string(), Value::String(f.name.clone()));
+                fdict.insert("type".to_string(), Value::String(f.type_name.clone()));
+                fdict.insert(
+                    "has_default".to_string(),
+                    Value::Bool(f.default_fn.is_some()),
+                );
+                let mut tag_map = HashMap::new();
+                for (k, v) in &f.tags {
+                    tag_map.insert(k.clone(), Value::String(v.clone()));
+                }
+                fdict.insert("tags".to_string(), Value::Dict(tag_map));
+                Value::Dict(fdict)
+            })
+            .collect();
+        let mut out = HashMap::new();
+        out.insert("name".to_string(), Value::String(self.name.clone()));
+        out.insert(
+            "type_params".to_string(),
+            Value::List(
+                self.type_params
+                    .iter()
+                    .cloned()
+                    .map(Value::String)
+                    .collect(),
+            ),
+        );
+        out.insert("fields".to_string(), Value::List(field_vals.into()));
+        Value::Dict(out)
+    }
+
+    /// Build a Mora `Value::Dict` mapping `field_name -> { tag_key: tag_val, ... }`.
+    pub fn to_tags_value(&self) -> Value {
+        let mut out = HashMap::new();
+        for f in &self.fields {
+            let mut tag_map = HashMap::new();
+            for (k, v) in &f.tags {
+                tag_map.insert(k.clone(), Value::String(v.clone()));
+            }
+            out.insert(f.name.clone(), Value::Dict(tag_map));
+        }
+        Value::Dict(out)
+    }
+}
+
+/// Wave 3 Stage 3C: Runtime metadata for a nominal `enum` definition.
+#[derive(Debug, Clone)]
+pub struct EnumDefRuntime {
+    pub name: String,
+    pub type_params: Vec<String>,
+    pub variants: Vec<(String, Vec<String>)>,
+}
+
 #[derive(Debug, Clone)]
 pub enum Value {
     String(String),
@@ -206,8 +285,41 @@ pub enum Value {
     TaskHandle(Arc<crate::runtime::scheduler::MoraTaskHandle>),
     /// Wave 2: Cooperative cancellation & deadline context (`context()`).
     Context(crate::runtime::scheduler::TaskContext),
+    /// Wave 2: Non-blocking async TCP listener (`tcp_listen(addr)`).
+    TcpListener(Arc<crate::runtime::reactor::MoraTcpListener>),
+    /// Wave 2: Non-blocking async TCP stream (`tcp_connect(addr)` / `listener.accept()`).
+    TcpStream(Arc<crate::runtime::reactor::MoraTcpStream>),
     /// Wave 3 — Stage 3B: First-class strided N-dimensional tensor (`tensor(...)` / `Tensor::*`).
     Tensor(Arc<tensor::Tensor>),
+    /// Wave 4: Native fused tensor compute graph (`trace_dag(...)`).
+    ComputeDag(Arc<crate::runtime::compute_dag::TensorComputeDag>),
+    /// Wave 4: Paged KV-cache dynamic resource allocator (`kv_allocator(...)`).
+    KVAllocator(Arc<crate::runtime::kv_cache::KVPageAllocator>),
+    /// Wave 3 — Stage 3C: First-class nominal struct type constructor & metadata object.
+    StructType(Arc<StructDefRuntime>),
+    /// Wave 3 — Stage 3C: First-class nominal struct instance preserving field order & `@tag` schema.
+    StructInstance {
+        type_name: String,
+        fields: HashMap<String, Value>,
+        field_order: Vec<String>,
+        def: Arc<StructDefRuntime>,
+    },
+    /// Wave 3 — Stage 3C: First-class nominal enum type descriptor.
+    EnumType(Arc<EnumDefRuntime>),
+    /// Wave 3 — Stage 3C: First-class nominal enum variant value with optional payload values.
+    EnumVariant {
+        enum_name: String,
+        variant: String,
+        payload: Vec<Value>,
+    },
+    /// Wave 3 — Stage 3C: Differentiated callable produced by `grad(fn)` or `value_and_grad(fn)`.
+    GradFn {
+        func: Box<Value>,
+        argnums: Vec<usize>,
+        return_value: bool,
+    },
+    /// Wave 3 — Stage 3C: Internal sentinel instructing callee prologue to evaluate a default param.
+    MissingArg,
 }
 
 // 手动实现 PartialEq（Atom/Task/Closure/Macro/Continuation 等不自动比较内部载荷）
@@ -215,6 +327,7 @@ impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Value::Nil, Value::Nil) => true,
+            (Value::MissingArg, Value::MissingArg) => true,
             (Value::Float(a), Value::Float(b)) => a == b,
             (Value::Int(a), Value::Int(b)) => a == b,
             (Value::Scalar(a), Value::Scalar(b)) => a == b,
@@ -244,7 +357,37 @@ impl PartialEq for Value {
             (Value::Channel(a), Value::Channel(b)) => Arc::ptr_eq(a, b),
             (Value::TaskHandle(a), Value::TaskHandle(b)) => Arc::ptr_eq(a, b),
             (Value::Context(a), Value::Context(b)) => a.same_handle(b),
+            (Value::TcpListener(a), Value::TcpListener(b)) => Arc::ptr_eq(a, b),
+            (Value::TcpStream(a), Value::TcpStream(b)) => Arc::ptr_eq(a, b),
+            (Value::ComputeDag(a), Value::ComputeDag(b)) => Arc::ptr_eq(a, b) || a == b,
+            (Value::KVAllocator(a), Value::KVAllocator(b)) => Arc::ptr_eq(a, b),
             (Value::Tensor(a), Value::Tensor(b)) => Arc::ptr_eq(a, b) || a == b,
+            (Value::StructType(a), Value::StructType(b)) => Arc::ptr_eq(a, b) || a.name == b.name,
+            (
+                Value::StructInstance {
+                    type_name: ta,
+                    fields: fa,
+                    ..
+                },
+                Value::StructInstance {
+                    type_name: tb,
+                    fields: fb,
+                    ..
+                },
+            ) => ta == tb && fa == fb,
+            (Value::EnumType(a), Value::EnumType(b)) => Arc::ptr_eq(a, b) || a.name == b.name,
+            (
+                Value::EnumVariant {
+                    enum_name: ea,
+                    variant: va,
+                    payload: pa,
+                },
+                Value::EnumVariant {
+                    enum_name: eb,
+                    variant: vb,
+                    payload: pb,
+                },
+            ) => ea == eb && va == vb && pa == pb,
             _ => false,
         }
     }
@@ -403,6 +546,45 @@ impl Value {
             ],
             Value::TaskHandle(_) => &["join", "abort", "is_done", "context"],
             Value::Context(_) => &["child", "with_timeout", "cancel", "is_cancelled", "spawn"],
+            Value::TcpListener(_) => &["accept", "local_addr", "close", "is_closed"],
+            Value::TcpStream(_) => &[
+                "read",
+                "read_bytes",
+                "read_line",
+                "write",
+                "write_bytes",
+                "shutdown",
+                "close",
+                "is_closed",
+                "local_addr",
+                "peer_addr",
+            ],
+            Value::ComputeDag(_) => &[
+                "run",
+                "fuse",
+                "node_count",
+                "fused_count",
+                "op_names",
+                "to_dot",
+                "is_fused",
+            ],
+            Value::KVAllocator(_) => &[
+                "alloc_seq",
+                "append_tokens",
+                "fork_seq",
+                "write_kv",
+                "read_kv",
+                "free_seq",
+                "evict_lru",
+                "seq_pages",
+                "seq_tokens",
+                "free_pages",
+                "used_pages",
+                "total_pages",
+                "utilization",
+                "bytes_used",
+                "stats",
+            ],
             Value::Tensor(_) => &[
                 "shape",
                 "ndim",
@@ -444,6 +626,9 @@ impl Value {
                 "layer_norm",
                 "to_list",
             ],
+            Value::StructType(_) => &["schema", "tags", "fields"],
+            Value::StructInstance { .. } => &["to_dict", "schema", "tags", "json"],
+            Value::EnumType(_) => &["variants"],
             _ => &[],
         };
         names.iter().map(|s| s.to_string()).collect()

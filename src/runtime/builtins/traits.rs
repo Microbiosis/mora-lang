@@ -69,18 +69,19 @@ pub(crate) fn resolve_trait_method_call(
     args: Vec<Value>,
     call_site: Span,
 ) -> MoraResult<TraitMethodTarget> {
-    let (for_type, for_generics, trait_name, trait_generics) = match receiver {
+    let (for_type, for_generics, trait_name, trait_generics, underlying_data) = match receiver {
         Value::TraitObject {
             for_type,
             for_generics,
             trait_name,
             trait_generics,
-            ..
+            data,
         } => (
             for_type.clone(),
             for_generics.clone(),
             trait_name.clone(),
             trait_generics.clone(),
+            (**data).clone(),
         ),
         Value::Nil => return Ok(TraitMethodTarget::Immediate(Value::Nil)),
         _ => {
@@ -101,11 +102,59 @@ pub(crate) fn resolve_trait_method_call(
             .map(|m| m.has_self)
             .unwrap_or(true);
 
+        // Stage 3C: Check compiled source-level `impl Trait for Type` registry first (case-insensitive for built-in names like String/string, plus `number` matching int/float).
+        let lookup_impl = |ty_key: &str| -> Option<(Value, bool)> {
+            core.trait_impls
+                .get(&(
+                    tname_str.to_string(),
+                    ty_key.to_string(),
+                    method.to_string(),
+                ))
+                .cloned()
+                .or_else(|| {
+                    let lower = ty_key.to_lowercase();
+                    core.trait_impls
+                        .iter()
+                        .find(|((tr, tgt, m), _)| {
+                            tr == tname_str
+                                && m == method
+                                && (tgt.eq_ignore_ascii_case(&lower)
+                                    || (tgt.eq_ignore_ascii_case("number")
+                                        && matches!(lower.as_str(), "int" | "float")))
+                        })
+                        .map(|(_, v)| v.clone())
+                })
+        };
+
+        if let Some((task, impl_has_self)) = lookup_impl(&for_type) {
+            let mut all_args = if impl_has_self {
+                vec![underlying_data.clone()]
+            } else {
+                Vec::new()
+            };
+            all_args.extend(args);
+            return Ok(TraitMethodTarget::Call(task, all_args));
+        }
+
         let impl_name =
             impl_method_key(tname_str, &trait_generics, &for_type, &for_generics, method);
         if let Some(task) = core.environment.get(&impl_name) {
             let mut all_args = if has_self {
                 vec![receiver.clone()]
+            } else {
+                Vec::new()
+            };
+            all_args.extend(args);
+            return Ok(TraitMethodTarget::Call(task, all_args));
+        }
+
+        if let Some((task, def_has_self)) = core
+            .trait_defaults
+            .get(&(tname_str.to_string(), method.to_string()))
+            .cloned()
+        {
+            let mut all_args = if def_has_self {
+                vec![underlying_data.clone()]
             } else {
                 Vec::new()
             };
@@ -132,6 +181,89 @@ pub(crate) fn resolve_trait_method_call(
         method,
         search_chain.join(" → "),
     )))
+}
+
+/// Pure lookup for inherent or trait `impl` method on a concrete (unboxed) receiver value.
+pub(crate) fn resolve_concrete_impl_method(
+    core: &crate::runtime::CoreRuntime,
+    receiver: &Value,
+    method: &str,
+    args: &[Value],
+) -> Option<(Value, Vec<Value>)> {
+    let type_key = crate::flow::dynamic_type_name(receiver);
+    let lower_key = type_key.to_lowercase();
+
+    let target_matches = |tgt: &str| -> bool {
+        tgt == type_key
+            || tgt.eq_ignore_ascii_case(&lower_key)
+            || (tgt.eq_ignore_ascii_case("number") && matches!(lower_key.as_str(), "int" | "float"))
+    };
+
+    // 1. Inherent `impl TargetType` methods
+    let inherent = core
+        .inherent_methods
+        .get(&(type_key.clone(), method.to_string()))
+        .cloned()
+        .or_else(|| {
+            core.inherent_methods
+                .iter()
+                .find(|((tgt, m), _)| m == method && target_matches(tgt))
+                .map(|(_, v)| v.clone())
+        });
+    if let Some((func, has_self)) = inherent {
+        let mut all_args = if has_self {
+            vec![receiver.clone()]
+        } else {
+            Vec::new()
+        };
+        all_args.extend(args.iter().cloned());
+        return Some((func, all_args));
+    }
+
+    // 2. Trait `impl Trait for TargetType` methods
+    let trait_direct = core
+        .trait_impls
+        .iter()
+        .find(|((_, tgt, m), _)| m == method && target_matches(tgt))
+        .map(|(_, v)| v.clone());
+    if let Some((func, has_self)) = trait_direct {
+        let mut all_args = if has_self {
+            vec![receiver.clone()]
+        } else {
+            Vec::new()
+        };
+        all_args.extend(args.iter().cloned());
+        return Some((func, all_args));
+    }
+
+    // 3. Default method on any trait implemented by `TargetType` (or its parent traits)
+    let mut implemented_traits: Vec<String> = Vec::new();
+    for (tr, tgt) in core.trait_impl_pairs.iter() {
+        if target_matches(tgt) && !implemented_traits.contains(tr) {
+            implemented_traits.push(tr.clone());
+        }
+    }
+    for (tr, tgt, _) in core.trait_impls.keys() {
+        if target_matches(tgt) && !implemented_traits.contains(tr) {
+            implemented_traits.push(tr.clone());
+        }
+    }
+    for tr in implemented_traits {
+        for anc in collect_parent_traits(&core.trait_registry, &tr) {
+            if let Some((func, has_self)) =
+                core.trait_defaults.get(&(anc, method.to_string())).cloned()
+            {
+                let mut all_args = if has_self {
+                    vec![receiver.clone()]
+                } else {
+                    Vec::new()
+                };
+                all_args.extend(args.iter().cloned());
+                return Some((func, all_args));
+            }
+        }
+    }
+    None
 }
 
 /// Pure helper constructing a `TraitObject` instance for `Trait::new("ForType")`.

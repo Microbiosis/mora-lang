@@ -38,7 +38,7 @@ use std::process::Command;
 /// 新增子命令时**必须**同时加进这里，否则本测试会红。
 const SUBCOMMANDS: &[&str] = &[
     // 顶层
-    "run", "install",
+    "run", "build", "install",
 ];
 
 fn help_text() -> String {
@@ -87,6 +87,7 @@ fn d185_help_still_lists_the_original_entries() {
         "mora --check <file>",
         "mora --repl",
         "mora run <file.mora>",
+        "mora build <file.mora>",
         "mora install <url>",
         "mora --version",
         "mora --help",

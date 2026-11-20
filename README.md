@@ -12,11 +12,11 @@
 
 ## Highlights
 
-- **AI-native numeric & compute foundation** — strict `Int` (`i64`, overflow-checked) vs `Float` (`f64`) literal semantics with cross-tower representability checks, low-bitwidth numeric suffixes (`f16`, `bf16`, `fp8`, `f32`, `f64`, `i4`..`i64`, `u8`..`u64`) for quantized/mixed-precision compute, native matrix/tensor contraction operator `@` (1D dot product, 2D matrix multiply, matrix-vector multiply), right-associative power `**`, scalar & vector math (`math.*`, `stats.*`, `linalg.*`), deterministic/ambient PRNG (`random.*`), and modular std workspace crates (`std/math/bigint` / `mora-std-bigint`).
-- **Single-pass Control SSA compiler & stackful VM** — Lexer → iterative Pratt `ParserV3::compile` → `MirWitness[]` + `ControlProgram` SSA IR (dominator/slot verification `verify_program`) → SSA optimization (`--opt=0/1/2` or `MORA_OPT`: CopyProp, GVN-CSE, LICM, DCE) → heap-framed stackful VM (`runtime::vm`) with `O(1)` tail-call optimization (100,000+ recursive frames in constant stack space).
-- **Unified Span-tracked Hindley-Milner type system** — single constraint solver (`src/typeck/check_mir.rs` + `src/typeck/hm/`) supporting rigid multi-character generic parameters (`<T, Dtype>`), qualified let-polymorphism with ML Value Restriction, effect-row subsumption, covariant `result<T, E>` & `task_handle<T>`, invariant `channel<T>`, fail-closed `unknown`, and cross-module `import` verification before execution.
-- **Go-style cloud-native concurrency & Tokio runtime** — first-class `spawn`, typed invariant `channel<T>` (unbuffered rendezvous & bounded FIFO), fair multi-arm `select` (`case recv`/`send`/`timeout`/`default`), hierarchical cooperative cancellation `context` (`task_handle<T>`), cancellable `sleep`, multi-threaded `TaskScheduler`, non-blocking `AsyncIoReactor` (`AsyncTcpListener` / `AsyncTcpStream`), and `FsPolicy` / `CheckedPath` filesystem confinement with isolated per-runtime virtual `cwd`.
-- **Algebraic effects, dynamic dispatch & homoiconic metaprogramming** — `perform` / `handle` with multi-shot delimited continuations (`resume`, `Value::Continuation`), `dyn` trait dispatch (`as dyn`, default trait methods) plus `HostObject` (`Value::External(Arc<dyn HostObject>)`) for opaque stateful host objects, chunked persistent `Value::List`, lexical `Environment` (`HashMap` + `Arc<Environment>` parent chain), atoms (`atom` / `swap` / `deref`), pattern matching with guards, and Lisp-heritage homoiconicity (`macro`, `quote`, `quasiquote`, `eval`, `p"..."`).
+- **AI-native numeric, tensor & compute foundation** — strict `Int` (`i64`, overflow-checked) vs `Float` (`f64`) literals with hardware low-bitwidth `DType` suffixes (`f16`, `bf16`, `fp8`, `fp8_e5m2`, `f32`, `f64`, `i4`..`i64`, `u8`..`u64`, `bool`), 64-byte aligned compact `Tensor<DType, Shape, Device>` with zero-copy strided multi-dim slicing (`t[0..4, :, -1]`, `t[..., None]`), native matrix/tensor contraction `@` and power `**`, reverse-mode `grad`/`value_and_grad`/`no_grad`, forward-mode `jvp`, `TensorComputeDag` operator fusion (`trace_dag`), PagedAttention `KVPageAllocator` (`kv_allocator`), scalar/tensor math (`math.*`, `stats.*`, `linalg.*`, `random.*`), and modular std workspace crates (`std/math/bigint`, pure-Mora `std/net/http` with SSE, and `std/mcp`).
+- **Single-pass Control SSA compiler, stackful VM & `mora build`** — Lexer → iterative Pratt `ParserV3::compile` → `MirWitness[]` + `ControlProgram` SSA IR (`verify_program`) → SSA optimization (`--opt=0/1/2` or `MORA_OPT`: CopyProp, GVN-CSE, LICM, DCE) → heap-framed stackful VM (`runtime::vm`) with `O(1)` tail-call optimization (100,000+ frames) and `mora build <file> -o <bin>` self-contained single-binary bundling.
+- **Unified Span-tracked Hindley-Milner type system** — single constraint solver (`src/typeck/check_mir.rs` + `src/typeck/hm/`) delivering 5 AI-native static checks (`DType`, `Shape`, `Device`, `Resource`, `Effect`), nominal generic `struct` (with defaults & compile-time `@tag(...)`) / payload `enum`, source-level `trait`/`impl`/`dyn Trait`, default & named keyword arguments, rigid multi-character generic parameters (`<T, Dtype>`), ML Value Restriction, effect-row subsumption, covariant `result<T, E>` & `task_handle<T>`, invariant `channel<T>`, fail-closed `unknown`, and cross-module `import` verification.
+- **Go-style cloud-native concurrency & Tokio runtime** — first-class `spawn`, typed invariant `channel<T>` (unbuffered rendezvous & bounded FIFO), fair multi-arm `select` (`case recv`/`send`/`timeout`/`default`), hierarchical cooperative cancellation `context` (`task_handle<T>`), cancellable `sleep`, multi-threaded `TaskScheduler`, non-blocking `AsyncIoReactor` (`tcp_listen` / `tcp_connect` / `tcp_listener` / `tcp_stream`), and `FsPolicy` / `CheckedPath` filesystem confinement with isolated per-runtime virtual `cwd`.
+- **Algebraic effects, dynamic dispatch & homoiconic metaprogramming** — `perform` / `handle` with multi-shot delimited continuations (`resume`, `Value::Continuation`), source-level `trait` / `impl` & `dyn` trait dispatch (`as dyn`, default methods, supertraits), `HostObject` (`Value::External(Arc<dyn HostObject>)`) for opaque stateful host objects, chunked persistent `Value::List`, lexical `Environment` (`HashMap` + `Arc<Environment>` parent chain), atoms (`atom` / `swap` / `deref`), typed pattern matching with guards, and Lisp-heritage homoiconicity (`macro`, `quote`, `quasiquote`, `eval`).
 - **LSP server (`mora-lsp`) & editor ecosystem** — stdio JSON-RPC 2.0 server with unified HM hover/completion (`infer_program_types`), bounded headers (`MAX_CONTENT_LENGTH`), shared iterative RFC 8259 JSON parser (`MAX_JSON_DEPTH = 256`), and integrations for VS Code, Neovim, Helix, Sublime Text, Vim, and Emacs.
 - **9-language heritage** — Clojure, Common Lisp, Prolog, Lisp, Ballerina, StreamIt, APL, Logo, Smalltalk (see [docs/influences.md](docs/influences.md)).
 
@@ -47,6 +47,7 @@ cargo build --release     # builds target/release/mora and target/release/mora-l
 ```bash
 mora script.mora          # run a script
 mora run script.mora      # explicit run subcommand
+mora build script.mora -o app  # compile into a self-contained single binary
 mora --opt=1 script.mora  # SSA optimization: 0=off / 1=basic / >=2=aggressive
 mora --check script.mora  # type check only
 mora --repl               # interactive REPL
@@ -90,14 +91,16 @@ print(classify(5))
 | Lists              | `[1, 2, 3]`, `.map(fn)`, `.filter(fn)`, `.reduce(fn, init)`, `.shape()`, `.reshape(...)` |
 | Dicts              | `{key: val}`, `dict.get("key")`                              |
 | String methods     | `.len()`, `.upper()`, `.lower()`, `.trim()`, `.split()`, `.contains()`, `.replace()` |
-| Control flow       | `if/then/else/end`, `for x in list/end`, `match expr with/end` |
-| Concurrency        | `spawn f()`, `channel(cap)`, `select ... end`, `context()`, `sleep(ms)` |
+| Control flow       | `if/then/else/end`, `for x in list/end`, `while cond/end`, `match expr with/end` |
+| Concurrency        | `spawn f()`, `channel(cap)`, `select ... end`, `context()`, `sleep(ms)`, `tcp_listen`/`tcp_connect` |
 | Parallel & STM     | `parallel ... end`, `worker w ... end`, `transaction ... end`, `atom(v)` |
+| Tensors & Autograd | `Tensor::zeros([m, n])`, `t[0..2, :, None]`, `grad(f)`, `value_and_grad(f)`, `jvp(f, x, dx)`, `no_grad ... end` |
+| Compute DAG & KV   | `trace_dag(fn, ...)`, `dag.run(...)`, `dag.to_dot()`, `kv_allocator(pages, page_tokens, heads, dim)` |
 | Algebraic effects  | `perform Name(arg)`, `handle Name { ... } { ... resume(...) }` |
 | Dyn dispatch & OO  | `trait` / `impl`, `expr as dyn Name`, `dyn Name<T>`          |
-| Modules            | `import "path"`, `export let/task`                           |
-| Types & ADTs       | `type Name = TargetType`, `enum Name ... end`, `struct Name ... end` |
-| Metaprogramming    | `macro name(params) ... end`, `quote(expr)`, `eval(src)`, `p"..."` |
+| Modules            | `import "path"`, `export let/task/struct/enum/trait/impl`, `std/net/http`, `std/mcp` |
+| Types & ADTs       | `type Name = TargetType`, `enum Name ... end`, `struct Name ... end` (with defaults & `@tag(...)`) |
+| Metaprogramming    | `macro name(params) ... end`, `quote(expr)`, `quasiquote`, `eval(src)` |
 
 ## Static Hindley-Milner type checking
 
@@ -205,19 +208,20 @@ Key modules under `src/`:
 - `parser_v3/` — iterative Pratt expression parser and single-pass Control SSA witness compiler
 - `mir/control/` — SSA IR (`ControlProgram`, `BasicBlock`, `ControlInst`, `ControlTerminator`), lowering, verifier, and optimizer (`OptLevel`)
 - `typeck/` — unified Span-tracked Hindley-Milner solver (`src/typeck/check_mir.rs`, `src/typeck/hm/`) and cross-module `import` symbol verification
-- `runtime/` — stackful VM (`vm/`), `CoreRuntime`, process-shared `EngineShared`, `TaskScheduler` / `MoraChannel` / `AsyncIoReactor` (`scheduler.rs`, `reactor.rs`), built-in domain/method handlers (`builtins/`), and `FsPolicy` / `CheckedPath` confinement (`fs.rs`)
-- `value/` & `value.rs` — `Value` (including `Channel`, `TaskHandle`, `Context`, `Continuation`, `External(Arc<dyn HostObject>)`), chunked persistent `list.rs`, lexical `Environment`, and `display.rs`
+- `runtime/` — stackful VM (`vm/`), `CoreRuntime`, process-shared `EngineShared`, `TaskScheduler` / `MoraChannel` / `AsyncIoReactor` (`scheduler.rs`, `reactor.rs`), reverse/forward autograd (`autograd.rs`), `TensorComputeDag` & `DeviceBackend` (`compute_dag.rs`), PagedAttention `KVPageAllocator` (`kv_cache.rs`), built-in domain/method handlers (`builtins/`), and `FsPolicy` / `CheckedPath` confinement (`fs.rs`)
+- `value/` & `value.rs` — `Value` (including `Scalar`, `Tensor`, `StructInstance`, `EnumVariant`, `DynTrait`, `Channel`, `TaskHandle`, `Context`, `TcpListener`, `TcpStream`, `Continuation`, `External(Arc<dyn HostObject>)`), 64-byte aligned packed `tensor.rs`, chunked persistent `list.rs`, lexical `Environment`, and `display.rs`
 - `flow/` & `flow.rs` — shared iterative RFC 8259 JSON parser/serializer and overflow-checked numeric tower
 - `lsp/` — bounded stdio transport, JSON-RPC router, and HM-unified LSP providers
-- `cli/` — shared CLI compilation, interactive REPL (`repl.rs`), and path helpers
-- `error.rs` — unified domain-typed `MoraError` / `MoraResult`
+- `cli/` — shared CLI compilation, single-binary bundler (`bundle.rs`), interactive REPL (`repl.rs`), and path helpers
+- `std/` — modular standard libraries (`std/math/bigint` Rust crate, pure-Mora `std/net/http.mora` with SSE, and `std/mcp.mora`)
+- `error.rs` — unified domain-typed `MoraError` / `MoraResult` with `Span` diagnostics
 
 ### Architecture evolution (Wave 1–4)
 
 - **Wave 1 (Completed, v0.110.0)** — Decoupled application-layer DSL constructs from the compiler core; extracted `BigInt` into `std/math/bigint` (`mora-std-bigint`) and focused the core runtime on language primitives and 7 foundational modules.
-- **Wave 2 (Completed, v0.110.0)** — Unified execution around the single-pass Control SSA IR & heap-framed stackful VM (`O(1)` tail-call optimization, multi-shot delimited continuations), Tokio `TaskScheduler` & `AsyncIoReactor`, Go-style `spawn`/`channel<T>`/`select`/`context`/`sleep`, `FsPolicy`/`CheckedPath` sandboxed I/O, `HostObject` extensibility, and HM-unified `mora-lsp`.
-- **Wave 3 — Stage 3A (Completed) & Stage 3B (In progress)** — Stage 3A delivered strict `Int`/`Float` lexical precision, low-bitwidth suffixes (`f16`/`bf16`/`fp8`/`i4`..`i64`), `**`/`@`/`!`, and the single Span-tracked HM constraint solver. Stage 3B extends this foundation with first-class `Tensor<DType, Shape, Device>`, symbolic shape/device/resource checking, and `grad` differentiation interfaces.
-- **Wave 4 (Planned)** — Native `TensorComputeDag`, VJP/JVP autograd & operator fusion, dynamic VRAM/KV-cache resource orchestration (`KVPageAllocator`), `mora build` single-binary compilation, and pure-Mora `std/net/http` (with SSE) & `std/mcp` standard libraries.
+- **Wave 2 (Completed, v0.110.0)** — Unified execution around the single-pass Control SSA IR & heap-framed stackful VM (`O(1)` tail-call optimization, multi-shot delimited continuations), Tokio `TaskScheduler` & `AsyncIoReactor`, Go-style `spawn`/`channel<T>`/`select`/`context`/`sleep`, first-class async TCP (`tcp_listen`/`tcp_connect`/`tcp_listener`/`tcp_stream`), `FsPolicy`/`CheckedPath` sandboxed I/O, `HostObject` extensibility, and HM-unified `mora-lsp`.
+- **Wave 3 — Stage 3A / 3B / 3C (Completed)** — Stage 3A delivered strict `Int`/`Float` lexical precision, low-bitwidth suffixes (`f16`/`bf16`/`fp8`/`i4`..`i64`), `**`/`@`/`!`, and the single Span-tracked HM constraint solver. Stage 3B added first-class `Tensor<DType, Shape, Device>` with 64-byte aligned packed storage and 5 static checks (DType, Shape, Device, Resource, Effect). Stage 3C delivered nominal `struct`/`enum`/`@tag` reflection, source-level `trait`/`impl`/`dyn`, default & named keyword arguments, zero-copy multi-dim `TensorSlice`, and reverse-mode `grad`/`value_and_grad`/`no_grad`.
+- **Wave 4 (Completed)** — Native `TensorComputeDag` (`trace_dag`) with `FusedLinearAct` & `FusedElementwise` operator fusion and `DeviceBackend`, forward-mode `jvp` differentiation, PagedAttention-style `KVPageAllocator` (`kv_allocator`), `mora build` single-binary compilation, and pure-Mora `std/net/http` (with SSE) & `std/mcp` standard libraries.
 
 ## Examples & tests
 

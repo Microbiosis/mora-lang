@@ -16,7 +16,7 @@ use tokio::time::{Duration, Instant};
 
 use crate::error::{MoraError, MoraResult};
 use crate::runtime::CoreRuntime;
-use crate::runtime::vm::{execute_method, execute_value};
+use crate::runtime::vm::{execute_method_named, execute_value, execute_value_named};
 use crate::value::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -614,6 +614,7 @@ impl TaskScheduler {
         ctx: &TaskContext,
     ) -> TaskHandle<Value> {
         let mut isolated = core.clone();
+        isolated.autograd = crate::runtime::autograd::AutogradContext::new();
         self.spawn_blocking(ctx, move |task_ctx| {
             task_ctx.status()?;
             isolated.task_context = Some(task_ctx);
@@ -734,11 +735,24 @@ impl TaskScheduler {
         core: &CoreRuntime,
         ctx: &TaskContext,
     ) -> Arc<MoraTaskHandle> {
+        self.spawn_mora_value_named(callee, args, Vec::new(), core, ctx)
+    }
+
+    /// Spawn a callable Mora value with named keyword arguments on an isolated VM task.
+    pub fn spawn_mora_value_named(
+        &self,
+        callee: Value,
+        args: Vec<Value>,
+        named_args: Vec<(String, Value)>,
+        core: &CoreRuntime,
+        ctx: &TaskContext,
+    ) -> Arc<MoraTaskHandle> {
         let mut isolated = core.clone();
+        isolated.autograd = crate::runtime::autograd::AutogradContext::new();
         self.spawn_blocking_mora(ctx, move |task_ctx| {
             task_ctx.status()?;
             isolated.task_context = Some(task_ctx);
-            execute_value(callee, args, &mut isolated)
+            execute_value_named(callee, args, named_args, &mut isolated)
         })
     }
 
@@ -751,11 +765,25 @@ impl TaskScheduler {
         core: &CoreRuntime,
         ctx: &TaskContext,
     ) -> Arc<MoraTaskHandle> {
+        self.spawn_mora_method_named(receiver, method, args, Vec::new(), core, ctx)
+    }
+
+    /// Spawn a method invocation with named keyword arguments on an isolated VM task.
+    pub fn spawn_mora_method_named(
+        &self,
+        receiver: Value,
+        method: String,
+        args: Vec<Value>,
+        named_args: Vec<(String, Value)>,
+        core: &CoreRuntime,
+        ctx: &TaskContext,
+    ) -> Arc<MoraTaskHandle> {
         let mut isolated = core.clone();
+        isolated.autograd = crate::runtime::autograd::AutogradContext::new();
         self.spawn_blocking_mora(ctx, move |task_ctx| {
             task_ctx.status()?;
             isolated.task_context = Some(task_ctx);
-            execute_method(receiver, &method, args, &mut isolated)
+            execute_method_named(receiver, &method, args, named_args, &mut isolated)
         })
     }
 

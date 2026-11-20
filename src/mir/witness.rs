@@ -35,11 +35,13 @@ pub enum WitnessKind {
     Call {
         callee: WitnessCallee,
         args: Vec<MirWitness>,
+        named_args: Vec<(String, MirWitness)>,
     },
     MethodCall {
         receiver: Box<MirWitness>,
         method: String,
         args: Vec<MirWitness>,
+        named_args: Vec<(String, MirWitness)>,
     },
     Closure {
         type_params: Vec<String>,
@@ -111,11 +113,38 @@ pub enum WitnessKind {
     },
     EnumDef {
         name: String,
-        variants: Vec<String>,
+        type_params: Vec<String>,
+        variants: Vec<WitnessEnumVariant>,
     },
     StructDef {
         name: String,
-        fields: Vec<(String, crate::mir::hint::TypeHint)>,
+        type_params: Vec<String>,
+        fields: Vec<WitnessStructField>,
+    },
+    /// Wave 3 Stage 3C: Source-level trait definition (`trait Name<T>: Parent ... end`).
+    TraitDef {
+        name: String,
+        type_params: Vec<String>,
+        parents: Vec<String>,
+        methods: Vec<WitnessTraitMethod>,
+    },
+    /// Wave 3 Stage 3C: Source-level trait or inherent `impl` block (`impl Trait for Target ... end` / `impl Target ... end`).
+    ImplDef {
+        type_params: Vec<String>,
+        trait_name: Option<String>,
+        trait_generics: Vec<crate::mir::hint::TypeHint>,
+        target_type: String,
+        target_generics: Vec<crate::mir::hint::TypeHint>,
+        methods: Vec<WitnessImplMethod>,
+    },
+    /// Wave 3 Stage 3C: Multi-dimensional zero-copy tensor slicing (`t[0..4, :, -1]`, `t[..., None]`).
+    TensorSlice {
+        target: Box<MirWitness>,
+        axes: Vec<WitnessSliceAxis>,
+    },
+    /// Wave 3 Stage 3C: Autograd tape suppression block (`no_grad ... end`).
+    NoGrad {
+        body: Box<MirWitness>,
     },
     Import(String),
     // v0.80: algebraic effects witness（Stage 2/4 落地）。
@@ -231,13 +260,70 @@ pub enum WitnessSpawnTarget {
     Call {
         callee: WitnessCallee,
         args: Vec<MirWitness>,
+        named_args: Vec<(String, MirWitness)>,
     },
     MethodCall {
         receiver: Box<MirWitness>,
         method: String,
         args: Vec<MirWitness>,
+        named_args: Vec<(String, MirWitness)>,
     },
     Expr(Box<MirWitness>),
+}
+
+/// Wave 3 Stage 3C: Field declaration inside `struct Name<T> ... end`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WitnessStructField {
+    pub name: String,
+    pub type_hint: crate::mir::hint::TypeHint,
+    pub default: Option<MirWitness>,
+    pub tags: Vec<(String, String)>,
+    pub span: Span,
+}
+
+/// Wave 3 Stage 3C: Variant declaration inside `enum Name<T> ... end`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WitnessEnumVariant {
+    pub name: String,
+    pub payload_types: Vec<crate::mir::hint::TypeHint>,
+    pub span: Span,
+}
+
+/// Wave 3 Stage 3C: Method signature (and optional default body) inside `trait ... end`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WitnessTraitMethod {
+    pub name: String,
+    pub type_params: Vec<String>,
+    pub params: Vec<WitnessParam>,
+    pub return_type: Option<crate::mir::hint::TypeHint>,
+    pub default_body: Option<MirWitness>,
+    pub has_self: bool,
+    pub span: Span,
+}
+
+/// Wave 3 Stage 3C: Method implementation inside `impl ... end`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WitnessImplMethod {
+    pub name: String,
+    pub type_params: Vec<String>,
+    pub params: Vec<WitnessParam>,
+    pub return_type: Option<crate::mir::hint::TypeHint>,
+    pub body: MirWitness,
+    pub has_self: bool,
+    pub span: Span,
+}
+
+/// Wave 3 Stage 3C: One axis entry inside multi-dimensional tensor slicing `t[a, b:c:s, ..., nil]`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WitnessSliceAxis {
+    Index(Box<MirWitness>),
+    Range {
+        start: Option<Box<MirWitness>>,
+        stop: Option<Box<MirWitness>>,
+        step: Option<Box<MirWitness>>,
+    },
+    Ellipsis,
+    NewAxis,
 }
 
 /// One branch inside `select ... end`.
@@ -288,24 +374,88 @@ impl MirWitness {
             | WitnessKind::Return(None)
             | WitnessKind::TypeAlias { .. }
             | WitnessKind::EnumDef { .. }
-            | WitnessKind::StructDef { .. }
             | WitnessKind::EffectSig { .. } => Vec::new(),
+            WitnessKind::StructDef { fields, .. } => {
+                fields.iter().filter_map(|f| f.default.as_ref()).collect()
+            }
+            WitnessKind::TraitDef { methods, .. } => {
+                let mut out = Vec::new();
+                for m in methods {
+                    for p in &m.params {
+                        if let Some(d) = &p.default {
+                            out.push(d);
+                        }
+                    }
+                    if let Some(b) = &m.default_body {
+                        out.push(b);
+                    }
+                }
+                out
+            }
+            WitnessKind::ImplDef { methods, .. } => {
+                let mut out = Vec::new();
+                for m in methods {
+                    for p in &m.params {
+                        if let Some(d) = &p.default {
+                            out.push(d);
+                        }
+                    }
+                    out.push(&m.body);
+                }
+                out
+            }
+            WitnessKind::TensorSlice { target, axes } => {
+                let mut out = vec![target.as_ref()];
+                for ax in axes {
+                    match ax {
+                        WitnessSliceAxis::Index(e) => out.push(e),
+                        WitnessSliceAxis::Range { start, stop, step } => {
+                            if let Some(s) = start {
+                                out.push(s);
+                            }
+                            if let Some(e) = stop {
+                                out.push(e);
+                            }
+                            if let Some(st) = step {
+                                out.push(st);
+                            }
+                        }
+                        WitnessSliceAxis::Ellipsis | WitnessSliceAxis::NewAxis => {}
+                    }
+                }
+                out
+            }
+            WitnessKind::NoGrad { body } => vec![body.as_ref()],
             WitnessKind::Binary { left, right, .. } => vec![left.as_ref(), right.as_ref()],
-            WitnessKind::Call { callee, args } => {
+            WitnessKind::Call {
+                callee,
+                args,
+                named_args,
+            } => {
                 let mut out: Vec<&MirWitness> = Vec::new();
                 if let WitnessCallee::Evaluated(e) = callee {
                     out.push(e.as_ref());
                 }
                 out.extend(args);
+                out.extend(named_args.iter().map(|(_, v)| v));
                 out
             }
-            WitnessKind::MethodCall { receiver, args, .. } => {
+            WitnessKind::MethodCall {
+                receiver,
+                args,
+                named_args,
+                ..
+            } => {
                 let mut out = vec![receiver.as_ref()];
                 out.extend(args);
+                out.extend(named_args.iter().map(|(_, v)| v));
                 out
             }
-            WitnessKind::Closure { body, .. } | WitnessKind::FnDef { body, .. } => {
-                vec![body.as_ref()]
+            WitnessKind::Closure { params, body, .. } | WitnessKind::FnDef { params, body, .. } => {
+                let mut out: Vec<&MirWitness> =
+                    params.iter().filter_map(|p| p.default.as_ref()).collect();
+                out.push(body.as_ref());
+                out
             }
             WitnessKind::Match { scrutinee, arms } => {
                 let mut out = vec![scrutinee.as_ref()];
@@ -372,17 +522,28 @@ impl MirWitness {
             WitnessKind::Parallel { body } => vec![body.as_ref()],
             WitnessKind::Export { decl, .. } => vec![decl.as_ref()],
             WitnessKind::Spawn { target } => match target {
-                WitnessSpawnTarget::Call { callee, args } => {
+                WitnessSpawnTarget::Call {
+                    callee,
+                    args,
+                    named_args,
+                } => {
                     let mut out = Vec::new();
                     if let WitnessCallee::Evaluated(e) = callee {
                         out.push(e.as_ref());
                     }
                     out.extend(args);
+                    out.extend(named_args.iter().map(|(_, v)| v));
                     out
                 }
-                WitnessSpawnTarget::MethodCall { receiver, args, .. } => {
+                WitnessSpawnTarget::MethodCall {
+                    receiver,
+                    args,
+                    named_args,
+                    ..
+                } => {
                     let mut out = vec![receiver.as_ref()];
                     out.extend(args);
+                    out.extend(named_args.iter().map(|(_, v)| v));
                     out
                 }
                 WitnessSpawnTarget::Expr(e) => vec![e.as_ref()],
@@ -437,11 +598,60 @@ fn push_owned_witness_children(kind: WitnessKind, out: &mut Vec<MirWitness>) {
         | WitnessKind::Import(_)
         | WitnessKind::TypeAlias { .. }
         | WitnessKind::EnumDef { .. }
-        | WitnessKind::StructDef { .. }
         | WitnessKind::EffectSig { .. }
         | WitnessKind::Commit
         | WitnessKind::Rollback
         | WitnessKind::Return(None) => {}
+        WitnessKind::StructDef { fields, .. } => {
+            for f in fields {
+                if let Some(d) = f.default {
+                    out.push(d);
+                }
+            }
+        }
+        WitnessKind::TraitDef { methods, .. } => {
+            for m in methods {
+                for p in m.params {
+                    if let Some(d) = p.default {
+                        out.push(d);
+                    }
+                }
+                if let Some(b) = m.default_body {
+                    out.push(b);
+                }
+            }
+        }
+        WitnessKind::ImplDef { methods, .. } => {
+            for m in methods {
+                for p in m.params {
+                    if let Some(d) = p.default {
+                        out.push(d);
+                    }
+                }
+                out.push(m.body);
+            }
+        }
+        WitnessKind::TensorSlice { target, axes } => {
+            out.push(*target);
+            for ax in axes {
+                match ax {
+                    WitnessSliceAxis::Index(e) => out.push(*e),
+                    WitnessSliceAxis::Range { start, stop, step } => {
+                        if let Some(s) = start {
+                            out.push(*s);
+                        }
+                        if let Some(e) = stop {
+                            out.push(*e);
+                        }
+                        if let Some(st) = step {
+                            out.push(*st);
+                        }
+                    }
+                    WitnessSliceAxis::Ellipsis | WitnessSliceAxis::NewAxis => {}
+                }
+            }
+        }
+        WitnessKind::NoGrad { body } => out.push(*body),
         WitnessKind::Binary { left, right, .. }
         | WitnessKind::Or { left, right }
         | WitnessKind::And { left, right }
@@ -449,15 +659,30 @@ fn push_owned_witness_children(kind: WitnessKind, out: &mut Vec<MirWitness>) {
             out.push(*left);
             out.push(*right);
         }
-        WitnessKind::Call { callee, args } => {
+        WitnessKind::Call {
+            callee,
+            args,
+            named_args,
+        } => {
             if let WitnessCallee::Evaluated(e) = callee {
                 out.push(*e);
             }
             out.extend(args);
+            for (_, v) in named_args {
+                out.push(v);
+            }
         }
-        WitnessKind::MethodCall { receiver, args, .. } => {
+        WitnessKind::MethodCall {
+            receiver,
+            args,
+            named_args,
+            ..
+        } => {
             out.push(*receiver);
             out.extend(args);
+            for (_, v) in named_args {
+                out.push(v);
+            }
         }
         WitnessKind::Closure { params, body, .. } | WitnessKind::FnDef { params, body, .. } => {
             for p in params {
@@ -535,15 +760,30 @@ fn push_owned_witness_children(kind: WitnessKind, out: &mut Vec<MirWitness>) {
             out.extend(expects);
         }
         WitnessKind::Spawn { target } => match target {
-            WitnessSpawnTarget::Call { callee, args } => {
+            WitnessSpawnTarget::Call {
+                callee,
+                args,
+                named_args,
+            } => {
                 if let WitnessCallee::Evaluated(e) = callee {
                     out.push(*e);
                 }
                 out.extend(args);
+                for (_, v) in named_args {
+                    out.push(v);
+                }
             }
-            WitnessSpawnTarget::MethodCall { receiver, args, .. } => {
+            WitnessSpawnTarget::MethodCall {
+                receiver,
+                args,
+                named_args,
+                ..
+            } => {
                 out.push(*receiver);
                 out.extend(args);
+                for (_, v) in named_args {
+                    out.push(v);
+                }
             }
             WitnessSpawnTarget::Expr(e) => out.push(*e),
         },
@@ -587,7 +827,6 @@ impl Drop for MirWitness {
                 | WitnessKind::Import(_)
                 | WitnessKind::TypeAlias { .. }
                 | WitnessKind::EnumDef { .. }
-                | WitnessKind::StructDef { .. }
                 | WitnessKind::EffectSig { .. }
                 | WitnessKind::Commit
                 | WitnessKind::Rollback
@@ -647,6 +886,18 @@ pub enum WitnessPattern {
     TypeAscription {
         name: String,
         pattern: Box<WitnessPattern>,
+    },
+    /// Wave 3 Stage 3C: Enum variant pattern (`Enum::Variant` or `Enum::Variant(p1, p2)`).
+    Variant {
+        enum_name: Option<String>,
+        variant: String,
+        fields: Vec<WitnessPattern>,
+    },
+    /// Wave 3 Stage 3C: Nominal struct destructuring pattern (`Point { x: a, y: b }` or `Point { x, .. }`).
+    Struct {
+        name: String,
+        fields: Vec<(String, WitnessPattern)>,
+        rest: bool,
     },
 }
 
@@ -729,6 +980,7 @@ mod tests {
                 kind: WitnessKind::Call {
                     callee: WitnessCallee::Name("f".into()),
                     args: vec![lit(1)],
+                    named_args: Vec::new(),
                 },
                 span: Span::default(),
             },

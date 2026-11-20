@@ -1,12 +1,10 @@
 //! Pure value helpers for indexing, compiled pattern matching, trait boxing,
 //! quasiquote interpolation, and `eval` assertions (Wave 2 — Stage W2.3).
 
-use std::collections::HashMap;
-
-use crate::common::EnumVariant;
 use crate::error::{MoraError, MoraResult};
-use crate::flow::{type_name, value_type_name, values_equal};
+use crate::flow::{dynamic_type_name, type_name, values_equal};
 use crate::mir::control::{CompiledPattern, ControlQqSegment, PatternTarget};
+use crate::runtime::autograd::AutogradContext;
 use crate::value::Value;
 
 /// Validate and truncate an index into `0..len` using exact source-facing error contracts.
@@ -37,8 +35,17 @@ fn char_at(s: &str, i: usize) -> MoraResult<Value> {
     })
 }
 
-/// Evaluate `obj[idx]` for lists, strings (Unicode scalar indexing), and dicts.
+/// Evaluate `obj[idx]` for lists, strings (Unicode scalar indexing), dicts, and tensors.
 pub fn index_value(obj: &Value, idx: &Value) -> MoraResult<Value> {
+    index_value_tracked(obj, idx, None)
+}
+
+/// Evaluate `obj[idx]` with negative tensor indexing and optional reverse-mode autograd tracking.
+pub fn index_value_tracked(
+    obj: &Value,
+    idx: &Value,
+    autograd: Option<&mut AutogradContext>,
+) -> MoraResult<Value> {
     match (obj, idx) {
         (Value::List(list), Value::Int(i)) => {
             let i = checked_index(*i as f64, list.len(), "index")?;
@@ -67,20 +74,23 @@ pub fn index_value(obj: &Value, idx: &Value) -> MoraResult<Value> {
             let i = checked_index(*n, s.chars().count(), "string index")?;
             char_at(s, i)
         }
-        (Value::Tensor(t), Value::Int(i)) => {
-            let len0 = t.shape.first().copied().unwrap_or(0);
-            let i = checked_index(*i as f64, len0, "tensor index")?;
-            t.index_axis0(i)
-        }
+        (Value::Tensor(t), Value::Int(i)) => t.index_axis0_tracked(*i as isize, autograd),
         (Value::Tensor(t), Value::Float(n)) => {
-            let len0 = t.shape.first().copied().unwrap_or(0);
-            let i = checked_index(*n, len0, "tensor index")?;
-            t.index_axis0(i)
+            if n.is_nan() || !n.is_finite() {
+                return Err(MoraError::Runtime(format!(
+                    "tensor index: {n} is not a valid index"
+                )));
+            }
+            t.index_axis0_tracked(*n as isize, autograd)
         }
         (Value::Tensor(t), Value::Scalar(s)) => {
-            let len0 = t.shape.first().copied().unwrap_or(0);
-            let i = checked_index(s.as_f64(), len0, "tensor index")?;
-            t.index_axis0(i)
+            let n = s.as_f64();
+            if n.is_nan() || !n.is_finite() {
+                return Err(MoraError::Runtime(format!(
+                    "tensor index: {n} is not a valid index"
+                )));
+            }
+            t.index_axis0_tracked(n as isize, autograd)
         }
         _ => Err(MoraError::Runtime(format!(
             "cannot index {} with {}",
@@ -131,7 +141,7 @@ pub fn index_assign_value(obj: &mut Value, idx: &Value, val: &Value) -> MoraResu
 
 /// Box `val` into a `Value::TraitObject` with its concrete runtime type name.
 pub fn make_dyn_trait(val: Value, trait_name: &str, generics: &[String]) -> Value {
-    let for_type = value_type_name(&val).to_string();
+    let for_type = dynamic_type_name(&val);
     Value::TraitObject {
         for_generics: Vec::new(),
         trait_generics: generics.to_vec(),
@@ -284,13 +294,65 @@ fn match_pattern_inner(
             true
         }
         CompiledPattern::TypeAscription { ty_name, inner } => {
-            let actual = type_name(val);
+            let actual = dynamic_type_name(val);
+            let base = type_name(val);
             let matches_ty = match ty_name.as_str() {
                 "number" => matches!(val, Value::Int(_) | Value::Float(_)),
                 "dynamic" | "any" => true,
-                other => actual == other,
+                other => actual == other || base == other,
             };
             matches_ty && match_pattern_inner(val, inner, bindings)
+        }
+        CompiledPattern::Variant {
+            enum_name,
+            variant,
+            fields,
+        } => {
+            let Value::EnumVariant {
+                enum_name: v_enum,
+                variant: v_name,
+                payload,
+            } = val
+            else {
+                return false;
+            };
+            if let Some(expected_enum) = enum_name
+                && expected_enum != v_enum
+            {
+                return false;
+            }
+            if v_name != variant || payload.len() != fields.len() {
+                return false;
+            }
+            payload
+                .iter()
+                .zip(fields.iter())
+                .all(|(item, pat)| match_pattern_inner(item, pat, bindings))
+        }
+        CompiledPattern::Struct { name, fields, rest } => {
+            let Value::StructInstance {
+                type_name: s_name,
+                fields: s_fields,
+                ..
+            } = val
+            else {
+                return false;
+            };
+            if s_name != name {
+                return false;
+            }
+            if !*rest && s_fields.len() != fields.len() {
+                return false;
+            }
+            for (k, sub_pat) in fields {
+                let Some(entry_val) = s_fields.get(k) else {
+                    return false;
+                };
+                if !match_pattern_inner(entry_val, sub_pat, bindings) {
+                    return false;
+                }
+            }
+            true
         }
     }
 }
@@ -323,21 +385,4 @@ pub fn eval_assert(
     }
     eprintln!("eval '{}': PASSED", name);
     Ok(())
-}
-
-/// Construct the runtime dictionary representation of an `enum` definition.
-pub fn make_enum_value(variants: &[EnumVariant]) -> Value {
-    let mut map = HashMap::new();
-    for v in variants {
-        map.insert(v.name.clone(), Value::String(v.name.clone()));
-    }
-    Value::Dict(map)
-}
-
-/// Construct the runtime metadata dictionary representation of a `struct` definition.
-pub fn make_struct_value(fields: &[String]) -> Value {
-    Value::Dict(HashMap::from([(
-        "__struct_fields__".to_string(),
-        Value::List(fields.iter().cloned().map(Value::String).collect()),
-    )]))
 }

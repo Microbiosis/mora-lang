@@ -39,6 +39,9 @@ const CANONICAL_KEYWORDS: &[&str] = &[
     "type",
     "enum",
     "struct",
+    "trait",
+    "impl",
+    "no_grad",
     "effect",
     "perform",
     "handle",
@@ -76,6 +79,22 @@ const STAGE3B_TYPES_AND_CTORS: &[(&str, &str)] = &[
     (
         "Tensor",
         "Tensor<DType, Shape, Device> first-class strided tensor",
+    ),
+    (
+        "tcp_listener",
+        "Non-blocking async TCP listener type (tcp_listen)",
+    ),
+    (
+        "tcp_stream",
+        "Non-blocking async TCP stream type (tcp_connect / accept)",
+    ),
+    (
+        "compute_dag",
+        "Fused TensorComputeDag compute graph type (trace_dag)",
+    ),
+    (
+        "kv_allocator",
+        "Paged KV-cache dynamic resource allocator type (kv_allocator)",
     ),
     (
         "Tensor::zeros",

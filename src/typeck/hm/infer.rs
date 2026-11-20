@@ -140,10 +140,22 @@ impl HMInference {
         if let WitnessKind::Closure { params, .. } | WitnessKind::FnDef { params, .. } = &value.kind
         {
             self.fn_arities.insert(name.to_string(), params.len());
-        } else if let WitnessKind::Variable(rhs) = &value.kind
-            && let Some(&arity) = self.fn_arities.get(rhs)
-        {
-            self.fn_arities.insert(name.to_string(), arity);
+            let min_arity = params.iter().filter(|p| p.default.is_none()).count();
+            self.fn_param_specs.insert(
+                name.to_string(),
+                FnParamSpec {
+                    names: params.iter().map(|p| p.name.clone()).collect(),
+                    has_default: params.iter().map(|p| p.default.is_some()).collect(),
+                    min_arity,
+                },
+            );
+        } else if let WitnessKind::Variable(rhs) = &value.kind {
+            if let Some(&arity) = self.fn_arities.get(rhs) {
+                self.fn_arities.insert(name.to_string(), arity);
+            }
+            if let Some(spec) = self.fn_param_specs.get(rhs).cloned() {
+                self.fn_param_specs.insert(name.to_string(), spec);
+            }
         }
 
         let gen_ty = if matches!(value_ty, Type::Error) {
@@ -184,6 +196,23 @@ impl HMInference {
         if let WitnessKind::Closure { params, .. } | WitnessKind::FnDef { params, .. } = &value.kind
         {
             self.fn_arities.insert(name.to_string(), params.len());
+            let min_arity = params.iter().filter(|p| p.default.is_none()).count();
+            self.fn_param_specs.insert(
+                name.to_string(),
+                FnParamSpec {
+                    names: params.iter().map(|p| p.name.clone()).collect(),
+                    has_default: params.iter().map(|p| p.default.is_some()).collect(),
+                    min_arity,
+                },
+            );
+        } else if let WitnessKind::Variable(rhs) = &value.kind
+            && let Some(spec) = self.fn_param_specs.get(rhs).cloned()
+        {
+            self.fn_arities.insert(name.to_string(), spec.names.len());
+            self.fn_param_specs.insert(name.to_string(), spec);
+        }
+        if let Type::TraitObject { trait_name, .. } = &ty_inner {
+            self.validate_dyn_trait_coercion(&value_ty, trait_name, value.span)?;
         }
         if !matches!(ty_inner, Type::Any | Type::TraitObject { .. })
             && !matches!(value_ty, Type::Error)
@@ -251,6 +280,69 @@ impl HMInference {
     pub(super) fn infer_var(&mut self, name: &str, span: Span) -> Result<Type, Vec<TypeError>> {
         if let Some(ty) = self.env.get(name).cloned() {
             return Ok(self.instantiate_named_binding(name, &ty, span));
+        }
+        if self.struct_defs.contains_key(name) {
+            return Ok(Type::Concrete {
+                name: format!("{}{name}", super::stage3c::STRUCT_TYPE_PREFIX),
+                generics: Vec::new(),
+                traits: Vec::new(),
+            });
+        }
+        if self.enum_defs.contains_key(name) {
+            return Ok(Type::Concrete {
+                name: format!("{}{name}", super::stage3c::ENUM_TYPE_PREFIX),
+                generics: Vec::new(),
+                traits: Vec::new(),
+            });
+        }
+        if let Some((type_name, member)) = name.split_once("::") {
+            if let Some(edef) = self.enum_defs.get(type_name).cloned() {
+                if let Some((_, payload_tys)) = edef.variants.iter().find(|(v, _)| v == member) {
+                    let fresh_gens: Vec<Type> = (0..edef.type_params.len())
+                        .map(|_| self.fresh_type_var())
+                        .collect();
+                    let enum_ty = Type::Concrete {
+                        name: type_name.to_string(),
+                        generics: fresh_gens.clone(),
+                        traits: Vec::new(),
+                    };
+                    if payload_tys.is_empty() {
+                        return Ok(enum_ty);
+                    }
+                    let arg_tys: Vec<Type> = payload_tys
+                        .iter()
+                        .map(|pt| {
+                            super::stage3c::substitute_named_generics(
+                                pt,
+                                &edef.type_params,
+                                &fresh_gens,
+                            )
+                        })
+                        .collect();
+                    return Ok(Type::curried_arrow(
+                        &arg_tys,
+                        enum_ty,
+                        &crate::mir::effect::EffectRow::Empty,
+                    ));
+                }
+                return Err(vec![TypeError::UnboundVariable {
+                    name: name.to_string(),
+                    span,
+                }]);
+            }
+            if let Some(sig) = self
+                .inherent_impls
+                .get(&(type_name.to_string(), member.to_string()))
+                .cloned()
+                && !sig.has_self
+            {
+                let param_tys: Vec<Type> = sig.params.iter().map(|(_, t, _)| t.clone()).collect();
+                return Ok(Type::curried_arrow(
+                    &param_tys,
+                    sig.return_type,
+                    &sig.effect_row,
+                ));
+            }
         }
         match name {
             "random" => Ok(Type::RandomModule),
@@ -499,6 +591,13 @@ impl HMInference {
                 }
                 if is_numeric(&left_ty) && is_numeric(&right_ty) {
                     // Int == Float valid.
+                } else if (matches!(left_ty, Type::Nil)
+                    && matches!(right_ty, Type::TypeVar(TypeVarId::Meta(_))))
+                    || (matches!(right_ty, Type::Nil)
+                        && matches!(left_ty, Type::TypeVar(TypeVarId::Meta(_))))
+                {
+                    // `x == nil` / `x != nil` on an open meta variable is a nil-check guard;
+                    // do not collapse `x` to `Nil` across subsequent branches.
                 } else if (is_numeric(&left_ty)
                     && matches!(right_ty, Type::TypeVar(TypeVarId::Meta(_))))
                     || (is_numeric(&right_ty)
@@ -604,18 +703,22 @@ impl HMInference {
             ));
         }
         if let Some((type_name, member)) = name.split_once("::")
-            && let Some(variants) = self.enum_defs.get(type_name)
+            && let Some(edef) = self.enum_defs.get(type_name)
         {
-            if !variants.contains(member) {
+            if !edef.variants.iter().any(|(v, _)| v == member) {
                 return Err(vec![TypeError::UnboundVariable {
                     name: name.to_string(),
                     span,
                 }]);
             }
+            let fresh_gens: Vec<Type> = (0..edef.type_params.len())
+                .map(|_| self.fresh_type_var())
+                .collect();
             return Ok((
-                Type::Trait {
+                Type::Concrete {
                     name: type_name.to_string(),
-                    generics: vec![],
+                    generics: fresh_gens,
+                    traits: Vec::new(),
                 },
                 crate::mir::effect::EffectRow::Empty,
                 None,
@@ -828,16 +931,17 @@ impl HMInference {
         &mut self,
         callee: &WitnessCallee,
         args: &[MirWitness],
+        named_args: &[(String, MirWitness)],
         span: Span,
     ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
         if matches!(
             callee,
             WitnessCallee::Builtin(crate::mir::witness::BuiltinOp::Neg)
         ) {
-            if args.len() != 1 {
+            if args.len() != 1 || !named_args.is_empty() {
                 return Err(vec![TypeError::ArityMismatch {
                     expected: 1,
-                    actual: args.len(),
+                    actual: args.len() + named_args.len(),
                     span,
                 }]);
             }
@@ -889,7 +993,7 @@ impl HMInference {
                     span,
                 }]);
             };
-            return self.infer_method_call(recv, method, method_args, span);
+            return self.infer_method_call(recv, method, method_args, named_args, span);
         }
 
         if matches!(callee, WitnessCallee::Name(n) | WitnessCallee::Var(n) if n == "[]") {
@@ -939,15 +1043,32 @@ impl HMInference {
             }
         }
 
-        if let WitnessCallee::Name(name) | WitnessCallee::Var(name) = callee {
+        if let WitnessCallee::Name(name) | WitnessCallee::Var(name) = callee
+            && !self.env.contains(name)
+        {
+            if let Some(res) = self.try_infer_nominal_or_assoc_call(name, args, named_args, span) {
+                return res;
+            }
+            if name == "grad" {
+                return self.infer_grad_builtin(false, args, named_args, span);
+            }
+            if name == "value_and_grad" {
+                return self.infer_grad_builtin(true, args, named_args, span);
+            }
+            if name == "jvp" {
+                return self.infer_jvp_builtin(args, named_args, span);
+            }
+            if name == "trace_dag" {
+                return self.infer_trace_dag_builtin(args, named_args, span);
+            }
             if name == "tensor" {
-                return self.infer_tensor_constructor_call("tensor", args, span);
+                return self.infer_tensor_constructor_call("tensor", args, named_args, span);
             }
             if let Some(assoc) = name
                 .strip_prefix("Tensor::")
                 .or_else(|| name.strip_prefix("tensor::"))
             {
-                return self.infer_tensor_constructor_call(assoc, args, span);
+                return self.infer_tensor_constructor_call(assoc, args, named_args, span);
             }
         }
 
@@ -981,6 +1102,11 @@ impl HMInference {
         };
 
         let resolved_callee = self.subst.apply(&callee_ty);
+        if let Type::Concrete { name: cname, .. } = &resolved_callee
+            && let Some(sname) = cname.strip_prefix(super::stage3c::STRUCT_TYPE_PREFIX)
+        {
+            return self.infer_struct_constructor(sname, args, named_args, span);
+        }
         if matches!(resolved_callee, Type::BuiltinModule(_) | Type::RandomModule) {
             let mod_name = match &resolved_callee {
                 Type::BuiltinModule(m) => m.as_str(),
@@ -1010,6 +1136,153 @@ impl HMInference {
             return Err(vec![TypeError::NotAClosure {
                 found: resolved_callee.name(),
                 span,
+            }]);
+        }
+
+        let param_spec: Option<(String, FnParamSpec)> = match callee {
+            WitnessCallee::Name(n) | WitnessCallee::Var(n) => {
+                self.fn_param_specs.get(n).cloned().map(|s| (n.clone(), s))
+            }
+            WitnessCallee::Evaluated(e) => {
+                if let Some(s) = self.closure_param_specs.get(&e.span).cloned() {
+                    Some(("<closure>".to_string(), s))
+                } else if let WitnessKind::Closure { params, .. } = &e.kind {
+                    Some((
+                        "<closure>".to_string(),
+                        FnParamSpec {
+                            names: params.iter().map(|p| p.name.clone()).collect(),
+                            has_default: params.iter().map(|p| p.default.is_some()).collect(),
+                            min_arity: params.iter().filter(|p| p.default.is_none()).count(),
+                        },
+                    ))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+
+        if let Some((label, spec)) = param_spec {
+            let slots = self.align_call_args(&label, &spec, args, named_args, span)?;
+            if let WitnessCallee::Name(fn_name) | WitnessCallee::Var(fn_name) = callee
+                && let Some(mut_indices) = self.fn_mutates_tensor_params.get(fn_name).cloned()
+            {
+                for idx in mut_indices {
+                    let arg_w = args.get(idx).or_else(|| {
+                        spec.names.get(idx).and_then(|pname| {
+                            named_args.iter().find(|(k, _)| k == pname).map(|(_, w)| w)
+                        })
+                    });
+                    if let Some(arg_w) = arg_w {
+                        if self.expr_produces_grad_tensor(arg_w) {
+                            return Err(vec![TypeError::UnificationFailure {
+                                expected: format!(
+                                    "non-differentiable tensor for parameter #{} of '{fn_name}' (mutated in-place)",
+                                    idx + 1
+                                ),
+                                got: "gradient-tracked tensor (requires_grad=true)".to_string(),
+                                span: Some(arg_w.span),
+                            }]);
+                        }
+                        if self.expr_produces_tensor_view(arg_w)
+                            || self.expr_is_aliased_source(arg_w)
+                        {
+                            return Err(vec![TypeError::UnificationFailure {
+                                expected: format!(
+                                    "unique owning tensor for parameter #{} of '{fn_name}' (mutated in-place; call .contiguous() first)",
+                                    idx + 1
+                                ),
+                                got: "aliased or strided tensor view".to_string(),
+                                span: Some(arg_w.span),
+                            }]);
+                        }
+                    }
+                }
+            }
+            return Ok(self.apply_curried_call_slots(callee_ty, acc_row, slots, span));
+        }
+
+        if !named_args.is_empty() {
+            if let Some(spec) = builtin_sig.as_ref()
+                && let WitnessCallee::Name(bname) | WitnessCallee::Var(bname) = callee
+                && (bname == "tcp_listen" || bname == "tcp_connect" || bname == "kv_allocator")
+            {
+                let pnames: Vec<String> = if bname == "tcp_listen" {
+                    vec!["addr".to_string()]
+                } else if bname == "tcp_connect" {
+                    vec![
+                        "addr".to_string(),
+                        "timeout_ms".to_string(),
+                        "ctx".to_string(),
+                    ]
+                } else {
+                    vec![
+                        "total_pages".to_string(),
+                        "page_tokens".to_string(),
+                        "num_heads".to_string(),
+                        "head_dim".to_string(),
+                        "dtype".to_string(),
+                        "device".to_string(),
+                    ]
+                };
+                let fspec = FnParamSpec {
+                    names: pnames,
+                    has_default: (0..spec.params.len())
+                        .map(|i| i >= spec.min_arity)
+                        .collect(),
+                    min_arity: spec.min_arity,
+                };
+                let slots = self.align_call_args(bname, &fspec, args, named_args, span)?;
+                let arg_vals: Vec<(Type, crate::mir::effect::EffectRow, Span)> = slots
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, slot)| match slot {
+                        Some(v) => v,
+                        None => (
+                            spec.params.get(i).cloned().unwrap_or(Type::Nil),
+                            crate::mir::effect::EffectRow::Empty,
+                            span,
+                        ),
+                    })
+                    .collect();
+                return Ok(self.apply_builtin_call_types(spec, arg_vals, span));
+            }
+            if matches!(
+                resolved_callee,
+                Type::Any
+                    | Type::TypeVar(_)
+                    | Type::Closure
+                    | Type::Task
+                    | Type::Builtin
+                    | Type::Error
+            ) {
+                let mut acc_row = acc_row;
+                for a in args {
+                    let (_, r) = self.infer_recover(a);
+                    acc_row = self.merge_rows(acc_row, r, span);
+                }
+                for (_, a) in named_args {
+                    let (_, r) = self.infer_recover(a);
+                    acc_row = self.merge_rows(acc_row, r, span);
+                }
+                return Ok((
+                    if matches!(resolved_callee, Type::Error) {
+                        Type::Error
+                    } else {
+                        self.fresh_type_var()
+                    },
+                    acc_row,
+                ));
+            }
+            return Err(vec![TypeError::UnificationFailure {
+                expected: "function with statically known parameter names for keyword arguments"
+                    .to_string(),
+                got: format!(
+                    "keyword argument '{}' on {}",
+                    named_args[0].0,
+                    resolved_callee.name()
+                ),
+                span: Some(named_args[0].1.span),
             }]);
         }
 
@@ -1089,6 +1362,7 @@ impl HMInference {
         receiver: &MirWitness,
         method: &str,
         args: &[MirWitness],
+        named_args: &[(String, MirWitness)],
         span: Span,
     ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
         let (recv_ty, recv_row) = self.infer_recover(receiver);
@@ -1103,6 +1377,7 @@ impl HMInference {
             recv_module_name,
             method,
             args,
+            named_args,
             span,
         )
     }
@@ -1116,9 +1391,79 @@ impl HMInference {
         recv_module_name: Option<&str>,
         method: &str,
         args: &[MirWitness],
+        named_args: &[(String, MirWitness)],
         span: Span,
     ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
-        let mut acc_row = recv_row;
+        let resolved_recv = self.subst.apply(&recv_ty);
+        if matches!(resolved_recv, Type::Error) {
+            let mut acc_row = recv_row;
+            for a in args {
+                let (_, r) = self.infer_recover(a);
+                acc_row = self.merge_rows(acc_row, r, span);
+            }
+            for (_, a) in named_args {
+                let (_, r) = self.infer_recover(a);
+                acc_row = self.merge_rows(acc_row, r, span);
+            }
+            return Ok((Type::Error, acc_row));
+        }
+
+        if let Type::Concrete { name, generics, .. } = &resolved_recv {
+            if let Some(res) = self.infer_concrete_receiver_member(
+                &resolved_recv,
+                name,
+                generics,
+                method,
+                args,
+                named_args,
+                recv_row.clone(),
+                span,
+            ) {
+                return res;
+            }
+            if let Some(res) = self.try_infer_concrete_impl_method(
+                &resolved_recv,
+                method,
+                args,
+                named_args,
+                recv_row.clone(),
+                span,
+            ) {
+                return res;
+            }
+        }
+        if let Type::TraitObject {
+            trait_name,
+            generics,
+        } = &resolved_recv
+            && let Some(res) = self.infer_trait_object_method(
+                trait_name,
+                generics,
+                method,
+                args,
+                named_args,
+                recv_row.clone(),
+                span,
+            )
+        {
+            return res;
+        }
+
+        if !named_args.is_empty()
+            && !matches!(resolved_recv, Type::Tensor { .. })
+            && let Some(res) = self.try_infer_concrete_impl_method(
+                &resolved_recv,
+                method,
+                args,
+                named_args,
+                recv_row.clone(),
+                span,
+            )
+        {
+            return res;
+        }
+
+        let mut acc_row = recv_row.clone();
         let mut arg_types: Vec<Type> = Vec::with_capacity(args.len());
         for a in args {
             let (t, r) = self.infer_recover(a);
@@ -1126,41 +1471,63 @@ impl HMInference {
             acc_row = self.merge_rows(acc_row, r, span);
         }
 
-        let resolved_recv = self.subst.apply(&recv_ty);
-        if matches!(resolved_recv, Type::Error) {
-            return Ok((Type::Error, acc_row));
-        }
         if matches!(resolved_recv, Type::RandomModule) {
             return self.infer_random_method(method, arg_types, acc_row, span);
         }
         if matches!(resolved_recv, Type::Tensor { .. }) {
-            return self.infer_tensor_method_call(
-                receiver_witness,
+            if named_args.is_empty() {
+                match self.infer_tensor_method_call(
+                    receiver_witness,
+                    &resolved_recv,
+                    method,
+                    args,
+                    &arg_types,
+                    acc_row.clone(),
+                    span,
+                ) {
+                    Ok(ok) => return Ok(ok),
+                    Err(errs) => {
+                        if let Some(res) = self.try_infer_concrete_impl_method(
+                            &resolved_recv,
+                            method,
+                            args,
+                            named_args,
+                            recv_row.clone(),
+                            span,
+                        ) {
+                            return res;
+                        }
+                        return Err(errs);
+                    }
+                }
+            } else if let Some(res) = self.try_infer_concrete_impl_method(
                 &resolved_recv,
                 method,
                 args,
-                &arg_types,
-                acc_row,
+                named_args,
+                recv_row.clone(),
                 span,
-            );
+            ) {
+                return res;
+            }
         }
         if matches!(resolved_recv, Type::Int | Type::Float | Type::Scalar(_)) {
             match method {
                 "dtype" => {
-                    if !args.is_empty() {
+                    if !args.is_empty() || !named_args.is_empty() {
                         return Err(vec![TypeError::ArityMismatch {
                             expected: 0,
-                            actual: args.len(),
+                            actual: args.len() + named_args.len(),
                             span,
                         }]);
                     }
                     return Ok((Type::String, acc_row));
                 }
                 "to_dtype" | "to" => {
-                    if args.len() != 1 {
+                    if args.len() != 1 || !named_args.is_empty() {
                         return Err(vec![TypeError::ArityMismatch {
                             expected: 1,
-                            actual: args.len(),
+                            actual: args.len() + named_args.len(),
                             span,
                         }]);
                     }
@@ -1226,10 +1593,26 @@ impl HMInference {
         }
         let module_sig = mod_name
             .and_then(|module| crate::typeck::dispatch::module_method_signature(module, method));
+        let has_resolved_sig = module_sig.is_some()
+            || crate::typeck::dispatch::method_signature(&resolved_recv, method).is_some();
         let resolved_sig = module_sig
             .clone()
             .or_else(|| crate::typeck::dispatch::method_signature(&resolved_recv, method));
         let module_return_ty = module_sig.map(|s| s.return_type);
+
+        if !has_resolved_sig
+            && mod_name.is_none()
+            && let Some(res) = self.try_infer_concrete_impl_method(
+                &resolved_recv,
+                method,
+                args,
+                named_args,
+                recv_row,
+                span,
+            )
+        {
+            return res;
+        }
 
         if let Some(sig) = resolved_sig {
             let user_arity = sig.params.len().saturating_sub(1);
@@ -1414,7 +1797,7 @@ impl HMInference {
         Ok((last_ty.unwrap_or(Type::Nil), acc_row))
     }
 
-    fn infer_closure_core(
+    pub(super) fn infer_closure_core(
         &mut self,
         param_types: &[Type],
         params: &[WitnessParam],
@@ -1439,6 +1822,24 @@ impl HMInference {
             self.aliased_source_tensors.clone(),
         );
         for (p, ty) in params.iter().zip(param_types.iter()) {
+            if let Some(def_expr) = &p.default {
+                let (def_ty, _def_row) = self.infer_recover(def_expr);
+                if !matches!(def_ty, Type::Error) {
+                    self.constraints.push(
+                        SpannedConstraint::new(
+                            Constraint::Subtype {
+                                sub: Box::new(def_ty),
+                                sup: Box::new(ty.clone()),
+                            },
+                            def_expr.span,
+                        )
+                        .with_hint(format!(
+                            "default value for parameter '{}' must match its parameter type",
+                            p.name
+                        )),
+                    );
+                }
+            }
             self.record_binding(span, &p.name, ty);
             self.env.add(p.name.clone(), ty.clone());
             self.grad_tracked_tensors.remove(&p.name);
@@ -1501,6 +1902,15 @@ impl HMInference {
             Type::ForAll(rigids, Box::new(arrow))
         };
         self.closure_rows.insert(span, body_row);
+        let min_arity = params.iter().filter(|p| p.default.is_none()).count();
+        self.closure_param_specs.insert(
+            span,
+            FnParamSpec {
+                names: params.iter().map(|p| p.name.clone()).collect(),
+                has_default: params.iter().map(|p| p.default.is_some()).collect(),
+                min_arity,
+            },
+        );
         Ok((ty, crate::mir::effect::EffectRow::Empty))
     }
 
@@ -1755,12 +2165,17 @@ impl HMInference {
     ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
         use crate::mir::witness::WitnessSpawnTarget;
         let (ret_ty, spawned_row) = match target {
-            WitnessSpawnTarget::Call { callee, args } => self.infer_call(callee, args, span)?,
+            WitnessSpawnTarget::Call {
+                callee,
+                args,
+                named_args,
+            } => self.infer_call(callee, args, named_args, span)?,
             WitnessSpawnTarget::MethodCall {
                 receiver,
                 method,
                 args,
-            } => self.infer_method_call(receiver, method, args, span)?,
+                named_args,
+            } => self.infer_method_call(receiver, method, args, named_args, span)?,
             WitnessSpawnTarget::Expr(expr) => {
                 let (expr_ty, expr_row) = self.infer_expr(expr)?;
                 let resolved = self.subst.apply(&expr_ty);
@@ -1910,7 +2325,7 @@ impl HMInference {
         Ok((result_ty.unwrap_or(Type::Nil), acc_row))
     }
 
-    fn infer_pattern(
+    pub(super) fn infer_pattern(
         &mut self,
         pattern: &crate::mir::witness::WitnessPattern,
         scrutinee_ty: &Type,
@@ -2008,6 +2423,9 @@ impl HMInference {
                 self.infer_pattern(pattern, scrutinee_ty, span)?;
                 Ok(())
             }
+            WitnessPattern::Variant { .. } | WitnessPattern::Struct { .. } => {
+                self.infer_pattern_variant_or_struct(pattern, scrutinee_ty, span)
+            }
         }
     }
 
@@ -2058,6 +2476,9 @@ impl HMInference {
             } => {
                 self.add_pattern_bindings(pattern, _scrutinee_ty, span)?;
                 Ok(())
+            }
+            WitnessPattern::Variant { .. } | WitnessPattern::Struct { .. } => {
+                self.bind_pattern_variant_or_struct(pattern, _scrutinee_ty, span)
             }
         }
     }
@@ -2262,7 +2683,8 @@ impl HMInference {
                 "transpose" | "reshape" | "with_grad" => Self::tensor_view_source_var(receiver),
                 _ => None,
             },
-            WitnessKind::Call { callee, args } => {
+            WitnessKind::TensorSlice { target, .. } => Self::tensor_view_source_var(target),
+            WitnessKind::Call { callee, args, .. } => {
                 if matches!(callee, WitnessCallee::Name(n) | WitnessCallee::Var(n) if n == "[]") {
                     args.first().and_then(Self::tensor_view_source_var)
                 } else {
@@ -2286,8 +2708,20 @@ impl HMInference {
     fn expr_produces_grad_tensor(&self, w: &MirWitness) -> bool {
         match &w.kind {
             WitnessKind::Variable(v) => self.grad_tracked_tensors.contains(v),
-            WitnessKind::Call { callee, args } => {
+            WitnessKind::TensorSlice { target, .. } => self.expr_produces_grad_tensor(target),
+            WitnessKind::NoGrad { .. } => false,
+            WitnessKind::Call {
+                callee,
+                args,
+                named_args,
+            } => {
                 if let WitnessCallee::Name(n) | WitnessCallee::Var(n) = callee {
+                    if let Some((_, rg)) = named_args.iter().find(|(k, _)| k == "requires_grad") {
+                        return matches!(
+                            &rg.kind,
+                            WitnessKind::Literal(crate::common::Literal::Bool(true, _))
+                        );
+                    }
                     if n == "tensor"
                         || n.eq_ignore_ascii_case("Tensor::from_list")
                         || n.eq_ignore_ascii_case("Tensor::zeros")
@@ -2328,6 +2762,7 @@ impl HMInference {
                 receiver,
                 method,
                 args,
+                ..
             } => match method.as_str() {
                 "with_grad" => match args.first().map(|a| &a.kind) {
                     None | Some(WitnessKind::Literal(crate::common::Literal::Bool(true, _))) => {
@@ -2351,6 +2786,7 @@ impl HMInference {
     fn expr_produces_tensor_view(&self, w: &MirWitness) -> bool {
         match &w.kind {
             WitnessKind::Variable(v) => self.view_aliased_tensors.contains(v),
+            WitnessKind::TensorSlice { .. } => true,
             WitnessKind::MethodCall {
                 receiver, method, ..
             } => match method.as_str() {
@@ -2359,7 +2795,7 @@ impl HMInference {
                 "with_grad" => self.expr_produces_tensor_view(receiver),
                 _ => false,
             },
-            WitnessKind::Call { callee, args } => {
+            WitnessKind::Call { callee, args, .. } => {
                 matches!(callee, WitnessCallee::Name(n) | WitnessCallee::Var(n) if n == "[]")
                     && !args.is_empty()
             }
@@ -2836,13 +3272,14 @@ impl HMInference {
         }
     }
 
-    fn extract_static_int_literal(w: &MirWitness) -> Option<i64> {
+    pub(super) fn extract_static_int_literal(w: &MirWitness) -> Option<i64> {
         match &w.kind {
             WitnessKind::Literal(crate::common::Literal::Int(n, _)) => Some(*n),
             WitnessKind::Literal(crate::common::Literal::TypedInt(n, _, _)) => Some(*n),
             WitnessKind::Call {
                 callee: WitnessCallee::Builtin(crate::mir::witness::BuiltinOp::Neg),
                 args,
+                ..
             } if args.len() == 1 => Self::extract_static_int_literal(&args[0])?.checked_neg(),
             _ => None,
         }
@@ -2895,6 +3332,7 @@ impl HMInference {
                 WitnessKind::Call {
                     callee: WitnessCallee::Builtin(crate::mir::witness::BuiltinOp::Neg),
                     args,
+                    ..
                 } if args.len() == 1 => walk(&args[0], shape, depth, leaf_dt),
                 WitnessKind::Literal(lit) => {
                     let ty = super::infer_lit(lit);
@@ -2988,16 +3426,276 @@ impl HMInference {
         &mut self,
         ctor: &str,
         args: &[MirWitness],
+        named_args: &[(String, MirWitness)],
         span: Span,
     ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
         use crate::typeck::{DimExpr, ShapeType};
-        let mut acc_row = crate::mir::effect::EffectRow::Empty;
-        let mut arg_types = Vec::with_capacity(args.len());
-        for a in args {
-            let (t, r) = self.infer_recover(a);
-            arg_types.push(t);
-            acc_row = self.merge_rows(acc_row, r, span);
+        if !matches!(
+            ctor,
+            "tensor"
+                | "from_list"
+                | "zeros"
+                | "ones"
+                | "randn"
+                | "rand"
+                | "full"
+                | "eye"
+                | "arange"
+        ) {
+            return Err(vec![TypeError::UnboundVariable {
+                name: format!("Tensor::{ctor}"),
+                span,
+            }]);
         }
+
+        let mut acc_row = crate::mir::effect::EffectRow::Empty;
+        if named_args.is_empty() {
+            let mut arg_types = Vec::with_capacity(args.len());
+            for a in args {
+                let (t, r) = self.infer_recover(a);
+                arg_types.push(t);
+                acc_row = self.merge_rows(acc_row, r, span);
+            }
+            return self.infer_tensor_constructor_positional(ctor, args, &arg_types, acc_row, span);
+        }
+
+        let slots = Self::normalize_tensor_ctor_args(ctor, args, named_args, span)?;
+        let mut slot_types: Vec<Option<Type>> = Vec::with_capacity(slots.len());
+        for s in &slots {
+            match s {
+                Some(w) => {
+                    let (t, r) = self.infer_recover(w);
+                    acc_row = self.merge_rows(acc_row, r, span);
+                    slot_types.push(Some(t));
+                }
+                None => slot_types.push(None),
+            }
+        }
+
+        match ctor {
+            "tensor" | "from_list" => {
+                let Some(data_w) = slots.first().copied().flatten() else {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: 1,
+                        actual: 0,
+                        span,
+                    }]);
+                };
+                let (inferred_shape, leaf_dt) = Self::extract_nested_list_shape_and_dtype(data_w)?;
+                let explicit_dt =
+                    Self::parse_static_dtype_witness(slots.get(1).copied().flatten())?;
+                let device = Self::parse_static_device_witness(slots.get(2).copied().flatten())?;
+                let dtype = explicit_dt.or(leaf_dt).unwrap_or_else(|| {
+                    match slot_types
+                        .first()
+                        .and_then(|t| t.as_ref())
+                        .map(|t| self.subst.apply(t))
+                    {
+                        Some(Type::Int) => Type::Int,
+                        Some(Type::Float) => Type::Float,
+                        Some(Type::Scalar(dt)) => Type::Scalar(dt),
+                        _ => Type::Float,
+                    }
+                });
+                Ok((
+                    Type::Tensor {
+                        dtype: Box::new(dtype),
+                        shape: inferred_shape,
+                        device,
+                    },
+                    acc_row,
+                ))
+            }
+            "zeros" | "ones" | "randn" | "rand" => {
+                let Some(shape_w) = slots.first().copied().flatten() else {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: 1,
+                        actual: 0,
+                        span,
+                    }]);
+                };
+                let shape = match Self::extract_static_shape_list(shape_w) {
+                    Some(dims) => ShapeType::Ranked(dims),
+                    None => ShapeType::Unranked(None),
+                };
+                let dtype = Self::parse_static_dtype_witness(slots.get(1).copied().flatten())?
+                    .unwrap_or(Type::Float);
+                if matches!(ctor, "randn" | "rand")
+                    && let Some(dt) = dtype.as_dtype()
+                    && !dt.is_float()
+                {
+                    return Err(vec![TypeError::UnificationFailure {
+                        expected: format!("floating-point DType for Tensor::{ctor}"),
+                        got: dtype.name(),
+                        span: Some(span),
+                    }]);
+                }
+                let device = Self::parse_static_device_witness(slots.get(2).copied().flatten())?;
+                if matches!(ctor, "randn" | "rand") {
+                    acc_row = self.merge_rows(
+                        acc_row,
+                        crate::mir::effect::EffectRow::Cons(
+                            "random_random".to_string(),
+                            Box::new(crate::mir::effect::EffectRow::Empty),
+                        ),
+                        span,
+                    );
+                }
+                Ok((
+                    Type::Tensor {
+                        dtype: Box::new(dtype),
+                        shape,
+                        device,
+                    },
+                    acc_row,
+                ))
+            }
+            "full" => {
+                let Some(shape_w) = slots.first().copied().flatten() else {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: 2,
+                        actual: 0,
+                        span,
+                    }]);
+                };
+                if slots.get(1).copied().flatten().is_none() {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: 2,
+                        actual: 1,
+                        span,
+                    }]);
+                }
+                let shape = match Self::extract_static_shape_list(shape_w) {
+                    Some(dims) => ShapeType::Ranked(dims),
+                    None => ShapeType::Unranked(None),
+                };
+                let fill_ty = slot_types[1]
+                    .as_ref()
+                    .map(|t| self.subst.apply(t))
+                    .unwrap_or(Type::Float);
+                let default_dt = match fill_ty {
+                    Type::Int => Type::Int,
+                    Type::Scalar(dt) => Type::Scalar(dt),
+                    _ => Type::Float,
+                };
+                let dtype = Self::parse_static_dtype_witness(slots.get(2).copied().flatten())?
+                    .unwrap_or(default_dt);
+                let device = Self::parse_static_device_witness(slots.get(3).copied().flatten())?;
+                Ok((
+                    Type::Tensor {
+                        dtype: Box::new(dtype),
+                        shape,
+                        device,
+                    },
+                    acc_row,
+                ))
+            }
+            "eye" => {
+                let Some(n_w) = slots.first().copied().flatten() else {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: 1,
+                        actual: 0,
+                        span,
+                    }]);
+                };
+                let n_opt = Self::extract_static_int_literal(n_w);
+                let m_opt = match slots.get(1).copied().flatten() {
+                    Some(mw) => Self::extract_static_int_literal(mw),
+                    None => n_opt,
+                };
+                let shape = match (n_opt, m_opt) {
+                    (Some(n), Some(m)) if n >= 0 && m >= 0 => ShapeType::Ranked(vec![
+                        DimExpr::Known(n as usize),
+                        DimExpr::Known(m as usize),
+                    ]),
+                    _ => ShapeType::Ranked(vec![
+                        DimExpr::Var(self.fresh_counter),
+                        DimExpr::Var(self.fresh_counter + 1),
+                    ]),
+                };
+                self.fresh_counter += 2;
+                let dtype = Self::parse_static_dtype_witness(slots.get(2).copied().flatten())?
+                    .unwrap_or(Type::Float);
+                let device = Self::parse_static_device_witness(slots.get(3).copied().flatten())?;
+                Ok((
+                    Type::Tensor {
+                        dtype: Box::new(dtype),
+                        shape,
+                        device,
+                    },
+                    acc_row,
+                ))
+            }
+            "arange" => {
+                let Some(s_w) = slots.first().copied().flatten() else {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: 1,
+                        actual: 0,
+                        span,
+                    }]);
+                };
+                let len_opt = match (
+                    Self::extract_static_int_literal(s_w),
+                    slots
+                        .get(1)
+                        .copied()
+                        .flatten()
+                        .and_then(Self::extract_static_int_literal),
+                    slots
+                        .get(2)
+                        .copied()
+                        .flatten()
+                        .and_then(Self::extract_static_int_literal),
+                ) {
+                    (Some(e), None, None) if slots.get(1).copied().flatten().is_none() => {
+                        Some(e.max(0) as usize)
+                    }
+                    (Some(s), Some(e), None) if slots.get(2).copied().flatten().is_none() => {
+                        Some((e - s).max(0) as usize)
+                    }
+                    (Some(s), Some(e), Some(step)) if step > 0 => {
+                        Some(((e - s + step - 1).max(0) / step) as usize)
+                    }
+                    _ => None,
+                };
+                let shape = match len_opt {
+                    Some(n) => ShapeType::Ranked(vec![DimExpr::Known(n)]),
+                    None => {
+                        let id = self.fresh_counter;
+                        self.fresh_counter += 1;
+                        ShapeType::Ranked(vec![DimExpr::Var(id)])
+                    }
+                };
+                let all_ints = slot_types[..3]
+                    .iter()
+                    .flatten()
+                    .all(|t| matches!(t, Type::Int));
+                let default_dt = if all_ints { Type::Int } else { Type::Float };
+                let dtype = Self::parse_static_dtype_witness(slots.get(3).copied().flatten())?
+                    .unwrap_or(default_dt);
+                let device = Self::parse_static_device_witness(slots.get(4).copied().flatten())?;
+                Ok((
+                    Type::Tensor {
+                        dtype: Box::new(dtype),
+                        shape,
+                        device,
+                    },
+                    acc_row,
+                ))
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn infer_tensor_constructor_positional(
+        &mut self,
+        ctor: &str,
+        args: &[MirWitness],
+        arg_types: &[Type],
+        mut acc_row: crate::mir::effect::EffectRow,
+        span: Span,
+    ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
+        use crate::typeck::{DimExpr, ShapeType};
 
         match ctor {
             "tensor" | "from_list" => {

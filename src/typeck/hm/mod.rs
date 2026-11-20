@@ -25,6 +25,7 @@ pub mod error;
 pub mod generalize;
 mod infer;
 pub mod row;
+mod stage3c;
 pub mod unify;
 pub mod util;
 
@@ -56,6 +57,71 @@ pub struct EffectSignature {
     pub result: Type,
 }
 
+/// Wave 3 Stage 3C: Nominal struct field type & compile-time tag descriptor.
+#[derive(Debug, Clone)]
+pub struct StructFieldTypeDef {
+    pub name: String,
+    pub ty: Type,
+    pub has_default: bool,
+    pub tags: Vec<(String, String)>,
+}
+
+/// Wave 3 Stage 3C: Nominal generic struct type definition.
+#[derive(Debug, Clone)]
+pub struct StructTypeDef {
+    pub name: String,
+    pub type_params: Vec<String>,
+    pub fields: Vec<StructFieldTypeDef>,
+}
+
+/// Wave 3 Stage 3C: Nominal generic enum type definition with payload variants.
+#[derive(Debug, Clone)]
+pub struct EnumTypeDef {
+    pub name: String,
+    pub type_params: Vec<String>,
+    pub variants: Vec<(String, Vec<Type>)>,
+}
+
+/// Wave 3 Stage 3C: Trait method signature (excluding implicit receiver `self` in `params`).
+#[derive(Debug, Clone)]
+pub struct TraitMethodTypeSig {
+    pub name: String,
+    pub type_params: Vec<String>,
+    pub params: Vec<(String, Type, bool)>,
+    pub return_type: Type,
+    pub has_self: bool,
+    pub has_default: bool,
+}
+
+/// Wave 3 Stage 3C: Source-level trait declaration descriptor.
+#[derive(Debug, Clone)]
+pub struct TraitTypeDef {
+    pub name: String,
+    pub type_params: Vec<String>,
+    pub parents: Vec<String>,
+    pub methods: Vec<TraitMethodTypeSig>,
+}
+
+/// Wave 3 Stage 3C: Compiled inherent or trait `impl` method signature (excluding `self` in `params`).
+#[derive(Debug, Clone)]
+pub struct ImplMethodTypeSig {
+    pub name: String,
+    pub type_params: Vec<String>,
+    pub target_type_params: Vec<String>,
+    pub params: Vec<(String, Type, bool)>,
+    pub return_type: Type,
+    pub has_self: bool,
+    pub effect_row: crate::mir::effect::EffectRow,
+}
+
+/// Wave 3 Stage 3C: Positional/keyword/default parameter contract for a function or closure.
+#[derive(Debug, Clone)]
+pub struct FnParamSpec {
+    pub names: Vec<String>,
+    pub has_default: Vec<bool>,
+    pub min_arity: usize,
+}
+
 #[derive(Default)]
 pub struct HMInference {
     pub env: TypeEnv,
@@ -71,6 +137,10 @@ pub struct HMInference {
     pub fn_placeholders: HashMap<String, (Vec<Type>, Type)>,
     /// Named `FnDef` / `MacroDef` / let-bound closure arities.
     pub fn_arities: HashMap<String, usize>,
+    /// Stage 3C: Parameter names & default-value arity specs for named functions/closures.
+    pub fn_param_specs: HashMap<String, FnParamSpec>,
+    /// Stage 3C: Parameter specs for anonymous closures keyed by definition span.
+    pub closure_param_specs: HashMap<Span, FnParamSpec>,
     /// Stack of in-scope closure names introduced by FnDef for recursion.
     pub fn_scope: Vec<String>,
     /// Row-polymorphic fresh var generator.
@@ -87,9 +157,13 @@ pub struct HMInference {
     pub closure_rows: HashMap<Span, crate::mir::effect::EffectRow>,
     /// Expected return type stack for active `FnDef`/`Closure` bodies (`return` validation).
     pub return_targets: Vec<Type>,
-    /// Pre-registered user struct, enum, and type alias declarations.
-    pub struct_defs: HashMap<String, Vec<(String, Type)>>,
-    pub enum_defs: HashMap<String, HashSet<String>>,
+    /// Pre-registered user struct, enum, trait, impl, and type alias declarations.
+    pub struct_defs: HashMap<String, StructTypeDef>,
+    pub enum_defs: HashMap<String, EnumTypeDef>,
+    pub trait_defs: HashMap<String, TraitTypeDef>,
+    pub inherent_impls: HashMap<(String, String), ImplMethodTypeSig>,
+    pub trait_impl_methods: HashMap<(String, String, String), ImplMethodTypeSig>,
+    pub trait_impl_pairs: HashSet<(String, String)>,
     pub type_aliases: HashMap<String, Type>,
     /// Span -> raw inferred type captured during `infer_expr`.
     pub inferred_spans: HashMap<Span, Type>,
@@ -105,6 +179,8 @@ pub struct HMInference {
     pub fn_mutates_tensor_params: HashMap<String, Vec<usize>>,
     /// Stage 3B: Stack of active function parameter tables `(param_names, mutated_indices)` for tracking in-place mutations inside `FnDef`.
     pub active_fn_mut_stack: Vec<(Vec<String>, HashSet<usize>)>,
+    /// Stage 3C: Active `no_grad ... end` nesting depth.
+    pub no_grad_depth: usize,
 }
 
 impl HMInference {
@@ -622,12 +698,20 @@ impl HMInference {
                     visiting.remove(name);
                     return resolved;
                 }
+                let resolved_generics: Vec<Type> = generics
+                    .iter()
+                    .map(|g| self.resolve_type_aliases_inner(g, visiting))
+                    .collect();
+                if self.struct_defs.contains_key(name) || self.enum_defs.contains_key(name) {
+                    return Type::Concrete {
+                        name: name.clone(),
+                        generics: resolved_generics,
+                        traits: Vec::new(),
+                    };
+                }
                 Type::Trait {
                     name: name.clone(),
-                    generics: generics
-                        .iter()
-                        .map(|g| self.resolve_type_aliases_inner(g, visiting))
-                        .collect(),
+                    generics: resolved_generics,
                 }
             }
             Type::List(elem) => {
@@ -710,37 +794,369 @@ impl HMInference {
         }
     }
 
+    /// Resolve a nominal or built-in `impl` target type header (`Point<T>`, `list<T>`, `int`, etc.).
+    pub(super) fn resolve_impl_target_type(
+        &self,
+        target_type: &str,
+        target_generics: &[crate::mir::hint::TypeHint],
+    ) -> Type {
+        let gen_tys: Vec<Type> = target_generics
+            .iter()
+            .map(|h| self.resolve_type_aliases(h.to_type()))
+            .collect();
+        let lower = target_type.to_lowercase();
+        if let Some(dt) = crate::common::DType::from_name(&lower) {
+            return Type::from_dtype(dt);
+        }
+        match lower.as_str() {
+            "int" => Type::Int,
+            "float" => Type::Float,
+            "number" => Type::Union(vec![Type::Int, Type::Float]),
+            "string" => Type::String,
+            "char" => Type::Char,
+            "bool" => Type::Bool,
+            "nil" => Type::Nil,
+            "context" => Type::Context,
+            "tcp_listener" | "tcplistener" => Type::TcpListener,
+            "tcp_stream" | "tcpstream" => Type::TcpStream,
+            "compute_dag" | "computedag" => Type::ComputeDag,
+            "kv_allocator" | "kvallocator" => Type::KVAllocator,
+            "list" => Type::List(Box::new(gen_tys.into_iter().next().unwrap_or(Type::Any))),
+            "dict" => {
+                let mut it = gen_tys.into_iter();
+                let k = it.next().unwrap_or(Type::String);
+                let v = it.next().unwrap_or(Type::Any);
+                Type::Dict(Box::new(k), Box::new(v))
+            }
+            "channel" => Type::Channel(Box::new(gen_tys.into_iter().next().unwrap_or(Type::Any))),
+            "task_handle" | "taskhandle" => {
+                Type::TaskHandle(Box::new(gen_tys.into_iter().next().unwrap_or(Type::Any)))
+            }
+            "tensor" => Type::any_tensor(),
+            _ => {
+                if let Some(aliased) = self.type_aliases.get(target_type) {
+                    return self.resolve_type_aliases(aliased);
+                }
+                Type::Concrete {
+                    name: target_type.to_string(),
+                    generics: gen_tys,
+                    traits: Vec::new(),
+                }
+            }
+        }
+    }
+
+    /// Replace `Self` references inside trait/impl method signatures with `self_ty`.
+    pub(super) fn substitute_self_type(ty: &Type, self_ty: &Type) -> Type {
+        match ty {
+            Type::Trait { name, generics } if name == "Self" && generics.is_empty() => {
+                self_ty.clone()
+            }
+            Type::Concrete { name, generics, .. } if name == "Self" && generics.is_empty() => {
+                self_ty.clone()
+            }
+            Type::TypeVar(TypeVarId::Rigid(s)) if s == "Self" => self_ty.clone(),
+            Type::List(e) => Type::List(Box::new(Self::substitute_self_type(e, self_ty))),
+            Type::Channel(e) => Type::Channel(Box::new(Self::substitute_self_type(e, self_ty))),
+            Type::TaskHandle(e) => {
+                Type::TaskHandle(Box::new(Self::substitute_self_type(e, self_ty)))
+            }
+            Type::Dict(k, v) => Type::Dict(
+                Box::new(Self::substitute_self_type(k, self_ty)),
+                Box::new(Self::substitute_self_type(v, self_ty)),
+            ),
+            Type::Result_(ok, err) => Type::Result_(
+                Box::new(Self::substitute_self_type(ok, self_ty)),
+                Box::new(Self::substitute_self_type(err, self_ty)),
+            ),
+            Type::Tuple(elems) => Type::Tuple(
+                elems
+                    .iter()
+                    .map(|e| Box::new(Self::substitute_self_type(e, self_ty)))
+                    .collect(),
+            ),
+            Type::Cons(h, t) => Type::Cons(
+                Box::new(Self::substitute_self_type(h, self_ty)),
+                Box::new(Self::substitute_self_type(t, self_ty)),
+            ),
+            Type::Union(ms) => Type::Union(
+                ms.iter()
+                    .map(|m| Self::substitute_self_type(m, self_ty))
+                    .collect(),
+            ),
+            Type::Trait { name, generics } => Type::Trait {
+                name: name.clone(),
+                generics: generics
+                    .iter()
+                    .map(|g| Self::substitute_self_type(g, self_ty))
+                    .collect(),
+            },
+            Type::Concrete {
+                name,
+                generics,
+                traits,
+            } => Type::Concrete {
+                name: name.clone(),
+                generics: generics
+                    .iter()
+                    .map(|g| Self::substitute_self_type(g, self_ty))
+                    .collect(),
+                traits: traits
+                    .iter()
+                    .map(|t| Self::substitute_self_type(t, self_ty))
+                    .collect(),
+            },
+            Type::TraitObject {
+                trait_name,
+                generics,
+            } => Type::TraitObject {
+                trait_name: trait_name.clone(),
+                generics: generics
+                    .iter()
+                    .map(|g| Self::substitute_self_type(g, self_ty))
+                    .collect(),
+            },
+            Type::Arrow(i, o, r) => Type::Arrow(
+                Box::new(Self::substitute_self_type(i, self_ty)),
+                Box::new(Self::substitute_self_type(o, self_ty)),
+                r.clone(),
+            ),
+            Type::ForAll(vars, inner) => Type::ForAll(
+                vars.clone(),
+                Box::new(Self::substitute_self_type(inner, self_ty)),
+            ),
+            Type::Tensor {
+                dtype,
+                shape,
+                device,
+            } => Type::Tensor {
+                dtype: Box::new(Self::substitute_self_type(dtype, self_ty)),
+                shape: shape.clone(),
+                device: device.clone(),
+            },
+            other => other.clone(),
+        }
+    }
+
     fn precompute_type_defs(&mut self, exprs: &[MirWitness]) {
         MirWitness::visit_preorder(exprs, |w| match &w.kind {
-            WitnessKind::StructDef { name, fields } => {
+            WitnessKind::StructDef {
+                name,
+                type_params,
+                fields,
+            } => {
                 let fs = fields
                     .iter()
-                    .map(|(fname, hint)| (fname.clone(), hint.to_type().clone()))
+                    .map(|f| StructFieldTypeDef {
+                        name: f.name.clone(),
+                        ty: f.type_hint.to_type().clone(),
+                        has_default: f.default.is_some(),
+                        tags: f.tags.clone(),
+                    })
                     .collect();
-                self.struct_defs.insert(name.clone(), fs);
+                self.struct_defs.insert(
+                    name.clone(),
+                    StructTypeDef {
+                        name: name.clone(),
+                        type_params: type_params.clone(),
+                        fields: fs,
+                    },
+                );
             }
-            WitnessKind::EnumDef { name, variants } => {
-                self.enum_defs
-                    .insert(name.clone(), variants.iter().cloned().collect());
+            WitnessKind::EnumDef {
+                name,
+                type_params,
+                variants,
+            } => {
+                let vs = variants
+                    .iter()
+                    .map(|v| {
+                        (
+                            v.name.clone(),
+                            v.payload_types
+                                .iter()
+                                .map(|h| h.to_type().clone())
+                                .collect(),
+                        )
+                    })
+                    .collect();
+                self.enum_defs.insert(
+                    name.clone(),
+                    EnumTypeDef {
+                        name: name.clone(),
+                        type_params: type_params.clone(),
+                        variants: vs,
+                    },
+                );
             }
             WitnessKind::TypeAlias { name, target } => {
                 self.type_aliases
                     .insert(name.clone(), target.to_type().clone());
             }
+            WitnessKind::TraitDef {
+                name,
+                type_params,
+                parents,
+                methods,
+            } => {
+                let ms = methods
+                    .iter()
+                    .map(|m| {
+                        let skip = usize::from(m.has_self);
+                        let params = m
+                            .params
+                            .iter()
+                            .skip(skip)
+                            .map(|p| {
+                                let pty = p
+                                    .type_hint
+                                    .as_ref()
+                                    .map(|h| h.to_type().clone())
+                                    .unwrap_or(Type::Any);
+                                (p.name.clone(), pty, p.default.is_some())
+                            })
+                            .collect();
+                        let ret = m
+                            .return_type
+                            .as_ref()
+                            .map(|h| h.to_type().clone())
+                            .unwrap_or(Type::Any);
+                        TraitMethodTypeSig {
+                            name: m.name.clone(),
+                            type_params: m.type_params.clone(),
+                            params,
+                            return_type: ret,
+                            has_self: m.has_self,
+                            has_default: m.default_body.is_some(),
+                        }
+                    })
+                    .collect();
+                self.trait_defs.insert(
+                    name.clone(),
+                    TraitTypeDef {
+                        name: name.clone(),
+                        type_params: type_params.clone(),
+                        parents: parents.clone(),
+                        methods: ms,
+                    },
+                );
+            }
             _ => {}
         });
+
         let raw_aliases = self.type_aliases.clone();
         for (name, target) in raw_aliases {
             let resolved = self.resolve_type_aliases(&target);
             self.type_aliases.insert(name, resolved);
         }
         let raw_structs = self.struct_defs.clone();
-        for (name, fields) in raw_structs {
-            let resolved_fields = fields
-                .into_iter()
-                .map(|(fname, fty)| (fname, self.resolve_type_aliases(&fty)))
-                .collect();
-            self.struct_defs.insert(name, resolved_fields);
+        for (name, mut def) in raw_structs {
+            for f in &mut def.fields {
+                f.ty = self.resolve_type_aliases(&f.ty);
+            }
+            self.struct_defs.insert(name, def);
+        }
+        let raw_enums = self.enum_defs.clone();
+        for (name, mut def) in raw_enums {
+            for (_, payload_tys) in &mut def.variants {
+                for pty in payload_tys.iter_mut() {
+                    *pty = self.resolve_type_aliases(pty);
+                }
+            }
+            self.enum_defs.insert(name, def);
+        }
+        let raw_traits = self.trait_defs.clone();
+        for (name, mut def) in raw_traits {
+            for m in &mut def.methods {
+                for (_, pty, _) in &mut m.params {
+                    *pty = self.resolve_type_aliases(pty);
+                }
+                m.return_type = self.resolve_type_aliases(&m.return_type);
+            }
+            self.trait_defs.insert(name, def);
+        }
+
+        // Second pass: register inherent and trait `impl` method tables with resolved aliases & `Self`.
+        let mut impl_nodes: Vec<&MirWitness> = Vec::new();
+        MirWitness::visit_preorder(exprs, |w| {
+            if matches!(&w.kind, WitnessKind::ImplDef { .. }) {
+                impl_nodes.push(w);
+            }
+        });
+        for w in impl_nodes {
+            if let WitnessKind::ImplDef {
+                type_params,
+                trait_name,
+                target_type,
+                target_generics,
+                methods,
+                ..
+            } = &w.kind
+            {
+                let self_ty = self.resolve_impl_target_type(target_type, target_generics);
+                let target_tp: Vec<String> = self
+                    .struct_defs
+                    .get(target_type)
+                    .map(|d| d.type_params.clone())
+                    .or_else(|| {
+                        self.enum_defs
+                            .get(target_type)
+                            .map(|d| d.type_params.clone())
+                    })
+                    .unwrap_or_else(|| type_params.clone());
+                if let Some(tr) = trait_name {
+                    self.trait_impl_pairs
+                        .insert((tr.clone(), target_type.clone()));
+                }
+                for m in methods {
+                    let skip = usize::from(m.has_self);
+                    let params: Vec<(String, Type, bool)> = m
+                        .params
+                        .iter()
+                        .skip(skip)
+                        .map(|p| {
+                            let raw = p
+                                .type_hint
+                                .as_ref()
+                                .map(|h| self.resolve_type_aliases(h.to_type()))
+                                .unwrap_or_else(|| self.fresh_type_var());
+                            let subbed = Self::substitute_self_type(&raw, &self_ty);
+                            (p.name.clone(), subbed, p.default.is_some())
+                        })
+                        .collect();
+                    let ret_raw = m
+                        .return_type
+                        .as_ref()
+                        .map(|h| self.resolve_type_aliases(h.to_type()))
+                        .unwrap_or_else(|| self.fresh_type_var());
+                    let ret = Self::substitute_self_type(&ret_raw, &self_ty);
+                    let mut ambient = HashSet::new();
+                    let effect_row =
+                        Self::tree_effect_row(&m.body, &mut ambient, &self.fn_effect_rows);
+                    let mut all_tps = type_params.clone();
+                    for tp in &m.type_params {
+                        if !all_tps.contains(tp) {
+                            all_tps.push(tp.clone());
+                        }
+                    }
+                    let sig = ImplMethodTypeSig {
+                        name: m.name.clone(),
+                        type_params: all_tps,
+                        target_type_params: target_tp.clone(),
+                        params,
+                        return_type: ret,
+                        has_self: m.has_self,
+                        effect_row,
+                    };
+                    if let Some(tr) = trait_name {
+                        self.trait_impl_methods
+                            .insert((tr.clone(), target_type.clone(), m.name.clone()), sig);
+                    } else {
+                        self.inherent_impls
+                            .insert((target_type.clone(), m.name.clone()), sig);
+                    }
+                }
+            }
         }
     }
 
@@ -782,6 +1198,14 @@ impl HMInference {
         MirWitness::visit_preorder(exprs, |def| match &def.kind {
             WitnessKind::FnDef { name, params, .. } => {
                 self.fn_arities.entry(name.clone()).or_insert(params.len());
+                let min_arity = params.iter().filter(|p| p.default.is_none()).count();
+                self.fn_param_specs
+                    .entry(name.clone())
+                    .or_insert(FnParamSpec {
+                        names: params.iter().map(|p| p.name.clone()).collect(),
+                        has_default: params.iter().map(|p| p.default.is_some()).collect(),
+                        min_arity,
+                    });
             }
             WitnessKind::MacroDef { name, params, .. } => {
                 self.fn_arities.entry(name.clone()).or_insert(params.len());
@@ -989,7 +1413,14 @@ impl HMInference {
                         });
                         stack.push(Task::Visit(body));
                     }
-                    WitnessKind::Call { callee, args } => {
+                    WitnessKind::Call {
+                        callee,
+                        args,
+                        named_args,
+                    } => {
+                        for (_, a) in named_args.iter().rev() {
+                            stack.push(Task::Visit(a));
+                        }
                         for a in args.iter().rev() {
                             stack.push(Task::Visit(a));
                         }
@@ -1024,7 +1455,11 @@ impl HMInference {
                         receiver,
                         method,
                         args,
+                        named_args,
                     } => {
+                        for (_, a) in named_args.iter().rev() {
+                            stack.push(Task::Visit(a));
+                        }
                         for a in args.iter().rev() {
                             stack.push(Task::Visit(a));
                         }
@@ -1160,9 +1595,16 @@ impl HMInference {
                         stack.push(Task::PopAmbient(effect, was_present));
                         stack.push(Task::Visit(body));
                     }
-                    WitnessKind::Call { callee, args } => {
+                    WitnessKind::Call {
+                        callee,
+                        args,
+                        named_args,
+                    } => {
                         if let WitnessCallee::Var(name) | WitnessCallee::Name(name) = callee {
                             stack.push(Task::CheckCall(w.span, name));
+                        }
+                        for (_, a) in named_args.iter().rev() {
+                            stack.push(Task::Visit(a));
                         }
                         for a in args.iter().rev() {
                             stack.push(Task::Visit(a));
@@ -1202,7 +1644,8 @@ impl HMInference {
                     crate::mir::witness::BuiltinOp::Neg | crate::mir::witness::BuiltinOp::Not
                 ),
                 args,
-            } if args.len() == 1
+                named_args,
+            } if args.len() == 1 && named_args.is_empty()
         ) {
             self.infer_infix_chain(expr)?
         } else {
@@ -1255,6 +1698,7 @@ impl HMInference {
                 recv_module_name: Option<&'w str>,
                 method: &'w str,
                 args: &'w [MirWitness],
+                named_args: &'w [(String, MirWitness)],
                 span: Span,
             },
         }
@@ -1268,14 +1712,16 @@ impl HMInference {
                     WitnessKind::Call {
                         callee: WitnessCallee::Builtin(crate::mir::witness::BuiltinOp::Neg),
                         args,
-                    } if args.len() == 1 => {
+                        named_args,
+                    } if args.len() == 1 && named_args.is_empty() => {
                         tasks.push(ChainTask::ApplyUnaryNeg { span: w.span });
                         tasks.push(ChainTask::Eval(&args[0]));
                     }
                     WitnessKind::Call {
                         callee: WitnessCallee::Builtin(crate::mir::witness::BuiltinOp::Not),
                         args,
-                    } if args.len() == 1 => {
+                        named_args,
+                    } if args.len() == 1 && named_args.is_empty() => {
                         tasks.push(ChainTask::ApplyUnaryNot {
                             arg_span: args[0].span,
                             span: w.span,
@@ -1331,6 +1777,7 @@ impl HMInference {
                         receiver,
                         method,
                         args,
+                        named_args,
                     } => {
                         let recv_module_name = match &receiver.kind {
                             WitnessKind::Variable(module) => Some(module.as_str()),
@@ -1341,6 +1788,7 @@ impl HMInference {
                             recv_module_name,
                             method,
                             args,
+                            named_args,
                             span: w.span,
                         });
                         tasks.push(ChainTask::Eval(receiver));
@@ -1483,6 +1931,7 @@ impl HMInference {
                     recv_module_name,
                     method,
                     args,
+                    named_args,
                     span,
                 } => {
                     let (recv_ty, recv_row) = vals.pop().expect("method receiver present");
@@ -1493,6 +1942,7 @@ impl HMInference {
                         recv_module_name,
                         method,
                         args,
+                        named_args,
                         span,
                     )?;
                     self.record_span_type(span, &res.0);
@@ -1532,7 +1982,15 @@ impl HMInference {
             | WitnessKind::And { .. }
             | WitnessKind::Pipe { .. }
             | WitnessKind::MethodCall { .. } => unreachable!("routed via infer_infix_chain"),
-            WitnessKind::Call { callee, args } => self.infer_call(callee, args, expr.span),
+            WitnessKind::Call {
+                callee,
+                args,
+                named_args,
+            } => self.infer_call(callee, args, named_args, expr.span),
+            WitnessKind::TensorSlice { target, axes } => {
+                self.infer_tensor_slice(target, axes, expr.span)
+            }
+            WitnessKind::NoGrad { body } => self.infer_no_grad(body, expr.span),
             WitnessKind::Spawn { target } => self.infer_spawn(target, expr.span),
             WitnessKind::Select { arms } => self.infer_select(arms, expr.span),
             WitnessKind::Parallel { body } => {
@@ -1601,10 +2059,11 @@ impl HMInference {
             }
             WitnessKind::List(items) => self.infer_list(items, expr.span),
             WitnessKind::Dict(entries) => self.infer_dict(entries, expr.span),
-            WitnessKind::DynTrait { expr, .. } => {
-                // v0.55: dyn Trait is opaque; defer to inner expression.
-                self.infer_expr(expr)
-            }
+            WitnessKind::DynTrait {
+                expr: inner,
+                trait_name,
+                generics,
+            } => self.infer_dyn_trait(inner, trait_name, generics, expr.span),
             WitnessKind::LetBinding {
                 name,
                 type_hint,
@@ -1726,10 +2185,41 @@ impl HMInference {
             // 于是 `macro m() 1 + "str" end` 的类型错与未绑定变量**双双静默**
             // （实测：宏体内 `1 + "str"` → `1.0str` exit 0；`nosuchvar` → exit 0）。
             // 现路由到 `infer_macro_def`（转调 `infer_fn_def`）。
-            WitnessKind::TypeAlias { .. }
-            | WitnessKind::EnumDef { .. }
-            | WitnessKind::StructDef { .. }
-            | WitnessKind::Import(_) => Ok((Type::Nil, crate::mir::effect::EffectRow::Empty)),
+            WitnessKind::TypeAlias { .. } | WitnessKind::Import(_) => {
+                Ok((Type::Nil, crate::mir::effect::EffectRow::Empty))
+            }
+            WitnessKind::StructDef {
+                name,
+                type_params,
+                fields,
+            } => self.infer_struct_def(name, type_params, fields, expr.span),
+            WitnessKind::EnumDef {
+                name,
+                type_params,
+                variants,
+            } => self.infer_enum_def(name, type_params, variants, expr.span),
+            WitnessKind::TraitDef {
+                name,
+                type_params,
+                parents,
+                methods,
+            } => self.infer_trait_def(name, type_params, parents, methods, expr.span),
+            WitnessKind::ImplDef {
+                type_params,
+                trait_name,
+                trait_generics,
+                target_type,
+                target_generics,
+                methods,
+            } => self.infer_impl_def(
+                type_params,
+                trait_name.as_deref(),
+                trait_generics,
+                target_type,
+                target_generics,
+                methods,
+                expr.span,
+            ),
             WitnessKind::MacroDef { name, params, body } => {
                 self.infer_macro_def(name, params, body.as_ref(), expr.span)
             }
@@ -2037,7 +2527,11 @@ pub(crate) fn witness_uses_ident(root: &MirWitness, target: &str) -> bool {
                     }
                     stack.push(Task::Visit(value));
                 }
-                WitnessKind::Call { callee, args } => {
+                WitnessKind::Call {
+                    callee,
+                    args,
+                    named_args,
+                } => {
                     match callee {
                         WitnessCallee::Name(n) | WitnessCallee::Var(n) if n == target => {
                             return true;
@@ -2047,6 +2541,9 @@ pub(crate) fn witness_uses_ident(root: &MirWitness, target: &str) -> bool {
                         | WitnessCallee::Var(_)
                         | WitnessCallee::Builtin(_)
                         | WitnessCallee::Method(_, _) => {}
+                    }
+                    for (_, a) in named_args.iter().rev() {
+                        stack.push(Task::Visit(a));
                     }
                     for a in args.iter().rev() {
                         stack.push(Task::Visit(a));
@@ -2174,6 +2671,7 @@ mod tests {
             kind: WitnessKind::Call {
                 callee: WitnessCallee::Var(name.to_string()),
                 args: vec![],
+                named_args: Vec::new(),
             },
             span: Span::new(9, 1),
         }
@@ -2301,6 +2799,7 @@ mod tests {
             kind: WitnessKind::Call {
                 callee: WitnessCallee::Var(name.to_string()),
                 args: vec![],
+                named_args: Vec::new(),
             },
             span,
         }
@@ -2746,6 +3245,7 @@ mod tests {
             kind: WitnessKind::Call {
                 callee: WitnessCallee::Var("c".to_string()),
                 args: vec![lit_int(7), lit_int(8)],
+                named_args: Vec::new(),
             },
             span: Span::default(),
         };

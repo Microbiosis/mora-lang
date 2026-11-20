@@ -961,6 +961,24 @@ fn unify_subtype_at(
             }
             Ok(s)
         }
+        (
+            Type::Concrete {
+                name: a,
+                generics: ga,
+                ..
+            },
+            Type::Concrete {
+                name: b,
+                generics: gb,
+                ..
+            },
+        ) if a == b && ga.len() == gb.len() => {
+            let mut s = subst.clone();
+            for (xa, xb) in ga.iter().zip(gb.iter()) {
+                s = unify_subtype_at(xa, xb, &s, span)?;
+            }
+            Ok(s)
+        }
         (Type::Concrete { traits, .. }, Type::Trait { .. }) => {
             for t in traits {
                 if let Ok(s) = unify_subtype_at(t, &t_sup, subst, span) {

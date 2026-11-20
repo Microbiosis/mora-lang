@@ -1,55 +1,30 @@
-//! v0.75.93: TypeHint —— mir 层的「用户类型注解」边界类型。
-//!
-//! ## 背景
-//!
-//! 架构审查报告（v0.75.90）标记「🔴 阻断级风险」：
-//! MirWitness 6 处直接持有 `crate::typeck::Type`，未来 typeck 重构会扩散到 mir 层。
+//! MIR 层的用户显式类型注解边界类型（[`TypeHint`]）。
 //!
 //! ## 设计
 //!
-//! TypeHint 是 `crate::typeck::Type` 的**透明包装**——保留全部 28 个变体，
-//! 仅在 mir 层**表达语义边界**「用户显式写的类型注解」vs「HM 推断产物」。
-//!
-//! TypeHint 与 typeck::Type 双向透明转换（`from_type` / `to_type`），HM 推断
-//! 路径通过 `to_type()` 取回 `crate::typeck::Type` 继续推进。
-//!
-//! ## 收益
-//!
-//! 未来 typeck 内部重构（变体增减、语义细化）只需修改 TypeHint 内部——mir
-//! 层、witness.rs、parser_v3 三者完全无感。爆炸半径从 6 处降为 1 处。
-//!
-//! ## 不变的
-//!
-//! - TypeHint 与 `crate::typeck::Type` 是 1:1 镜像（无变体裁剪）
-//! - parser_v3 仍直接构造完整 `crate::typeck::Type`，**在 mir 层边界处**调用
-//!   `TypeHint::from_type()` 包装
-//! - HM 推断路径不变（继续产出 `crate::typeck::Type`）
+//! [`TypeHint`] 透明包装 [`crate::typeck::Type`]，用于在 [`crate::mir::witness::MirWitness`]
+//! 中区分「用户在源码中显式书写的类型注解」与「统一 HM 约束求解器的推断产物」。
+//! 通过 `from_type` / `to_type` / `into_type` 在 `parser_v3`、`mir` 与 `typeck` 之间
+//! 保持清晰的模块边界。
 
 use std::fmt;
 
-/// v0.75.93: mir 层的「用户类型注解」边界类型。
-///
-/// 包装 `crate::typeck::Type`，但语义独立——表达「这是用户在源码里
-/// 显式写的类型注解」，与「HM 推断产物」**正交**。
-///
-/// 后续 typeck 重构（变体增减、语义细化）只动内部 `crate::typeck::Type`
-/// 定义，mir 层调用 `from_type/to_type` 即可。
+/// MIR 层的用户显式类型注解包装类型。
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypeHint(pub crate::typeck::Type);
 
 impl TypeHint {
-    /// 从 `crate::typeck::Type` 构造 TypeHint。语义包装，无变体裁剪。
+    /// 从 [`crate::typeck::Type`] 构造 `TypeHint`。
     pub fn from_type(ty: crate::typeck::Type) -> Self {
         TypeHint(ty)
     }
 
-    /// 取出内部 `crate::typeck::Type`。HM 推断路径通过此方法回到 typeck 层。
+    /// 借用内部 [`crate::typeck::Type`]，供 HM 约束求解器消费。
     pub fn to_type(&self) -> &crate::typeck::Type {
         &self.0
     }
 
-    /// 取出内部 `crate::typeck::Type`（consume）。构造 MirExpr/Inst 等
-    /// 一次性消费的字段时使用。
+    /// 消费并取出内部 [`crate::typeck::Type`]。
     pub fn into_type(self) -> crate::typeck::Type {
         self.0
     }

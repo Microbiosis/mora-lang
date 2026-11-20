@@ -22,7 +22,10 @@ use crate::mir::witness::MirWitness;
 use crate::runtime::CoreRuntime;
 use crate::value::Value;
 
-pub use builtins::{CallAction, resolve_dyn_call, resolve_method_call, resolve_value_call};
+pub use builtins::{
+    CallAction, resolve_dyn_call, resolve_dyn_call_named, resolve_method_call,
+    resolve_method_call_named, resolve_value_call, resolve_value_call_named,
+};
 pub use continuation::{
     CallFrame, CapturedContinuation, ModuleGlobals, UpvalueValue, init_globals, materialize_frame,
 };
@@ -65,7 +68,17 @@ pub fn run_main_task(
 
 /// Invoke an arbitrary first-class callable [`Value`] on `core`'s stackful VM.
 pub fn execute_value(callee: Value, args: Vec<Value>, core: &mut CoreRuntime) -> MoraResult<Value> {
-    let action = resolve_value_call(callee, args, core)?;
+    execute_value_named(callee, args, Vec::new(), core)
+}
+
+/// Invoke an arbitrary first-class callable [`Value`] with named keyword arguments.
+pub fn execute_value_named(
+    callee: Value,
+    args: Vec<Value>,
+    named_args: Vec<(String, Value)>,
+    core: &mut CoreRuntime,
+) -> MoraResult<Value> {
+    let action = resolve_value_call_named(callee, args, named_args, core)?;
     let mut vm = VmEngine::new(core);
     vm.execute_root_action(action)
 }
@@ -77,7 +90,25 @@ pub fn execute_method(
     args: Vec<Value>,
     core: &mut CoreRuntime,
 ) -> MoraResult<Value> {
-    let action = resolve_method_call(core, receiver, method, args, crate::common::Span::default())?;
+    execute_method_named(receiver, method, args, Vec::new(), core)
+}
+
+/// Invoke `receiver.method(args..., kw=val...)` on `core`'s stackful VM.
+pub fn execute_method_named(
+    receiver: Value,
+    method: &str,
+    args: Vec<Value>,
+    named_args: Vec<(String, Value)>,
+    core: &mut CoreRuntime,
+) -> MoraResult<Value> {
+    let action = resolve_method_call_named(
+        core,
+        receiver,
+        method,
+        args,
+        named_args,
+        crate::common::Span::default(),
+    )?;
     let mut vm = VmEngine::new(core);
     vm.execute_root_action(action)
 }

@@ -218,6 +218,28 @@ pub fn builtin_signatures() -> Vec<(String, Signature)> {
             ),
         ),
         (
+            "tcp_listen".to_string(),
+            Signature::new(vec![("addr".to_string(), Type::String)], Type::TcpListener),
+        ),
+        (
+            "tcp_connect".to_string(),
+            Signature::with_min_arity(
+                vec![
+                    ("addr".to_string(), Type::String),
+                    (
+                        "timeout_ms".to_string(),
+                        Type::Union(vec![Type::Int, Type::Float, Type::Nil]),
+                    ),
+                    (
+                        "ctx".to_string(),
+                        Type::Union(vec![Type::Context, Type::Nil]),
+                    ),
+                ],
+                1,
+                Type::TcpStream,
+            ),
+        ),
+        (
             "tensor".to_string(),
             Signature::with_min_arity(
                 vec![
@@ -237,6 +259,76 @@ pub fn builtin_signatures() -> Vec<(String, Signature)> {
                 ],
                 1,
                 Type::any_tensor(),
+            ),
+        ),
+        (
+            "grad".to_string(),
+            Signature::with_min_arity(
+                vec![
+                    ("f".to_string(), Type::Any),
+                    (
+                        "argnums".to_string(),
+                        Type::Union(vec![Type::Int, Type::List(Box::new(Type::Int)), Type::Nil]),
+                    ),
+                ],
+                1,
+                Type::Closure,
+            ),
+        ),
+        (
+            "value_and_grad".to_string(),
+            Signature::with_min_arity(
+                vec![
+                    ("f".to_string(), Type::Any),
+                    (
+                        "argnums".to_string(),
+                        Type::Union(vec![Type::Int, Type::List(Box::new(Type::Int)), Type::Nil]),
+                    ),
+                ],
+                1,
+                Type::Closure,
+            ),
+        ),
+        (
+            "jvp".to_string(),
+            Signature::new(
+                vec![
+                    ("f".to_string(), Type::Any),
+                    ("primals".to_string(), Type::Any),
+                    ("tangents".to_string(), Type::Any),
+                ],
+                Type::List(Box::new(Type::Any)),
+            ),
+        ),
+        (
+            "trace_dag".to_string(),
+            Signature::variadic(
+                vec![
+                    ("f".to_string(), Type::Any),
+                    ("input".to_string(), Type::Any),
+                ],
+                Type::ComputeDag,
+            ),
+        ),
+        (
+            "kv_allocator".to_string(),
+            Signature::with_min_arity(
+                vec![
+                    ("total_pages".to_string(), Type::Int),
+                    ("page_tokens".to_string(), Type::Int),
+                    ("num_heads".to_string(), Type::Int),
+                    ("head_dim".to_string(), Type::Int),
+                    (
+                        "dtype".to_string(),
+                        Type::Union(vec![Type::String, Type::Nil]),
+                    ),
+                    (
+                        "device".to_string(),
+                        Type::Union(vec![Type::String, Type::Nil]),
+                    ),
+                ],
+                4,
+                Type::KVAllocator,
             ),
         ),
         // v0.91: 数学 builtin — math/stats/linalg/random
@@ -874,6 +966,193 @@ fn method_signature_builtin(receiver: &Type, method: &str) -> Option<Signature> 
                 ("fn".to_string(), Type::Any),
             ],
             Type::TaskHandle(Box::new(Type::Any)),
+        )),
+        // ── Wave 2: AsyncTcpListener / AsyncTcpStream methods ──
+        (Type::TcpListener, "accept") => Some(Signature::with_min_arity(
+            vec![
+                ("self".to_string(), Type::TcpListener),
+                (
+                    "ctx".to_string(),
+                    Type::Union(vec![Type::Context, Type::Nil]),
+                ),
+            ],
+            1,
+            Type::TcpStream,
+        )),
+        (Type::TcpListener, "local_addr") => Some(Signature::new(
+            vec![("self".to_string(), Type::TcpListener)],
+            Type::String,
+        )),
+        (Type::TcpListener, "close") => Some(Signature::new(
+            vec![("self".to_string(), Type::TcpListener)],
+            Type::Nil,
+        )),
+        (Type::TcpListener, "is_closed") => Some(Signature::new(
+            vec![("self".to_string(), Type::TcpListener)],
+            Type::Bool,
+        )),
+        (Type::TcpStream, "read" | "read_line") => Some(Signature::with_min_arity(
+            vec![
+                ("self".to_string(), Type::TcpStream),
+                (
+                    "max_bytes".to_string(),
+                    Type::Union(vec![Type::Int, Type::Nil]),
+                ),
+                (
+                    "ctx".to_string(),
+                    Type::Union(vec![Type::Context, Type::Nil]),
+                ),
+            ],
+            1,
+            Type::String,
+        )),
+        (Type::TcpStream, "read_bytes") => Some(Signature::with_min_arity(
+            vec![
+                ("self".to_string(), Type::TcpStream),
+                (
+                    "max_bytes".to_string(),
+                    Type::Union(vec![Type::Int, Type::Nil]),
+                ),
+                (
+                    "ctx".to_string(),
+                    Type::Union(vec![Type::Context, Type::Nil]),
+                ),
+            ],
+            1,
+            Type::List(Box::new(Type::Int)),
+        )),
+        (Type::TcpStream, "write") => Some(Signature::with_min_arity(
+            vec![
+                ("self".to_string(), Type::TcpStream),
+                ("data".to_string(), Type::String),
+                (
+                    "ctx".to_string(),
+                    Type::Union(vec![Type::Context, Type::Nil]),
+                ),
+            ],
+            2,
+            Type::Int,
+        )),
+        (Type::TcpStream, "write_bytes") => Some(Signature::with_min_arity(
+            vec![
+                ("self".to_string(), Type::TcpStream),
+                ("bytes".to_string(), Type::List(Box::new(Type::Int))),
+                (
+                    "ctx".to_string(),
+                    Type::Union(vec![Type::Context, Type::Nil]),
+                ),
+            ],
+            2,
+            Type::Int,
+        )),
+        (Type::TcpStream, "shutdown" | "close") => Some(Signature::new(
+            vec![("self".to_string(), Type::TcpStream)],
+            Type::Nil,
+        )),
+        (Type::TcpStream, "is_closed") => Some(Signature::new(
+            vec![("self".to_string(), Type::TcpStream)],
+            Type::Bool,
+        )),
+        (Type::TcpStream, "local_addr" | "peer_addr") => Some(Signature::new(
+            vec![("self".to_string(), Type::TcpStream)],
+            Type::String,
+        )),
+        // ── Wave 4: TensorComputeDag & KVPageAllocator methods ──
+        (Type::ComputeDag, "fuse") => Some(Signature::new(
+            vec![("self".to_string(), Type::ComputeDag)],
+            Type::ComputeDag,
+        )),
+        (Type::ComputeDag, "run") => Some(Signature::variadic(
+            vec![
+                ("self".to_string(), Type::ComputeDag),
+                ("input".to_string(), Type::Any),
+            ],
+            Type::any_tensor(),
+        )),
+        (Type::ComputeDag, "node_count" | "fused_count") => Some(Signature::new(
+            vec![("self".to_string(), Type::ComputeDag)],
+            Type::Int,
+        )),
+        (Type::ComputeDag, "is_fused") => Some(Signature::new(
+            vec![("self".to_string(), Type::ComputeDag)],
+            Type::Bool,
+        )),
+        (Type::ComputeDag, "op_names") => Some(Signature::new(
+            vec![("self".to_string(), Type::ComputeDag)],
+            Type::List(Box::new(Type::String)),
+        )),
+        (Type::ComputeDag, "to_dot") => Some(Signature::new(
+            vec![("self".to_string(), Type::ComputeDag)],
+            Type::String,
+        )),
+        (Type::KVAllocator, "alloc_seq") => Some(Signature::new(
+            vec![
+                ("self".to_string(), Type::KVAllocator),
+                ("seq_id".to_string(), Type::Int),
+            ],
+            Type::Bool,
+        )),
+        (Type::KVAllocator, "append_tokens") => Some(Signature::new(
+            vec![
+                ("self".to_string(), Type::KVAllocator),
+                ("seq_id".to_string(), Type::Int),
+                ("count".to_string(), Type::Int),
+            ],
+            Type::List(Box::new(Type::Int)),
+        )),
+        (Type::KVAllocator, "fork_seq") => Some(Signature::new(
+            vec![
+                ("self".to_string(), Type::KVAllocator),
+                ("src_seq_id".to_string(), Type::Int),
+                ("dst_seq_id".to_string(), Type::Int),
+            ],
+            Type::List(Box::new(Type::Int)),
+        )),
+        (Type::KVAllocator, "write_kv") => Some(Signature::new(
+            vec![
+                ("self".to_string(), Type::KVAllocator),
+                ("seq_id".to_string(), Type::Int),
+                ("token_pos".to_string(), Type::Int),
+                ("k".to_string(), Type::any_tensor()),
+                ("v".to_string(), Type::any_tensor()),
+            ],
+            Type::Nil,
+        )),
+        (Type::KVAllocator, "read_kv") => Some(Signature::new(
+            vec![
+                ("self".to_string(), Type::KVAllocator),
+                ("seq_id".to_string(), Type::Int),
+            ],
+            Type::List(Box::new(Type::any_tensor())),
+        )),
+        (Type::KVAllocator, "free_seq" | "seq_tokens") => Some(Signature::new(
+            vec![
+                ("self".to_string(), Type::KVAllocator),
+                ("seq_id".to_string(), Type::Int),
+            ],
+            Type::Int,
+        )),
+        (Type::KVAllocator, "seq_pages") => Some(Signature::new(
+            vec![
+                ("self".to_string(), Type::KVAllocator),
+                ("seq_id".to_string(), Type::Int),
+            ],
+            Type::List(Box::new(Type::Int)),
+        )),
+        (
+            Type::KVAllocator,
+            "evict_lru" | "free_pages" | "used_pages" | "total_pages" | "bytes_used",
+        ) => Some(Signature::new(
+            vec![("self".to_string(), Type::KVAllocator)],
+            Type::Int,
+        )),
+        (Type::KVAllocator, "utilization") => Some(Signature::new(
+            vec![("self".to_string(), Type::KVAllocator)],
+            Type::Float,
+        )),
+        (Type::KVAllocator, "stats") => Some(Signature::new(
+            vec![("self".to_string(), Type::KVAllocator)],
+            Type::Dict(Box::new(Type::String), Box::new(Type::Int)),
         )),
         (Type::Tensor { .. }, "shape") => Some(Signature::new(
             vec![("self".to_string(), receiver.clone())],

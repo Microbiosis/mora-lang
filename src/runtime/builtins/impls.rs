@@ -70,11 +70,18 @@ pub(crate) fn eval_pure_builtin(
         BuiltinFnId::MergeWith => Some(call_builtin_merge_with_core(core, args)),
         BuiltinFnId::Gensym => Some(call_builtin_gensym_core(core, args)),
         BuiltinFnId::Tensor => Some(crate::value::tensor::call_builtin_tensor(args)),
+        BuiltinFnId::Grad => Some(call_builtin_grad(args, false)),
+        BuiltinFnId::ValueAndGrad => Some(call_builtin_grad(args, true)),
         BuiltinFnId::Swap
         | BuiltinFnId::Into
         | BuiltinFnId::Eval
         | BuiltinFnId::Apply
-        | BuiltinFnId::Macroexpand => None,
+        | BuiltinFnId::Macroexpand
+        | BuiltinFnId::TcpConnect
+        | BuiltinFnId::TcpListen
+        | BuiltinFnId::Jvp
+        | BuiltinFnId::TraceDag
+        | BuiltinFnId::KvAllocator => None,
     }
 }
 
@@ -343,11 +350,87 @@ pub(crate) fn call_builtin_deref(args: &[Value]) -> MoraResult<Value> {
     }
 }
 
+pub(crate) fn call_builtin_grad(args: &[Value], return_value: bool) -> MoraResult<Value> {
+    let fname = if return_value {
+        "value_and_grad"
+    } else {
+        "grad"
+    };
+    let func = args.first().cloned().ok_or_else(|| {
+        MoraError::Runtime(format!(
+            "{fname}(fn, argnums?) requires a callable function as first argument"
+        ))
+    })?;
+    let is_callable = matches!(
+        func,
+        Value::Task { .. }
+            | Value::Closure { .. }
+            | Value::Compose(_)
+            | Value::Partial(_, _)
+            | Value::Curry { .. }
+            | Value::Builtin(_)
+            | Value::GradFn { .. }
+    );
+    if !is_callable {
+        return Err(MoraError::Runtime(format!(
+            "{fname}() expects a callable function, got {}",
+            crate::flow::dynamic_type_name(&func)
+        )));
+    }
+    let argnums = match args.get(1) {
+        None | Some(Value::Nil) => vec![0usize],
+        Some(Value::Int(i)) if *i >= 0 => vec![*i as usize],
+        Some(Value::Float(f)) if f.is_finite() && *f >= 0.0 && f.fract() == 0.0 => {
+            vec![*f as usize]
+        }
+        Some(Value::List(items)) => {
+            if items.is_empty() {
+                return Err(MoraError::Runtime(format!(
+                    "{fname}() argnums list cannot be empty"
+                )));
+            }
+            let mut out = Vec::with_capacity(items.len());
+            for item in items.iter() {
+                let idx = match item {
+                    Value::Int(i) if *i >= 0 => *i as usize,
+                    Value::Float(f) if f.is_finite() && *f >= 0.0 && f.fract() == 0.0 => {
+                        *f as usize
+                    }
+                    other => {
+                        return Err(MoraError::Runtime(format!(
+                            "{fname}() argnums entries must be non-negative integers, got {}",
+                            crate::flow::dynamic_type_name(other)
+                        )));
+                    }
+                };
+                if out.contains(&idx) {
+                    return Err(MoraError::Runtime(format!(
+                        "{fname}() duplicate argnum index {idx}"
+                    )));
+                }
+                out.push(idx);
+            }
+            out
+        }
+        Some(other) => {
+            return Err(MoraError::Runtime(format!(
+                "{fname}() second argument `argnums` must be a non-negative integer or list of integers, got {}",
+                crate::flow::dynamic_type_name(other)
+            )));
+        }
+    };
+    Ok(Value::GradFn {
+        func: Box::new(func),
+        argnums,
+        return_value,
+    })
+}
+
 pub(crate) fn call_builtin_type_of(args: &[Value]) -> MoraResult<Value> {
     let value = args
         .first()
         .ok_or_else(|| MoraError::Runtime("type_of() requires 1 argument".to_string()))?;
-    Ok(Value::String(value_type_name(value).to_string()))
+    Ok(Value::String(crate::flow::dynamic_type_name(value)))
 }
 
 pub(crate) fn call_builtin_is_instance(args: &[Value]) -> MoraResult<Value> {
@@ -357,7 +440,7 @@ pub(crate) fn call_builtin_is_instance(args: &[Value]) -> MoraResult<Value> {
         ));
     }
     let value = &args[0];
-    let type_name = match &args[1] {
+    let target = match &args[1] {
         Value::String(s) => s.as_str(),
         _ => {
             return Err(MoraError::Runtime(
@@ -365,7 +448,9 @@ pub(crate) fn call_builtin_is_instance(args: &[Value]) -> MoraResult<Value> {
             ));
         }
     };
-    Ok(Value::Bool(value_type_name(value) == type_name))
+    Ok(Value::Bool(
+        crate::flow::dynamic_type_name(value) == target || value_type_name(value) == target,
+    ))
 }
 
 pub(crate) fn call_builtin_methods_of(args: &[Value]) -> MoraResult<Value> {

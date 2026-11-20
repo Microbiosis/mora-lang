@@ -18,9 +18,12 @@ pub const RUNTIME_BUILTIN_NAMES: &[&str] = &[
     "eval",
     "float",
     "gensym",
+    "grad",
     "int",
     "into",
     "is_instance",
+    "jvp",
+    "kv_allocator",
     "len",
     "macroexpand",
     "merge_with",
@@ -34,9 +37,13 @@ pub const RUNTIME_BUILTIN_NAMES: &[&str] = &[
     "str",
     "swap",
     "tail",
+    "tcp_connect",
+    "tcp_listen",
     "tensor",
+    "trace_dag",
     "type_of",
     "uncurry",
+    "value_and_grad",
 ];
 
 #[cfg(test)]

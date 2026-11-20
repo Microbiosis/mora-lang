@@ -1,6 +1,7 @@
 //! v0.110.0: CLI 共享编译/路径辅助与 REPL 入口。
 //! main.rs 保留 dispatch + 执行入口。
 
+pub mod bundle;
 pub mod repl;
 
 use std::fs;

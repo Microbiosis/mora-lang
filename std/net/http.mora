@@ -1,0 +1,330 @@
+-- Pure-Mora HTTP/1.1 + Server-Sent Events (SSE) Standard Library (`std/net/http`)
+-- Built directly on Mora's Wave 2 async TCP primitives (`tcp_listen`, `tcp_connect`,
+-- `tcp_listener`, `tcp_stream`, `spawn`, `context`).
+
+export struct HttpRequest
+  method: string = "GET"
+  path: string = "/"
+  query: string = ""
+  headers: dict<string, string>
+  body: string = ""
+  raw_target: string = "/"
+end
+
+export struct HttpResponse
+  status: int = 200
+  headers: dict<string, string>
+  body: string = ""
+end
+
+export struct SseEvent
+  event: string = "message"
+  data: string = ""
+  id: string = ""
+end
+
+export struct HttpClientResponse
+  status: int = 200
+  status_text: string = "OK"
+  headers: dict<string, string>
+  body: string = ""
+end
+
+export task status_reason(code: int): string
+  if code == 200 then
+    return "OK"
+  end
+  if code == 201 then
+    return "Created"
+  end
+  if code == 204 then
+    return "No Content"
+  end
+  if code == 400 then
+    return "Bad Request"
+  end
+  if code == 401 then
+    return "Unauthorized"
+  end
+  if code == 403 then
+    return "Forbidden"
+  end
+  if code == 404 then
+    return "Not Found"
+  end
+  if code == 405 then
+    return "Method Not Allowed"
+  end
+  if code == 500 then
+    return "Internal Server Error"
+  end
+  return "OK"
+end
+
+export task response(status: int, body: string, content_type: string = "text/plain; charset=utf-8"): HttpResponse
+  let hdrs: dict<string, string> = {"Content-Type": content_type}
+  return HttpResponse(status=status, headers=hdrs, body=body)
+end
+
+export task json_response(status: int, data: any): HttpResponse
+  let payload = json.stringify(data)
+  let hdrs: dict<string, string> = {"Content-Type": "application/json; charset=utf-8"}
+  return HttpResponse(status=status, headers=hdrs, body=payload)
+end
+
+task join_tail(parts: list<string>, sep: string): string
+  let n = parts.len()
+  if n == 0 then
+    return ""
+  end
+  let acc = parts.get(0)
+  let i = 1
+  while i < n
+    assign acc = acc + sep + parts.get(i)
+    assign i = i + 1
+  end
+  return acc
+end
+
+task parse_headers_from_stream(stream: tcp_stream, ctx: any): dict<string, string>
+  let hdrs: dict<string, string> = {}
+  while true
+    let raw_line = stream.read_line(8192, ctx)
+    let line = raw_line.trim()
+    if line == "" then
+      break
+    end
+    if line.contains(":") then
+      let segs = line.split(":")
+      let k = segs.get(0).trim().lower()
+      let v = join_tail(segs.drop(1), ":").trim()
+      assign hdrs = hdrs.set(k, v)
+    end
+  end
+  return hdrs
+end
+
+task read_exact_body(stream: tcp_stream, content_len: int, ctx: any): string
+  if content_len <= 0 then
+    return ""
+  end
+  let body = ""
+  while body.len() < content_len
+    let remaining = content_len - body.len()
+    let chunk = stream.read(remaining, ctx)
+    if chunk == "" then
+      break
+    end
+    assign body = body + chunk
+  end
+  return body
+end
+
+export task read_request(stream: tcp_stream, ctx: any = nil): HttpRequest
+  let start_line = stream.read_line(8192, ctx).trim()
+  if start_line == "" then
+    let empty_h: dict<string, string> = {}
+    return HttpRequest(method="", path="", query="", headers=empty_h, body="", raw_target="")
+  end
+  let parts = start_line.split(" ")
+  let method = parts.get(0).upper()
+  let raw_target = if parts.len() >= 2 then parts.get(1) else "/" end
+  let path = raw_target
+  let query = ""
+  if raw_target.contains("?") then
+    let qp = raw_target.split("?")
+    assign path = qp.get(0)
+    assign query = join_tail(qp.drop(1), "?")
+  end
+  let hdrs = parse_headers_from_stream(stream, ctx)
+  let cl_str = hdrs.get("content-length")
+  let body = ""
+  if cl_str != nil then
+    let clen = int(cl_str.trim())
+    assign body = read_exact_body(stream, clen, ctx)
+  end
+  return HttpRequest(method=method, path=path, query=query, headers=hdrs, body=body, raw_target=raw_target)
+end
+
+export task write_response(stream: tcp_stream, resp: HttpResponse, ctx: any = nil): nil
+  let reason = status_reason(resp.status)
+  let out = "HTTP/1.1 " + str(resp.status) + " " + reason + "\r\n"
+  let has_cl = false
+  let has_conn = false
+  for k in resp.headers.keys()
+    let lk = k.lower()
+    if lk == "content-length" then
+      assign has_cl = true
+    end
+    if lk == "connection" then
+      assign has_conn = true
+    end
+    let v = resp.headers.get(k)
+    if v != nil then
+      assign out = out + k + ": " + str(v) + "\r\n"
+    end
+  end
+  if !has_cl then
+    assign out = out + "Content-Length: " + str(resp.body.len()) + "\r\n"
+  end
+  if !has_conn then
+    assign out = out + "Connection: close\r\n"
+  end
+  assign out = out + "\r\n" + resp.body
+  stream.write(out, ctx)
+  stream.shutdown()
+  return nil
+end
+
+export task sse_start(stream: tcp_stream, ctx: any = nil): nil
+  let hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n"
+  stream.write(hdr, ctx)
+  return nil
+end
+
+export task sse_send(stream: tcp_stream, event_name: string, data: string, id: string = "", ctx: any = nil): nil
+  let frame = ""
+  if id != "" then
+    assign frame = frame + "id: " + id + "\n"
+  end
+  if event_name != "" then
+    assign frame = frame + "event: " + event_name + "\n"
+  end
+  for line in data.split("\n")
+    assign frame = frame + "data: " + line + "\n"
+  end
+  assign frame = frame + "\n"
+  stream.write(frame, ctx)
+  return nil
+end
+
+export task sse_read_event(stream: tcp_stream, ctx: any = nil): SseEvent
+  let ev_name = "message"
+  let ev_id = ""
+  let ev_data = ""
+  let has_data = false
+  while true
+    let raw = stream.read_line(65536, ctx)
+    if raw == "" then
+      break
+    end
+    let line = raw.replace("\r", "").replace("\n", "")
+    if line == "" then
+      if has_data or ev_id != "" then
+        break
+      end
+      continue
+    end
+    if line.starts_with(":") then
+      continue
+    end
+    if line.starts_with("event:") then
+      assign ev_name = line.split(":").drop(1).get(0).trim()
+    end
+    if line.starts_with("id:") then
+      assign ev_id = join_tail(line.split(":").drop(1), ":").trim()
+    end
+    if line.starts_with("data:") then
+      let payload = join_tail(line.split(":").drop(1), ":")
+      if payload.starts_with(" ") then
+        assign payload = join_tail(payload.split(" ").drop(1), " ")
+      end
+      if has_data then
+        assign ev_data = ev_data + "\n" + payload
+      else
+        assign has_data = true
+        assign ev_data = payload
+      end
+    end
+  end
+  return SseEvent(event=ev_name, data=ev_data, id=ev_id)
+end
+
+export task serve_listener(listener: tcp_listener, handler: any, max_requests: int = 0, ctx: any = nil): int
+  let served = 0
+  let workers: list<task_handle<any>> = []
+  while max_requests <= 0 or served < max_requests
+    if ctx != nil and ctx.is_cancelled() then
+      break
+    end
+    let stream = listener.accept(ctx)
+    assign served = served + 1
+    let h = spawn fn()
+      let req = read_request(stream, ctx)
+      if req.method != "" then
+        let res = handler(req, stream)
+        if is_instance(res, "HttpResponse") then
+          write_response(stream, res, ctx)
+        end
+      end
+      stream.close()
+      return nil
+    end
+    assign workers = workers.push(h)
+  end
+  for w in workers
+    w.join()
+  end
+  return served
+end
+
+export task serve(addr: string, handler: any, max_requests: int = 0, ctx: any = nil): int
+  let listener = tcp_listen(addr)
+  let count = serve_listener(listener, handler, max_requests, ctx)
+  listener.close()
+  return count
+end
+
+task read_http_response(stream: tcp_stream, ctx: any): HttpClientResponse
+  let status_line = stream.read_line(8192, ctx).trim()
+  let parts = status_line.split(" ")
+  let code = if parts.len() >= 2 then int(parts.get(1)) else 200 end
+  let reason = if parts.len() >= 3 then join_tail(parts.drop(2), " ") else "OK" end
+  let hdrs = parse_headers_from_stream(stream, ctx)
+  let cl_str = hdrs.get("content-length")
+  let body = ""
+  if cl_str != nil then
+    let clen = int(cl_str.trim())
+    assign body = read_exact_body(stream, clen, ctx)
+  end
+  if cl_str == nil then
+    while true
+      let chunk = stream.read(65536, ctx)
+      if chunk == "" then
+        break
+      end
+      assign body = body + chunk
+    end
+  end
+  return HttpClientResponse(status=code, status_text=reason, headers=hdrs, body=body)
+end
+
+export task request(method: string, addr: string, path: string, body: string = "", content_type: string = "application/json", timeout_ms: int = 5000): HttpClientResponse
+  let stream = tcp_connect(addr, timeout_ms)
+  let req = method.upper() + " " + path + " HTTP/1.1\r\nHost: " + addr + "\r\nConnection: close\r\n"
+  if body != "" then
+    assign req = req + "Content-Type: " + content_type + "\r\nContent-Length: " + str(body.len()) + "\r\n"
+  end
+  assign req = req + "\r\n" + body
+  stream.write(req)
+  let resp = read_http_response(stream, nil)
+  stream.close()
+  return resp
+end
+
+export task get(addr: string, path: string = "/", timeout_ms: int = 5000): HttpClientResponse
+  return request("GET", addr, path, "", "text/plain", timeout_ms)
+end
+
+export task post(addr: string, path: string, body: string, content_type: string = "application/json", timeout_ms: int = 5000): HttpClientResponse
+  return request("POST", addr, path, body, content_type, timeout_ms)
+end
+
+export task open_sse(addr: string, path: string = "/sse", timeout_ms: int = 5000): tcp_stream
+  let stream = tcp_connect(addr, timeout_ms)
+  let req = "GET " + path + " HTTP/1.1\r\nHost: " + addr + "\r\nAccept: text/event-stream\r\nConnection: keep-alive\r\n\r\n"
+  stream.write(req)
+  let _status = stream.read_line(8192)
+  let _hdrs = parse_headers_from_stream(stream, nil)
+  return stream
+end

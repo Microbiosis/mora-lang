@@ -5,31 +5,39 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::common::Span;
+use crate::common::trait_info::{
+    TraitInfo, TraitMethodSig, default_impl_method_key, impl_method_key,
+};
+use crate::common::{DType, ScalarValue, Span};
 use crate::error::{MoraError, MoraResult};
-use crate::flow::{eval_binary, is_truthy};
+use crate::flow::{eval_binary_tracked, eval_unary_neg_tracked, is_truthy};
 use crate::mir::control::{
-    CalleeTarget, ControlConst, ControlInst, ControlSelectArm, ControlSpawnTarget,
-    ControlTerminator, FnId, OptLevel, ParallelSegment, PatternTarget, UnaryOp, optimize_program,
+    CalleeTarget, ControlConst, ControlInst, ControlSelectArm, ControlSliceAxis,
+    ControlSpawnTarget, ControlTerminator, FnId, OptLevel, ParallelSegment, PatternTarget, UnaryOp,
+    optimize_program,
 };
 use crate::mir::effect::ambient;
 use crate::parser_v3::ParserV3;
 use crate::runtime::CoreRuntime;
-use crate::typeck::check_mir::check_program_witnesses;
-use crate::value::{BuiltinKind, Environment, MergeStrategy, Value};
+use crate::value::tensor::RuntimeSliceAxis;
+use crate::value::{
+    BuiltinKind, EnumDefRuntime, Environment, MergeStrategy, StructDefRuntime, StructFieldRuntime,
+    Value,
+};
 
 use super::builtins::{
-    CallAction, resolve_builtin_call, resolve_dyn_call, resolve_method_call, resolve_value_call,
+    CallAction, resolve_builtin_call_named, resolve_dyn_call_named, resolve_method_call_named,
+    resolve_value_call, resolve_value_call_named,
 };
 use super::continuation::{
     CallFrame, CapturedContinuation, CombinatorFrame, HandleBarrierState, ModuleGlobals,
     ParallelFrame, ScriptFrame, TransactionState, UpvalueCell, UpvalueValue,
-    clone_isolated_globals, clone_worker_upvalues, materialize_frame, materialize_handler_frame,
-    resolve_captures, restore_globals, snapshot_globals,
+    clone_isolated_globals, clone_worker_upvalues, materialize_frame, materialize_frame_named,
+    materialize_handler_frame, resolve_captures, restore_globals, snapshot_globals,
 };
 use super::value_ops::{
-    eval_assert, eval_quasiquote, index_assign_value, index_value, make_dyn_trait, make_enum_value,
-    make_struct_value, match_pattern,
+    eval_assert, eval_quasiquote, index_assign_value, index_value_tracked, make_dyn_trait,
+    match_pattern,
 };
 
 /// Result of running a single instruction inside the active [`ScriptFrame`].
@@ -127,6 +135,9 @@ impl<'a> VmEngine<'a> {
                 CallFrame::ErrorContext { .. } => {
                     unreachable!("ErrorContext popped directly without return delivery")
                 }
+                CallFrame::NoGradGuard => {
+                    unreachable!("NoGradGuard popped directly without return delivery")
+                }
             }
         }
         Ok(Value::Nil)
@@ -147,6 +158,10 @@ impl<'a> VmEngine<'a> {
                 }
                 CallFrame::HandleBarrier(_) | CallFrame::ErrorContext { .. } => {
                     // Handled body returned normally or macro finished cleanly; pass `val` down.
+                    continue;
+                }
+                CallFrame::NoGradGuard => {
+                    self.core.autograd.exit_no_grad();
                     continue;
                 }
                 CallFrame::AutoResume(cont) => {
@@ -325,6 +340,203 @@ impl<'a> VmEngine<'a> {
                 *atom.lock() = reply.clone();
                 Ok(Some(reply))
             }
+            CombinatorFrame::AutogradEval {
+                tape_id,
+                leaf_nodes,
+                scalar_flags,
+                return_value,
+            } => {
+                let tape = self.core.autograd.pop_tape(tape_id).ok_or_else(|| {
+                    MoraError::Runtime("autograd: active tape missing on completion".to_string())
+                })?;
+                let (display_val, grad_tensors) = match &reply {
+                    Value::Tensor(t) => {
+                        if t.numel() != 1 {
+                            return Err(MoraError::Runtime(format!(
+                                "grad: differentiated function must return a scalar (0-D or 1-element tensor), got shape {:?}",
+                                t.shape
+                            )));
+                        }
+                        let disp = if t.shape.is_empty() {
+                            let scalar_v = t.get_linear(0);
+                            if t.dtype == DType::F64 {
+                                Value::Float(scalar_v)
+                            } else {
+                                ScalarValue::from_f64_quantized(scalar_v, t.dtype)
+                                    .map(Value::Scalar)
+                                    .unwrap_or(Value::Float(scalar_v))
+                            }
+                        } else {
+                            Value::Tensor(Arc::clone(t))
+                        };
+                        let grads = if let Some((tid, out_idx)) = t.grad_node
+                            && tid == tape_id
+                        {
+                            tape.backward(out_idx, &leaf_nodes)?
+                        } else {
+                            tape.zero_grads_for_leaves(&leaf_nodes)?
+                        };
+                        (disp, grads)
+                    }
+                    Value::Float(_) | Value::Int(_) | Value::Scalar(_) => {
+                        (reply.clone(), tape.zero_grads_for_leaves(&leaf_nodes)?)
+                    }
+                    other => {
+                        return Err(MoraError::Runtime(format!(
+                            "grad: differentiated function must return a scalar float or 0-D tensor, got {}",
+                            crate::flow::type_name(other)
+                        )));
+                    }
+                };
+                let mut grad_vals = Vec::with_capacity(grad_tensors.len());
+                for (gt, scalar_flag) in grad_tensors.into_iter().zip(scalar_flags) {
+                    if let Some(dt) = scalar_flag {
+                        let v = gt.get_linear(0);
+                        if dt == DType::F64 {
+                            grad_vals.push(Value::Float(v));
+                        } else {
+                            grad_vals.push(
+                                ScalarValue::from_f64_quantized(v, dt)
+                                    .map(Value::Scalar)
+                                    .unwrap_or(Value::Float(v)),
+                            );
+                        }
+                    } else {
+                        grad_vals.push(Value::Tensor(gt));
+                    }
+                }
+                let grad_result = if grad_vals.len() == 1 {
+                    grad_vals.pop().expect("grad_vals has length 1")
+                } else {
+                    Value::List(grad_vals.into())
+                };
+                if return_value {
+                    Ok(Some(Value::List(vec![display_val, grad_result].into())))
+                } else {
+                    Ok(Some(grad_result))
+                }
+            }
+            CombinatorFrame::JvpEval {
+                tape_id,
+                leaf_nodes,
+                leaf_tangents,
+                scalar_out_dtype,
+            } => {
+                let tape = self.core.autograd.pop_tape(tape_id).ok_or_else(|| {
+                    MoraError::Runtime("jvp: active tape missing on completion".to_string())
+                })?;
+                let (primal_val, tangent_val) = match &reply {
+                    Value::Tensor(t) => {
+                        let tangent_t = if let Some((tid, out_idx)) = t.grad_node
+                            && tid == tape_id
+                        {
+                            tape.forward_jvp(out_idx, &leaf_nodes, &leaf_tangents)?
+                        } else {
+                            crate::value::tensor::Tensor::zeros(
+                                t.shape.clone(),
+                                t.dtype,
+                                t.device.clone(),
+                                false,
+                            )?
+                        };
+                        if t.shape.is_empty() && scalar_out_dtype.is_some() {
+                            let pv = t.get_linear(0);
+                            let tv = tangent_t.get_linear(0);
+                            let p_out = if t.dtype == DType::F64 {
+                                Value::Float(pv)
+                            } else {
+                                ScalarValue::from_f64_quantized(pv, t.dtype)
+                                    .map(Value::Scalar)
+                                    .unwrap_or(Value::Float(pv))
+                            };
+                            let t_out = if t.dtype == DType::F64 {
+                                Value::Float(tv)
+                            } else {
+                                ScalarValue::from_f64_quantized(tv, t.dtype)
+                                    .map(Value::Scalar)
+                                    .unwrap_or(Value::Float(tv))
+                            };
+                            (p_out, t_out)
+                        } else {
+                            (Value::Tensor(Arc::clone(t)), Value::Tensor(tangent_t))
+                        }
+                    }
+                    Value::Float(_) | Value::Int(_) | Value::Scalar(_) => {
+                        (reply.clone(), Value::Float(0.0))
+                    }
+                    other => {
+                        return Err(MoraError::Runtime(format!(
+                            "jvp: differentiated function must return a Tensor or float scalar, got {}",
+                            crate::flow::type_name(other)
+                        )));
+                    }
+                };
+                Ok(Some(Value::List(vec![primal_val, tangent_val].into())))
+            }
+            CombinatorFrame::TraceDagEval {
+                tape_id,
+                leaf_nodes,
+            } => {
+                let tape = self.core.autograd.pop_tape(tape_id).ok_or_else(|| {
+                    MoraError::Runtime("trace_dag: active tape missing on completion".to_string())
+                })?;
+                let Value::Tensor(t) = &reply else {
+                    return Err(MoraError::Runtime(format!(
+                        "trace_dag: traced function must return a Tensor, got {}",
+                        crate::flow::type_name(&reply)
+                    )));
+                };
+                let out_idx = match t.grad_node {
+                    Some((tid, idx)) if tid == tape_id => idx,
+                    _ => {
+                        return Err(MoraError::Runtime(
+                            "trace_dag: output tensor is disconnected from traced inputs"
+                                .to_string(),
+                        ));
+                    }
+                };
+                let dag = crate::runtime::compute_dag::TensorComputeDag::from_tape(
+                    &tape,
+                    out_idx,
+                    &leaf_nodes,
+                )?;
+                Ok(Some(Value::ComputeDag(Arc::new(dag))))
+            }
+            CombinatorFrame::StructInit {
+                def,
+                mut fields,
+                mut pending_defaults,
+                current_field,
+            } => {
+                fields.insert(current_field, reply);
+                if pending_defaults.is_empty() {
+                    let field_order = def.fields.iter().map(|f| f.name.clone()).collect();
+                    return Ok(Some(Value::StructInstance {
+                        type_name: def.name.clone(),
+                        fields,
+                        field_order,
+                        def,
+                    }));
+                }
+                let (next_field, next_fn_id) = pending_defaults.remove(0);
+                let thunk = Value::Task {
+                    name: format!("{}::<default>", def.name),
+                    params: Vec::new(),
+                    program: Arc::clone(&def.program),
+                    fn_id: next_fn_id,
+                    globals: Arc::clone(&def.globals),
+                };
+                self.frames
+                    .push(CallFrame::Combinator(CombinatorFrame::StructInit {
+                        def,
+                        fields,
+                        pending_defaults,
+                        current_field: next_field,
+                    }));
+                let action = resolve_value_call(thunk, Vec::new(), self.core)?;
+                self.apply_action_chained(action)?;
+                Ok(None)
+            }
         }
     }
 
@@ -479,6 +691,16 @@ impl<'a> VmEngine<'a> {
                         err = MoraError::Runtime("Transaction rolled back".to_string());
                     }
                 }
+                CallFrame::NoGradGuard => {
+                    self.core.autograd.exit_no_grad();
+                }
+                CallFrame::Combinator(
+                    CombinatorFrame::AutogradEval { tape_id, .. }
+                    | CombinatorFrame::JvpEval { tape_id, .. }
+                    | CombinatorFrame::TraceDagEval { tape_id, .. },
+                ) => {
+                    let _ = self.core.autograd.pop_tape(tape_id);
+                }
                 CallFrame::Script(_)
                 | CallFrame::HandleBarrier(_)
                 | CallFrame::AutoResume(_)
@@ -595,6 +817,11 @@ impl<'a> VmEngine<'a> {
         let CallFrame::HandleBarrier(barrier) = drained.remove(0) else {
             unreachable!("find_barrier returned HandleBarrier index");
         };
+        for f in &drained {
+            if matches!(f, CallFrame::NoGradGuard) {
+                self.core.autograd.exit_no_grad();
+            }
+        }
         let cont = Arc::new(CapturedContinuation {
             effect_name: effect_name.to_string(),
             barrier: barrier.clone(),
@@ -616,6 +843,11 @@ impl<'a> VmEngine<'a> {
         self.frames
             .push(CallFrame::HandleBarrier(cont.barrier.clone()));
         let mut restored = cont.frames.clone();
+        for f in &restored {
+            if matches!(f, CallFrame::NoGradGuard) {
+                self.core.autograd.enter_no_grad();
+            }
+        }
         if let Some(last) = restored.last_mut() {
             match last {
                 CallFrame::Script(sf) => sf.receive_reply(val),
@@ -950,15 +1182,28 @@ impl<'a> VmEngine<'a> {
         target: &CalleeTarget,
         arg_vals: Vec<Value>,
     ) -> MoraResult<CallAction> {
+        self.resolve_callee_named(frame, target, arg_vals, Vec::new())
+    }
+
+    fn resolve_callee_named(
+        &mut self,
+        frame: &ScriptFrame,
+        target: &CalleeTarget,
+        arg_vals: Vec<Value>,
+        named_vals: Vec<(String, Value)>,
+    ) -> MoraResult<CallAction> {
         match target {
-            CalleeTarget::Builtin(id) => resolve_builtin_call(*id, self.core, arg_vals),
+            CalleeTarget::Builtin(id) => {
+                resolve_builtin_call_named(*id, self.core, arg_vals, named_vals)
+            }
             CalleeTarget::Fn(fn_id) => {
-                let next_frame = materialize_frame(
+                let next_frame = materialize_frame_named(
                     Arc::clone(&frame.program),
                     *fn_id,
                     Arc::clone(&frame.globals),
                     Arc::new(Vec::new()),
                     &arg_vals,
+                    &named_vals,
                 )?;
                 Ok(CallAction::PushFrame {
                     frame: next_frame,
@@ -967,13 +1212,14 @@ impl<'a> VmEngine<'a> {
             }
             CalleeTarget::Value(r) => {
                 let val = frame.regs[r.0 as usize].clone();
-                resolve_value_call(val, arg_vals, self.core)
+                resolve_value_call_named(val, arg_vals, named_vals, self.core)
             }
             CalleeTarget::DynGlobal(sym) => {
                 let name = frame.program.symbols.resolve(*sym);
-                resolve_dyn_call(
+                resolve_dyn_call_named(
                     name,
                     arg_vals,
+                    named_vals,
                     self.core,
                     Some(&(Arc::clone(&frame.program), Arc::clone(&frame.globals))),
                 )
@@ -1045,10 +1291,12 @@ impl<'a> VmEngine<'a> {
                 let out = match op {
                     UnaryOp::Truthy => Value::Bool(is_truthy(v)),
                     UnaryOp::Not => Value::Bool(!is_truthy(v)),
-                    UnaryOp::Neg => match crate::flow::eval_unary_neg(v) {
-                        Ok(negated) => negated,
-                        Err(e) => return StepOutcome::Err(e),
-                    },
+                    UnaryOp::Neg => {
+                        match eval_unary_neg_tracked(v, Some(&mut self.core.autograd)) {
+                            Ok(negated) => negated,
+                            Err(e) => return StepOutcome::Err(e),
+                        }
+                    }
                 };
                 frame.regs[dst.0 as usize] = out;
                 StepOutcome::NextInst
@@ -1056,7 +1304,7 @@ impl<'a> VmEngine<'a> {
             ControlInst::Binary(dst, lhs, op, rhs) => {
                 let l = frame.regs[lhs.0 as usize].clone();
                 let r = frame.regs[rhs.0 as usize].clone();
-                match eval_binary(l, &op, r) {
+                match eval_binary_tracked(l, &op, r, Some(&mut self.core.autograd)) {
                     Ok(v) => {
                         frame.regs[dst.0 as usize] = v;
                         StepOutcome::NextInst
@@ -1130,6 +1378,11 @@ impl<'a> VmEngine<'a> {
                 frame.locals[slot.0 as usize].set(val);
                 StepOutcome::NextInst
             }
+            ControlInst::IsMissingArg(dst, slot) => {
+                let missing = matches!(frame.locals[slot.0 as usize].get(), Value::MissingArg);
+                frame.regs[dst.0 as usize] = Value::Bool(missing);
+                StepOutcome::NextInst
+            }
             ControlInst::LoadUpvalue(dst, slot) => {
                 frame.regs[dst.0 as usize] = frame.upvalues[slot.0 as usize].get();
                 StepOutcome::NextInst
@@ -1183,7 +1436,11 @@ impl<'a> VmEngine<'a> {
                 StepOutcome::NextInst
             }
             ControlInst::Index(dst, obj, idx) => {
-                match index_value(&frame.regs[obj.0 as usize], &frame.regs[idx.0 as usize]) {
+                match index_value_tracked(
+                    &frame.regs[obj.0 as usize],
+                    &frame.regs[idx.0 as usize],
+                    Some(&mut self.core.autograd),
+                ) {
                     Ok(v) => {
                         frame.regs[dst.0 as usize] = v;
                         StepOutcome::NextInst
@@ -1203,12 +1460,82 @@ impl<'a> VmEngine<'a> {
                     Err(e) => StepOutcome::Err(e),
                 }
             }
-            ControlInst::Call { dst, target, args } => {
+            ControlInst::TensorSlice { dst, target, axes } => {
+                let target_val = frame.regs[target.0 as usize].clone();
+                let mut rt_axes = Vec::with_capacity(axes.len());
+                for ax in &axes {
+                    match ax {
+                        ControlSliceAxis::Index(r) => {
+                            let i = match value_to_slice_isize(&frame.regs[r.0 as usize]) {
+                                Ok(v) => v,
+                                Err(e) => return StepOutcome::Err(e),
+                            };
+                            rt_axes.push(RuntimeSliceAxis::Index(i));
+                        }
+                        ControlSliceAxis::Range { start, stop, step } => {
+                            let s = match start {
+                                Some(r) => match value_to_slice_isize(&frame.regs[r.0 as usize]) {
+                                    Ok(v) => Some(v),
+                                    Err(e) => return StepOutcome::Err(e),
+                                },
+                                None => None,
+                            };
+                            let e = match stop {
+                                Some(r) => match value_to_slice_isize(&frame.regs[r.0 as usize]) {
+                                    Ok(v) => Some(v),
+                                    Err(e) => return StepOutcome::Err(e),
+                                },
+                                None => None,
+                            };
+                            let st = match step {
+                                Some(r) => match value_to_slice_isize(&frame.regs[r.0 as usize]) {
+                                    Ok(v) => Some(v),
+                                    Err(e) => return StepOutcome::Err(e),
+                                },
+                                None => None,
+                            };
+                            rt_axes.push(RuntimeSliceAxis::Range {
+                                start: s,
+                                stop: e,
+                                step: st,
+                            });
+                        }
+                        ControlSliceAxis::Ellipsis => rt_axes.push(RuntimeSliceAxis::Ellipsis),
+                        ControlSliceAxis::NewAxis => rt_axes.push(RuntimeSliceAxis::NewAxis),
+                    }
+                }
+                let sliced = match &target_val {
+                    Value::Tensor(t) => t.slice_nd(&rt_axes, Some(&mut self.core.autograd)),
+                    other => slice_sequence_value(other, &rt_axes),
+                };
+                match sliced {
+                    Ok(v) => {
+                        frame.regs[dst.0 as usize] = v;
+                        StepOutcome::NextInst
+                    }
+                    Err(e) => StepOutcome::Err(e),
+                }
+            }
+            ControlInst::Call {
+                dst,
+                target,
+                args,
+                named_args,
+            } => {
                 let arg_vals: Vec<Value> = args
                     .iter()
                     .map(|r| frame.regs[r.0 as usize].clone())
                     .collect();
-                match self.resolve_callee(frame, &target, arg_vals) {
+                let named_vals: Vec<(String, Value)> = named_args
+                    .iter()
+                    .map(|(sym, r)| {
+                        (
+                            frame.program.symbols.resolve(*sym).to_string(),
+                            frame.regs[r.0 as usize].clone(),
+                        )
+                    })
+                    .collect();
+                match self.resolve_callee_named(frame, &target, arg_vals, named_vals) {
                     Ok(action) => self.suspend_and_dispatch(frame, dst, action),
                     Err(e) => StepOutcome::Err(e),
                 }
@@ -1218,17 +1545,28 @@ impl<'a> VmEngine<'a> {
                 module,
                 method,
                 args,
+                named_args,
             } => {
                 let mname = frame.program.symbols.resolve(method).to_string();
                 let arg_vals: Vec<Value> = args
                     .iter()
                     .map(|r| frame.regs[r.0 as usize].clone())
                     .collect();
-                match resolve_method_call(
+                let named_vals: Vec<(String, Value)> = named_args
+                    .iter()
+                    .map(|(sym, r)| {
+                        (
+                            frame.program.symbols.resolve(*sym).to_string(),
+                            frame.regs[r.0 as usize].clone(),
+                        )
+                    })
+                    .collect();
+                match resolve_method_call_named(
                     self.core,
                     Value::Builtin(module),
                     &mname,
                     arg_vals,
+                    named_vals,
                     Span::default(),
                 ) {
                     Ok(action) => self.suspend_and_dispatch(frame, dst, action),
@@ -1240,6 +1578,7 @@ impl<'a> VmEngine<'a> {
                 receiver,
                 method,
                 args,
+                named_args,
             } => {
                 let mname = frame.program.symbols.resolve(method).to_string();
                 let recv = frame.regs[receiver.0 as usize].clone();
@@ -1247,7 +1586,23 @@ impl<'a> VmEngine<'a> {
                     .iter()
                     .map(|r| frame.regs[r.0 as usize].clone())
                     .collect();
-                match resolve_method_call(self.core, recv, &mname, arg_vals, Span::default()) {
+                let named_vals: Vec<(String, Value)> = named_args
+                    .iter()
+                    .map(|(sym, r)| {
+                        (
+                            frame.program.symbols.resolve(*sym).to_string(),
+                            frame.regs[r.0 as usize].clone(),
+                        )
+                    })
+                    .collect();
+                match resolve_method_call_named(
+                    self.core,
+                    recv,
+                    &mname,
+                    arg_vals,
+                    named_vals,
+                    Span::default(),
+                ) {
                     Ok(action) => self.suspend_and_dispatch(frame, dst, action),
                     Err(e) => StepOutcome::Err(e),
                 }
@@ -1407,23 +1762,66 @@ impl<'a> VmEngine<'a> {
             }
             ControlInst::Spawn { dst, target } => self.exec_spawn(frame, dst, target),
             ControlInst::Select { dst, arms } => self.exec_select(frame, dst, arms),
+            ControlInst::NoGrad {
+                dst,
+                body_fn,
+                body_captures,
+            } => {
+                let b_uvs = resolve_captures(
+                    &body_captures,
+                    &frame.locals,
+                    &frame.upvalues,
+                    frame.program.func(body_fn),
+                );
+                let body_frame = match materialize_frame(
+                    Arc::clone(&frame.program),
+                    body_fn,
+                    Arc::clone(&frame.globals),
+                    Arc::new(b_uvs),
+                    &[],
+                ) {
+                    Ok(f) => f,
+                    Err(e) => return StepOutcome::Err(e),
+                };
+                self.core.autograd.enter_no_grad();
+                frame.pc += 1;
+                frame.resume_dst = Some(dst);
+                self.frames.push(CallFrame::Script(Box::new(frame.clone())));
+                self.frames.push(CallFrame::NoGradGuard);
+                self.frames.push(CallFrame::Script(Box::new(body_frame)));
+                StepOutcome::Yielded
+            }
             ControlInst::Import { path } => {
-                let checked = match self.core.fs_context().resolve_path(&path, "import") {
-                    Ok(p) => p,
-                    Err(e) => return StepOutcome::Err(e),
+                let source = if let Some(s) = self.core.bundled_modules.get(&path) {
+                    s.clone()
+                } else if let Some(std_src) = crate::resolve_std_module(&path) {
+                    std_src.to_string()
+                } else {
+                    let checked = match self.core.fs_context().resolve_path(&path, "import") {
+                        Ok(p) => p,
+                        Err(e) => return StepOutcome::Err(e),
+                    };
+                    let ctx = self.core.task_context.as_ref();
+                    match self.core.reactor().run_fs(ctx, move || {
+                        std::fs::read_to_string(checked.as_path()).map_err(MoraError::from)
+                    }) {
+                        Ok(s) => s,
+                        Err(e) => return StepOutcome::Err(e.with_prefix("import error: ")),
+                    }
                 };
-                let ctx = self.core.task_context.as_ref();
-                let source = match self.core.reactor().run_fs(ctx, move || {
-                    std::fs::read_to_string(checked.as_path()).map_err(MoraError::from)
-                }) {
-                    Ok(s) => s,
-                    Err(e) => return StepOutcome::Err(e.with_prefix("import error: ")),
+                let mods_opt = if self.core.bundled_modules.is_empty() {
+                    None
+                } else {
+                    Some(self.core.bundled_modules.as_ref())
                 };
-                let (mut child_prog, witnesses) = match ParserV3::compile(&source) {
-                    Ok(v) => v,
-                    Err(e) => return StepOutcome::Err(e),
-                };
-                let type_errs = check_program_witnesses(&witnesses);
+                let (mut child_prog, witnesses) =
+                    match ParserV3::compile_with_modules(&source, mods_opt) {
+                        Ok(v) => v,
+                        Err(e) => return StepOutcome::Err(e),
+                    };
+                let type_errs = crate::typeck::check_mir::check_program_witnesses_with_modules(
+                    &witnesses, mods_opt,
+                );
                 if !type_errs.is_empty() {
                     let msg = type_errs
                         .iter()
@@ -1501,29 +1899,198 @@ impl<'a> VmEngine<'a> {
             }
             ControlInst::RegisterEnum {
                 name,
+                type_params,
                 variants,
                 dst,
             } => {
                 let n = frame.program.symbols.resolve(name).to_string();
-                let evs: Vec<crate::common::EnumVariant> = variants
+                let tp_names: Vec<String> = type_params
                     .into_iter()
-                    .map(|sym| crate::common::EnumVariant {
-                        name: frame.program.symbols.resolve(sym).to_string(),
-                        data: None,
+                    .map(|s| frame.program.symbols.resolve(s).to_string())
+                    .collect();
+                let evs: Vec<(String, Vec<String>)> = variants
+                    .into_iter()
+                    .map(|(sym, payload_tys)| {
+                        (frame.program.symbols.resolve(sym).to_string(), payload_tys)
                     })
                     .collect();
-                let v = make_enum_value(&evs);
+                let def = Arc::new(EnumDefRuntime {
+                    name: n.clone(),
+                    type_params: tp_names,
+                    variants: evs,
+                });
+                self.core.register_enum_def(Arc::clone(&def));
+                self.store_registered_decl(frame, dst, n, Value::EnumType(def));
+                StepOutcome::NextInst
+            }
+            ControlInst::RegisterStruct {
+                name,
+                type_params,
+                fields,
+                dst,
+            } => {
+                let n = frame.program.symbols.resolve(name).to_string();
+                let tp_names: Vec<String> = type_params
+                    .into_iter()
+                    .map(|s| frame.program.symbols.resolve(s).to_string())
+                    .collect();
+                let rt_fields: Vec<StructFieldRuntime> = fields
+                    .into_iter()
+                    .map(|f| StructFieldRuntime {
+                        name: frame.program.symbols.resolve(f.name).to_string(),
+                        type_name: f.type_name,
+                        default_fn: f.default_fn,
+                        tags: f.tags,
+                    })
+                    .collect();
+                let def = Arc::new(StructDefRuntime {
+                    name: n.clone(),
+                    type_params: tp_names,
+                    fields: rt_fields,
+                    program: Arc::clone(&frame.program),
+                    globals: Arc::clone(&frame.globals),
+                });
+                self.core.register_struct_def(Arc::clone(&def));
+                self.store_registered_decl(frame, dst, n, Value::StructType(def));
+                StepOutcome::NextInst
+            }
+            ControlInst::RegisterTrait {
+                name,
+                type_params,
+                parents,
+                methods,
+                dst,
+            } => {
+                let n = frame.program.symbols.resolve(name).to_string();
+                let tp_names: Vec<String> = type_params
+                    .iter()
+                    .map(|s| frame.program.symbols.resolve(*s).to_string())
+                    .collect();
+                let parent_names: Vec<String> = parents
+                    .iter()
+                    .map(|s| frame.program.symbols.resolve(*s).to_string())
+                    .collect();
+                let mut method_sigs = Vec::with_capacity(methods.len());
+                for m in methods {
+                    let mname = frame.program.symbols.resolve(m.name).to_string();
+                    let params: Vec<(String, Option<String>)> = m
+                        .params
+                        .iter()
+                        .map(|(ps, ty)| {
+                            (frame.program.symbols.resolve(*ps).to_string(), ty.clone())
+                        })
+                        .collect();
+                    if let Some(def_fn) = m.default_fn {
+                        let f = frame.program.func(def_fn);
+                        let pnames: Vec<String> = f
+                            .params
+                            .iter()
+                            .map(|s| frame.program.symbols.resolve(*s).to_string())
+                            .collect();
+                        let task_val = Value::Task {
+                            name: format!("{n}::{mname}"),
+                            params: pnames,
+                            program: Arc::clone(&frame.program),
+                            fn_id: def_fn,
+                            globals: Arc::clone(&frame.globals),
+                        };
+                        self.core.register_trait_default_method(
+                            n.clone(),
+                            mname.clone(),
+                            task_val.clone(),
+                            m.has_self,
+                        );
+                        let def_key = default_impl_method_key(&n, &tp_names, &mname);
+                        self.core.environment.define(def_key, task_val, false);
+                    }
+                    method_sigs.push(TraitMethodSig {
+                        name: mname,
+                        params,
+                        return_type: m.return_type,
+                        has_self: m.has_self,
+                        has_default: m.default_fn.is_some(),
+                    });
+                }
+                self.core.register_trait(
+                    n.clone(),
+                    TraitInfo {
+                        name: n.clone(),
+                        type_params: tp_names,
+                        parents: parent_names,
+                        methods: method_sigs,
+                    },
+                );
+                let v = Value::String(format!("<trait {n}>"));
                 self.store_registered_decl(frame, dst, n, v);
                 StepOutcome::NextInst
             }
-            ControlInst::RegisterStruct { name, fields, dst } => {
-                let n = frame.program.symbols.resolve(name).to_string();
-                let fnames: Vec<String> = fields
-                    .into_iter()
-                    .map(|(sym, _)| frame.program.symbols.resolve(sym).to_string())
-                    .collect();
-                let v = make_struct_value(&fnames);
-                self.store_registered_decl(frame, dst, n, v);
+            ControlInst::RegisterImpl {
+                trait_name,
+                trait_generics,
+                target_type,
+                target_generics,
+                methods,
+            } => {
+                let target_name = frame.program.symbols.resolve(target_type).to_string();
+                if let Some(tr_sym) = trait_name {
+                    let tr_name = frame.program.symbols.resolve(tr_sym).to_string();
+                    self.core
+                        .register_trait_impl_pair(tr_name.clone(), target_name.clone());
+                    for m in methods {
+                        let mname = frame.program.symbols.resolve(m.name).to_string();
+                        let f = frame.program.func(m.fn_id);
+                        let pnames: Vec<String> = f
+                            .params
+                            .iter()
+                            .map(|s| frame.program.symbols.resolve(*s).to_string())
+                            .collect();
+                        let task_val = Value::Task {
+                            name: format!("{target_name}::{mname}"),
+                            params: pnames,
+                            program: Arc::clone(&frame.program),
+                            fn_id: m.fn_id,
+                            globals: Arc::clone(&frame.globals),
+                        };
+                        self.core.register_trait_impl_method(
+                            tr_name.clone(),
+                            target_name.clone(),
+                            mname.clone(),
+                            task_val.clone(),
+                            m.has_self,
+                        );
+                        let key = impl_method_key(
+                            &tr_name,
+                            &trait_generics,
+                            &target_name,
+                            &target_generics,
+                            &mname,
+                        );
+                        self.core.environment.define(key, task_val, false);
+                    }
+                } else {
+                    for m in methods {
+                        let mname = frame.program.symbols.resolve(m.name).to_string();
+                        let f = frame.program.func(m.fn_id);
+                        let pnames: Vec<String> = f
+                            .params
+                            .iter()
+                            .map(|s| frame.program.symbols.resolve(*s).to_string())
+                            .collect();
+                        let task_val = Value::Task {
+                            name: format!("{target_name}::{mname}"),
+                            params: pnames,
+                            program: Arc::clone(&frame.program),
+                            fn_id: m.fn_id,
+                            globals: Arc::clone(&frame.globals),
+                        };
+                        self.core.register_inherent_method(
+                            target_name.clone(),
+                            mname,
+                            task_val,
+                            m.has_self,
+                        );
+                    }
+                }
                 StepOutcome::NextInst
             }
             ControlInst::RegisterMacro {
@@ -1588,10 +2155,23 @@ impl<'a> VmEngine<'a> {
             .unwrap_or_else(crate::runtime::scheduler::TaskContext::root);
         let scheduler = Arc::clone(self.core.scheduler());
         let handle = match target {
-            ControlSpawnTarget::Call { target, args } => {
+            ControlSpawnTarget::Call {
+                target,
+                args,
+                named_args,
+            } => {
                 let arg_vals: Vec<Value> = args
                     .iter()
                     .map(|r| frame.regs[r.0 as usize].clone())
+                    .collect();
+                let named_vals: Vec<(String, Value)> = named_args
+                    .iter()
+                    .map(|(sym, r)| {
+                        (
+                            frame.program.symbols.resolve(*sym).to_string(),
+                            frame.regs[r.0 as usize].clone(),
+                        )
+                    })
                     .collect();
                 let callee_val = match target {
                     CalleeTarget::Builtin(id) => ControlConst::BuiltinFn(id).to_value(),
@@ -1628,12 +2208,14 @@ impl<'a> VmEngine<'a> {
                         }
                     }
                 };
-                scheduler.spawn_mora_value(callee_val, arg_vals, self.core, &base_ctx)
+                scheduler
+                    .spawn_mora_value_named(callee_val, arg_vals, named_vals, self.core, &base_ctx)
             }
             ControlSpawnTarget::MethodCall {
                 receiver,
                 method,
                 args,
+                named_args,
             } => {
                 let recv_val = frame.regs[receiver.0 as usize].clone();
                 let method_name = frame.program.symbols.resolve(method).to_string();
@@ -1641,7 +2223,23 @@ impl<'a> VmEngine<'a> {
                     .iter()
                     .map(|r| frame.regs[r.0 as usize].clone())
                     .collect();
-                scheduler.spawn_mora_method(recv_val, method_name, arg_vals, self.core, &base_ctx)
+                let named_vals: Vec<(String, Value)> = named_args
+                    .iter()
+                    .map(|(sym, r)| {
+                        (
+                            frame.program.symbols.resolve(*sym).to_string(),
+                            frame.regs[r.0 as usize].clone(),
+                        )
+                    })
+                    .collect();
+                scheduler.spawn_mora_method_named(
+                    recv_val,
+                    method_name,
+                    arg_vals,
+                    named_vals,
+                    self.core,
+                    &base_ctx,
+                )
             }
             ControlSpawnTarget::Callable(reg) => {
                 let callee_val = frame.regs[reg.0 as usize].clone();
@@ -1781,4 +2379,91 @@ pub fn collect_env_names(env: &Environment) -> Vec<String> {
         cur = layer.parent.as_deref();
     }
     names
+}
+
+fn value_to_slice_isize(val: &Value) -> MoraResult<isize> {
+    match val {
+        Value::Int(i) => Ok(*i as isize),
+        Value::Float(f) if f.is_finite() && f.fract() == 0.0 => Ok(*f as isize),
+        Value::Scalar(s) if s.dtype().is_int() => Ok(s.as_f64() as isize),
+        other => Err(MoraError::Runtime(format!(
+            "slice index must be an integer, got {}",
+            crate::flow::type_name(other)
+        ))),
+    }
+}
+
+/// Normalize Python-style `(start, stop, step)` bounds over sequence length `len`.
+fn normalize_seq_slice(
+    len: usize,
+    start: Option<isize>,
+    stop: Option<isize>,
+    step: Option<isize>,
+) -> MoraResult<Vec<usize>> {
+    let st = step.unwrap_or(1);
+    if st == 0 {
+        return Err(MoraError::Runtime("slice step cannot be zero".to_string()));
+    }
+    let n = len as isize;
+    let mut indices = Vec::new();
+    if st > 0 {
+        let mut s = start.unwrap_or(0);
+        let mut e = stop.unwrap_or(n);
+        if s < 0 {
+            s += n;
+        }
+        if e < 0 {
+            e += n;
+        }
+        let s = s.clamp(0, n);
+        let e = e.clamp(0, n);
+        let mut cur = s;
+        while cur < e {
+            indices.push(cur as usize);
+            cur += st;
+        }
+    } else {
+        let mut s = start.unwrap_or(n - 1);
+        let mut e = stop.unwrap_or(-n - 1);
+        if s < 0 {
+            s += n;
+        }
+        if stop.is_some() && e < 0 {
+            e += n;
+        }
+        let s = s.clamp(-1, n - 1);
+        let e = e.clamp(-1, n - 1);
+        let mut cur = s;
+        while cur > e {
+            indices.push(cur as usize);
+            cur += st;
+        }
+    }
+    Ok(indices)
+}
+
+fn slice_sequence_value(target: &Value, axes: &[RuntimeSliceAxis]) -> MoraResult<Value> {
+    if axes.len() != 1 {
+        return Err(MoraError::Runtime(format!(
+            "multi-dimensional slicing requires a Tensor, got {}",
+            crate::flow::type_name(target)
+        )));
+    }
+    match (target, &axes[0]) {
+        (Value::List(list), RuntimeSliceAxis::Range { start, stop, step }) => {
+            let idxs = normalize_seq_slice(list.len(), *start, *stop, *step)?;
+            let out: crate::value::list::List = idxs.into_iter().map(|i| list[i].clone()).collect();
+            Ok(Value::List(out))
+        }
+        (Value::String(s), RuntimeSliceAxis::Range { start, stop, step }) => {
+            let chars: Vec<char> = s.chars().collect();
+            let idxs = normalize_seq_slice(chars.len(), *start, *stop, *step)?;
+            let out: String = idxs.into_iter().map(|i| chars[i]).collect();
+            Ok(Value::String(out))
+        }
+        _ => Err(MoraError::Runtime(format!(
+            "cannot slice value of type {}",
+            crate::flow::type_name(target)
+        ))),
+    }
 }

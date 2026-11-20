@@ -10,6 +10,23 @@
 use crate::error::{MoraError, MoraResult};
 use crate::value::Value;
 
+/// math.* builtin 入口分发（支持自动微分磁带追踪）
+pub fn call_math_method_tracked(
+    method: &str,
+    args: &[Value],
+    autograd: Option<&mut crate::runtime::autograd::AutogradContext>,
+) -> MoraResult<Value> {
+    if let Some(Value::Tensor(t)) = args.first()
+        && matches!(
+            method,
+            "sin" | "cos" | "tanh" | "exp" | "log" | "sqrt" | "abs"
+        )
+    {
+        return crate::value::tensor::eval_tensor_math_unary_tracked(t, method, autograd);
+    }
+    call_math_method(method, args)
+}
+
 /// math.* builtin 入口分发
 pub fn call_math_method(method: &str, args: &[Value]) -> MoraResult<Value> {
     match method {

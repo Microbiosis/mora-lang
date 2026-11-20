@@ -621,6 +621,10 @@ pub fn value_to_json(value: &Value) -> String {
                 Value::Channel(_) => out.push_str("\"<channel>\""),
                 Value::TaskHandle(_) => out.push_str("\"<task_handle>\""),
                 Value::Context(_) => out.push_str("\"<context>\""),
+                Value::TcpListener(_) => out.push_str("\"<tcp_listener>\""),
+                Value::TcpStream(_) => out.push_str("\"<tcp_stream>\""),
+                Value::ComputeDag(_) => out.push_str("\"<compute_dag>\""),
+                Value::KVAllocator(_) => out.push_str("\"<kv_allocator>\""),
                 Value::External(obj) => match obj.to_json() {
                     Some(v) if atom_depth < MAX_JSON_DEPTH => {
                         stack.push(SerStep::Val(Cow::Owned(v), atom_depth + 1));
@@ -662,6 +666,85 @@ pub fn value_to_json(value: &Value) -> String {
                 Value::Tensor(t) => {
                     stack.push(SerStep::Val(Cow::Owned(t.to_nested_list()), atom_depth));
                 }
+                Value::StructType(def) => {
+                    stack.push(SerStep::Val(Cow::Owned(def.to_schema_value()), atom_depth));
+                }
+                Value::StructInstance {
+                    fields,
+                    field_order,
+                    def,
+                    ..
+                } => {
+                    out.push('{');
+                    stack.push(SerStep::Raw("}"));
+                    let mut projected: Vec<(String, Value)> = Vec::new();
+                    for fname in field_order {
+                        let Some(val) = fields.get(fname) else {
+                            continue;
+                        };
+                        let json_tag = def.fields.iter().find(|f| &f.name == fname).and_then(|f| {
+                            f.tags
+                                .iter()
+                                .find(|(k, _)| k == "json")
+                                .map(|(_, v)| v.as_str())
+                        });
+                        let mut key = fname.clone();
+                        let mut omit_empty = false;
+                        if let Some(tag) = json_tag {
+                            if tag == "-" {
+                                continue;
+                            }
+                            let mut parts = tag.split(',');
+                            if let Some(alias) = parts.next()
+                                && !alias.is_empty()
+                            {
+                                key = alias.to_string();
+                            }
+                            for opt in parts {
+                                if opt.trim() == "omitempty" {
+                                    omit_empty = true;
+                                }
+                            }
+                        }
+                        if omit_empty && is_json_empty_value(val) {
+                            continue;
+                        }
+                        projected.push((key, val.clone()));
+                    }
+                    for (idx, (k, val)) in projected.into_iter().enumerate().rev() {
+                        stack.push(SerStep::Val(Cow::Owned(val), atom_depth));
+                        stack.push(SerStep::KeyQuoted(k));
+                        if idx > 0 {
+                            stack.push(SerStep::Raw(","));
+                        }
+                    }
+                }
+                Value::EnumType(def) => {
+                    out.push_str("\"<enum ");
+                    write_escaped_json_string(&mut out, &def.name);
+                    out.push_str(">\"");
+                }
+                Value::EnumVariant {
+                    variant, payload, ..
+                } => {
+                    if payload.is_empty() {
+                        out.push('"');
+                        write_escaped_json_string(&mut out, variant);
+                        out.push('"');
+                    } else {
+                        out.push('{');
+                        stack.push(SerStep::Raw("}"));
+                        let inner = if payload.len() == 1 {
+                            payload[0].clone()
+                        } else {
+                            Value::List(payload.clone().into())
+                        };
+                        stack.push(SerStep::Val(Cow::Owned(inner), atom_depth));
+                        stack.push(SerStep::KeyQuoted(variant.clone()));
+                    }
+                }
+                Value::GradFn { .. } => out.push_str("\"<grad>\""),
+                Value::MissingArg => out.push_str("null"),
                 Value::Dict(_) => {
                     out.push('{');
                     stack.push(SerStep::Raw("}"));
@@ -689,6 +772,19 @@ pub fn value_to_json(value: &Value) -> String {
     }
 
     out
+}
+
+fn is_json_empty_value(v: &Value) -> bool {
+    match v {
+        Value::Nil | Value::MissingArg => true,
+        Value::Bool(false) => true,
+        Value::Int(0) => true,
+        Value::Float(f) if *f == 0.0 => true,
+        Value::String(s) => s.is_empty(),
+        Value::List(l) => l.is_empty(),
+        Value::Dict(d) => d.is_empty(),
+        _ => false,
+    }
 }
 
 #[cfg(test)]

@@ -160,6 +160,7 @@ pub fn builtin_signatures() -> Vec<(String, Signature)> {
                         Type::List(Box::new(Type::Union(vec![]))),
                         Type::Dict(Box::new(Type::Union(vec![])), Box::new(Type::Union(vec![]))),
                         Type::Channel(Box::new(Type::Union(vec![]))),
+                        Type::any_tensor(),
                     ]),
                 )],
                 Type::Int,
@@ -214,6 +215,28 @@ pub fn builtin_signatures() -> Vec<(String, Signature)> {
             Signature::new(
                 vec![("ms".to_string(), Type::Union(vec![Type::Int, Type::Float]))],
                 Type::Nil,
+            ),
+        ),
+        (
+            "tensor".to_string(),
+            Signature::with_min_arity(
+                vec![
+                    ("data".to_string(), Type::Any),
+                    (
+                        "dtype".to_string(),
+                        Type::Union(vec![Type::String, Type::Nil]),
+                    ),
+                    (
+                        "device".to_string(),
+                        Type::Union(vec![Type::String, Type::Nil]),
+                    ),
+                    (
+                        "requires_grad".to_string(),
+                        Type::Union(vec![Type::Bool, Type::Nil]),
+                    ),
+                ],
+                1,
+                Type::any_tensor(),
             ),
         ),
         // v0.91: 数学 builtin — math/stats/linalg/random
@@ -851,6 +874,102 @@ fn method_signature_builtin(receiver: &Type, method: &str) -> Option<Signature> 
                 ("fn".to_string(), Type::Any),
             ],
             Type::TaskHandle(Box::new(Type::Any)),
+        )),
+        (Type::Tensor { .. }, "shape") => Some(Signature::new(
+            vec![("self".to_string(), receiver.clone())],
+            Type::List(Box::new(Type::Int)),
+        )),
+        (Type::Tensor { .. }, "ndim" | "rank" | "numel" | "len") => Some(Signature::new(
+            vec![("self".to_string(), receiver.clone())],
+            Type::Int,
+        )),
+        (Type::Tensor { .. }, "dtype" | "device") => Some(Signature::new(
+            vec![("self".to_string(), receiver.clone())],
+            Type::String,
+        )),
+        (Type::Tensor { .. }, "is_contiguous" | "requires_grad") => Some(Signature::new(
+            vec![("self".to_string(), receiver.clone())],
+            Type::Bool,
+        )),
+        (
+            Type::Tensor { .. },
+            "contiguous" | "abs" | "sqrt" | "exp" | "ln" | "relu" | "gelu" | "silu" | "tanh"
+            | "sigmoid" | "softmax",
+        ) => Some(Signature::new(
+            vec![("self".to_string(), receiver.clone())],
+            receiver.clone(),
+        )),
+        (Type::Tensor { .. }, "with_grad") => Some(Signature::with_min_arity(
+            vec![
+                ("self".to_string(), receiver.clone()),
+                ("enabled".to_string(), Type::Bool),
+            ],
+            1,
+            receiver.clone(),
+        )),
+        (Type::Tensor { .. }, "rms_norm" | "layer_norm") => Some(Signature::with_min_arity(
+            vec![
+                ("self".to_string(), receiver.clone()),
+                ("eps".to_string(), Type::Union(vec![Type::Int, Type::Float])),
+            ],
+            1,
+            receiver.clone(),
+        )),
+        (Type::Tensor { dtype, .. }, "sum" | "max" | "min" | "item") => Some(Signature::new(
+            vec![("self".to_string(), receiver.clone())],
+            (**dtype).clone(),
+        )),
+        (Type::Tensor { dtype, .. }, "mean") => {
+            let ret = match (**dtype).as_dtype() {
+                Some(dt) if dt.is_float() => Type::from_dtype(dt),
+                _ => Type::Float,
+            };
+            Some(Signature::new(
+                vec![("self".to_string(), receiver.clone())],
+                ret,
+            ))
+        }
+        (Type::Tensor { .. }, "to_list") => Some(Signature::new(
+            vec![("self".to_string(), receiver.clone())],
+            Type::List(Box::new(Type::Any)),
+        )),
+        (Type::Tensor { .. }, "reshape") => Some(Signature::variadic(
+            vec![
+                ("self".to_string(), receiver.clone()),
+                ("shape".to_string(), Type::Any),
+            ],
+            Type::any_tensor(),
+        )),
+        (Type::Tensor { .. }, "transpose") => Some(Signature::with_min_arity(
+            vec![
+                ("self".to_string(), receiver.clone()),
+                (
+                    "dim0".to_string(),
+                    Type::Union(vec![Type::Int, Type::Float]),
+                ),
+                (
+                    "dim1".to_string(),
+                    Type::Union(vec![Type::Int, Type::Float]),
+                ),
+            ],
+            1,
+            Type::any_tensor(),
+        )),
+        (Type::Tensor { .. }, "to" | "to_dtype" | "to_device") => Some(Signature::with_min_arity(
+            vec![
+                ("self".to_string(), receiver.clone()),
+                ("target".to_string(), Type::String),
+                ("second".to_string(), Type::String),
+            ],
+            2,
+            Type::any_tensor(),
+        )),
+        (Type::Tensor { .. }, "fill_" | "add_" | "mul_") => Some(Signature::new(
+            vec![
+                ("self".to_string(), receiver.clone()),
+                ("rhs".to_string(), Type::Any),
+            ],
+            receiver.clone(),
         )),
         _ => None,
     }

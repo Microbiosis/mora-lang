@@ -157,26 +157,35 @@ fn as_f64(v: &Value) -> Option<f64> {
     match v {
         Value::Int(n) => Some(*n as f64),
         Value::Float(n) => Some(*n),
+        Value::Scalar(s) => Some(s.as_f64()),
         _ => None,
     }
 }
 
 fn expect_number_list(arg: Option<&Value>, ctx: &str) -> MoraResult<Vec<f64>> {
-    let v = arg.ok_or_else(|| MoraError::Runtime(format!("{}: list argument required", ctx)))?;
-    let list = match v {
-        Value::List(xs) => xs,
-        _ => {
-            return Err(MoraError::Runtime(format!(
-                "{}: list argument required",
-                ctx
-            )));
+    let v = arg
+        .ok_or_else(|| MoraError::Runtime(format!("{}: list or tensor argument required", ctx)))?;
+    match v {
+        Value::List(xs) => xs
+            .iter()
+            .map(|x| {
+                as_f64(x).ok_or_else(|| MoraError::Runtime(format!("{}: non-numeric element", ctx)))
+            })
+            .collect(),
+        Value::Tensor(t) => {
+            if t.dtype.is_bool() {
+                return Err(MoraError::Runtime(format!(
+                    "{}: Tensor<bool> is not a numeric tensor",
+                    ctx
+                )));
+            }
+            Ok(t.to_flat_vec())
         }
-    };
-    list.iter()
-        .map(|x| {
-            as_f64(x).ok_or_else(|| MoraError::Runtime(format!("{}: non-numeric element", ctx)))
-        })
-        .collect()
+        _ => Err(MoraError::Runtime(format!(
+            "{}: list or tensor argument required",
+            ctx
+        ))),
+    }
 }
 
 fn sum_value(xs: &[f64]) -> Value {

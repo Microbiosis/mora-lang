@@ -576,6 +576,20 @@ pub fn value_to_json(value: &Value) -> String {
                 Value::Int(i) => {
                     let _ = write!(out, "{}", i);
                 }
+                Value::Scalar(s) => {
+                    if s.dtype().is_float() {
+                        let f = s.as_f64();
+                        if !f.is_finite() {
+                            out.push_str("null");
+                        } else if f.fract() == 0.0 {
+                            let _ = write!(out, "{:.1}", f);
+                        } else {
+                            let _ = write!(out, "{}", f);
+                        }
+                    } else {
+                        let _ = write!(out, "{}", s);
+                    }
+                }
                 Value::Float(f) => {
                     if !f.is_finite() {
                         out.push_str("null");
@@ -644,6 +658,9 @@ pub fn value_to_json(value: &Value) -> String {
                             stack.push(SerStep::Raw(","));
                         }
                     }
+                }
+                Value::Tensor(t) => {
+                    stack.push(SerStep::Val(Cow::Owned(t.to_nested_list()), atom_depth));
                 }
                 Value::Dict(_) => {
                     out.push('{');

@@ -36,22 +36,38 @@ fn compile_check_and_run(src: &str) -> Value {
 
 #[test]
 fn track3a1_numeric_literals_underscores_scientific_and_suffixes() {
+    use mora::common::{
+        ScalarValue, f64_to_bf16_bits, f64_to_f16_bits, f64_to_fp8_e4m3_bits, f64_to_fp8_e5m2_bits,
+    };
     for (src, expected) in [
         ("1", Value::Int(1)),
         ("42", Value::Int(42)),
         ("1_000_000", Value::Int(1_000_000)),
-        ("255u8", Value::Int(255)),
-        ("127i8", Value::Int(127)),
+        ("255u8", Value::Scalar(ScalarValue::U8(255))),
+        ("127i8", Value::Scalar(ScalarValue::I8(127))),
         ("42i", Value::Int(42)),
-        ("100u64", Value::Int(100)),
+        ("100u64", Value::Scalar(ScalarValue::U64(100))),
         ("1.0", Value::Float(1.0)),
         ("1e5", Value::Float(100_000.0)),
         ("2.5e-2", Value::Float(0.025)),
         ("1_000.5", Value::Float(1_000.5)),
-        ("1f32", Value::Float(1.0)),
-        ("1f16", Value::Float(1.0)),
-        ("1bf16", Value::Float(1.0)),
-        ("1fp8", Value::Float(1.0)),
+        ("1f32", Value::Scalar(ScalarValue::F32(1.0))),
+        (
+            "1f16",
+            Value::Scalar(ScalarValue::F16(f64_to_f16_bits(1.0))),
+        ),
+        (
+            "1bf16",
+            Value::Scalar(ScalarValue::BF16(f64_to_bf16_bits(1.0))),
+        ),
+        (
+            "1fp8",
+            Value::Scalar(ScalarValue::FP8E4M3(f64_to_fp8_e4m3_bits(1.0))),
+        ),
+        (
+            "1fp8_e5m2",
+            Value::Scalar(ScalarValue::FP8E5M2(f64_to_fp8_e5m2_bits(1.0))),
+        ),
     ] {
         let got = compile_check_and_run(&format!("{src}\n"));
         assert_eq!(got, expected, "literal `{src}` mismatch");

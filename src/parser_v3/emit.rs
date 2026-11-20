@@ -363,35 +363,91 @@ impl ParserV3 {
         let mut expr = self.emit_power_w()?;
         for p in prefixes.into_iter().rev() {
             expr = match p {
-                UnaryPrefix::Not(span) => MirWitness {
-                    kind: WitnessKind::Call {
-                        callee: crate::mir::witness::WitnessCallee::Builtin(
-                            crate::mir::witness::BuiltinOp::Not,
-                        ),
-                        args: vec![expr],
-                    },
-                    span,
-                },
-                UnaryPrefix::Minus(span) => MirWitness {
-                    kind: WitnessKind::Binary {
-                        left: Box::new(MirWitness {
-                            kind: WitnessKind::Literal(Literal::Int(0, span)),
+                UnaryPrefix::Not(span) => {
+                    self.check_unnegated_typed_int(&expr)?;
+                    MirWitness {
+                        kind: WitnessKind::Call {
+                            callee: crate::mir::witness::WitnessCallee::Builtin(
+                                crate::mir::witness::BuiltinOp::Not,
+                            ),
+                            args: vec![expr],
+                        },
+                        span,
+                    }
+                }
+                UnaryPrefix::Minus(span) => match &expr.kind {
+                    WitnessKind::Literal(Literal::TypedInt(n, dt, _)) => {
+                        let (n, dt) = (*n, *dt);
+                        let neg = match n.checked_neg() {
+                            Some(v) => v,
+                            None => {
+                                eprintln!(
+                                    "Parse error: integer literal '-{}' out of range for '{}' at line {}, column {}",
+                                    n,
+                                    dt.short_name(),
+                                    span.line,
+                                    span.column
+                                );
+                                return None;
+                            }
+                        };
+                        if let Err(msg) = dt.check_int_range(neg) {
+                            eprintln!(
+                                "Parse error: {} at line {}, column {}",
+                                msg, span.line, span.column
+                            );
+                            return None;
+                        }
+                        MirWitness {
+                            kind: WitnessKind::Literal(Literal::TypedInt(neg, dt, span)),
                             span,
-                        }),
-                        op: BinaryOp::Sub,
-                        right: Box::new(expr),
+                        }
+                    }
+                    WitnessKind::Literal(Literal::TypedFloat(f, dt, _)) => {
+                        let (f, dt) = (*f, *dt);
+                        MirWitness {
+                            kind: WitnessKind::Literal(Literal::TypedFloat(
+                                dt.quantize_f64(-f),
+                                dt,
+                                span,
+                            )),
+                            span,
+                        }
+                    }
+                    _ => MirWitness {
+                        kind: WitnessKind::Call {
+                            callee: crate::mir::witness::WitnessCallee::Builtin(
+                                crate::mir::witness::BuiltinOp::Neg,
+                            ),
+                            args: vec![expr],
+                        },
+                        span,
                     },
-                    span,
                 },
             };
         }
+        self.check_unnegated_typed_int(&expr)?;
         Some(expr)
+    }
+
+    fn check_unnegated_typed_int(&self, w: &MirWitness) -> Option<()> {
+        if let WitnessKind::Literal(Literal::TypedInt(n, dt, lit_span)) = &w.kind
+            && let Err(msg) = dt.check_int_range(*n)
+        {
+            eprintln!(
+                "Parse error: {} at line {}, column {}",
+                msg, lit_span.line, lit_span.column
+            );
+            return None;
+        }
+        Some(())
     }
 
     /// Right-associative power operator `**` (binds tighter than unary `-` on LHS).
     fn emit_power_w(&mut self) -> Option<MirWitness> {
         let lhs = self.emit_call_w()?;
         if self.check(&TokenType::StarStar) {
+            self.check_unnegated_typed_int(&lhs)?;
             let span = self.span_of_current();
             self.advance();
             let rhs = self.emit_unary_w()?;
@@ -463,6 +519,7 @@ impl ParserV3 {
     fn emit_call_tail_w(&mut self, mut callee_w: MirWitness) -> Option<MirWitness> {
         loop {
             if self.match_token_exact(TokenType::Dot) {
+                self.check_unnegated_typed_int(&callee_w)?;
                 let method_name = self.consume_identifier("Expected method name")?;
                 let span = self.span_of_current();
                 let mut arg_wits = Vec::new();
@@ -479,6 +536,7 @@ impl ParserV3 {
                     span,
                 };
             } else if self.match_token_exact(TokenType::LBracket) {
+                self.check_unnegated_typed_int(&callee_w)?;
                 // Indexing: obj[idx]
                 let span = self.span_of_current();
                 let idx_w = self.emit_expr_w()?;
@@ -491,6 +549,7 @@ impl ParserV3 {
                     span,
                 };
             } else if self.match_token_exact(TokenType::LParen) {
+                self.check_unnegated_typed_int(&callee_w)?;
                 // v0.104.6 D123 **补齐能力**（此前是硬报错，见下方沿革）。
                 //
                 // D123 当时只做了「消除静默」：`mk(1)(2)` 修复前会算出 `2.0`
@@ -565,11 +624,27 @@ impl ParserV3 {
                     span,
                 }
             }
+            TokenType::TypedInt(val, dt) => {
+                self.advance();
+
+                MirWitness {
+                    kind: WitnessKind::Literal(Literal::TypedInt(val, dt, span)),
+                    span,
+                }
+            }
             TokenType::Float(val) => {
                 self.advance();
 
                 MirWitness {
                     kind: WitnessKind::Literal(Literal::Float(val, span)),
+                    span,
+                }
+            }
+            TokenType::TypedFloat(val, dt) => {
+                self.advance();
+
+                MirWitness {
+                    kind: WitnessKind::Literal(Literal::TypedFloat(val, dt, span)),
                     span,
                 }
             }
@@ -1408,7 +1483,9 @@ impl ParserV3 {
                 TokenType::String(_)
                 | TokenType::Char(_)
                 | TokenType::Int(_)
+                | TokenType::TypedInt(_, _)
                 | TokenType::Float(_)
+                | TokenType::TypedFloat(_, _)
                 | TokenType::True
                 | TokenType::False
                 | TokenType::Nil

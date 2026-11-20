@@ -1045,6 +1045,10 @@ impl<'a> VmEngine<'a> {
                 let out = match op {
                     UnaryOp::Truthy => Value::Bool(is_truthy(v)),
                     UnaryOp::Not => Value::Bool(!is_truthy(v)),
+                    UnaryOp::Neg => match crate::flow::eval_unary_neg(v) {
+                        Ok(negated) => negated,
+                        Err(e) => return StepOutcome::Err(e),
+                    },
                 };
                 frame.regs[dst.0 as usize] = out;
                 StepOutcome::NextInst

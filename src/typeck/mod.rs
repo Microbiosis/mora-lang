@@ -57,6 +57,114 @@ impl std::fmt::Display for TypeVarId {
     }
 }
 
+/// Stage 3B: Static tensor dimension expression in `ShapeType::Ranked`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum DimExpr {
+    /// Statically known concrete dimension extent (e.g., `128`).
+    Known(usize),
+    /// Named symbolic dimension from user annotation (e.g., `B`, `Seq`, `Hidden`, or `"_"` wildcard).
+    Symbolic(String),
+    /// Unification meta-variable for dimension inference.
+    Var(u32),
+}
+
+impl DimExpr {
+    pub fn compatible_with(&self, other: &DimExpr) -> bool {
+        match (self, other) {
+            (DimExpr::Known(a), DimExpr::Known(b)) => a == b,
+            (DimExpr::Var(_), _) | (_, DimExpr::Var(_)) => true,
+            (DimExpr::Symbolic(s), _) | (_, DimExpr::Symbolic(s)) if s == "_" => true,
+            (DimExpr::Symbolic(a), DimExpr::Symbolic(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl std::fmt::Display for DimExpr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DimExpr::Known(n) => write!(f, "{n}"),
+            DimExpr::Symbolic(s) => write!(f, "{s}"),
+            DimExpr::Var(id) => write!(f, "_d{id}"),
+        }
+    }
+}
+
+/// Stage 3B: Static tensor shape representation in `Type::Tensor`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ShapeType {
+    /// Ranked shape with known rank and per-axis `DimExpr` (e.g., `[B, 128]`).
+    Ranked(Vec<DimExpr>),
+    /// Unranked / polymorphic shape (`None` = unconstrained wildcard shape, `Some(var)` = generic shape variable `S`).
+    Unranked(Option<TypeVarId>),
+}
+
+impl ShapeType {
+    pub fn compatible_with(&self, other: &ShapeType) -> bool {
+        match (self, other) {
+            (ShapeType::Unranked(None), _) | (_, ShapeType::Unranked(None)) => true,
+            (ShapeType::Unranked(Some(TypeVarId::Meta(_))), _)
+            | (_, ShapeType::Unranked(Some(TypeVarId::Meta(_)))) => true,
+            (
+                ShapeType::Unranked(Some(TypeVarId::Rigid(a))),
+                ShapeType::Unranked(Some(TypeVarId::Rigid(b))),
+            ) => a == b,
+            (ShapeType::Ranked(a), ShapeType::Ranked(b)) => {
+                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.compatible_with(y))
+            }
+            _ => false,
+        }
+    }
+}
+
+impl std::fmt::Display for ShapeType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ShapeType::Ranked(dims) => {
+                let parts: Vec<String> = dims.iter().map(|d| d.to_string()).collect();
+                write!(f, "[{}]", parts.join(", "))
+            }
+            ShapeType::Unranked(Some(var)) => write!(f, "{var}"),
+            ShapeType::Unranked(None) => write!(f, "_"),
+        }
+    }
+}
+
+/// Stage 3B: Static tensor device placement representation in `Type::Tensor`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum DeviceType {
+    /// Concrete placement (`cpu`, `cuda:0`, `metal:0`).
+    Concrete(crate::common::Device),
+    /// Polymorphic device parameter (`Dev` in `Tensor<D, S, Dev>` or meta inference var).
+    Var(TypeVarId),
+    /// Unconstrained device wildcard (`_` or bare `tensor`).
+    Any,
+}
+
+impl DeviceType {
+    pub fn compatible_with(&self, other: &DeviceType) -> bool {
+        match (self, other) {
+            (DeviceType::Any, _) | (_, DeviceType::Any) => true,
+            (DeviceType::Var(TypeVarId::Meta(_)), _) | (_, DeviceType::Var(TypeVarId::Meta(_))) => {
+                true
+            }
+            (DeviceType::Var(TypeVarId::Rigid(a)), DeviceType::Var(TypeVarId::Rigid(b))) => a == b,
+            (DeviceType::Concrete(a), DeviceType::Concrete(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl std::fmt::Display for DeviceType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DeviceType::Concrete(d) => write!(f, "{d}"),
+            DeviceType::Var(v) => write!(f, "{v}"),
+            DeviceType::Any => write!(f, "_"),
+        }
+    }
+}
+
 /// Mora 类型系统：基础类型 + Any（推断不出时退路）
 #[derive(Debug, Clone, PartialEq)]
 pub enum Type {
@@ -142,9 +250,48 @@ pub enum Type {
     TaskHandle(Box<Type>),
     /// Wave 2: Cooperative cancellation & deadline context (`context`).
     Context,
+    /// Stage 3B: Distinct low-bitwidth / hardware-precision scalar type (`f32`, `f16`, `bf16`, `fp8`, `i32`, `i16`, `i8`, `i4`, `u64`, `u32`, `u16`, `u8`).
+    /// Canonical 64-bit `i64` is `Type::Int` and `f64` is `Type::Float`.
+    Scalar(crate::common::DType),
+    /// Stage 3B: First-class multidimensional tensor type `Tensor<DType, Shape, Device>`.
+    Tensor {
+        dtype: Box<Type>,
+        shape: ShapeType,
+        device: DeviceType,
+    },
 } // ← close pub enum Type
 
 impl Type {
+    /// Convert a `DType` into its canonical `Type` representation (`I64 -> Type::Int`, `F64 -> Type::Float`, `Bool -> Type::Bool`, others `Type::Scalar(dt)`).
+    pub fn from_dtype(dt: crate::common::DType) -> Type {
+        match dt {
+            crate::common::DType::I64 => Type::Int,
+            crate::common::DType::F64 => Type::Float,
+            crate::common::DType::Bool => Type::Bool,
+            other => Type::Scalar(other),
+        }
+    }
+
+    /// Extract the concrete `DType` if this type is `Type::Int`, `Type::Float`, `Type::Bool`, or `Type::Scalar(dt)`.
+    pub fn as_dtype(&self) -> Option<crate::common::DType> {
+        match self {
+            Type::Int => Some(crate::common::DType::I64),
+            Type::Float => Some(crate::common::DType::F64),
+            Type::Bool => Some(crate::common::DType::Bool),
+            Type::Scalar(dt) => Some(*dt),
+            _ => None,
+        }
+    }
+
+    /// Construct an unconstrained `Type::Tensor` (used for bare `tensor` annotations and fallback signatures).
+    pub fn any_tensor() -> Type {
+        Type::Tensor {
+            dtype: Box::new(Type::Any),
+            shape: ShapeType::Unranked(None),
+            device: DeviceType::Any,
+        }
+    }
+
     /// Build a curried `Arrow` type for a parameter slice, using empty `Tuple([])`
     /// as the unit domain when `param_types` is empty so 0-arg callables remain
     /// `Type::Arrow` values rather than bare return types.
@@ -249,16 +396,34 @@ impl Type {
             Type::Channel(t) => format!("channel<{}>", t.name()),
             Type::TaskHandle(t) => format!("task_handle<{}>", t.name()),
             Type::Context => "context".to_string(),
+            Type::Scalar(dt) => dt.canonical_type_name().to_string(),
+            Type::Tensor {
+                dtype,
+                shape,
+                device,
+            } => {
+                if matches!(**dtype, Type::Any)
+                    && matches!(shape, ShapeType::Unranked(None))
+                    && matches!(device, DeviceType::Any)
+                {
+                    "tensor".to_string()
+                } else {
+                    format!("Tensor<{}, {}, {}>", dtype.name(), shape, device)
+                }
+            }
         }
     }
 
     /// 从用户写的类型 hint 字符串解析
     pub fn from_hint(hint: &str) -> Type {
+        if let Some(dt) = crate::common::DType::from_name(hint) {
+            return Type::from_dtype(dt);
+        }
         match hint {
             "string" => Type::String,
             "char" => Type::Char,
-            "int" | "i4" | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => Type::Int,
-            "float" | "f16" | "bf16" | "fp8" | "f32" | "f64" => Type::Float,
+            "int" => Type::Int,
+            "float" => Type::Float,
             "number" => Type::Union(vec![Type::Int, Type::Float]),
             "bool" => Type::Bool,
             "nil" => Type::Nil,
@@ -269,6 +434,7 @@ impl Type {
             "channel" => Type::Channel(Box::new(Type::Union(vec![]))),
             "task_handle" | "taskhandle" => Type::TaskHandle(Box::new(Type::Union(vec![]))),
             "context" => Type::Context,
+            "tensor" | "Tensor" => Type::any_tensor(),
             "task" => Type::Task,
             "closure" => Type::Closure,
             // v0.x: list<T> 泛型语法
@@ -379,6 +545,8 @@ impl Type {
                 | "task_handle"
                 | "taskhandle"
                 | "context"
+                | "tensor"
+                | "Tensor"
                 | "task"
                 | "closure"
                 | "any"
@@ -407,10 +575,22 @@ impl Type {
             if members.is_empty() {
                 return true;
             }
+            if matches!(self, Type::Scalar(_))
+                && members.contains(&Type::Int)
+                && members.contains(&Type::Float)
+            {
+                return true;
+            }
             return members.iter().any(|m| self.compatible_with(m));
         }
         if let Type::Union(members) = self {
             if members.is_empty() {
+                return true;
+            }
+            if matches!(expected, Type::Scalar(_))
+                && members.contains(&Type::Int)
+                && members.contains(&Type::Float)
+            {
                 return true;
             }
             return members.iter().any(|m| m.compatible_with(expected));
@@ -430,6 +610,24 @@ impl Type {
             || matches!(expected, Type::TypeVar(TypeVarId::Rigid(_)))
         {
             return false;
+        }
+        if let (
+            Type::Tensor {
+                dtype: d1,
+                shape: s1,
+                device: dev1,
+            },
+            Type::Tensor {
+                dtype: d2,
+                shape: s2,
+                device: dev2,
+            },
+        ) = (self, expected)
+        {
+            let dtype_ok = (d1.subtype_of(d2) && d2.subtype_of(d1))
+                || matches!(**d1, Type::Any | Type::TypeVar(TypeVarId::Meta(_)))
+                || matches!(**d2, Type::Any | Type::TypeVar(TypeVarId::Meta(_)));
+            return dtype_ok && s1.compatible_with(s2) && dev1.compatible_with(dev2);
         }
         // v0.13: Result<T1, E1> 兼容 Result<T2, E2> 当 T1 兼容 T2 且 E1 兼容 E2
         if let (Type::Result_(t1, e1), Type::Result_(t2, e2)) = (self, expected) {
@@ -540,6 +738,12 @@ impl Type {
             if members.is_empty() {
                 return true;
             }
+            if matches!(self, Type::Scalar(_))
+                && members.contains(&Type::Int)
+                && members.contains(&Type::Float)
+            {
+                return true;
+            }
             return members.iter().any(|m| self.subtype_of(m));
         }
         if let (Type::TypeVar(TypeVarId::Rigid(a)), Type::TypeVar(TypeVarId::Rigid(b))) =
@@ -551,6 +755,24 @@ impl Type {
             || matches!(super_ty, Type::TypeVar(TypeVarId::Rigid(_)))
         {
             return false;
+        }
+        if let (
+            Type::Tensor {
+                dtype: d1,
+                shape: s1,
+                device: dev1,
+            },
+            Type::Tensor {
+                dtype: d2,
+                shape: s2,
+                device: dev2,
+            },
+        ) = (self, super_ty)
+        {
+            let dtype_ok = (d1.subtype_of(d2) && d2.subtype_of(d1))
+                || matches!(**d1, Type::Any | Type::TypeVar(TypeVarId::Meta(_)))
+                || matches!(**d2, Type::Any | Type::TypeVar(TypeVarId::Meta(_)));
+            return dtype_ok && s1.compatible_with(s2) && dev1.compatible_with(dev2);
         }
         // Result<T, E> is covariant in both ok (T) and err (E) variants.
         if let (Type::Result_(t1, e1), Type::Result_(t2, e2)) = (self, super_ty) {
@@ -730,6 +952,7 @@ pub fn is_known_type(name: &str) -> bool {
             | "nil"
             | "list"
             | "dict"
+            | "tensor"
             | "task"
             | "closure"
             | "result"
@@ -740,6 +963,7 @@ pub fn is_known_type(name: &str) -> bool {
             | "any"
     ) || lower.starts_with("list<")
         || lower.starts_with("dict<")
+        || lower.starts_with("tensor<")
         || lower.starts_with("result<")
         || lower.starts_with("dyn ")
 }

@@ -38,6 +38,10 @@ pub enum TokenType {
     // v0.38: numeric tower — Int and Float tokens.
     Int(i64),
     Float(f64),
+    /// Wave 3 Stage 3B: Explicit hardware width integer literal (`i4`, `i8`, `i16`, `i32`, `u8`..`u64`).
+    TypedInt(i64, crate::common::DType),
+    /// Wave 3 Stage 3B: Explicit hardware width float literal (`f16`, `bf16`, `fp8`, `f32`).
+    TypedFloat(f64, crate::common::DType),
     Plus,
     Minus,
     Star,
@@ -692,7 +696,8 @@ impl Lexer {
         } else {
             let suf = suffix_raw.to_ascii_lowercase();
             match suf.as_str() {
-                "f" | "f16" | "f32" | "f64" | "bf16" | "fp8" => {
+                "f" | "f16" | "f32" | "f64" | "bf16" | "fp8" | "fp8_e4m3" | "fp8e4m3"
+                | "fp8_e5m2" | "fp8e5m2" => {
                     let num: f64 = match clean_num.parse() {
                         Ok(n) => n,
                         Err(_) => {
@@ -706,7 +711,13 @@ impl Lexer {
                     if let Some(msg) = literal_range_error(&clean_num, num) {
                         return self.error_token(start_line, start_col, &msg);
                     }
-                    TokenType::Float(num)
+                    let dt = crate::common::DType::from_literal_suffix(&suf)
+                        .expect("valid float suffix");
+                    if matches!(dt, crate::common::DType::F64) {
+                        TokenType::Float(num)
+                    } else {
+                        TokenType::TypedFloat(dt.quantize_f64(num), dt)
+                    }
                 }
                 "i" | "i4" | "i8" | "i16" | "i32" | "i64" | "u" | "u8" | "u16" | "u32" | "u64" => {
                     if has_dot || has_exp {
@@ -718,20 +729,20 @@ impl Lexer {
                     }
                     match clean_num.parse::<i64>() {
                         Ok(n) => {
-                            let width_ok = match suf.as_str() {
-                                "u8" => n <= u8::MAX as i64,
-                                "u16" => n <= u16::MAX as i64,
-                                "u32" => n <= u32::MAX as i64,
-                                _ => true,
-                            };
-                            if !width_ok {
+                            let dt = crate::common::DType::from_literal_suffix(&suf)
+                                .expect("valid int suffix");
+                            if !dt.check_lex_int_magnitude(n) {
                                 return self.error_token(
                                     start_line,
                                     start_col,
                                     &format!("Invalid integer literal: {}", full_text),
                                 );
                             }
-                            TokenType::Int(n)
+                            if matches!(suf.as_str(), "i" | "i64" | "u") {
+                                TokenType::Int(n)
+                            } else {
+                                TokenType::TypedInt(n, dt)
+                            }
                         }
                         Err(_) => {
                             return self.error_token(

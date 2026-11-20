@@ -33,6 +33,7 @@ pub fn is_truthy(value: &Value) -> bool {
         Value::Bool(b) => *b,
         Value::Int(i) => *i != 0,
         Value::Float(n) => *n != 0.0,
+        Value::Scalar(s) => s.is_truthy(),
         Value::String(s) => !s.is_empty(),
         Value::List(l) => !l.is_empty(),
         Value::Dict(d) => !d.is_empty(),
@@ -113,7 +114,72 @@ pub fn is_pipe_method(name: &str) -> bool {
     )
 }
 
+/// Evaluate unary arithmetic negation (`-x`) preserving exact scalar/tensor `DType`.
+pub fn eval_unary_neg(val: &Value) -> Result<Value, MoraError> {
+    match val {
+        Value::Int(n) => n.checked_neg().map(Value::Int).ok_or_else(|| {
+            MoraError::Runtime("integer overflow in unary negation of i64::MIN".to_string())
+        }),
+        Value::Float(f) => Ok(Value::Float(-*f)),
+        Value::Scalar(s) => s.neg().map(Value::Scalar).map_err(MoraError::Runtime),
+        Value::Tensor(t) => {
+            if t.dtype.is_unsigned_int() || t.dtype.is_bool() {
+                return Err(MoraError::Runtime(format!(
+                    "cannot negate Tensor<{}> (unsigned or bool dtype)",
+                    t.dtype
+                )));
+            }
+            Ok(Value::Tensor(t.map_unary(|x| -x)?))
+        }
+        other => Err(MoraError::Runtime(format!(
+            "cannot negate value of type {}",
+            type_name(other)
+        ))),
+    }
+}
+
 pub fn eval_binary(left: Value, op: &BinaryOp, right: Value) -> Result<Value, MoraError> {
+    if matches!(&left, Value::Tensor(_)) || matches!(&right, Value::Tensor(_)) {
+        match op {
+            BinaryOp::Add
+            | BinaryOp::Sub
+            | BinaryOp::Mul
+            | BinaryOp::Div
+            | BinaryOp::Mod
+            | BinaryOp::Pow
+            | BinaryOp::MatMul => {
+                return crate::value::tensor::eval_tensor_binary(op, &left, &right);
+            }
+            BinaryOp::Equal => return Ok(Value::Bool(values_equal(&left, &right))),
+            BinaryOp::NotEqual => return Ok(Value::Bool(!values_equal(&left, &right))),
+            _ => {}
+        }
+    }
+    if matches!(&left, Value::Scalar(_)) || matches!(&right, Value::Scalar(_)) {
+        match (&left, op, &right) {
+            (Value::String(a), BinaryOp::Add, _) => {
+                return Ok(Value::String(format!("{a}{right}")));
+            }
+            (_, BinaryOp::Add, Value::String(b)) => return Ok(Value::String(format!("{left}{b}"))),
+            (Value::Scalar(a), _, Value::Scalar(b)) => {
+                return match crate::common::ScalarValue::eval_binary(op, *a, *b) {
+                    Ok(crate::common::ScalarBinaryOut::Scalar(s)) => Ok(Value::Scalar(s)),
+                    Ok(crate::common::ScalarBinaryOut::Bool(flag)) => Ok(Value::Bool(flag)),
+                    Err(msg) => Err(MoraError::Runtime(msg)),
+                };
+            }
+            (_, BinaryOp::Equal, _) => return Ok(Value::Bool(values_equal(&left, &right))),
+            (_, BinaryOp::NotEqual, _) => return Ok(Value::Bool(!values_equal(&left, &right))),
+            _ => {
+                return Err(MoraError::Runtime(format!(
+                    "DType mismatch: cannot apply {:?} to '{}' and '{}' without explicit cast",
+                    op,
+                    type_name(&left),
+                    type_name(&right)
+                )));
+            }
+        }
+    }
     match op {
         BinaryOp::Add => match (&left, &right) {
             // ── 数值加法：委托数值塔（D468）──
@@ -463,6 +529,8 @@ pub fn values_equal(a: &Value, b: &Value) -> bool {
                 && a.iter()
                     .all(|(k, va)| b.get(k).is_some_and(|vb| container_elem_eq(va, vb)))
         }
+        (Value::Tensor(a), Value::Tensor(b)) => a == b,
+        (Value::Scalar(a), Value::Scalar(b)) => a == b,
         // Conversation 不支持相等比较——比较引用无意义
         _ => false,
     }
@@ -505,6 +573,7 @@ pub fn value_as_f64(v: &Value) -> Option<f64> {
     match v {
         Value::Int(i) => Some(*i as f64),
         Value::Float(n) => Some(*n),
+        Value::Scalar(s) => Some(s.as_f64()),
         _ => None,
     }
 }
@@ -539,6 +608,18 @@ pub fn literal_to_value_static(lit: &Literal) -> Value {
         Literal::Char(c, _) => Value::Char(*c),
         Literal::Int(i, _) => Value::Int(*i),
         Literal::Float(f, _) => Value::Float(*f),
+        Literal::TypedInt(i, dt, _) => {
+            match crate::common::ScalarValue::from_i64_checked(*i, *dt) {
+                Ok(s) => Value::Scalar(s),
+                Err(_) => Value::Int(dt.quantize_i64(*i)),
+            }
+        }
+        Literal::TypedFloat(f, dt, _) => {
+            match crate::common::ScalarValue::from_f64_quantized(*f, *dt) {
+                Some(s) => Value::Scalar(s),
+                None => Value::Float(dt.quantize_f64(*f)),
+            }
+        }
         Literal::Bool(b, _) => Value::Bool(*b),
         Literal::Nil(_) => Value::Nil,
     }
@@ -551,6 +632,7 @@ pub fn type_name(value: &Value) -> &'static str {
         Value::Char(_) => "char",
         Value::Int(_) => "int",
         Value::Float(_) => "float",
+        Value::Scalar(s) => s.dtype().canonical_type_name(),
         Value::Bool(_) => "bool",
         Value::Nil => "nil",
         Value::List(_) => "list",
@@ -574,6 +656,7 @@ pub fn type_name(value: &Value) -> &'static str {
         Value::Channel(_) => "channel",
         Value::TaskHandle(_) => "task_handle",
         Value::Context(_) => "context",
+        Value::Tensor(_) => "tensor",
     }
 }
 

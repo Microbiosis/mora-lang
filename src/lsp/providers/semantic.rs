@@ -159,8 +159,12 @@ fn token_of(e: &crate::mir::witness::MirWitness) -> Option<(String, f64)> {
     match &e.kind {
         WitnessKind::Variable(n) => Some((n.clone(), IDX_VARIABLE)),
         WitnessKind::Literal(crate::common::Literal::String(s, _)) => Some((s.clone(), IDX_STRING)),
-        WitnessKind::Literal(crate::common::Literal::Int(n, _)) => Some((n.to_string(), IDX_FLOAT)),
-        WitnessKind::Literal(crate::common::Literal::Float(n, _)) => {
+        WitnessKind::Literal(crate::common::Literal::Int(n, _))
+        | WitnessKind::Literal(crate::common::Literal::TypedInt(n, _, _)) => {
+            Some((n.to_string(), IDX_FLOAT))
+        }
+        WitnessKind::Literal(crate::common::Literal::Float(n, _))
+        | WitnessKind::Literal(crate::common::Literal::TypedFloat(n, _, _)) => {
             Some((format!("{}", n), IDX_FLOAT))
         }
         WitnessKind::Call { callee, .. } => match callee {

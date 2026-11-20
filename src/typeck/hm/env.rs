@@ -121,6 +121,32 @@ pub(crate) fn collect_type_vars(ty: &Type) -> Vec<TypeVarId> {
             .into_iter()
             .filter(|v| !bound.contains(v))
             .collect(),
+        Type::Tensor {
+            dtype,
+            shape,
+            device,
+        } => {
+            let mut vars = collect_type_vars(dtype);
+            match shape {
+                crate::typeck::ShapeType::Unranked(Some(var)) => vars.push(var.clone()),
+                crate::typeck::ShapeType::Unranked(None) => {}
+                crate::typeck::ShapeType::Ranked(dims) => {
+                    for d in dims {
+                        match d {
+                            crate::typeck::DimExpr::Var(id) => vars.push(TypeVarId::Meta(*id)),
+                            crate::typeck::DimExpr::Symbolic(sym) if sym != "_" => {
+                                vars.push(TypeVarId::Rigid(sym.clone()))
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            if let crate::typeck::DeviceType::Var(var) = device {
+                vars.push(var.clone());
+            }
+            vars
+        }
         _ => Vec::new(),
     }
 }

@@ -74,6 +74,7 @@ pub fn call_math_method(method: &str, args: &[Value]) -> MoraResult<Value> {
         "is_nan" => match args.first() {
             Some(Value::Float(x)) => Ok(Value::Bool(x.is_nan())),
             Some(Value::Int(_)) => Ok(Value::Bool(false)),
+            Some(Value::Scalar(s)) => Ok(Value::Bool(s.dtype().is_float() && s.as_f64().is_nan())),
             _ => Err(MoraError::Runtime(
                 "math.is_nan requires a numeric argument".to_string(),
             )),
@@ -81,6 +82,9 @@ pub fn call_math_method(method: &str, args: &[Value]) -> MoraResult<Value> {
         "is_inf" => match args.first() {
             Some(Value::Float(x)) => Ok(Value::Bool(x.is_infinite())),
             Some(Value::Int(_)) => Ok(Value::Bool(false)),
+            Some(Value::Scalar(s)) => Ok(Value::Bool(
+                s.dtype().is_float() && s.as_f64().is_infinite(),
+            )),
             _ => Err(MoraError::Runtime(
                 "math.is_inf requires a numeric argument".to_string(),
             )),
@@ -88,6 +92,9 @@ pub fn call_math_method(method: &str, args: &[Value]) -> MoraResult<Value> {
         "is_finite" => match args.first() {
             Some(Value::Float(x)) => Ok(Value::Bool(x.is_finite())),
             Some(Value::Int(_)) => Ok(Value::Bool(true)),
+            Some(Value::Scalar(s)) => {
+                Ok(Value::Bool(!s.dtype().is_float() || s.as_f64().is_finite()))
+            }
             _ => Err(MoraError::Runtime(
                 "math.is_finite requires a numeric argument".to_string(),
             )),
@@ -100,14 +107,113 @@ pub fn call_math_method(method: &str, args: &[Value]) -> MoraResult<Value> {
     }
 }
 
-/// Float 入参单参运算（Int 自动转 Float）。结果总是 Float。
+/// Float 入参单参运算（支持标量、低位宽 `Value::Scalar` 与逐元素 `Value::Tensor`）。
 fn unary_float<F: Fn(f64) -> f64>(args: &[Value], f: F) -> MoraResult<Value> {
+    if let Some(Value::Tensor(t)) = args.first() {
+        if t.dtype.is_bool() {
+            return Err(MoraError::Runtime(
+                "math: cannot apply floating-point math op to Tensor<bool>".to_string(),
+            ));
+        }
+        return Ok(Value::Tensor(t.map_unary(f)?));
+    }
+    if let Some(Value::Scalar(s)) = args.first() {
+        let out = f(s.as_f64());
+        if s.dtype().is_float() {
+            return Ok(crate::value::tensor::scalar_value_for_dtype(out, s.dtype()));
+        }
+        return Ok(Value::Float(out));
+    }
     let x = expect_number(args.first(), "math")?;
     Ok(Value::Float(f(x)))
 }
 
-/// 双参 Float 运算
+/// 双参 Float 运算（支持 `Value::Tensor` 与 `Value::Scalar`）。
 fn binary_float<F: Fn(f64, f64) -> f64>(args: &[Value], f: F) -> MoraResult<Value> {
+    match (args.first(), args.get(1)) {
+        (Some(Value::Tensor(a)), Some(Value::Tensor(b))) => {
+            if a.device != b.device {
+                return Err(MoraError::Runtime(format!(
+                    "math: device mismatch between '{}' and '{}'",
+                    a.device, b.device
+                )));
+            }
+            if a.dtype != b.dtype {
+                return Err(MoraError::Runtime(format!(
+                    "math: dtype mismatch between Tensor<{}> and Tensor<{}>",
+                    a.dtype, b.dtype
+                )));
+            }
+            let out_shape = crate::value::tensor::broadcast_runtime_shapes(&a.shape, &b.shape)?;
+            let numel = crate::value::tensor::checked_numel(&out_shape)?;
+            let fa = a.to_flat_vec();
+            let fb = b.to_flat_vec();
+            if a.shape == b.shape {
+                let out: Vec<f64> = fa.into_iter().zip(fb).map(|(x, y)| f(x, y)).collect();
+                return Ok(Value::Tensor(crate::value::tensor::Tensor::from_raw(
+                    out,
+                    out_shape,
+                    a.dtype,
+                    a.device.clone(),
+                    a.requires_grad || b.requires_grad,
+                )?));
+            }
+            let mut out = Vec::with_capacity(numel);
+            let rank = out_shape.len();
+            for mut lin in 0..numel {
+                let mut coords = vec![0usize; rank];
+                for axis in (0..rank).rev() {
+                    coords[axis] = lin % out_shape[axis];
+                    lin /= out_shape[axis];
+                }
+                let a_off = rank - a.shape.len();
+                let b_off = rank - b.shape.len();
+                let ca: Vec<usize> = (0..a.shape.len())
+                    .map(|i| {
+                        if a.shape[i] == 1 {
+                            0
+                        } else {
+                            coords[a_off + i]
+                        }
+                    })
+                    .collect();
+                let cb: Vec<usize> = (0..b.shape.len())
+                    .map(|i| {
+                        if b.shape[i] == 1 {
+                            0
+                        } else {
+                            coords[b_off + i]
+                        }
+                    })
+                    .collect();
+                out.push(f(a.get_at(&ca), b.get_at(&cb)));
+            }
+            return Ok(Value::Tensor(crate::value::tensor::Tensor::from_raw(
+                out,
+                out_shape,
+                a.dtype,
+                a.device.clone(),
+                a.requires_grad || b.requires_grad,
+            )?));
+        }
+        (Some(Value::Tensor(t)), Some(rhs)) => {
+            let y = expect_number(Some(rhs), "math")?;
+            return Ok(Value::Tensor(t.map_unary(|x| f(x, y))?));
+        }
+        (Some(lhs), Some(Value::Tensor(t))) => {
+            let x = expect_number(Some(lhs), "math")?;
+            return Ok(Value::Tensor(t.map_unary(|y| f(x, y))?));
+        }
+        (Some(Value::Scalar(a)), Some(Value::Scalar(b)))
+            if a.dtype() == b.dtype() && a.dtype().is_float() =>
+        {
+            return Ok(crate::value::tensor::scalar_value_for_dtype(
+                f(a.as_f64(), b.as_f64()),
+                a.dtype(),
+            ));
+        }
+        _ => {}
+    }
     let x = expect_number(args.first(), "math")?;
     let y = expect_number(args.get(1), "math")?;
     Ok(Value::Float(f(x, y)))
@@ -152,17 +258,34 @@ fn unary_preserve(
     match args.first() {
         Some(Value::Int(n)) => Ok(Value::Int(int_fn(*n))),
         Some(Value::Float(n)) => Ok(Value::Float(float_fn(*n))),
+        Some(Value::Scalar(s)) => {
+            if s.dtype().is_float() {
+                Ok(crate::value::tensor::scalar_value_for_dtype(
+                    float_fn(s.as_f64()),
+                    s.dtype(),
+                ))
+            } else if let Some(n) = s.as_i64() {
+                let res = int_fn(n);
+                crate::common::ScalarValue::from_i64_checked(res, s.dtype())
+                    .map(Value::Scalar)
+                    .map_err(MoraError::Runtime)
+            } else {
+                Ok(Value::Scalar(*s))
+            }
+        }
+        Some(Value::Tensor(t)) => Ok(Value::Tensor(t.map_unary(float_fn)?)),
         _ => Err(MoraError::Runtime(
             "math: numeric argument required".to_string(),
         )),
     }
 }
 
-/// 把 Value 转 f64，Int 自动转 Float
+/// 把 Value 转 f64，Int/Scalar 自动转 Float
 fn expect_number(arg: Option<&Value>, ns: &str) -> MoraResult<f64> {
     match arg {
         Some(Value::Int(n)) => Ok(*n as f64),
         Some(Value::Float(n)) => Ok(*n),
+        Some(Value::Scalar(s)) => Ok(s.as_f64()),
         _ => Err(MoraError::Runtime(format!(
             "{}: numeric argument required",
             ns

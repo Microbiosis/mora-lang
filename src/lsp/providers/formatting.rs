@@ -432,6 +432,7 @@ fn token_text(tt: &crate::lexer::TokenType) -> String {
         TokenType::String(s) => format!("\"{}\"", mora_string_body(s)),
         TokenType::Char(c) => format!("'{}'", mora_char_body(*c)),
         TokenType::Int(n) => n.to_string(),
+        TokenType::TypedInt(n, dt) => format!("{n}{}", dt.short_name()),
         TokenType::Float(n) => {
             let s = n.to_string();
             if n.is_finite() && !s.contains(['.', 'e', 'E']) {
@@ -440,6 +441,7 @@ fn token_text(tt: &crate::lexer::TokenType) -> String {
                 s
             }
         }
+        TokenType::TypedFloat(n, dt) => format!("{n}{}", dt.short_name()),
         TokenType::Lifetime(s) => format!("'{}'", s),
         // v0.104.6 D202：注释**原样**带出。正文里已经含 `--` 之后的
         // 那个空格（`-- foo` 的正文是 `" foo"`），所以这里只补 `--` 前缀，

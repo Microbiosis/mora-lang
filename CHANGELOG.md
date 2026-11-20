@@ -54,6 +54,22 @@ All notable changes to Mora will be documented in this file.
   - 收敛为唯一类型检查入口 `check_program_witnesses`，引入 `TypeVarId::{Meta, Rigid}`、`Type::Error` 毒化哨兵、fail-closed `Type::Unknown`、`Type::BuiltinModule`、协变 `Result_` 与效果行包含（`EffectRow` subsumption）
   - 支持多字符泛型参数（如 `<TT, Tx>`）与刚性参数约束检查、限定 `let` 多态与 ML Value Restriction、预注册全部 `FnDef` / `MacroDef` 支持互递归、强制 `return_targets` 检查并封堵未定义自由函数/内建模块/大写关联调用逃逸；同步打通用户 `type` / `enum` / `struct` 类型标注解析与别名递归展开，清理残余 `123n`/`bidirectional` 陈旧文档与 `.mimosa` 缓存目录（新增 `tests/stage3a_precision_and_hm.rs` 覆盖）
 
+### Wave 3 Stage 3B 一等硬件 `DType`、`Tensor` 底座与 5 项 AI-Native 静态检查（含 Wave 1/2 尾项清理）
+
+- **Track 3B-1（硬件 `DType` 不擦除、真紧凑 64 字节对齐 `TensorStorage` 与算子互通）**：
+  - 拆分 `src/common/dtype.rs` 实现精确位级编解码器（IEEE 754 `f16`、`bf16`、OCP `fp8`/`fp8_e4m3`、`fp8_e5m2` 与 4-bit 补码 `i4`，支持 `Bool` 掩码）与一等运行期标量 `Value::Scalar(ScalarValue)`（低位宽标量在 `ControlConst` / `CompiledPattern` / VM 算术与溢出检查中完整保留精度，不再退化为 64-bit 算术）
+  - 补齐一等 `BuiltinOp::Neg` / `UnaryOp::Neg`（迭代化 `ChainTask` 支撑深层嵌套零爆栈，原生支持有符号标量与张量取负并静态拦截无符号/布尔取负）
+  - 落地 64 字节缓存行对齐的真紧凑位宽存储 `AlignedByteBuffer`（`src/value/tensor.rs`，`i4` 按半字节 2 元素/字节打包、`fp8`/`i8`/`u8`/`bool` 按 1 字节、`f16`/`bf16`/`i16`/`u16` 按 2 字节、`f32` 按 4 字节、`f64` 按 8 字节），提供零拷贝步幅视图（`transpose` / `reshape` / 轴-0 索引 `t[i]`）、构造器（`tensor(...)`、`Tensor::{zeros,ones,full,eye,arange,randn,rand,from_list}`）、`.nbytes()` / `.byte_len()`、广播算术、1D/2D/批量 ND `@` 收缩与激活/归一化算子（`relu`/`gelu`/`silu`/`tanh`/`sigmoid`/`softmax`/`rms_norm`/`layer_norm`）
+  - 打通 `linalg.*` / `math.*` / `stats.*` 对 `Value::Tensor` 与 `Value::Scalar` 的原生支持
+- **Track 3B-2（统一 HM 求解器中的 5 项 AI-Native 静态检查与 LSP 同步）**：
+  - 新增 `DimExpr` / `ShapeType` / `DeviceType` / `Type::Scalar(DType)` / `Type::Tensor { dtype, shape, device }` 与依赖维度多态合一（如 `[M, K] @ [K, N] -> [M, N]`）
+  - 完整兑现 5 项编译期静态检查：`DType` 严格精度匹配（禁隐式跨精度混算）、`Shape` 静态广播/收缩/`reshape`/`transpose` 检查、`Device` 静态跨设备禁令、`Resource` 作用域化 + 源张量别名传播 + 跨函数原位修改检查、`Effect`（`tensor_mutate` 与 `random_random` 效果行追踪）
+  - 同步更新 `src/lsp/providers/completion.rs` 暴露低位宽类型与 `Tensor::*` 补全，新增 `tests/stage3b_tensor_and_static_checks.rs`（含 13 项集成与 `proptest` 位级属性测试）并同步更新 `tests/stage3a_precision_and_hm.rs`
+- **Wave 1/2 尾项清理**：
+  - 将 `src/runtime/builtins/exec.rs` 统一切换至 `tokio::process::Command` + `tokio::sync::Semaphore` + `tokio::task::JoinSet`（经 `AsyncIoReactor` 调度，彻底移除手工 `std::thread` 与自制 `Condvar` 信号量）
+  - 在 `src/error.rs` 增加 `MoraError::Spanned`、`with_span`、`span`、`from_type_error` / `from_type_errors` 统一带 `Span` 诊断边界
+  - 归档过时文档 `docs/nine-layer-ir.md -> docs/_archive/nine-layer-ir.md`，并同步修复 35 个 CLI 集成测试对新版启动横幅（`并发与抽象`）的 stderr 过滤规则
+
 ## [Unreleased] — 历史提交记录（`Int` 语义统一 + D468–D491）
 
 自 `v0.104.5`（最后一个真正的发布，tag `v0.104.5`）起累计：

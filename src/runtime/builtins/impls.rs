@@ -69,6 +69,7 @@ pub(crate) fn eval_pure_builtin(
         BuiltinFnId::Sleep => Some(call_builtin_sleep_core(core, args)),
         BuiltinFnId::MergeWith => Some(call_builtin_merge_with_core(core, args)),
         BuiltinFnId::Gensym => Some(call_builtin_gensym_core(core, args)),
+        BuiltinFnId::Tensor => Some(crate::value::tensor::call_builtin_tensor(args)),
         BuiltinFnId::Swap
         | BuiltinFnId::Into
         | BuiltinFnId::Eval
@@ -199,9 +200,13 @@ pub(crate) fn call_builtin_len(args: &[Value]) -> MoraResult<Value> {
             testcase!(true, "len: channel");
             ch.len()
         }
+        Some(Value::Tensor(t)) => {
+            testcase!(true, "len: tensor");
+            t.shape.first().copied().unwrap_or(0)
+        }
         _ => {
             return Err(MoraError::Runtime(
-                "len() expects a list, string, dict, or channel".to_string(),
+                "len() expects a list, string, dict, channel, or tensor".to_string(),
             ));
         }
     };
@@ -236,6 +241,19 @@ pub(crate) fn call_builtin_int(args: &[Value]) -> MoraResult<Value> {
             f as i64
         }
         Value::Int(n) => n,
+        Value::Scalar(s) => {
+            if let Some(n) = s.as_i64() {
+                n
+            } else {
+                let f = s.as_f64();
+                if !f.is_finite() {
+                    return Err(MoraError::Runtime(format!(
+                        "int() cannot convert non-finite scalar: {f}"
+                    )));
+                }
+                f as i64
+            }
+        }
         Value::Bool(b) => {
             if b {
                 1
@@ -263,6 +281,7 @@ pub(crate) fn call_builtin_float(args: &[Value]) -> MoraResult<Value> {
             .map_err(|_| MoraError::Runtime(format!("float() cannot parse string: {s:?}")))?,
         Value::Float(f) => f,
         Value::Int(n) => n as f64,
+        Value::Scalar(s) => s.as_f64(),
         Value::Bool(b) => {
             if b {
                 1.0

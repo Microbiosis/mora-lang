@@ -10,6 +10,7 @@ impl std::fmt::Display for Value {
             Value::String(s) => write!(f, "{}", s),
             Value::Char(c) => write!(f, "{}", c),
             Value::Int(i) => write!(f, "{}", i),
+            Value::Scalar(s) => write!(f, "{}", s),
             Value::Float(n) => {
                 // v0.36 (P1-3.13): never panic on NaN/Inf — Display must be infallible.
                 if n.is_nan() {
@@ -128,6 +129,7 @@ impl std::fmt::Display for Value {
             Value::Context(ctx) => {
                 write!(f, "<context cancelled={}>", ctx.status().is_err())
             }
+            Value::Tensor(t) => write!(f, "{t}"),
         }
     }
 }

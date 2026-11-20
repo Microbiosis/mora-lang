@@ -52,6 +52,12 @@ pub fn index_value(obj: &Value, idx: &Value) -> MoraResult<Value> {
                 MoraError::Runtime(format!("index {} out of bounds (len {})", i, list.len()))
             })
         }
+        (Value::List(list), Value::Scalar(s)) => {
+            let i = checked_index(s.as_f64(), list.len(), "index")?;
+            list.get(i).cloned().ok_or_else(|| {
+                MoraError::Runtime(format!("index {} out of bounds (len {})", i, list.len()))
+            })
+        }
         (Value::Dict(map), Value::String(key)) => Ok(map.get(key).cloned().unwrap_or(Value::Nil)),
         (Value::String(s), Value::Int(i)) => {
             let i = checked_index(*i as f64, s.chars().count(), "string index")?;
@@ -60,6 +66,21 @@ pub fn index_value(obj: &Value, idx: &Value) -> MoraResult<Value> {
         (Value::String(s), Value::Float(n)) => {
             let i = checked_index(*n, s.chars().count(), "string index")?;
             char_at(s, i)
+        }
+        (Value::Tensor(t), Value::Int(i)) => {
+            let len0 = t.shape.first().copied().unwrap_or(0);
+            let i = checked_index(*i as f64, len0, "tensor index")?;
+            t.index_axis0(i)
+        }
+        (Value::Tensor(t), Value::Float(n)) => {
+            let len0 = t.shape.first().copied().unwrap_or(0);
+            let i = checked_index(*n, len0, "tensor index")?;
+            t.index_axis0(i)
+        }
+        (Value::Tensor(t), Value::Scalar(s)) => {
+            let len0 = t.shape.first().copied().unwrap_or(0);
+            let i = checked_index(s.as_f64(), len0, "tensor index")?;
+            t.index_axis0(i)
         }
         _ => Err(MoraError::Runtime(format!(
             "cannot index {} with {}",
@@ -129,6 +150,7 @@ pub fn value_to_string(v: &Value) -> String {
         Value::String(s) | Value::Code(s) => s.clone(),
         Value::Int(i) => i.to_string(),
         Value::Float(f) => f.to_string(),
+        Value::Scalar(s) => s.to_string(),
         Value::Bool(b) => b.to_string(),
         Value::Nil => "nil".to_string(),
         Value::Char(c) => c.to_string(),
@@ -190,6 +212,7 @@ fn match_pattern_inner(
         CompiledPattern::Bool(b) => matches!(val, Value::Bool(v) if v == b),
         CompiledPattern::Int(n) => matches!(val, Value::Int(v) if v == n),
         CompiledPattern::Float(f) => matches!(val, Value::Float(v) if v == f),
+        CompiledPattern::Scalar(s) => matches!(val, Value::Scalar(v) if v == s),
         CompiledPattern::Char(c) => matches!(val, Value::Char(v) if v == c),
         CompiledPattern::String(s) => matches!(val, Value::String(v) if v == s),
         CompiledPattern::Tuple(elems) => {

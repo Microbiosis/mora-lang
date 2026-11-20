@@ -10,6 +10,8 @@ use std::sync::Arc;
 
 // v0.104.6: 不可变分块列表（`Rc` 结构共享）—— `Value::List` 的目标表示。
 pub mod list;
+/// Wave 3 — Stage 3B: 一等连续对齐内存 `Tensor<DType, Shape, Device>` 与零拷贝步幅视图。
+pub mod tensor;
 
 // v1 Stmt 已移除 — Value::Task/Closure 不再持有 body
 
@@ -136,9 +138,11 @@ pub enum Value {
     String(String),
     /// v0.x: 单字符（`string[number]` 索引结果）
     Char(char),
-    // v0.38: Numeric tower — distinct Int and Float variants.
+    // v0.38: Numeric tower — default 64-bit Int and Float variants.
     Int(i64),
     Float(f64),
+    /// Wave 3 — Stage 3B: Non-default hardware-width scalar (`f32`, `f16`, `bf16`, `fp8`, `fp8_e5m2`, `i32`..`i4`, `u64`..`u8`).
+    Scalar(crate::common::ScalarValue),
     Bool(bool),
     Nil,
     List(list::List),
@@ -202,6 +206,8 @@ pub enum Value {
     TaskHandle(Arc<crate::runtime::scheduler::MoraTaskHandle>),
     /// Wave 2: Cooperative cancellation & deadline context (`context()`).
     Context(crate::runtime::scheduler::TaskContext),
+    /// Wave 3 — Stage 3B: First-class strided N-dimensional tensor (`tensor(...)` / `Tensor::*`).
+    Tensor(Arc<tensor::Tensor>),
 }
 
 // 手动实现 PartialEq（Atom/Task/Closure/Macro/Continuation 等不自动比较内部载荷）
@@ -211,6 +217,7 @@ impl PartialEq for Value {
             (Value::Nil, Value::Nil) => true,
             (Value::Float(a), Value::Float(b)) => a == b,
             (Value::Int(a), Value::Int(b)) => a == b,
+            (Value::Scalar(a), Value::Scalar(b)) => a == b,
             (Value::String(a), Value::String(b)) => a == b,
             (Value::Char(a), Value::Char(b)) => a == b,
             (Value::Bool(a), Value::Bool(b)) => a == b,
@@ -237,6 +244,7 @@ impl PartialEq for Value {
             (Value::Channel(a), Value::Channel(b)) => Arc::ptr_eq(a, b),
             (Value::TaskHandle(a), Value::TaskHandle(b)) => Arc::ptr_eq(a, b),
             (Value::Context(a), Value::Context(b)) => a.same_handle(b),
+            (Value::Tensor(a), Value::Tensor(b)) => Arc::ptr_eq(a, b) || a == b,
             _ => false,
         }
     }
@@ -395,6 +403,47 @@ impl Value {
             ],
             Value::TaskHandle(_) => &["join", "abort", "is_done", "context"],
             Value::Context(_) => &["child", "with_timeout", "cancel", "is_cancelled", "spawn"],
+            Value::Tensor(_) => &[
+                "shape",
+                "ndim",
+                "rank",
+                "numel",
+                "nbytes",
+                "byte_len",
+                "len",
+                "dtype",
+                "device",
+                "is_contiguous",
+                "contiguous",
+                "reshape",
+                "transpose",
+                "to",
+                "to_dtype",
+                "to_device",
+                "requires_grad",
+                "with_grad",
+                "fill_",
+                "add_",
+                "mul_",
+                "sum",
+                "mean",
+                "max",
+                "min",
+                "item",
+                "abs",
+                "sqrt",
+                "exp",
+                "ln",
+                "relu",
+                "gelu",
+                "silu",
+                "tanh",
+                "sigmoid",
+                "softmax",
+                "rms_norm",
+                "layer_norm",
+                "to_list",
+            ],
             _ => &[],
         };
         names.iter().map(|s| s.to_string()).collect()

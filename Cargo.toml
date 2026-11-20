@@ -33,7 +33,7 @@ path = "src/bin/lsp.rs"
 libc = { version = "0.2", features = ["extra_traits"] }
 parking_lot = "0.12"
 # v0.50.0 (P0-B): tokio async runtime (reserved for Wave 2 TaskScheduler + AsyncIoReactor)
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "io-std"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "io-std", "process"] }
 
 [dev-dependencies]
 # v0.53: property-based testing for formal semantics verification

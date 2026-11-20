@@ -69,6 +69,7 @@ fn run(src: &str, tag: &str, opt: bool) -> (i32, Vec<String>) {
                 && !l.contains("AI 原语")
                 && !l.contains("显式 API")
                 && !l.contains("Trait 系统")
+                && !l.contains("并发与抽象")
                 && !l.contains("类型与执行")
                 && !l.contains("Built-in")
                 && !l.contains("v0.15 CLI")

@@ -66,6 +66,7 @@ fn runtime_type_of_program(src: &str) -> String {
         "Router" => "router",
         "McpServer" => "mcp_server",
         "Agent" => "agent",
+        "Tensor" => "tensor",
         other => panic!("无法从 {raw:?} 推出类型名（前缀 {other}）"),
     }
     .to_string()
@@ -114,6 +115,7 @@ fn call_for(name: &str) -> Option<&'static str> {
         "channel" => "channel(1)",
         "context" => "context()",
         "sleep" => "sleep(1)",
+        "tensor" => "tensor([1.0, 2.0])",
         // domain prefix 模块 / 宏展开，无独立固定返回值语义
         "math" | "stats" | "linalg" | "macroexpand" => return None,
         _ => return None,

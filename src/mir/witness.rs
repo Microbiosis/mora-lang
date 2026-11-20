@@ -612,6 +612,7 @@ pub enum BuiltinOp {
     Print,
     Assert,
     Not,
+    Neg,
     Length,
 }
 

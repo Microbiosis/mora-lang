@@ -82,6 +82,7 @@ impl WorkDir {
                     && !t.starts_with("AI 原语")
                     && !t.starts_with("显式 API")
                     && !t.starts_with("Trait 系统")
+                    && !t.starts_with("并发与抽象")
                     && !t.starts_with("类型与执行")
                     && !t.starts_with("Built-in")
                     && !t.starts_with("v0.15 CLI")

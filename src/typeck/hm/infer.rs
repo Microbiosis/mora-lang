@@ -158,6 +158,7 @@ impl HMInference {
             value_ty.clone()
         };
 
+        self.update_tensor_resource_flags(name, value);
         self.record_binding(span, name, &gen_ty);
         self.env.add(name.to_string(), gen_ty.clone());
         if matches!(
@@ -177,7 +178,8 @@ impl HMInference {
         value: &MirWitness,
         span: Span,
     ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
-        let ty_inner = self.resolve_type_aliases(type_hint.to_type());
+        let ty_aliased = self.resolve_type_aliases(type_hint.to_type());
+        let ty_inner = self.instantiate_wildcards(&ty_aliased);
         let (value_ty, value_row) = self.infer_recover(value);
         if let WitnessKind::Closure { params, .. } | WitnessKind::FnDef { params, .. } = &value.kind
         {
@@ -186,15 +188,22 @@ impl HMInference {
         if !matches!(ty_inner, Type::Any | Type::TraitObject { .. })
             && !matches!(value_ty, Type::Error)
         {
-            self.constraints.push(SpannedConstraint::new(
+            let sub_c = SpannedConstraint::new(
                 Constraint::Subtype {
                     sub: Box::new(value_ty),
                     sup: Box::new(ty_inner.clone()),
                 },
                 value.span,
-            ));
+            );
+            // Eagerly solve when possible so wildcard dims (`_`) resolve immediately in `subst`.
+            match unify::solve_spanned(&sub_c, &self.subst) {
+                Ok(new_s) => self.subst = new_s,
+                Err(_) => self.constraints.push(sub_c),
+            }
         }
-        let gen_hint = generalize::generalize(&ty_inner, &self.free_in_resolved_env());
+        let resolved_hint = self.subst.apply(&ty_inner);
+        let gen_hint = generalize::generalize(&resolved_hint, &self.free_in_resolved_env());
+        self.update_tensor_resource_flags(name, value);
         self.record_binding(span, name, &gen_hint);
         self.env.add(name.to_string(), gen_hint.clone());
         if matches!(
@@ -235,6 +244,7 @@ impl HMInference {
                 }]);
             }
         }
+        self.update_tensor_resource_flags(target, value);
         Ok((value_ty, value_row))
     }
 
@@ -257,6 +267,7 @@ impl HMInference {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn apply_binop_types(
         &mut self,
         op: &crate::common::BinaryOp,
@@ -268,6 +279,8 @@ impl HMInference {
     ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
         use crate::common::BinaryOp::*;
         let merged_row = self.merge_rows(left_row, right_row, span);
+        let left_ty = self.subst.apply(&left_ty);
+        let right_ty = self.subst.apply(&right_ty);
         if matches!(left_ty, Type::Error) || matches!(right_ty, Type::Error) {
             return Ok((Type::Error, merged_row));
         }
@@ -281,6 +294,19 @@ impl HMInference {
 
         match op {
             Add | Sub | Mul | Div | Mod | Pow => {
+                // Stage 3B: Tensor elementwise binary operations (DType + Shape broadcast + Device).
+                if matches!(left_ty, Type::Tensor { .. }) || matches!(right_ty, Type::Tensor { .. })
+                {
+                    let out_ty = self.infer_tensor_binary_op(&left_ty, &right_ty, span)?;
+                    return Ok((out_ty, merged_row));
+                }
+
+                // Stage 3B: Low-bitwidth scalar binary operations require exact DType matching.
+                if matches!(left_ty, Type::Scalar(_)) || matches!(right_ty, Type::Scalar(_)) {
+                    let out_ty = self.infer_scalar_binary_op(&left_ty, &right_ty, false, span)?;
+                    return Ok((out_ty, merged_row));
+                }
+
                 let is_add = matches!(op, Add);
                 let is_num_or_open = |t: &Type| {
                     is_numeric(t) || matches!(t, Type::TypeVar(TypeVarId::Meta(_)) | Type::Any)
@@ -380,6 +406,13 @@ impl HMInference {
                 }
             }
             MatMul => {
+                // Stage 3B: First-class Tensor matrix/tensor contraction (@).
+                if matches!(left_ty, Type::Tensor { .. }) || matches!(right_ty, Type::Tensor { .. })
+                {
+                    let out_ty = self.infer_tensor_matmul_op(&left_ty, &right_ty, span)?;
+                    return Ok((out_ty, merged_row));
+                }
+
                 if matches!(left_ty, Type::TypeVar(TypeVarId::Meta(_)) | Type::Any)
                     || matches!(right_ty, Type::TypeVar(TypeVarId::Meta(_)) | Type::Any)
                 {
@@ -398,14 +431,14 @@ impl HMInference {
                 }
                 let Some((dl, el)) = matmul_shape(&left_ty) else {
                     return Err(vec![TypeError::UnificationFailure {
-                        expected: "list<number> or list<list<number>>".to_string(),
+                        expected: "Tensor or list<number> or list<list<number>>".to_string(),
                         got: left_ty.name(),
                         span: Some(span),
                     }]);
                 };
                 let Some((dr, er)) = matmul_shape(&right_ty) else {
                     return Err(vec![TypeError::UnificationFailure {
-                        expected: "list<number> or list<list<number>>".to_string(),
+                        expected: "Tensor or list<number> or list<list<number>>".to_string(),
                         got: right_ty.name(),
                         span: Some(span),
                     }]);
@@ -453,6 +486,10 @@ impl HMInference {
                 Ok((ret, merged_row))
             }
             Equal | NotEqual => {
+                if matches!(left_ty, Type::Scalar(_)) || matches!(right_ty, Type::Scalar(_)) {
+                    let _ = self.infer_scalar_binary_op(&left_ty, &right_ty, true, span)?;
+                    return Ok((Type::Bool, merged_row));
+                }
                 if !left_ty.compatible_with(&right_ty) {
                     return Err(vec![TypeError::UnificationFailure {
                         expected: left_ty.name(),
@@ -485,6 +522,10 @@ impl HMInference {
                 Ok((Type::Bool, merged_row))
             }
             Greater | Less | GreaterEqual | LessEqual => {
+                if matches!(left_ty, Type::Scalar(_)) || matches!(right_ty, Type::Scalar(_)) {
+                    let _ = self.infer_scalar_binary_op(&left_ty, &right_ty, true, span)?;
+                    return Ok((Type::Bool, merged_row));
+                }
                 if !left_ty.compatible_with(&right_ty) {
                     return Err(vec![TypeError::UnificationFailure {
                         expected: left_ty.name(),
@@ -789,6 +830,57 @@ impl HMInference {
         args: &[MirWitness],
         span: Span,
     ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
+        if matches!(
+            callee,
+            WitnessCallee::Builtin(crate::mir::witness::BuiltinOp::Neg)
+        ) {
+            if args.len() != 1 {
+                return Err(vec![TypeError::ArityMismatch {
+                    expected: 1,
+                    actual: args.len(),
+                    span,
+                }]);
+            }
+            let (arg_ty, arg_row) = self.infer_recover(&args[0]);
+            let resolved = self.subst.apply(&arg_ty);
+            match &resolved {
+                Type::Error => return Ok((Type::Error, arg_row)),
+                Type::Int | Type::Float | Type::Any | Type::TypeVar(_) => {
+                    return Ok((resolved, arg_row));
+                }
+                Type::Scalar(dt) => {
+                    if dt.is_unsigned_int() || dt.is_bool() {
+                        return Err(vec![TypeError::UnificationFailure {
+                            expected: "signed numeric type for unary '-'".to_string(),
+                            got: resolved.name(),
+                            span: Some(span),
+                        }]);
+                    }
+                    return Ok((resolved, arg_row));
+                }
+                Type::Tensor { dtype, .. } => {
+                    let dt_resolved = self.subst.apply(dtype);
+                    if let Some(dt) = dt_resolved.as_dtype()
+                        && (dt.is_unsigned_int() || dt.is_bool())
+                    {
+                        return Err(vec![TypeError::UnificationFailure {
+                            expected: "signed numeric Tensor DType for unary '-'".to_string(),
+                            got: resolved.name(),
+                            span: Some(span),
+                        }]);
+                    }
+                    return Ok((resolved, arg_row));
+                }
+                _ => {
+                    return Err(vec![TypeError::UnificationFailure {
+                        expected: "numeric type or Tensor for unary '-'".to_string(),
+                        got: resolved.name(),
+                        span: Some(span),
+                    }]);
+                }
+            }
+        }
+
         if let WitnessCallee::Method(_, method) = callee {
             let Some((recv, method_args)) = args.split_first() else {
                 return Err(vec![TypeError::ArityMismatch {
@@ -819,7 +911,43 @@ impl HMInference {
                 Type::String => return Ok((Type::Char, acc_row)),
                 Type::List(e) => return Ok(((**e).clone(), acc_row)),
                 Type::Dict(_, v) => return Ok((v.as_ref().clone(), acc_row)),
+                Type::Tensor {
+                    dtype,
+                    shape: crate::typeck::ShapeType::Ranked(dims),
+                    device,
+                } => {
+                    if dims.is_empty() {
+                        return Err(vec![TypeError::UnificationFailure {
+                            expected: "tensor with rank >= 1 for indexing".to_string(),
+                            got: resolved_recv.name(),
+                            span: Some(span),
+                        }]);
+                    } else if dims.len() == 1 {
+                        return Ok(((**dtype).clone(), acc_row));
+                    } else {
+                        return Ok((
+                            Type::Tensor {
+                                dtype: dtype.clone(),
+                                shape: crate::typeck::ShapeType::Ranked(dims[1..].to_vec()),
+                                device: device.clone(),
+                            },
+                            acc_row,
+                        ));
+                    }
+                }
                 _ => return Ok((self.fresh_type_var(), acc_row)),
+            }
+        }
+
+        if let WitnessCallee::Name(name) | WitnessCallee::Var(name) = callee {
+            if name == "tensor" {
+                return self.infer_tensor_constructor_call("tensor", args, span);
+            }
+            if let Some(assoc) = name
+                .strip_prefix("Tensor::")
+                .or_else(|| name.strip_prefix("tensor::"))
+            {
+                return self.infer_tensor_constructor_call(assoc, args, span);
             }
         }
 
@@ -915,6 +1043,37 @@ impl HMInference {
             arg_vals.push((t, r, arg.span));
         }
 
+        // Stage 3B inter-procedural Resource safety check: reject passing a gradient-tracked
+        // or view-aliased tensor into a function parameter mutated in-place (`fill_`/`add_`/`mul_`).
+        if let WitnessCallee::Name(fn_name) | WitnessCallee::Var(fn_name) = callee
+            && let Some(mut_indices) = self.fn_mutates_tensor_params.get(fn_name).cloned()
+        {
+            for idx in mut_indices {
+                if let Some(arg_w) = args.get(idx) {
+                    if self.expr_produces_grad_tensor(arg_w) {
+                        return Err(vec![TypeError::UnificationFailure {
+                            expected: format!(
+                                "non-differentiable tensor for parameter #{} of '{fn_name}' (mutated in-place)",
+                                idx + 1
+                            ),
+                            got: "gradient-tracked tensor (requires_grad=true)".to_string(),
+                            span: Some(arg_w.span),
+                        }]);
+                    }
+                    if self.expr_produces_tensor_view(arg_w) || self.expr_is_aliased_source(arg_w) {
+                        return Err(vec![TypeError::UnificationFailure {
+                            expected: format!(
+                                "unique owning tensor for parameter #{} of '{fn_name}' (mutated in-place; call .contiguous() first)",
+                                idx + 1
+                            ),
+                            got: "aliased or strided tensor view".to_string(),
+                            span: Some(arg_w.span),
+                        }]);
+                    }
+                }
+            }
+        }
+
         Ok(self.apply_curried_call_types(callee_ty, acc_row, arg_vals, span))
     }
 
@@ -937,11 +1096,21 @@ impl HMInference {
             WitnessKind::Variable(module) => Some(module.as_str()),
             _ => None,
         };
-        self.infer_method_call_with_recv(recv_ty, recv_row, recv_module_name, method, args, span)
+        self.infer_method_call_with_recv(
+            Some(receiver),
+            recv_ty,
+            recv_row,
+            recv_module_name,
+            method,
+            args,
+            span,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn infer_method_call_with_recv(
         &mut self,
+        receiver_witness: Option<&MirWitness>,
         recv_ty: Type,
         recv_row: crate::mir::effect::EffectRow,
         recv_module_name: Option<&str>,
@@ -963,6 +1132,44 @@ impl HMInference {
         }
         if matches!(resolved_recv, Type::RandomModule) {
             return self.infer_random_method(method, arg_types, acc_row, span);
+        }
+        if matches!(resolved_recv, Type::Tensor { .. }) {
+            return self.infer_tensor_method_call(
+                receiver_witness,
+                &resolved_recv,
+                method,
+                args,
+                &arg_types,
+                acc_row,
+                span,
+            );
+        }
+        if matches!(resolved_recv, Type::Int | Type::Float | Type::Scalar(_)) {
+            match method {
+                "dtype" => {
+                    if !args.is_empty() {
+                        return Err(vec![TypeError::ArityMismatch {
+                            expected: 0,
+                            actual: args.len(),
+                            span,
+                        }]);
+                    }
+                    return Ok((Type::String, acc_row));
+                }
+                "to_dtype" | "to" => {
+                    if args.len() != 1 {
+                        return Err(vec![TypeError::ArityMismatch {
+                            expected: 1,
+                            actual: args.len(),
+                            span,
+                        }]);
+                    }
+                    let target = Self::parse_static_dtype_witness(args.first())?
+                        .unwrap_or_else(|| self.fresh_type_var());
+                    return Ok((target, acc_row));
+                }
+                _ => {}
+            }
         }
         if matches!(resolved_recv, Type::Context) && method == "spawn" {
             if args.is_empty() {
@@ -1011,6 +1218,12 @@ impl HMInference {
             Type::BuiltinModule(m) => Some(m.as_str()),
             _ => recv_module_name.filter(|_| matches!(resolved_recv, Type::Any | Type::TypeVar(_))),
         };
+        if let Some(mod_n) = mod_name
+            && let Some(tensor_res) =
+                self.try_infer_module_tensor_method(mod_n, method, args, &arg_types, &acc_row, span)
+        {
+            return tensor_res;
+        }
         let module_sig = mod_name
             .and_then(|module| crate::typeck::dispatch::module_method_signature(module, method));
         let resolved_sig = module_sig
@@ -1220,9 +1433,17 @@ impl HMInference {
             }
         }
         let saved_env = self.env.clone();
+        let saved_resources = (
+            self.grad_tracked_tensors.clone(),
+            self.view_aliased_tensors.clone(),
+            self.aliased_source_tensors.clone(),
+        );
         for (p, ty) in params.iter().zip(param_types.iter()) {
             self.record_binding(span, &p.name, ty);
             self.env.add(p.name.clone(), ty.clone());
+            self.grad_tracked_tensors.remove(&p.name);
+            self.view_aliased_tensors.remove(&p.name);
+            self.aliased_source_tensors.remove(&p.name);
         }
         self.return_targets.push(expected_ret);
         self.closure_depth += 1;
@@ -1230,6 +1451,9 @@ impl HMInference {
         self.closure_depth -= 1;
         self.return_targets.pop();
         self.env = saved_env;
+        self.grad_tracked_tensors = saved_resources.0;
+        self.view_aliased_tensors = saved_resources.1;
+        self.aliased_source_tensors = saved_resources.2;
         body_res
     }
 
@@ -1262,13 +1486,18 @@ impl HMInference {
             ));
         }
         let arrow = Type::curried_arrow(&param_types, body_ty, &body_row);
-        let ty = if type_params.is_empty() {
+        let mut rigids: Vec<TypeVarId> = type_params
+            .iter()
+            .map(|p| TypeVarId::Rigid(p.clone()))
+            .collect();
+        for v in env::collect_type_vars(&arrow) {
+            if matches!(v, TypeVarId::Rigid(_)) && !rigids.contains(&v) {
+                rigids.push(v);
+            }
+        }
+        let ty = if rigids.is_empty() {
             arrow
         } else {
-            let rigids: Vec<TypeVarId> = type_params
-                .iter()
-                .map(|p| TypeVarId::Rigid(p.clone()))
-                .collect();
             Type::ForAll(rigids, Box::new(arrow))
         };
         self.closure_rows.insert(span, body_row);
@@ -1342,8 +1571,22 @@ impl HMInference {
                 .any(|sc| unify::constraint_mentions_any(&sc.kind, &ph_metas));
 
         let c_start = self.constraints.len();
-        let (body_ty, body_row) =
-            self.infer_closure_core(&param_types, params, ret_placeholder.clone(), body, span)?;
+        let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
+        self.active_fn_mut_stack.push((param_names, HashSet::new()));
+        let body_res =
+            self.infer_closure_core(&param_types, params, ret_placeholder.clone(), body, span);
+        let (_, mutated_param_set) = self
+            .active_fn_mut_stack
+            .pop()
+            .unwrap_or_else(|| (Vec::new(), HashSet::new()));
+        let (body_ty, body_row) = body_res?;
+        if let Some(n) = name
+            && !mutated_param_set.is_empty()
+        {
+            let mut indices: Vec<usize> = mutated_param_set.into_iter().collect();
+            indices.sort_unstable();
+            self.fn_mutates_tensor_params.insert(n.to_string(), indices);
+        }
 
         if !matches!(body_ty, Type::Error) {
             self.constraints.push(
@@ -1371,7 +1614,16 @@ impl HMInference {
         };
 
         let arrow = Type::curried_arrow(&param_types, effective_ret, &body_row);
-        let final_ty = if !type_params.is_empty() {
+        let mut rigids: Vec<TypeVarId> = type_params
+            .iter()
+            .map(|p| TypeVarId::Rigid(p.clone()))
+            .collect();
+        for v in env::collect_type_vars(&arrow) {
+            if matches!(v, TypeVarId::Rigid(_)) && !rigids.contains(&v) {
+                rigids.push(v);
+            }
+        }
+        let final_ty = if !rigids.is_empty() {
             let drained: Vec<SpannedConstraint> = self.constraints.drain(c_start..).collect();
             for sc in drained {
                 match &sc.kind {
@@ -1382,10 +1634,6 @@ impl HMInference {
                     },
                 }
             }
-            let rigids: Vec<TypeVarId> = type_params
-                .iter()
-                .map(|p| TypeVarId::Rigid(p.clone()))
-                .collect();
             Type::ForAll(rigids, Box::new(self.subst.apply(&arrow)))
         } else if let Some(n) = name
             && !was_forward_referenced
@@ -1426,6 +1674,11 @@ impl HMInference {
             }
 
             let saved_env = self.env.clone();
+            let saved_res = (
+                self.grad_tracked_tensors.clone(),
+                self.view_aliased_tensors.clone(),
+                self.aliased_source_tensors.clone(),
+            );
             if let Err(errs) = self.add_pattern_bindings(&arm.pattern, &scrutinee_ty, span) {
                 self.errors.extend(errs);
             }
@@ -1447,6 +1700,9 @@ impl HMInference {
             }
             let (arm_ty, arm_row) = self.infer_recover(&arm.body);
             self.env = saved_env;
+            self.grad_tracked_tensors = saved_res.0;
+            self.view_aliased_tensors = saved_res.1;
+            self.aliased_source_tensors = saved_res.2;
             acc_row = self.merge_rows(acc_row, arm_row, arm.body.span);
             self.merge_arm_result_type(&mut result_ty, arm_ty, arm.body.span);
         }
@@ -1959,6 +2215,1834 @@ impl HMInference {
         }
         let val_ty = self.finalize_container_elements(&valid, acc_val);
         Ok((Type::Dict(Box::new(k_ty), Box::new(val_ty)), acc_row))
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Stage 3B: 5 AI-Native Static Checks (DType, Shape, Device, Resource, Effect)
+    // ════════════════════════════════════════════════════════════════════════
+
+    fn update_tensor_resource_flags(&mut self, name: &str, value: &MirWitness) {
+        if self.expr_produces_grad_tensor(value) {
+            self.grad_tracked_tensors.insert(name.to_string());
+        } else {
+            self.grad_tracked_tensors.remove(name);
+        }
+        if self.expr_produces_tensor_view(value) {
+            self.view_aliased_tensors.insert(name.to_string());
+            if let Some(src_var) = Self::tensor_view_source_var(value)
+                && src_var != name
+            {
+                self.aliased_source_tensors.insert(src_var);
+            }
+        } else {
+            self.view_aliased_tensors.remove(name);
+            // Reassigning `name` to a fresh contiguous/owning tensor clears prior source aliasing on `name`.
+            self.aliased_source_tensors.remove(name);
+        }
+        // Creating a second variable alias to an existing tensor shares `Arc<TensorStorage>` at runtime.
+        if let WitnessKind::Variable(src_var) = &value.kind
+            && src_var != name
+            && self
+                .env
+                .get(src_var)
+                .map(|t| self.subst.apply(t))
+                .is_some_and(|t| matches!(t, Type::Tensor { .. }))
+        {
+            self.aliased_source_tensors.insert(src_var.clone());
+            self.aliased_source_tensors.insert(name.to_string());
+        }
+    }
+
+    fn tensor_view_source_var(w: &MirWitness) -> Option<String> {
+        match &w.kind {
+            WitnessKind::Variable(v) => Some(v.clone()),
+            WitnessKind::MethodCall {
+                receiver, method, ..
+            } => match method.as_str() {
+                "transpose" | "reshape" | "with_grad" => Self::tensor_view_source_var(receiver),
+                _ => None,
+            },
+            WitnessKind::Call { callee, args } => {
+                if matches!(callee, WitnessCallee::Name(n) | WitnessCallee::Var(n) if n == "[]") {
+                    args.first().and_then(Self::tensor_view_source_var)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn expr_is_aliased_source(&self, w: &MirWitness) -> bool {
+        match &w.kind {
+            WitnessKind::Variable(v) => self.aliased_source_tensors.contains(v),
+            WitnessKind::MethodCall {
+                receiver, method, ..
+            } if method == "with_grad" => self.expr_is_aliased_source(receiver),
+            _ => false,
+        }
+    }
+
+    fn expr_produces_grad_tensor(&self, w: &MirWitness) -> bool {
+        match &w.kind {
+            WitnessKind::Variable(v) => self.grad_tracked_tensors.contains(v),
+            WitnessKind::Call { callee, args } => {
+                if let WitnessCallee::Name(n) | WitnessCallee::Var(n) = callee {
+                    if n == "tensor"
+                        || n.eq_ignore_ascii_case("Tensor::from_list")
+                        || n.eq_ignore_ascii_case("Tensor::zeros")
+                        || n.eq_ignore_ascii_case("Tensor::ones")
+                        || n.eq_ignore_ascii_case("Tensor::randn")
+                        || n.eq_ignore_ascii_case("Tensor::rand")
+                    {
+                        return matches!(
+                            args.get(3).map(|a| &a.kind),
+                            Some(WitnessKind::Literal(crate::common::Literal::Bool(true, _)))
+                        );
+                    }
+                    if n.eq_ignore_ascii_case("Tensor::full") {
+                        return matches!(
+                            args.get(4).map(|a| &a.kind),
+                            Some(WitnessKind::Literal(crate::common::Literal::Bool(true, _)))
+                        );
+                    }
+                    if n.eq_ignore_ascii_case("Tensor::eye")
+                        || n.eq_ignore_ascii_case("Tensor::arange")
+                    {
+                        return args.iter().any(|a| {
+                            matches!(
+                                &a.kind,
+                                WitnessKind::Literal(crate::common::Literal::Bool(true, _))
+                            )
+                        });
+                    }
+                    if n == "[]"
+                        && let Some(recv) = args.first()
+                    {
+                        return self.expr_produces_grad_tensor(recv);
+                    }
+                }
+                false
+            }
+            WitnessKind::MethodCall {
+                receiver,
+                method,
+                args,
+            } => match method.as_str() {
+                "with_grad" => match args.first().map(|a| &a.kind) {
+                    None | Some(WitnessKind::Literal(crate::common::Literal::Bool(true, _))) => {
+                        true
+                    }
+                    Some(WitnessKind::Literal(crate::common::Literal::Bool(false, _))) => false,
+                    _ => true,
+                },
+                "reshape" | "transpose" | "contiguous" | "to" | "to_dtype" | "to_device"
+                | "abs" | "sqrt" | "exp" | "ln" | "relu" | "gelu" | "silu" | "tanh" | "sigmoid"
+                | "softmax" | "rms_norm" | "layer_norm" => self.expr_produces_grad_tensor(receiver),
+                _ => false,
+            },
+            WitnessKind::Binary { left, right, .. } => {
+                self.expr_produces_grad_tensor(left) || self.expr_produces_grad_tensor(right)
+            }
+            _ => false,
+        }
+    }
+
+    fn expr_produces_tensor_view(&self, w: &MirWitness) -> bool {
+        match &w.kind {
+            WitnessKind::Variable(v) => self.view_aliased_tensors.contains(v),
+            WitnessKind::MethodCall {
+                receiver, method, ..
+            } => match method.as_str() {
+                "transpose" | "reshape" => true,
+                "contiguous" | "to" | "to_dtype" | "to_device" => false,
+                "with_grad" => self.expr_produces_tensor_view(receiver),
+                _ => false,
+            },
+            WitnessKind::Call { callee, args } => {
+                matches!(callee, WitnessCallee::Name(n) | WitnessCallee::Var(n) if n == "[]")
+                    && !args.is_empty()
+            }
+            _ => false,
+        }
+    }
+
+    fn infer_scalar_binary_op(
+        &mut self,
+        left_ty: &Type,
+        right_ty: &Type,
+        is_cmp: bool,
+        span: Span,
+    ) -> Result<Type, Vec<TypeError>> {
+        match (left_ty, right_ty) {
+            (Type::Scalar(dt1), Type::Scalar(dt2)) => {
+                if dt1 == dt2 {
+                    Ok(if is_cmp {
+                        Type::Bool
+                    } else {
+                        Type::Scalar(*dt1)
+                    })
+                } else {
+                    Err(vec![TypeError::UnificationFailure {
+                        expected: format!(
+                            "matching scalar DType '{}' (no implicit cross-precision coercion)",
+                            dt1.canonical_type_name()
+                        ),
+                        got: format!("{} and {}", left_ty.name(), right_ty.name()),
+                        span: Some(span),
+                    }])
+                }
+            }
+            (Type::Scalar(dt), Type::TypeVar(TypeVarId::Meta(_)))
+            | (Type::TypeVar(TypeVarId::Meta(_)), Type::Scalar(dt)) => {
+                let sty = Type::Scalar(*dt);
+                let eq_c = SpannedConstraint::new(
+                    Constraint::Eq(Box::new(left_ty.clone()), Box::new(right_ty.clone())),
+                    span,
+                );
+                match unify::solve_spanned(&eq_c, &self.subst) {
+                    Ok(new_s) => self.subst = new_s,
+                    Err(e) => return Err(vec![e]),
+                }
+                Ok(if is_cmp { Type::Bool } else { sty })
+            }
+            (Type::Scalar(dt), Type::Any) | (Type::Any, Type::Scalar(dt)) => Ok(if is_cmp {
+                Type::Bool
+            } else {
+                Type::Scalar(*dt)
+            }),
+            _ => Err(vec![TypeError::UnificationFailure {
+                expected: format!(
+                    "matching scalar DType (cannot mix {} with {})",
+                    left_ty.name(),
+                    right_ty.name()
+                ),
+                got: format!("{} and {}", left_ty.name(), right_ty.name()),
+                span: Some(span),
+            }]),
+        }
+    }
+
+    fn unify_tensor_dtypes(
+        &mut self,
+        d1: &Type,
+        d2: &Type,
+        span: Span,
+    ) -> Result<Type, Vec<TypeError>> {
+        let a = self.subst.apply(d1);
+        let b = self.subst.apply(d2);
+        let eq_c = SpannedConstraint::new(
+            Constraint::Eq(Box::new(a.clone()), Box::new(b.clone())),
+            span,
+        );
+        match unify::solve_spanned(&eq_c, &self.subst) {
+            Ok(new_s) => {
+                self.subst = new_s;
+                Ok(self.subst.apply(&a))
+            }
+            Err(_) => Err(vec![TypeError::UnificationFailure {
+                expected: format!(
+                    "matching tensor DType '{}' (use .to(\"{}\") for explicit conversion)",
+                    a.name(),
+                    a.name()
+                ),
+                got: format!("{} and {}", a.name(), b.name()),
+                span: Some(span),
+            }]),
+        }
+    }
+
+    fn unify_tensor_devices(
+        &mut self,
+        dev1: &crate::typeck::DeviceType,
+        dev2: &crate::typeck::DeviceType,
+        span: Span,
+    ) -> Result<crate::typeck::DeviceType, Vec<TypeError>> {
+        use crate::typeck::DeviceType;
+        let a = self.subst.apply_device(dev1);
+        let b = self.subst.apply_device(dev2);
+        let dummy1 = Type::Tensor {
+            dtype: Box::new(Type::Any),
+            shape: crate::typeck::ShapeType::Unranked(None),
+            device: a.clone(),
+        };
+        let dummy2 = Type::Tensor {
+            dtype: Box::new(Type::Any),
+            shape: crate::typeck::ShapeType::Unranked(None),
+            device: b.clone(),
+        };
+        let eq_c = SpannedConstraint::new(Constraint::Eq(Box::new(dummy1), Box::new(dummy2)), span);
+        match unify::solve_spanned(&eq_c, &self.subst) {
+            Ok(new_s) => {
+                self.subst = new_s;
+                let resolved = if matches!(a, DeviceType::Any) {
+                    self.subst.apply_device(&b)
+                } else {
+                    self.subst.apply_device(&a)
+                };
+                Ok(resolved)
+            }
+            Err(_) => Err(vec![TypeError::UnificationFailure {
+                expected: format!(
+                    "tensors on same device '{}' (use .to(\"{}\") to transfer explicitly)",
+                    a, a
+                ),
+                got: format!("'{}' and '{}'", a, b),
+                span: Some(span),
+            }]),
+        }
+    }
+
+    fn broadcast_tensor_shapes(
+        &mut self,
+        s1: &crate::typeck::ShapeType,
+        s2: &crate::typeck::ShapeType,
+        span: Span,
+    ) -> Result<crate::typeck::ShapeType, Vec<TypeError>> {
+        use crate::typeck::{DimExpr, ShapeType};
+        let a = self.subst.apply_shape(s1);
+        let b = self.subst.apply_shape(s2);
+        match (&a, &b) {
+            (ShapeType::Ranked(dims_a), ShapeType::Ranked(dims_b)) => {
+                let max_rank = dims_a.len().max(dims_b.len());
+                let mut out_dims = Vec::with_capacity(max_rank);
+                for i in 0..max_rank {
+                    let da = if i < max_rank - dims_a.len() {
+                        DimExpr::Known(1)
+                    } else {
+                        self.subst.apply_dim(&dims_a[i - (max_rank - dims_a.len())])
+                    };
+                    let db = if i < max_rank - dims_b.len() {
+                        DimExpr::Known(1)
+                    } else {
+                        self.subst.apply_dim(&dims_b[i - (max_rank - dims_b.len())])
+                    };
+                    let merged = match (&da, &db) {
+                        (DimExpr::Known(1), other) | (other, DimExpr::Known(1)) => other.clone(),
+                        (DimExpr::Known(x), DimExpr::Known(y)) if x == y => DimExpr::Known(*x),
+                        (DimExpr::Symbolic(sa), DimExpr::Symbolic(sb)) if sa == sb => {
+                            DimExpr::Symbolic(sa.clone())
+                        }
+                        (DimExpr::Symbolic(s), other) | (other, DimExpr::Symbolic(s))
+                            if s == "_" =>
+                        {
+                            other.clone()
+                        }
+                        (DimExpr::Var(id1), DimExpr::Var(id2)) if id1 == id2 => DimExpr::Var(*id1),
+                        (DimExpr::Var(_), _) | (_, DimExpr::Var(_)) => {
+                            let d1_ty = Type::Tensor {
+                                dtype: Box::new(Type::Any),
+                                shape: ShapeType::Ranked(vec![da.clone()]),
+                                device: crate::typeck::DeviceType::Any,
+                            };
+                            let d2_ty = Type::Tensor {
+                                dtype: Box::new(Type::Any),
+                                shape: ShapeType::Ranked(vec![db.clone()]),
+                                device: crate::typeck::DeviceType::Any,
+                            };
+                            if let Ok(new_s) = unify::solve_spanned(
+                                &SpannedConstraint::new(
+                                    Constraint::Eq(Box::new(d1_ty), Box::new(d2_ty)),
+                                    span,
+                                ),
+                                &self.subst,
+                            ) {
+                                self.subst = new_s;
+                            }
+                            self.subst.apply_dim(&da)
+                        }
+                        _ => {
+                            return Err(vec![TypeError::UnificationFailure {
+                                expected: format!("broadcast-compatible tensor shapes (got {a})"),
+                                got: format!("{a} and {b}"),
+                                span: Some(span),
+                            }]);
+                        }
+                    };
+                    out_dims.push(merged);
+                }
+                Ok(ShapeType::Ranked(out_dims))
+            }
+            (ShapeType::Unranked(None), other) | (other, ShapeType::Unranked(None)) => {
+                Ok(other.clone())
+            }
+            (ShapeType::Unranked(Some(v1)), ShapeType::Unranked(Some(v2))) if v1 == v2 => {
+                Ok(ShapeType::Unranked(Some(v1.clone())))
+            }
+            (ShapeType::Unranked(Some(TypeVarId::Meta(_))), _)
+            | (_, ShapeType::Unranked(Some(TypeVarId::Meta(_)))) => {
+                let d1_ty = Type::Tensor {
+                    dtype: Box::new(Type::Any),
+                    shape: a.clone(),
+                    device: crate::typeck::DeviceType::Any,
+                };
+                let d2_ty = Type::Tensor {
+                    dtype: Box::new(Type::Any),
+                    shape: b.clone(),
+                    device: crate::typeck::DeviceType::Any,
+                };
+                match unify::solve_spanned(
+                    &SpannedConstraint::new(Constraint::Eq(Box::new(d1_ty), Box::new(d2_ty)), span),
+                    &self.subst,
+                ) {
+                    Ok(new_s) => {
+                        self.subst = new_s;
+                        Ok(self.subst.apply_shape(&a))
+                    }
+                    Err(e) => Err(vec![e]),
+                }
+            }
+            _ => Err(vec![TypeError::UnificationFailure {
+                expected: format!("compatible tensor shapes (got {a})"),
+                got: format!("{a} and {b}"),
+                span: Some(span),
+            }]),
+        }
+    }
+
+    fn infer_tensor_binary_op(
+        &mut self,
+        left_ty: &Type,
+        right_ty: &Type,
+        span: Span,
+    ) -> Result<Type, Vec<TypeError>> {
+        match (left_ty, right_ty) {
+            (
+                Type::Tensor {
+                    dtype: d1,
+                    shape: s1,
+                    device: dev1,
+                },
+                Type::Tensor {
+                    dtype: d2,
+                    shape: s2,
+                    device: dev2,
+                },
+            ) => {
+                let out_dtype = self.unify_tensor_dtypes(d1, d2, span)?;
+                if out_dtype.as_dtype().is_some_and(|d| d.is_bool()) {
+                    return Err(vec![TypeError::UnificationFailure {
+                        expected: "numeric Tensor DType for arithmetic operator".to_string(),
+                        got: format!("Tensor<{}>", out_dtype.name()),
+                        span: Some(span),
+                    }]);
+                }
+                let out_device = self.unify_tensor_devices(dev1, dev2, span)?;
+                let out_shape = self.broadcast_tensor_shapes(s1, s2, span)?;
+                Ok(Type::Tensor {
+                    dtype: Box::new(out_dtype),
+                    shape: out_shape,
+                    device: out_device,
+                })
+            }
+            (
+                Type::Tensor {
+                    dtype,
+                    shape,
+                    device,
+                },
+                scalar_ty,
+            )
+            | (
+                scalar_ty,
+                Type::Tensor {
+                    dtype,
+                    shape,
+                    device,
+                },
+            ) => {
+                if !is_numeric(scalar_ty)
+                    && !matches!(scalar_ty, Type::Scalar(_) | Type::TypeVar(_) | Type::Any)
+                {
+                    return Err(vec![TypeError::UnificationFailure {
+                        expected: format!("Tensor or scalar matching DType '{}'", dtype.name()),
+                        got: format!("{} and {}", left_ty.name(), right_ty.name()),
+                        span: Some(span),
+                    }]);
+                }
+                let out_dtype = self.unify_tensor_dtypes(dtype, scalar_ty, span)?;
+                Ok(Type::Tensor {
+                    dtype: Box::new(out_dtype),
+                    shape: self.subst.apply_shape(shape),
+                    device: self.subst.apply_device(device),
+                })
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn unify_contract_dim(
+        &mut self,
+        k1: &crate::typeck::DimExpr,
+        k2: &crate::typeck::DimExpr,
+        sa: &crate::typeck::ShapeType,
+        sb: &crate::typeck::ShapeType,
+        span: Span,
+    ) -> Result<(), Vec<TypeError>> {
+        use crate::typeck::{DeviceType, ShapeType};
+        let d1_ty = Type::Tensor {
+            dtype: Box::new(Type::Any),
+            shape: ShapeType::Ranked(vec![k1.clone()]),
+            device: DeviceType::Any,
+        };
+        let d2_ty = Type::Tensor {
+            dtype: Box::new(Type::Any),
+            shape: ShapeType::Ranked(vec![k2.clone()]),
+            device: DeviceType::Any,
+        };
+        match unify::solve_spanned(
+            &SpannedConstraint::new(Constraint::Eq(Box::new(d1_ty), Box::new(d2_ty)), span),
+            &self.subst,
+        ) {
+            Ok(new_s) => {
+                self.subst = new_s;
+                Ok(())
+            }
+            Err(_) => Err(vec![TypeError::UnificationFailure {
+                expected: format!(
+                    "matching contraction inner dimension for '@' (left inner dim is {})",
+                    self.subst.apply_dim(k1)
+                ),
+                got: format!(
+                    "{sa} @ {sb} ({} != {})",
+                    self.subst.apply_dim(k1),
+                    self.subst.apply_dim(k2)
+                ),
+                span: Some(span),
+            }]),
+        }
+    }
+
+    fn infer_tensor_matmul_op(
+        &mut self,
+        left_ty: &Type,
+        right_ty: &Type,
+        span: Span,
+    ) -> Result<Type, Vec<TypeError>> {
+        use crate::typeck::ShapeType;
+        let (
+            Type::Tensor {
+                dtype: d1,
+                shape: s1,
+                device: dev1,
+            },
+            Type::Tensor {
+                dtype: d2,
+                shape: s2,
+                device: dev2,
+            },
+        ) = (left_ty, right_ty)
+        else {
+            if matches!(left_ty, Type::TypeVar(TypeVarId::Meta(_)) | Type::Any)
+                || matches!(right_ty, Type::TypeVar(TypeVarId::Meta(_)) | Type::Any)
+            {
+                return Ok(self.fresh_type_var());
+            }
+            return Err(vec![TypeError::UnificationFailure {
+                expected: "two Tensor operands for '@' matrix contraction".to_string(),
+                got: format!("{} @ {}", left_ty.name(), right_ty.name()),
+                span: Some(span),
+            }]);
+        };
+
+        let out_dtype = self.unify_tensor_dtypes(d1, d2, span)?;
+        if out_dtype.as_dtype().is_some_and(|d| d.is_bool()) {
+            return Err(vec![TypeError::UnificationFailure {
+                expected: "numeric Tensor DType for '@' matrix contraction".to_string(),
+                got: format!("Tensor<{}>", out_dtype.name()),
+                span: Some(span),
+            }]);
+        }
+        let out_device = self.unify_tensor_devices(dev1, dev2, span)?;
+        let sa = self.subst.apply_shape(s1);
+        let sb = self.subst.apply_shape(s2);
+
+        match (&sa, &sb) {
+            (ShapeType::Ranked(da), ShapeType::Ranked(db)) => {
+                if da.is_empty() || db.is_empty() {
+                    return Err(vec![TypeError::UnificationFailure {
+                        expected: "tensors with rank >= 1 for '@'".to_string(),
+                        got: format!("{sa} @ {sb}"),
+                        span: Some(span),
+                    }]);
+                }
+                match (da.len(), db.len()) {
+                    (1, 1) => {
+                        self.unify_contract_dim(&da[0], &db[0], &sa, &sb, span)?;
+                        Ok(out_dtype)
+                    }
+                    (2, 2) => {
+                        self.unify_contract_dim(&da[1], &db[0], &sa, &sb, span)?;
+                        let m = self.subst.apply_dim(&da[0]);
+                        let n = self.subst.apply_dim(&db[1]);
+                        Ok(Type::Tensor {
+                            dtype: Box::new(out_dtype),
+                            shape: ShapeType::Ranked(vec![m, n]),
+                            device: out_device,
+                        })
+                    }
+                    (2, 1) => {
+                        self.unify_contract_dim(&da[1], &db[0], &sa, &sb, span)?;
+                        let m = self.subst.apply_dim(&da[0]);
+                        Ok(Type::Tensor {
+                            dtype: Box::new(out_dtype),
+                            shape: ShapeType::Ranked(vec![m]),
+                            device: out_device,
+                        })
+                    }
+                    (1, 2) => {
+                        self.unify_contract_dim(&da[0], &db[0], &sa, &sb, span)?;
+                        let n = self.subst.apply_dim(&db[1]);
+                        Ok(Type::Tensor {
+                            dtype: Box::new(out_dtype),
+                            shape: ShapeType::Ranked(vec![n]),
+                            device: out_device,
+                        })
+                    }
+                    (ra, rb) if ra >= 2 && rb >= 2 => {
+                        let m = da[ra - 2].clone();
+                        let k1 = da[ra - 1].clone();
+                        let k2 = db[rb - 2].clone();
+                        let n = db[rb - 1].clone();
+                        self.unify_contract_dim(&k1, &k2, &sa, &sb, span)?;
+                        let batch_a = ShapeType::Ranked(da[..ra - 2].to_vec());
+                        let batch_b = ShapeType::Ranked(db[..rb - 2].to_vec());
+                        let ShapeType::Ranked(mut out_dims) =
+                            self.broadcast_tensor_shapes(&batch_a, &batch_b, span)?
+                        else {
+                            unreachable!()
+                        };
+                        out_dims.push(self.subst.apply_dim(&m));
+                        out_dims.push(self.subst.apply_dim(&n));
+                        Ok(Type::Tensor {
+                            dtype: Box::new(out_dtype),
+                            shape: ShapeType::Ranked(out_dims),
+                            device: out_device,
+                        })
+                    }
+                    _ => Err(vec![TypeError::UnificationFailure {
+                        expected: "compatible tensor ranks for '@' (1D, 2D, or batched >=2D)"
+                            .to_string(),
+                        got: format!("{sa} @ {sb}"),
+                        span: Some(span),
+                    }]),
+                }
+            }
+            _ => Ok(Type::Tensor {
+                dtype: Box::new(out_dtype),
+                shape: ShapeType::Unranked(None),
+                device: out_device,
+            }),
+        }
+    }
+
+    fn extract_static_int_literal(w: &MirWitness) -> Option<i64> {
+        match &w.kind {
+            WitnessKind::Literal(crate::common::Literal::Int(n, _)) => Some(*n),
+            WitnessKind::Literal(crate::common::Literal::TypedInt(n, _, _)) => Some(*n),
+            WitnessKind::Call {
+                callee: WitnessCallee::Builtin(crate::mir::witness::BuiltinOp::Neg),
+                args,
+            } if args.len() == 1 => Self::extract_static_int_literal(&args[0])?.checked_neg(),
+            _ => None,
+        }
+    }
+
+    fn extract_static_shape_list(w: &MirWitness) -> Option<Vec<crate::typeck::DimExpr>> {
+        let WitnessKind::List(items) = &w.kind else {
+            return None;
+        };
+        let mut dims = Vec::with_capacity(items.len());
+        for item in items {
+            let n = Self::extract_static_int_literal(item)?;
+            if n < 0 {
+                return None;
+            }
+            dims.push(crate::typeck::DimExpr::Known(n as usize));
+        }
+        Some(dims)
+    }
+
+    fn extract_nested_list_shape_and_dtype(
+        w: &MirWitness,
+    ) -> Result<(crate::typeck::ShapeType, Option<Type>), Vec<TypeError>> {
+        use crate::typeck::{DimExpr, ShapeType};
+        fn walk(
+            node: &MirWitness,
+            shape: &mut Vec<usize>,
+            depth: usize,
+            leaf_dt: &mut Option<Type>,
+        ) -> Result<(), Vec<TypeError>> {
+            match &node.kind {
+                WitnessKind::List(items) => {
+                    if shape.len() == depth {
+                        shape.push(items.len());
+                    } else if shape[depth] != items.len() {
+                        return Err(vec![TypeError::UnificationFailure {
+                            expected: format!(
+                                "rectangular tensor nested list (dimension {} has length {})",
+                                depth, shape[depth]
+                            ),
+                            got: format!("sub-list of length {}", items.len()),
+                            span: Some(node.span),
+                        }]);
+                    }
+                    for item in items {
+                        walk(item, shape, depth + 1, leaf_dt)?;
+                    }
+                    Ok(())
+                }
+                WitnessKind::Call {
+                    callee: WitnessCallee::Builtin(crate::mir::witness::BuiltinOp::Neg),
+                    args,
+                } if args.len() == 1 => walk(&args[0], shape, depth, leaf_dt),
+                WitnessKind::Literal(lit) => {
+                    let ty = super::infer_lit(lit);
+                    match leaf_dt {
+                        None => *leaf_dt = Some(ty),
+                        Some(prev) => {
+                            if prev != &ty {
+                                if matches!(
+                                    (&prev, &ty),
+                                    (Type::Int, Type::Float) | (Type::Float, Type::Int)
+                                ) {
+                                    *leaf_dt = Some(Type::Float);
+                                } else {
+                                    return Err(vec![TypeError::UnificationFailure {
+                                        expected: format!(
+                                            "uniform scalar DType '{}' in tensor literal",
+                                            prev.name()
+                                        ),
+                                        got: ty.name(),
+                                        span: Some(node.span),
+                                    }]);
+                                }
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+                _ => Err(vec![]),
+            }
+        }
+        let mut shape = Vec::new();
+        let mut leaf_dt = None;
+        match walk(w, &mut shape, 0, &mut leaf_dt) {
+            Ok(()) => {
+                let dims = shape.into_iter().map(DimExpr::Known).collect();
+                Ok((ShapeType::Ranked(dims), leaf_dt))
+            }
+            Err(errs) if errs.is_empty() => Ok((ShapeType::Unranked(None), None)),
+            Err(errs) => Err(errs),
+        }
+    }
+
+    fn parse_static_dtype_witness(
+        arg: Option<&MirWitness>,
+    ) -> Result<Option<Type>, Vec<TypeError>> {
+        let Some(w) = arg else {
+            return Ok(None);
+        };
+        match &w.kind {
+            WitnessKind::Literal(crate::common::Literal::Nil(_)) => Ok(None),
+            WitnessKind::Literal(crate::common::Literal::String(s, _)) => {
+                match crate::common::DType::from_name(s) {
+                    Some(dt) => Ok(Some(Type::from_dtype(dt))),
+                    None => Err(vec![TypeError::InvalidLiteral {
+                        what: "tensor dtype".to_string(),
+                        value: s.clone(),
+                        span: Some(w.span),
+                    }]),
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn parse_static_device_witness(
+        arg: Option<&MirWitness>,
+    ) -> Result<crate::typeck::DeviceType, Vec<TypeError>> {
+        use crate::typeck::DeviceType;
+        let Some(w) = arg else {
+            return Ok(DeviceType::Concrete(crate::common::Device::Cpu));
+        };
+        match &w.kind {
+            WitnessKind::Literal(crate::common::Literal::Nil(_)) => {
+                Ok(DeviceType::Concrete(crate::common::Device::Cpu))
+            }
+            WitnessKind::Literal(crate::common::Literal::String(s, _)) => {
+                match crate::common::Device::parse(s) {
+                    Ok(dev) => Ok(DeviceType::Concrete(dev)),
+                    Err(_) => Err(vec![TypeError::InvalidLiteral {
+                        what: "tensor device".to_string(),
+                        value: s.clone(),
+                        span: Some(w.span),
+                    }]),
+                }
+            }
+            _ => Ok(DeviceType::Any),
+        }
+    }
+
+    fn infer_tensor_constructor_call(
+        &mut self,
+        ctor: &str,
+        args: &[MirWitness],
+        span: Span,
+    ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
+        use crate::typeck::{DimExpr, ShapeType};
+        let mut acc_row = crate::mir::effect::EffectRow::Empty;
+        let mut arg_types = Vec::with_capacity(args.len());
+        for a in args {
+            let (t, r) = self.infer_recover(a);
+            arg_types.push(t);
+            acc_row = self.merge_rows(acc_row, r, span);
+        }
+
+        match ctor {
+            "tensor" | "from_list" => {
+                if args.is_empty() || args.len() > 4 {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: 1,
+                        actual: args.len(),
+                        span,
+                    }]);
+                }
+                let (inferred_shape, leaf_dt) =
+                    Self::extract_nested_list_shape_and_dtype(&args[0])?;
+                let explicit_dt = Self::parse_static_dtype_witness(args.get(1))?;
+                let device = Self::parse_static_device_witness(args.get(2))?;
+                let dtype = explicit_dt.or(leaf_dt).unwrap_or_else(|| {
+                    match self.subst.apply(&arg_types[0]) {
+                        Type::Int => Type::Int,
+                        Type::Float => Type::Float,
+                        Type::Scalar(dt) => Type::Scalar(dt),
+                        _ => Type::Float,
+                    }
+                });
+                Ok((
+                    Type::Tensor {
+                        dtype: Box::new(dtype),
+                        shape: inferred_shape,
+                        device,
+                    },
+                    acc_row,
+                ))
+            }
+            "zeros" | "ones" => {
+                if args.is_empty() || args.len() > 4 {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: 1,
+                        actual: args.len(),
+                        span,
+                    }]);
+                }
+                let shape = match Self::extract_static_shape_list(&args[0]) {
+                    Some(dims) => ShapeType::Ranked(dims),
+                    None => ShapeType::Unranked(None),
+                };
+                let dtype = Self::parse_static_dtype_witness(args.get(1))?.unwrap_or(Type::Float);
+                let device = Self::parse_static_device_witness(args.get(2))?;
+                Ok((
+                    Type::Tensor {
+                        dtype: Box::new(dtype),
+                        shape,
+                        device,
+                    },
+                    acc_row,
+                ))
+            }
+            "randn" | "rand" => {
+                if args.is_empty() || args.len() > 4 {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: 1,
+                        actual: args.len(),
+                        span,
+                    }]);
+                }
+                let shape = match Self::extract_static_shape_list(&args[0]) {
+                    Some(dims) => ShapeType::Ranked(dims),
+                    None => ShapeType::Unranked(None),
+                };
+                let dtype = Self::parse_static_dtype_witness(args.get(1))?.unwrap_or(Type::Float);
+                if let Some(dt) = dtype.as_dtype()
+                    && !dt.is_float()
+                {
+                    return Err(vec![TypeError::UnificationFailure {
+                        expected: format!("floating-point DType for Tensor::{ctor}"),
+                        got: dtype.name(),
+                        span: Some(span),
+                    }]);
+                }
+                let device = Self::parse_static_device_witness(args.get(2))?;
+                let eff_label = "random_random";
+                acc_row = self.merge_rows(
+                    acc_row,
+                    crate::mir::effect::EffectRow::Cons(
+                        eff_label.to_string(),
+                        Box::new(crate::mir::effect::EffectRow::Empty),
+                    ),
+                    span,
+                );
+                Ok((
+                    Type::Tensor {
+                        dtype: Box::new(dtype),
+                        shape,
+                        device,
+                    },
+                    acc_row,
+                ))
+            }
+            "full" => {
+                if args.len() < 2 || args.len() > 5 {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: 2,
+                        actual: args.len(),
+                        span,
+                    }]);
+                }
+                let shape = match Self::extract_static_shape_list(&args[0]) {
+                    Some(dims) => ShapeType::Ranked(dims),
+                    None => ShapeType::Unranked(None),
+                };
+                let fill_ty = self.subst.apply(&arg_types[1]);
+                let default_dt = match fill_ty {
+                    Type::Int => Type::Int,
+                    Type::Scalar(dt) => Type::Scalar(dt),
+                    _ => Type::Float,
+                };
+                let dtype = Self::parse_static_dtype_witness(args.get(2))?.unwrap_or(default_dt);
+                let device = Self::parse_static_device_witness(args.get(3))?;
+                Ok((
+                    Type::Tensor {
+                        dtype: Box::new(dtype),
+                        shape,
+                        device,
+                    },
+                    acc_row,
+                ))
+            }
+            "eye" => {
+                if args.is_empty() || args.len() > 5 {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: 1,
+                        actual: args.len(),
+                        span,
+                    }]);
+                }
+                let n_opt = Self::extract_static_int_literal(&args[0]);
+                let (m_opt, opt_start) =
+                    match args.get(1).and_then(Self::extract_static_int_literal) {
+                        Some(m) => (Some(m), 2),
+                        None => {
+                            if matches!(
+                                arg_types.get(1),
+                                Some(Type::Int | Type::Float | Type::Scalar(_))
+                            ) {
+                                (None, 2)
+                            } else {
+                                (n_opt, 1)
+                            }
+                        }
+                    };
+                let shape = match (n_opt, m_opt) {
+                    (Some(n), Some(m)) if n >= 0 && m >= 0 => ShapeType::Ranked(vec![
+                        DimExpr::Known(n as usize),
+                        DimExpr::Known(m as usize),
+                    ]),
+                    _ => ShapeType::Ranked(vec![
+                        DimExpr::Var(self.fresh_counter),
+                        DimExpr::Var(self.fresh_counter + 1),
+                    ]),
+                };
+                self.fresh_counter += 2;
+                let dtype =
+                    Self::parse_static_dtype_witness(args.get(opt_start))?.unwrap_or(Type::Float);
+                let device = Self::parse_static_device_witness(args.get(opt_start + 1))?;
+                Ok((
+                    Type::Tensor {
+                        dtype: Box::new(dtype),
+                        shape,
+                        device,
+                    },
+                    acc_row,
+                ))
+            }
+            "arange" => {
+                if args.is_empty() || args.len() > 6 {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: 1,
+                        actual: args.len(),
+                        span,
+                    }]);
+                }
+                let mut num_count = 0usize;
+                while num_count < args.len()
+                    && num_count < 3
+                    && matches!(
+                        arg_types[num_count],
+                        Type::Int | Type::Float | Type::Scalar(_)
+                    )
+                {
+                    num_count += 1;
+                }
+                let len_opt = match num_count {
+                    1 => Self::extract_static_int_literal(&args[0]).map(|e| e.max(0) as usize),
+                    2 => match (
+                        Self::extract_static_int_literal(&args[0]),
+                        Self::extract_static_int_literal(&args[1]),
+                    ) {
+                        (Some(s), Some(e)) => Some((e - s).max(0) as usize),
+                        _ => None,
+                    },
+                    3 => match (
+                        Self::extract_static_int_literal(&args[0]),
+                        Self::extract_static_int_literal(&args[1]),
+                        Self::extract_static_int_literal(&args[2]),
+                    ) {
+                        (Some(s), Some(e), Some(step)) if step > 0 => {
+                            Some(((e - s + step - 1).max(0) / step) as usize)
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let shape = match len_opt {
+                    Some(n) => ShapeType::Ranked(vec![DimExpr::Known(n)]),
+                    None => {
+                        let id = self.fresh_counter;
+                        self.fresh_counter += 1;
+                        ShapeType::Ranked(vec![DimExpr::Var(id)])
+                    }
+                };
+                let all_ints = arg_types[..num_count]
+                    .iter()
+                    .all(|t| matches!(t, Type::Int));
+                let default_dt = if all_ints { Type::Int } else { Type::Float };
+                let dtype =
+                    Self::parse_static_dtype_witness(args.get(num_count))?.unwrap_or(default_dt);
+                let device = Self::parse_static_device_witness(args.get(num_count + 1))?;
+                Ok((
+                    Type::Tensor {
+                        dtype: Box::new(dtype),
+                        shape,
+                        device,
+                    },
+                    acc_row,
+                ))
+            }
+            _ => Err(vec![TypeError::UnboundVariable {
+                name: format!("Tensor::{ctor}"),
+                span,
+            }]),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn infer_tensor_method_call(
+        &mut self,
+        receiver_witness: Option<&MirWitness>,
+        recv_ty: &Type,
+        method: &str,
+        args: &[MirWitness],
+        arg_types: &[Type],
+        mut acc_row: crate::mir::effect::EffectRow,
+        span: Span,
+    ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
+        use crate::typeck::{DeviceType, DimExpr, ShapeType};
+        let Type::Tensor {
+            dtype,
+            shape,
+            device,
+        } = recv_ty
+        else {
+            unreachable!()
+        };
+        let cur_dtype = self.subst.apply(dtype);
+        let cur_shape = self.subst.apply_shape(shape);
+        let cur_device = self.subst.apply_device(device);
+
+        match method {
+            "shape" => {
+                if !args.is_empty() {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: 0,
+                        actual: args.len(),
+                        span,
+                    }]);
+                }
+                Ok((Type::List(Box::new(Type::Int)), acc_row))
+            }
+            "ndim" | "rank" | "numel" | "nbytes" | "byte_len" | "len" => {
+                if !args.is_empty() {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: 0,
+                        actual: args.len(),
+                        span,
+                    }]);
+                }
+                Ok((Type::Int, acc_row))
+            }
+            "dtype" | "device" => {
+                if !args.is_empty() {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: 0,
+                        actual: args.len(),
+                        span,
+                    }]);
+                }
+                Ok((Type::String, acc_row))
+            }
+            "is_contiguous" | "requires_grad" => {
+                if !args.is_empty() {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: 0,
+                        actual: args.len(),
+                        span,
+                    }]);
+                }
+                Ok((Type::Bool, acc_row))
+            }
+            "contiguous" | "abs" | "sqrt" | "exp" | "ln" | "relu" | "gelu" | "silu" | "tanh"
+            | "sigmoid" | "softmax" => {
+                if !args.is_empty() {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: 0,
+                        actual: args.len(),
+                        span,
+                    }]);
+                }
+                if method == "softmax"
+                    && let Some(dt) = cur_dtype.as_dtype()
+                    && !dt.is_float()
+                {
+                    return Err(vec![TypeError::UnificationFailure {
+                        expected: "floating-point tensor DType for softmax()".to_string(),
+                        got: cur_dtype.name(),
+                        span: Some(span),
+                    }]);
+                }
+                Ok((
+                    Type::Tensor {
+                        dtype: Box::new(cur_dtype),
+                        shape: cur_shape,
+                        device: cur_device,
+                    },
+                    acc_row,
+                ))
+            }
+            "rms_norm" | "layer_norm" => {
+                if args.len() > 1 {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: 1,
+                        actual: args.len(),
+                        span,
+                    }]);
+                }
+                if let Some(dt) = cur_dtype.as_dtype()
+                    && !dt.is_float()
+                {
+                    return Err(vec![TypeError::UnificationFailure {
+                        expected: format!("floating-point tensor DType for {method}()"),
+                        got: cur_dtype.name(),
+                        span: Some(span),
+                    }]);
+                }
+                Ok((
+                    Type::Tensor {
+                        dtype: Box::new(cur_dtype),
+                        shape: cur_shape,
+                        device: cur_device,
+                    },
+                    acc_row,
+                ))
+            }
+            "with_grad" => {
+                if args.len() > 1 {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: 1,
+                        actual: args.len(),
+                        span,
+                    }]);
+                }
+                if let Some(arg0) = arg_types.first()
+                    && !matches!(arg0, Type::Error)
+                {
+                    self.constraints.push(SpannedConstraint::new(
+                        Constraint::Subtype {
+                            sub: Box::new(arg0.clone()),
+                            sup: Box::new(Type::Bool),
+                        },
+                        args[0].span,
+                    ));
+                }
+                Ok((
+                    Type::Tensor {
+                        dtype: Box::new(cur_dtype),
+                        shape: cur_shape,
+                        device: cur_device,
+                    },
+                    acc_row,
+                ))
+            }
+            "sum" | "max" | "min" | "item" => {
+                if !args.is_empty() {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: 0,
+                        actual: args.len(),
+                        span,
+                    }]);
+                }
+                if method == "item"
+                    && let ShapeType::Ranked(dims) = &cur_shape
+                    && dims.iter().all(|d| matches!(d, DimExpr::Known(_)))
+                {
+                    let numel: usize = dims
+                        .iter()
+                        .map(|d| match d {
+                            DimExpr::Known(n) => *n,
+                            _ => 1,
+                        })
+                        .product();
+                    if numel != 1 {
+                        return Err(vec![TypeError::UnificationFailure {
+                            expected: "1-element tensor for .item()".to_string(),
+                            got: format!("shape {cur_shape} ({numel} elements)"),
+                            span: Some(span),
+                        }]);
+                    }
+                }
+                Ok((cur_dtype, acc_row))
+            }
+            "mean" => {
+                if !args.is_empty() {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: 0,
+                        actual: args.len(),
+                        span,
+                    }]);
+                }
+                let ret = match cur_dtype.as_dtype() {
+                    Some(dt) if dt.is_float() => Type::from_dtype(dt),
+                    _ => Type::Float,
+                };
+                Ok((ret, acc_row))
+            }
+            "to_list" => {
+                if !args.is_empty() {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: 0,
+                        actual: args.len(),
+                        span,
+                    }]);
+                }
+                Ok((Type::List(Box::new(Type::Any)), acc_row))
+            }
+            "reshape" => {
+                if args.is_empty() {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: 1,
+                        actual: 0,
+                        span,
+                    }]);
+                }
+                let target_dims_opt = if args.len() == 1 {
+                    Self::extract_static_shape_list(&args[0]).or_else(|| {
+                        Self::extract_static_int_literal(&args[0])
+                            .filter(|&n| n >= 0)
+                            .map(|n| vec![DimExpr::Known(n as usize)])
+                    })
+                } else {
+                    let mut dims = Vec::with_capacity(args.len());
+                    let mut ok = true;
+                    for a in args {
+                        if let Some(n) = Self::extract_static_int_literal(a)
+                            && n >= 0
+                        {
+                            dims.push(DimExpr::Known(n as usize));
+                        } else {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if ok { Some(dims) } else { None }
+                };
+
+                let new_shape = match target_dims_opt {
+                    Some(target_dims) => {
+                        if let ShapeType::Ranked(cur_dims) = &cur_shape
+                            && cur_dims.iter().all(|d| matches!(d, DimExpr::Known(_)))
+                        {
+                            let cur_numel: usize = cur_dims
+                                .iter()
+                                .map(|d| match d {
+                                    DimExpr::Known(n) => *n,
+                                    _ => 1,
+                                })
+                                .product();
+                            let target_numel: usize = target_dims
+                                .iter()
+                                .map(|d| match d {
+                                    DimExpr::Known(n) => *n,
+                                    _ => 1,
+                                })
+                                .product();
+                            if cur_numel != target_numel {
+                                return Err(vec![TypeError::UnificationFailure {
+                                    expected: format!(
+                                        "reshape target with {cur_numel} elements (matching source shape {cur_shape})"
+                                    ),
+                                    got: format!(
+                                        "shape {} with {target_numel} elements",
+                                        ShapeType::Ranked(target_dims)
+                                    ),
+                                    span: Some(span),
+                                }]);
+                            }
+                        }
+                        ShapeType::Ranked(target_dims)
+                    }
+                    None => ShapeType::Unranked(None),
+                };
+                Ok((
+                    Type::Tensor {
+                        dtype: Box::new(cur_dtype),
+                        shape: new_shape,
+                        device: cur_device,
+                    },
+                    acc_row,
+                ))
+            }
+            "transpose" => {
+                if args.len() > 2 {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: 2,
+                        actual: args.len(),
+                        span,
+                    }]);
+                }
+                let new_shape = match &cur_shape {
+                    ShapeType::Ranked(cur_dims) => {
+                        if cur_dims.len() < 2 {
+                            return Err(vec![TypeError::UnificationFailure {
+                                expected: "tensor with rank >= 2 for transpose()".to_string(),
+                                got: format!("rank {} ({cur_shape})", cur_dims.len()),
+                                span: Some(span),
+                            }]);
+                        }
+                        let ax0 = match args.first() {
+                            None => Some(cur_dims.len() - 2),
+                            Some(w) => Self::extract_static_int_literal(w)
+                                .filter(|&n| n >= 0)
+                                .map(|n| n as usize),
+                        };
+                        let ax1 = match args.get(1) {
+                            None => Some(cur_dims.len() - 1),
+                            Some(w) => Self::extract_static_int_literal(w)
+                                .filter(|&n| n >= 0)
+                                .map(|n| n as usize),
+                        };
+                        if let (Some(a0), Some(a1)) = (ax0, ax1) {
+                            if a0 >= cur_dims.len() || a1 >= cur_dims.len() {
+                                return Err(vec![TypeError::UnificationFailure {
+                                    expected: format!("transpose axes < rank {}", cur_dims.len()),
+                                    got: format!("axes ({a0}, {a1})"),
+                                    span: Some(span),
+                                }]);
+                            }
+                            let mut swapped = cur_dims.clone();
+                            swapped.swap(a0, a1);
+                            ShapeType::Ranked(swapped)
+                        } else {
+                            ShapeType::Unranked(None)
+                        }
+                    }
+                    other => other.clone(),
+                };
+                Ok((
+                    Type::Tensor {
+                        dtype: Box::new(cur_dtype),
+                        shape: new_shape,
+                        device: cur_device,
+                    },
+                    acc_row,
+                ))
+            }
+            "to_dtype" => {
+                if args.len() != 1 {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: 1,
+                        actual: args.len(),
+                        span,
+                    }]);
+                }
+                let new_dt = Self::parse_static_dtype_witness(args.first())?.unwrap_or(Type::Any);
+                Ok((
+                    Type::Tensor {
+                        dtype: Box::new(new_dt),
+                        shape: cur_shape,
+                        device: cur_device,
+                    },
+                    acc_row,
+                ))
+            }
+            "to_device" => {
+                if args.len() != 1 {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: 1,
+                        actual: args.len(),
+                        span,
+                    }]);
+                }
+                let new_dev = Self::parse_static_device_witness(args.first())?;
+                Ok((
+                    Type::Tensor {
+                        dtype: Box::new(cur_dtype),
+                        shape: cur_shape,
+                        device: new_dev,
+                    },
+                    acc_row,
+                ))
+            }
+            "to" => {
+                if args.is_empty() || args.len() > 2 {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: 1,
+                        actual: args.len(),
+                        span,
+                    }]);
+                }
+                let mut next_dt = cur_dtype;
+                let mut next_dev = cur_device;
+                for arg in args {
+                    if let WitnessKind::Literal(crate::common::Literal::String(s, _)) = &arg.kind {
+                        if let Some(dt) = crate::common::DType::from_name(s) {
+                            next_dt = Type::from_dtype(dt);
+                        } else if let Ok(dev) = crate::common::Device::parse(s) {
+                            next_dev = DeviceType::Concrete(dev);
+                        } else {
+                            return Err(vec![TypeError::InvalidLiteral {
+                                what: "tensor dtype or device".to_string(),
+                                value: s.clone(),
+                                span: Some(arg.span),
+                            }]);
+                        }
+                    } else {
+                        // Non-literal target: allocate a fresh device meta-variable instead of
+                        // silently widening to `DeviceType::Any`, preserving cross-device safety.
+                        let id = self.fresh_counter;
+                        self.fresh_counter += 1;
+                        next_dev = DeviceType::Var(TypeVarId::Meta(id));
+                    }
+                }
+                Ok((
+                    Type::Tensor {
+                        dtype: Box::new(next_dt),
+                        shape: cur_shape,
+                        device: next_dev,
+                    },
+                    acc_row,
+                ))
+            }
+            "fill_" | "add_" | "mul_" => {
+                if args.len() != 1 {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: 1,
+                        actual: args.len(),
+                        span,
+                    }]);
+                }
+                // Check 4 (Resource safety): forbid in-place mutation on gradient-tracked,
+                // view-aliased, or storage-aliased source tensors.
+                if let Some(recv_w) = receiver_witness {
+                    if self.expr_produces_grad_tensor(recv_w) {
+                        return Err(vec![TypeError::UnificationFailure {
+                            expected: "non-differentiable tensor for in-place mutation".to_string(),
+                            got: format!(
+                                "cannot perform in-place '{method}' on a gradient-tracked tensor (requires_grad=true)"
+                            ),
+                            span: Some(span),
+                        }]);
+                    }
+                    if self.expr_produces_tensor_view(recv_w) || self.expr_is_aliased_source(recv_w)
+                    {
+                        return Err(vec![TypeError::UnificationFailure {
+                            expected: "unique contiguous owning tensor for in-place mutation"
+                                .to_string(),
+                            got: format!(
+                                "cannot perform in-place '{method}' on an aliased or strided tensor view (call .contiguous() first)"
+                            ),
+                            span: Some(span),
+                        }]);
+                    }
+                    if let WitnessKind::Variable(v) = &recv_w.kind
+                        && let Some((param_names, mut_set)) = self.active_fn_mut_stack.last_mut()
+                        && let Some(pos) = param_names.iter().position(|p| p == v)
+                    {
+                        mut_set.insert(pos);
+                    }
+                }
+                // Check 1/2/3 (DType, Shape, Device) on the mutation operand.
+                let rhs_ty = self.subst.apply(&arg_types[0]);
+                if method == "fill_" {
+                    let _ = self.unify_tensor_dtypes(&cur_dtype, &rhs_ty, args[0].span)?;
+                } else {
+                    match &rhs_ty {
+                        Type::Tensor {
+                            dtype: d2,
+                            shape: s2,
+                            device: dev2,
+                        } => {
+                            let _ = self.unify_tensor_dtypes(&cur_dtype, d2, args[0].span)?;
+                            let _ = self.unify_tensor_devices(&cur_device, dev2, args[0].span)?;
+                            let rhs_dummy = Type::Tensor {
+                                dtype: Box::new(cur_dtype.clone()),
+                                shape: s2.clone(),
+                                device: cur_device.clone(),
+                            };
+                            let lhs_dummy = Type::Tensor {
+                                dtype: Box::new(cur_dtype.clone()),
+                                shape: cur_shape.clone(),
+                                device: cur_device.clone(),
+                            };
+                            match unify::solve_spanned(
+                                &SpannedConstraint::new(
+                                    Constraint::Eq(Box::new(lhs_dummy), Box::new(rhs_dummy)),
+                                    args[0].span,
+                                ),
+                                &self.subst,
+                            ) {
+                                Ok(new_s) => self.subst = new_s,
+                                Err(e) => return Err(vec![e]),
+                            }
+                        }
+                        _ => {
+                            let _ = self.unify_tensor_dtypes(&cur_dtype, &rhs_ty, args[0].span)?;
+                        }
+                    }
+                }
+                // Check 5 (Effect): record in-place tensor mutation effect in the active EffectRow.
+                acc_row = self.merge_rows(
+                    acc_row,
+                    crate::mir::effect::EffectRow::Cons(
+                        crate::mir::effect::ambient::TENSOR_MUTATE_LABEL.to_string(),
+                        Box::new(crate::mir::effect::EffectRow::Empty),
+                    ),
+                    span,
+                );
+                Ok((
+                    Type::Tensor {
+                        dtype: Box::new(self.subst.apply(&cur_dtype)),
+                        shape: self.subst.apply_shape(&cur_shape),
+                        device: self.subst.apply_device(&cur_device),
+                    },
+                    acc_row,
+                ))
+            }
+            _ => Err(vec![TypeError::UnificationFailure {
+                expected: "known Tensor method".to_string(),
+                got: format!("Tensor.{method}"),
+                span: Some(span),
+            }]),
+        }
+    }
+
+    /// Stage 3B: Native HM type inference for `linalg.*`, `math.*`, and `stats.*` calls
+    /// when invoked on `Type::Tensor` or hardware-width `Type::Scalar` operands.
+    fn try_infer_module_tensor_method(
+        &mut self,
+        module: &str,
+        method: &str,
+        args: &[MirWitness],
+        arg_types: &[Type],
+        acc_row: &crate::mir::effect::EffectRow,
+        span: Span,
+    ) -> Option<Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>>> {
+        let resolved: Vec<Type> = arg_types.iter().map(|t| self.subst.apply(t)).collect();
+        let has_tensor = resolved.iter().any(|t| matches!(t, Type::Tensor { .. }));
+        let has_scalar = resolved.iter().any(|t| matches!(t, Type::Scalar(_)));
+        if !has_tensor && !has_scalar {
+            return None;
+        }
+
+        match module {
+            "linalg" if has_tensor => match method {
+                "matmul" => {
+                    if args.len() != 2 {
+                        return Some(Err(vec![TypeError::ArityMismatch {
+                            expected: 2,
+                            actual: args.len(),
+                            span,
+                        }]));
+                    }
+                    Some(
+                        self.infer_tensor_matmul_op(&resolved[0], &resolved[1], span)
+                            .map(|ty| (ty, acc_row.clone())),
+                    )
+                }
+                "dot" => {
+                    if args.len() != 2 {
+                        return Some(Err(vec![TypeError::ArityMismatch {
+                            expected: 2,
+                            actual: args.len(),
+                            span,
+                        }]));
+                    }
+                    if let (Type::Tensor { shape: s1, .. }, Type::Tensor { shape: s2, .. }) =
+                        (&resolved[0], &resolved[1])
+                        && (matches!(s1, crate::typeck::ShapeType::Ranked(d) if d.len() != 1)
+                            || matches!(s2, crate::typeck::ShapeType::Ranked(d) if d.len() != 1))
+                    {
+                        return Some(Err(vec![TypeError::UnificationFailure {
+                            expected: "1D tensors for linalg.dot".to_string(),
+                            got: format!("{s1} and {s2}"),
+                            span: Some(span),
+                        }]));
+                    }
+                    Some(
+                        self.infer_tensor_matmul_op(&resolved[0], &resolved[1], span)
+                            .map(|ty| (ty, acc_row.clone())),
+                    )
+                }
+                "cross" => {
+                    if args.len() != 2 {
+                        return Some(Err(vec![TypeError::ArityMismatch {
+                            expected: 2,
+                            actual: args.len(),
+                            span,
+                        }]));
+                    }
+                    if let (
+                        Type::Tensor {
+                            dtype: d1,
+                            shape: s1,
+                            device: dev1,
+                        },
+                        Type::Tensor {
+                            dtype: d2,
+                            shape: s2,
+                            device: dev2,
+                        },
+                    ) = (&resolved[0], &resolved[1])
+                    {
+                        let out_dt = match self.unify_tensor_dtypes(d1, d2, span) {
+                            Ok(d) => d,
+                            Err(e) => return Some(Err(e)),
+                        };
+                        let out_dev = match self.unify_tensor_devices(dev1, dev2, span) {
+                            Ok(d) => d,
+                            Err(e) => return Some(Err(e)),
+                        };
+                        let expected_3 =
+                            crate::typeck::ShapeType::Ranked(vec![crate::typeck::DimExpr::Known(
+                                3,
+                            )]);
+                        if !s1.compatible_with(&expected_3) || !s2.compatible_with(&expected_3) {
+                            return Some(Err(vec![TypeError::UnificationFailure {
+                                expected: "1D tensors of shape [3] for linalg.cross".to_string(),
+                                got: format!("{s1} and {s2}"),
+                                span: Some(span),
+                            }]));
+                        }
+                        return Some(Ok((
+                            Type::Tensor {
+                                dtype: Box::new(out_dt),
+                                shape: expected_3,
+                                device: out_dev,
+                            },
+                            acc_row.clone(),
+                        )));
+                    }
+                    Some(Err(vec![TypeError::UnificationFailure {
+                        expected: "two 1D tensors of shape [3] for linalg.cross".to_string(),
+                        got: format!("{}, {}", resolved[0].name(), resolved[1].name()),
+                        span: Some(span),
+                    }]))
+                }
+                "transpose" => {
+                    if args.len() != 1 {
+                        return Some(Err(vec![TypeError::ArityMismatch {
+                            expected: 1,
+                            actual: args.len(),
+                            span,
+                        }]));
+                    }
+                    Some(self.infer_tensor_method_call(
+                        args.first(),
+                        &resolved[0],
+                        "transpose",
+                        &[],
+                        &[],
+                        acc_row.clone(),
+                        span,
+                    ))
+                }
+                "norm" => {
+                    if args.is_empty() || args.len() > 2 {
+                        return Some(Err(vec![TypeError::ArityMismatch {
+                            expected: 1,
+                            actual: args.len(),
+                            span,
+                        }]));
+                    }
+                    if let Type::Tensor { dtype, .. } = &resolved[0]
+                        && self
+                            .subst
+                            .apply(dtype)
+                            .as_dtype()
+                            .is_some_and(|d| d.is_bool())
+                    {
+                        return Some(Err(vec![TypeError::UnificationFailure {
+                            expected: "numeric tensor for linalg.norm".to_string(),
+                            got: resolved[0].name(),
+                            span: Some(span),
+                        }]));
+                    }
+                    Some(Ok((Type::Float, acc_row.clone())))
+                }
+                _ => None,
+            },
+            "math" => {
+                let is_unary = matches!(
+                    method,
+                    "sin"
+                        | "cos"
+                        | "tan"
+                        | "asin"
+                        | "acos"
+                        | "atan"
+                        | "sinh"
+                        | "cosh"
+                        | "tanh"
+                        | "exp"
+                        | "log"
+                        | "log2"
+                        | "log10"
+                        | "log1p"
+                        | "sqrt"
+                        | "cbrt"
+                        | "fract"
+                        | "abs"
+                        | "sign"
+                        | "floor"
+                        | "ceil"
+                        | "round"
+                        | "trunc"
+                );
+                let is_binary = matches!(method, "pow" | "hypot" | "atan2");
+                if is_unary && args.len() == 1 {
+                    match &resolved[0] {
+                        Type::Tensor {
+                            dtype,
+                            shape,
+                            device,
+                        } => {
+                            let dt_r = self.subst.apply(dtype);
+                            if dt_r.as_dtype().is_some_and(|d| d.is_bool()) {
+                                return Some(Err(vec![TypeError::UnificationFailure {
+                                    expected: format!("numeric tensor for math.{method}"),
+                                    got: resolved[0].name(),
+                                    span: Some(span),
+                                }]));
+                            }
+                            return Some(Ok((
+                                Type::Tensor {
+                                    dtype: Box::new(dt_r),
+                                    shape: self.subst.apply_shape(shape),
+                                    device: self.subst.apply_device(device),
+                                },
+                                acc_row.clone(),
+                            )));
+                        }
+                        Type::Scalar(dt) => {
+                            let ret = if dt.is_float()
+                                || matches!(
+                                    method,
+                                    "abs" | "sign" | "floor" | "ceil" | "round" | "trunc"
+                                ) {
+                                Type::Scalar(*dt)
+                            } else {
+                                Type::Float
+                            };
+                            return Some(Ok((ret, acc_row.clone())));
+                        }
+                        _ => return None,
+                    }
+                }
+                if is_binary && args.len() == 2 && has_tensor {
+                    return Some(
+                        self.infer_tensor_binary_op(&resolved[0], &resolved[1], span)
+                            .map(|ty| (ty, acc_row.clone())),
+                    );
+                }
+                if is_binary
+                    && args.len() == 2
+                    && let (Type::Scalar(d1), Type::Scalar(d2)) = (&resolved[0], &resolved[1])
+                    && d1 == d2
+                    && d1.is_float()
+                {
+                    return Some(Ok((Type::Scalar(*d1), acc_row.clone())));
+                }
+                None
+            }
+            "stats" if has_tensor => {
+                for (arg_w, ty) in args.iter().zip(resolved.iter()) {
+                    if let Type::Tensor { dtype, .. } = ty
+                        && self
+                            .subst
+                            .apply(dtype)
+                            .as_dtype()
+                            .is_some_and(|d| d.is_bool())
+                    {
+                        return Some(Err(vec![TypeError::UnificationFailure {
+                            expected: format!("numeric tensor for stats.{method}"),
+                            got: ty.name(),
+                            span: Some(arg_w.span),
+                        }]));
+                    }
+                }
+                match method {
+                    "sum" | "mean" | "median" | "var" | "stddev" | "min" | "max" => {
+                        if args.len() != 1 {
+                            return Some(Err(vec![TypeError::ArityMismatch {
+                                expected: 1,
+                                actual: args.len(),
+                                span,
+                            }]));
+                        }
+                        Some(Ok((Type::Float, acc_row.clone())))
+                    }
+                    "quantile" | "corr" | "cov" => {
+                        if args.len() != 2 {
+                            return Some(Err(vec![TypeError::ArityMismatch {
+                                expected: 2,
+                                actual: args.len(),
+                                span,
+                            }]));
+                        }
+                        Some(Ok((Type::Float, acc_row.clone())))
+                    }
+                    "histogram" => {
+                        if args.len() != 2 {
+                            return Some(Err(vec![TypeError::ArityMismatch {
+                                expected: 2,
+                                actual: args.len(),
+                                span,
+                            }]));
+                        }
+                        Some(Ok((
+                            Type::List(Box::new(Type::Dict(
+                                Box::new(Type::String),
+                                Box::new(Type::Float),
+                            ))),
+                            acc_row.clone(),
+                        )))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
     }
 }
 

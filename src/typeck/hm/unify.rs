@@ -7,13 +7,16 @@ use std::collections::{HashMap, HashSet};
 
 use super::error::TypeError;
 use crate::common::Span;
-use crate::typeck::{Type, TypeVarId};
+use crate::typeck::{DeviceType, DimExpr, ShapeType, Type, TypeVarId};
 
-/// Substitution mapping inference meta-variables and effect row variables.
+/// Substitution mapping inference meta-variables, effect row variables, and tensor shape/device variables.
 #[derive(Debug, Clone)]
 pub struct Substitution {
     mapping: HashMap<TypeVarId, Type>,
     row_mapping: HashMap<String, crate::mir::effect::EffectRow>,
+    dim_mapping: HashMap<u32, DimExpr>,
+    shape_mapping: HashMap<TypeVarId, ShapeType>,
+    device_mapping: HashMap<TypeVarId, DeviceType>,
 }
 
 impl Substitution {
@@ -21,6 +24,9 @@ impl Substitution {
         Self {
             mapping: HashMap::new(),
             row_mapping: HashMap::new(),
+            dim_mapping: HashMap::new(),
+            shape_mapping: HashMap::new(),
+            device_mapping: HashMap::new(),
         }
     }
 
@@ -34,6 +40,51 @@ impl Substitution {
 
     pub fn bind_row(&mut self, name: String, row: crate::mir::effect::EffectRow) {
         self.row_mapping.insert(name, row);
+    }
+
+    pub fn apply_dim(&self, dim: &DimExpr) -> DimExpr {
+        match dim {
+            DimExpr::Var(id) => {
+                if let Some(resolved) = self.dim_mapping.get(id)
+                    && resolved != dim
+                {
+                    return self.apply_dim(resolved);
+                }
+                dim.clone()
+            }
+            other => other.clone(),
+        }
+    }
+
+    pub fn apply_shape(&self, shape: &ShapeType) -> ShapeType {
+        match shape {
+            ShapeType::Ranked(dims) => {
+                ShapeType::Ranked(dims.iter().map(|d| self.apply_dim(d)).collect())
+            }
+            ShapeType::Unranked(Some(var)) => {
+                if let Some(resolved) = self.shape_mapping.get(var)
+                    && resolved != shape
+                {
+                    return self.apply_shape(resolved);
+                }
+                shape.clone()
+            }
+            ShapeType::Unranked(None) => ShapeType::Unranked(None),
+        }
+    }
+
+    pub fn apply_device(&self, device: &DeviceType) -> DeviceType {
+        match device {
+            DeviceType::Var(var) => {
+                if let Some(resolved) = self.device_mapping.get(var)
+                    && resolved != device
+                {
+                    return self.apply_device(resolved);
+                }
+                device.clone()
+            }
+            other => other.clone(),
+        }
     }
 
     /// Apply substitution transitively to a type, avoiding capture under `ForAll`.
@@ -127,6 +178,15 @@ impl Substitution {
                 Box::new(self.apply_with_bound(output, bound)),
                 crate::typeck::hm::row::apply_row(row, self),
             ),
+            Type::Tensor {
+                dtype,
+                shape,
+                device,
+            } => Type::Tensor {
+                dtype: Box::new(self.apply_with_bound(dtype, bound)),
+                shape: self.apply_shape(shape),
+                device: self.apply_device(device),
+            },
             _ => ty.clone(),
         }
     }
@@ -161,6 +221,9 @@ impl Substitution {
         Ok(Self {
             mapping: new_mapping,
             row_mapping: self.row_mapping.clone(),
+            dim_mapping: self.dim_mapping.clone(),
+            shape_mapping: self.shape_mapping.clone(),
+            device_mapping: self.device_mapping.clone(),
         })
     }
 
@@ -174,9 +237,24 @@ impl Substitution {
         for (k, v) in &other.row_mapping {
             new_rows.insert(k.clone(), crate::typeck::hm::row::apply_row(v, self));
         }
+        let mut new_dims = self.dim_mapping.clone();
+        for (k, v) in &other.dim_mapping {
+            new_dims.insert(*k, self.apply_dim(v));
+        }
+        let mut new_shapes = self.shape_mapping.clone();
+        for (k, v) in &other.shape_mapping {
+            new_shapes.insert(k.clone(), self.apply_shape(v));
+        }
+        let mut new_devices = self.device_mapping.clone();
+        for (k, v) in &other.device_mapping {
+            new_devices.insert(k.clone(), self.apply_device(v));
+        }
         Self {
             mapping: new_mapping,
             row_mapping: new_rows,
+            dim_mapping: new_dims,
+            shape_mapping: new_shapes,
+            device_mapping: new_devices,
         }
     }
 }
@@ -370,6 +448,15 @@ fn solve_numeric(
         (Type::Float, Type::Float) | (Type::Int, Type::Float) | (Type::Float, Type::Int) => {
             Type::Float
         }
+        (Type::Scalar(dt1), Type::Scalar(dt2)) if dt1 == dt2 => Type::Scalar(*dt1),
+        (Type::Tensor { .. }, Type::Tensor { .. }) => {
+            let s = unify_at(&left, &right, subst, span)?;
+            let res_ty = s.apply(&left);
+            if let Some(ref result) = bc.result {
+                return unify_at(&res_ty, result, &s, span);
+            }
+            return Ok(s);
+        }
         (Type::Float, u) | (u, Type::Float) if is_number_union(u) => Type::Float,
         (Type::Int, u) | (u, Type::Int) if is_number_union(u) => {
             Type::Union(vec![Type::Int, Type::Float])
@@ -380,6 +467,7 @@ fn solve_numeric(
         (Type::String, Type::String) if bc.allow_string => Type::String,
         (Type::Any, Type::Int) | (Type::Int, Type::Any) => Type::Int,
         (Type::Any, Type::Float) | (Type::Float, Type::Any) => Type::Float,
+        (Type::Any, Type::Scalar(dt)) | (Type::Scalar(dt), Type::Any) => Type::Scalar(*dt),
         (Type::Any, u) | (u, Type::Any) if is_number_union(u) => u.clone(),
         (Type::Any, Type::String) | (Type::String, Type::Any) if bc.allow_string => Type::String,
         (Type::Any, Type::Any) => Type::Any,
@@ -397,6 +485,23 @@ fn solve_numeric(
             let s = subst.extend_at(v.clone(), Type::Float, span)?;
             if let Some(ref result) = bc.result {
                 return unify_at(&Type::Float, result, &s, span);
+            }
+            return Ok(s);
+        }
+        (Type::TypeVar(v @ TypeVarId::Meta(_)), Type::Scalar(dt))
+        | (Type::Scalar(dt), Type::TypeVar(v @ TypeVarId::Meta(_))) => {
+            let sty = Type::Scalar(*dt);
+            let s = subst.extend_at(v.clone(), sty.clone(), span)?;
+            if let Some(ref result) = bc.result {
+                return unify_at(&sty, result, &s, span);
+            }
+            return Ok(s);
+        }
+        (Type::TypeVar(v @ TypeVarId::Meta(_)), t @ Type::Tensor { .. })
+        | (t @ Type::Tensor { .. }, Type::TypeVar(v @ TypeVarId::Meta(_))) => {
+            let s = subst.extend_at(v.clone(), t.clone(), span)?;
+            if let Some(ref result) = bc.result {
+                return unify_at(t, result, &s, span);
             }
             return Ok(s);
         }
@@ -447,6 +552,94 @@ fn solve_numeric(
         unify_at(&promoted, result, subst, span)
     } else {
         Ok(subst.clone())
+    }
+}
+
+fn unify_dim_at(
+    d1: &DimExpr,
+    d2: &DimExpr,
+    subst: &mut Substitution,
+    full_t1: &Type,
+    full_t2: &Type,
+    span: Option<Span>,
+) -> Result<(), TypeError> {
+    let a = subst.apply_dim(d1);
+    let b = subst.apply_dim(d2);
+    match (&a, &b) {
+        (DimExpr::Known(x), DimExpr::Known(y)) if x == y => Ok(()),
+        (DimExpr::Symbolic(s1), DimExpr::Symbolic(s2)) if s1 == s2 || s1 == "_" || s2 == "_" => {
+            Ok(())
+        }
+        (DimExpr::Symbolic(s), _) | (_, DimExpr::Symbolic(s)) if s == "_" => Ok(()),
+        (DimExpr::Var(id1), DimExpr::Var(id2)) if id1 == id2 => Ok(()),
+        (DimExpr::Var(id), other) | (other, DimExpr::Var(id)) => {
+            subst.dim_mapping.insert(*id, other.clone());
+            Ok(())
+        }
+        _ => Err(TypeError::UnificationFailure {
+            expected: format_type(&subst.apply(full_t1)),
+            got: format_type(&subst.apply(full_t2)),
+            span,
+        }),
+    }
+}
+
+fn unify_shape_at(
+    s1: &ShapeType,
+    s2: &ShapeType,
+    subst: &mut Substitution,
+    full_t1: &Type,
+    full_t2: &Type,
+    span: Option<Span>,
+) -> Result<(), TypeError> {
+    let a = subst.apply_shape(s1);
+    let b = subst.apply_shape(s2);
+    match (&a, &b) {
+        (ShapeType::Unranked(None), _) | (_, ShapeType::Unranked(None)) => Ok(()),
+        (ShapeType::Unranked(Some(v1)), ShapeType::Unranked(Some(v2))) if v1 == v2 => Ok(()),
+        (ShapeType::Unranked(Some(v @ TypeVarId::Meta(_))), other)
+        | (other, ShapeType::Unranked(Some(v @ TypeVarId::Meta(_)))) => {
+            subst.shape_mapping.insert(v.clone(), other.clone());
+            Ok(())
+        }
+        (ShapeType::Ranked(dims1), ShapeType::Ranked(dims2)) if dims1.len() == dims2.len() => {
+            for (d1, d2) in dims1.iter().zip(dims2.iter()) {
+                unify_dim_at(d1, d2, subst, full_t1, full_t2, span)?;
+            }
+            Ok(())
+        }
+        _ => Err(TypeError::UnificationFailure {
+            expected: format_type(&subst.apply(full_t1)),
+            got: format_type(&subst.apply(full_t2)),
+            span,
+        }),
+    }
+}
+
+fn unify_device_at(
+    dev1: &DeviceType,
+    dev2: &DeviceType,
+    subst: &mut Substitution,
+    full_t1: &Type,
+    full_t2: &Type,
+    span: Option<Span>,
+) -> Result<(), TypeError> {
+    let a = subst.apply_device(dev1);
+    let b = subst.apply_device(dev2);
+    match (&a, &b) {
+        (DeviceType::Any, _) | (_, DeviceType::Any) => Ok(()),
+        (DeviceType::Concrete(d1), DeviceType::Concrete(d2)) if d1 == d2 => Ok(()),
+        (DeviceType::Var(v1), DeviceType::Var(v2)) if v1 == v2 => Ok(()),
+        (DeviceType::Var(v @ TypeVarId::Meta(_)), other)
+        | (other, DeviceType::Var(v @ TypeVarId::Meta(_))) => {
+            subst.device_mapping.insert(v.clone(), other.clone());
+            Ok(())
+        }
+        _ => Err(TypeError::UnificationFailure {
+            expected: format_type(&subst.apply(full_t1)),
+            got: format_type(&subst.apply(full_t2)),
+            span,
+        }),
     }
 }
 
@@ -503,6 +696,23 @@ fn unify_at(
         }
         (Type::ForAll(_, inner), other) | (other, Type::ForAll(_, inner)) => {
             unify_at(inner, other, subst, span)
+        }
+        (
+            Type::Tensor {
+                dtype: d1,
+                shape: s1,
+                device: dev1,
+            },
+            Type::Tensor {
+                dtype: d2,
+                shape: s2,
+                device: dev2,
+            },
+        ) => {
+            let mut next = unify_at(d1, d2, subst, span)?;
+            unify_shape_at(s1, s2, &mut next, &t1, &t2, span)?;
+            unify_device_at(dev1, dev2, &mut next, &t1, &t2, span)?;
+            Ok(next)
         }
         (Type::Cons(h1, t1_rest), Type::Cons(h2, t2_rest)) => {
             let s1 = unify_at(h1, h2, subst, span)?;
@@ -584,7 +794,12 @@ fn unify_at(
             Ok(s3)
         }
         (Type::Union(members), other) | (other, Type::Union(members)) => {
-            if members.is_empty() || members.iter().any(|m| matches!(m, Type::Any)) {
+            if members.is_empty()
+                || members.iter().any(|m| matches!(m, Type::Any))
+                || (matches!(other, Type::Scalar(_))
+                    && members.contains(&Type::Int)
+                    && members.contains(&Type::Float))
+            {
                 Ok(subst.clone())
             } else {
                 let mut special_err: Option<TypeError> = None;
@@ -669,6 +884,12 @@ fn unify_subtype_at(
             Ok(s)
         }
         (_, Type::Union(members)) => {
+            if matches!(t_sub, Type::Scalar(_))
+                && members.contains(&Type::Int)
+                && members.contains(&Type::Float)
+            {
+                return Ok(subst.clone());
+            }
             let mut special_err: Option<TypeError> = None;
             for m in members {
                 match unify_subtype_at(&t_sub, m, subst, span) {
@@ -698,6 +919,24 @@ fn unify_subtype_at(
         }
         (Type::ForAll(_, inner), other) => unify_subtype_at(inner, other, subst, span),
         (other, Type::ForAll(_, inner)) => unify_subtype_at(other, inner, subst, span),
+        (
+            Type::Tensor {
+                dtype: d1,
+                shape: s1,
+                device: dev1,
+            },
+            Type::Tensor {
+                dtype: d2,
+                shape: s2,
+                device: dev2,
+            },
+        ) => {
+            // Tensor DType is invariant in memory representation.
+            let mut next = unify_at(d1, d2, subst, span)?;
+            unify_shape_at(s1, s2, &mut next, &t_sup, &t_sub, span)?;
+            unify_device_at(dev1, dev2, &mut next, &t_sup, &t_sub, span)?;
+            Ok(next)
+        }
         (Type::List(a), Type::List(b)) => unify_subtype_at(a, b, subst, span),
         // Channel<T> is INVARIANT in T because channels both receive and send.
         (Type::Channel(a), Type::Channel(b)) => unify_at(a, b, subst, span),
@@ -836,6 +1075,7 @@ fn contains_typevar_resolved(s: &Substitution, var: &TypeVarId, ty: &Type) -> bo
         Type::List(elem) | Type::Channel(elem) | Type::TaskHandle(elem) => {
             occurs_in_subst(s, var, elem)
         }
+        Type::Tensor { dtype, .. } => occurs_in_subst(s, var, dtype),
         Type::ForAll(bound, elem) => {
             if bound.contains(var) {
                 false

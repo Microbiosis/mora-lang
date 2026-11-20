@@ -207,6 +207,10 @@ impl HMInference {
             BuiltinOp::Print => Ok(curried_arrow(vec![Type::Any], Type::Nil)),
             BuiltinOp::Assert => Ok(curried_arrow(vec![Type::Bool], Type::Nil)),
             BuiltinOp::Not => Ok(curried_arrow(vec![Type::Bool], Type::Bool)),
+            BuiltinOp::Neg => {
+                let arg = self.fresh_type_var();
+                Ok(curried_arrow(vec![arg.clone()], arg))
+            }
             BuiltinOp::Length => {
                 let arg = self.fresh_type_var();
                 Ok(curried_arrow(vec![arg], Type::Int))

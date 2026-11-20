@@ -599,6 +599,14 @@ pub fn resolve_dyn_call(
         return resolve_builtin_call(id, core, args);
     }
 
+    if let Some(assoc) = name
+        .strip_prefix("Tensor::")
+        .or_else(|| name.strip_prefix("tensor::"))
+    {
+        return crate::value::tensor::call_tensor_associated(assoc, &args, core)
+            .map(CallAction::Done);
+    }
+
     if let Some(val) = core.environment.get(name) {
         return dispatch_named_callable(name, val, args, core);
     }

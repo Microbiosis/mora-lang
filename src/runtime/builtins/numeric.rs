@@ -32,9 +32,37 @@ pub(super) fn call_method_numeric(
 ) -> MoraResult<Value> {
     // ── 类型转换方法（不走 math.*）──
     match method {
+        "dtype" => {
+            let dt = match recv {
+                Value::Int(_) => crate::common::DType::I64,
+                Value::Float(_) => crate::common::DType::F64,
+                Value::Scalar(s) => s.dtype(),
+                _ => unreachable!(),
+            };
+            return Ok(Value::String(dt.short_name().to_string()));
+        }
+        "to_dtype" | "to" => {
+            let Some(Value::String(name)) = args.first() else {
+                return Err(MoraError::Runtime(format!(
+                    "{method}(dtype) requires a dtype string argument"
+                )));
+            };
+            let target_dt = crate::common::DType::from_name(name)
+                .ok_or_else(|| MoraError::Runtime(format!("{method}: unknown dtype '{name}'")))?;
+            let val_f64 = match recv {
+                Value::Int(n) => *n as f64,
+                Value::Float(f) => *f,
+                Value::Scalar(s) => s.as_f64(),
+                _ => 0.0,
+            };
+            return Ok(crate::value::tensor::scalar_value_for_dtype(
+                val_f64, target_dt,
+            ));
+        }
         "to_float" => match recv {
             Value::Int(n) => return Ok(Value::Float(*n as f64)),
             Value::Float(_) => return Ok(recv.clone()),
+            Value::Scalar(s) => return Ok(Value::Float(s.as_f64())),
             _ => {}
         },
         "to_int" => match recv {
@@ -47,6 +75,18 @@ pub(super) fn call_method_numeric(
                 return Ok(Value::Int(*f as i64));
             }
             Value::Int(_) => return Ok(recv.clone()),
+            Value::Scalar(s) => {
+                if let Some(n) = s.as_i64() {
+                    return Ok(Value::Int(n));
+                }
+                let f = s.as_f64();
+                if f.is_nan() || f.is_infinite() {
+                    return Err(MoraError::Runtime(
+                        "to_int: NaN/Inf cannot convert to int".to_string(),
+                    ));
+                }
+                return Ok(Value::Int(f as i64));
+            }
             _ => {}
         },
         _ => {}

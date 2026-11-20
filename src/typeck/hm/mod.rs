@@ -95,6 +95,16 @@ pub struct HMInference {
     pub inferred_spans: HashMap<Span, Type>,
     /// Lexical bindings `(span, name, raw_type)` recorded in declaration order.
     pub recorded_bindings: Vec<(Span, String, Type)>,
+    /// Stage 3B: Tensors statically known to have `requires_grad = true` in the active lexical scope.
+    pub grad_tracked_tensors: HashSet<String>,
+    /// Stage 3B: Tensors statically known to be zero-copy strided views (`transpose`/`reshape`/slice) in the active lexical scope.
+    pub view_aliased_tensors: HashSet<String>,
+    /// Stage 3B: Source tensor variables whose underlying `TensorStorage` has been aliased by a view.
+    pub aliased_source_tensors: HashSet<String>,
+    /// Stage 3B: Inter-procedural map `fn_name -> [param_indices]` mutated in-place via `fill_`/`add_`/`mul_`.
+    pub fn_mutates_tensor_params: HashMap<String, Vec<usize>>,
+    /// Stage 3B: Stack of active function parameter tables `(param_names, mutated_indices)` for tracking in-place mutations inside `FnDef`.
+    pub active_fn_mut_stack: Vec<(Vec<String>, HashSet<usize>)>,
 }
 
 impl HMInference {
@@ -312,7 +322,173 @@ impl HMInference {
                 Box::new(self.instantiate_ty(output, quantified, remap)),
                 crate::typeck::hm::row::rename_row(row, &mut self.fresh_vars),
             ),
+            Type::Tensor {
+                dtype,
+                shape,
+                device,
+            } => {
+                let new_dtype = Box::new(self.instantiate_ty(dtype, quantified, remap));
+                let new_shape = match shape {
+                    crate::typeck::ShapeType::Unranked(Some(id)) => {
+                        if quantified.contains(id) {
+                            let fresh = match remap.get(id) {
+                                Some(f) => f.clone(),
+                                None => {
+                                    let f = self.fresh_type_var_id();
+                                    remap.insert(id.clone(), f.clone());
+                                    f
+                                }
+                            };
+                            crate::typeck::ShapeType::Unranked(Some(fresh))
+                        } else {
+                            crate::typeck::ShapeType::Unranked(Some(id.clone()))
+                        }
+                    }
+                    crate::typeck::ShapeType::Unranked(None) => {
+                        crate::typeck::ShapeType::Unranked(None)
+                    }
+                    crate::typeck::ShapeType::Ranked(dims) => {
+                        let mut new_dims = Vec::with_capacity(dims.len());
+                        for d in dims {
+                            let nd = match d {
+                                crate::typeck::DimExpr::Known(n) => {
+                                    crate::typeck::DimExpr::Known(*n)
+                                }
+                                crate::typeck::DimExpr::Var(id) => {
+                                    let vid = TypeVarId::Meta(*id);
+                                    if quantified.contains(&vid) {
+                                        let fresh = match remap.get(&vid) {
+                                            Some(f) => f.clone(),
+                                            None => {
+                                                let f = self.fresh_type_var_id();
+                                                remap.insert(vid, f.clone());
+                                                f
+                                            }
+                                        };
+                                        match fresh {
+                                            TypeVarId::Meta(nid) => {
+                                                crate::typeck::DimExpr::Var(nid)
+                                            }
+                                            TypeVarId::Rigid(s) => {
+                                                crate::typeck::DimExpr::Symbolic(s)
+                                            }
+                                        }
+                                    } else {
+                                        crate::typeck::DimExpr::Var(*id)
+                                    }
+                                }
+                                crate::typeck::DimExpr::Symbolic(sym) => {
+                                    if sym == "_" {
+                                        match self.fresh_type_var_id() {
+                                            TypeVarId::Meta(nid) => {
+                                                crate::typeck::DimExpr::Var(nid)
+                                            }
+                                            TypeVarId::Rigid(s) => {
+                                                crate::typeck::DimExpr::Symbolic(s)
+                                            }
+                                        }
+                                    } else {
+                                        let vid = TypeVarId::Rigid(sym.clone());
+                                        if quantified.contains(&vid) {
+                                            let fresh = match remap.get(&vid) {
+                                                Some(f) => f.clone(),
+                                                None => {
+                                                    let f = self.fresh_type_var_id();
+                                                    remap.insert(vid, f.clone());
+                                                    f
+                                                }
+                                            };
+                                            match fresh {
+                                                TypeVarId::Meta(nid) => {
+                                                    crate::typeck::DimExpr::Var(nid)
+                                                }
+                                                TypeVarId::Rigid(s) => {
+                                                    crate::typeck::DimExpr::Symbolic(s)
+                                                }
+                                            }
+                                        } else {
+                                            crate::typeck::DimExpr::Symbolic(sym.clone())
+                                        }
+                                    }
+                                }
+                            };
+                            new_dims.push(nd);
+                        }
+                        crate::typeck::ShapeType::Ranked(new_dims)
+                    }
+                };
+                let new_device = match device {
+                    crate::typeck::DeviceType::Var(id) => {
+                        if quantified.contains(id) {
+                            let fresh = match remap.get(id) {
+                                Some(f) => f.clone(),
+                                None => {
+                                    let f = self.fresh_type_var_id();
+                                    remap.insert(id.clone(), f.clone());
+                                    f
+                                }
+                            };
+                            crate::typeck::DeviceType::Var(fresh)
+                        } else {
+                            crate::typeck::DeviceType::Var(id.clone())
+                        }
+                    }
+                    other => other.clone(),
+                };
+                Type::Tensor {
+                    dtype: new_dtype,
+                    shape: new_shape,
+                    device: new_device,
+                }
+            }
             _ => ty.clone(),
+        }
+    }
+
+    /// Replace `_` wildcard dimensions inside a type annotation with fresh dimension inference variables.
+    pub(super) fn instantiate_wildcards(&mut self, ty: &Type) -> Type {
+        match ty {
+            Type::Tensor {
+                dtype,
+                shape,
+                device,
+            } => {
+                let new_dtype = Box::new(self.instantiate_wildcards(dtype));
+                let new_shape = match shape {
+                    crate::typeck::ShapeType::Ranked(dims) => {
+                        let mut out = Vec::with_capacity(dims.len());
+                        for d in dims {
+                            if matches!(d, crate::typeck::DimExpr::Symbolic(s) if s == "_") {
+                                if let TypeVarId::Meta(nid) = self.fresh_type_var_id() {
+                                    out.push(crate::typeck::DimExpr::Var(nid));
+                                } else {
+                                    out.push(d.clone());
+                                }
+                            } else {
+                                out.push(d.clone());
+                            }
+                        }
+                        crate::typeck::ShapeType::Ranked(out)
+                    }
+                    other => other.clone(),
+                };
+                Type::Tensor {
+                    dtype: new_dtype,
+                    shape: new_shape,
+                    device: device.clone(),
+                }
+            }
+            Type::List(e) => Type::List(Box::new(self.instantiate_wildcards(e))),
+            Type::Channel(e) => Type::Channel(Box::new(self.instantiate_wildcards(e))),
+            Type::TaskHandle(e) => Type::TaskHandle(Box::new(self.instantiate_wildcards(e))),
+            Type::Dict(k, v) => Type::Dict(
+                Box::new(self.instantiate_wildcards(k)),
+                Box::new(self.instantiate_wildcards(v)),
+            ),
+            Type::Union(ms) => {
+                Type::Union(ms.iter().map(|m| self.instantiate_wildcards(m)).collect())
+            }
+            other => other.clone(),
         }
     }
 
@@ -365,6 +541,11 @@ impl HMInference {
         self.errors.clear();
         self.inferred_spans.clear();
         self.recorded_bindings.clear();
+        self.grad_tracked_tensors.clear();
+        self.view_aliased_tensors.clear();
+        self.aliased_source_tensors.clear();
+        self.fn_mutates_tensor_params.clear();
+        self.active_fn_mut_stack.clear();
         let mut errors: Vec<TypeError> = Vec::new();
         self.seed_ambient_effect_signatures();
         self.precompute_type_defs(exprs);
@@ -516,6 +697,15 @@ impl HMInference {
                 Box::new(self.resolve_type_aliases_inner(h, visiting)),
                 Box::new(self.resolve_type_aliases_inner(t, visiting)),
             ),
+            Type::Tensor {
+                dtype,
+                shape,
+                device,
+            } => Type::Tensor {
+                dtype: Box::new(self.resolve_type_aliases_inner(dtype, visiting)),
+                shape: shape.clone(),
+                device: device.clone(),
+            },
             other => other.clone(),
         }
     }
@@ -646,13 +836,18 @@ impl HMInference {
                     self.fn_placeholders
                         .insert(name.clone(), (param_types.clone(), ret.clone()));
                     let ty = Type::curried_arrow(&param_types, ret, &eff_row);
-                    let ty = if type_params.is_empty() {
+                    let mut rigids: Vec<TypeVarId> = type_params
+                        .iter()
+                        .map(|p| TypeVarId::Rigid(p.clone()))
+                        .collect();
+                    for v in env::collect_type_vars(&ty) {
+                        if matches!(v, TypeVarId::Rigid(_)) && !rigids.contains(&v) {
+                            rigids.push(v);
+                        }
+                    }
+                    let ty = if rigids.is_empty() {
                         ty
                     } else {
-                        let rigids = type_params
-                            .iter()
-                            .map(|p| TypeVarId::Rigid(p.clone()))
-                            .collect();
                         Type::ForAll(rigids, Box::new(ty))
                     };
                     self.env.add(name.clone(), ty);
@@ -833,6 +1028,13 @@ impl HMInference {
                         for a in args.iter().rev() {
                             stack.push(Task::Visit(a));
                         }
+                        if matches!(method.as_str(), "fill_" | "add_" | "mul_") {
+                            let r = EffectRow::Cons(
+                                crate::mir::effect::ambient::TENSOR_MUTATE_LABEL.to_string(),
+                                Box::new(EffectRow::Empty),
+                            );
+                            cur_row = Self::union_effect_rows(&cur_row, &r);
+                        }
                         match &receiver.kind {
                             WitnessKind::Variable(n) if n == "random" => {
                                 if let Some(l) =
@@ -993,6 +1195,14 @@ impl HMInference {
                 | WitnessKind::And { .. }
                 | WitnessKind::Pipe { .. }
                 | WitnessKind::MethodCall { .. }
+        ) || matches!(
+            &expr.kind,
+            WitnessKind::Call {
+                callee: WitnessCallee::Builtin(
+                    crate::mir::witness::BuiltinOp::Neg | crate::mir::witness::BuiltinOp::Not
+                ),
+                args,
+            } if args.len() == 1
         ) {
             self.infer_infix_chain(expr)?
         } else {
@@ -1012,6 +1222,13 @@ impl HMInference {
 
         enum ChainTask<'w> {
             Eval(&'w MirWitness),
+            ApplyUnaryNeg {
+                span: Span,
+            },
+            ApplyUnaryNot {
+                arg_span: Span,
+                span: Span,
+            },
             ApplyBinary {
                 op: &'w BinaryOp,
                 span: Span,
@@ -1034,6 +1251,7 @@ impl HMInference {
                 span: Span,
             },
             ApplyMethodCall {
+                receiver: &'w MirWitness,
                 recv_module_name: Option<&'w str>,
                 method: &'w str,
                 args: &'w [MirWitness],
@@ -1047,6 +1265,23 @@ impl HMInference {
         while let Some(task) = tasks.pop() {
             match task {
                 ChainTask::Eval(w) => match &w.kind {
+                    WitnessKind::Call {
+                        callee: WitnessCallee::Builtin(crate::mir::witness::BuiltinOp::Neg),
+                        args,
+                    } if args.len() == 1 => {
+                        tasks.push(ChainTask::ApplyUnaryNeg { span: w.span });
+                        tasks.push(ChainTask::Eval(&args[0]));
+                    }
+                    WitnessKind::Call {
+                        callee: WitnessCallee::Builtin(crate::mir::witness::BuiltinOp::Not),
+                        args,
+                    } if args.len() == 1 => {
+                        tasks.push(ChainTask::ApplyUnaryNot {
+                            arg_span: args[0].span,
+                            span: w.span,
+                        });
+                        tasks.push(ChainTask::Eval(&args[0]));
+                    }
                     WitnessKind::Binary { left, op, right } => {
                         tasks.push(ChainTask::ApplyBinary { op, span: w.span });
                         tasks.push(ChainTask::Eval(right));
@@ -1102,6 +1337,7 @@ impl HMInference {
                             _ => None,
                         };
                         tasks.push(ChainTask::ApplyMethodCall {
+                            receiver,
                             recv_module_name,
                             method,
                             args,
@@ -1115,6 +1351,61 @@ impl HMInference {
                         vals.push(res);
                     }
                 },
+                ChainTask::ApplyUnaryNeg { span } => {
+                    let (arg_ty, arg_row) = vals.pop().expect("unary neg arg present");
+                    let resolved = self.subst.apply(&arg_ty);
+                    let out_ty = match &resolved {
+                        Type::Error => Type::Error,
+                        Type::Int | Type::Float | Type::Any | Type::TypeVar(_) => resolved,
+                        Type::Scalar(dt) => {
+                            if dt.is_unsigned_int() || dt.is_bool() {
+                                return Err(vec![TypeError::UnificationFailure {
+                                    expected: "signed numeric type for unary '-'".to_string(),
+                                    got: resolved.name(),
+                                    span: Some(span),
+                                }]);
+                            }
+                            resolved
+                        }
+                        Type::Tensor { dtype, .. } => {
+                            let dt_resolved = self.subst.apply(dtype);
+                            if let Some(dt) = dt_resolved.as_dtype()
+                                && (dt.is_unsigned_int() || dt.is_bool())
+                            {
+                                return Err(vec![TypeError::UnificationFailure {
+                                    expected: "signed numeric Tensor DType for unary '-'"
+                                        .to_string(),
+                                    got: resolved.name(),
+                                    span: Some(span),
+                                }]);
+                            }
+                            resolved
+                        }
+                        _ => {
+                            return Err(vec![TypeError::UnificationFailure {
+                                expected: "numeric type or Tensor for unary '-'".to_string(),
+                                got: resolved.name(),
+                                span: Some(span),
+                            }]);
+                        }
+                    };
+                    self.record_span_type(span, &out_ty);
+                    vals.push((out_ty, arg_row));
+                }
+                ChainTask::ApplyUnaryNot { arg_span, span } => {
+                    let (arg_ty, arg_row) = vals.pop().expect("unary not arg present");
+                    if !matches!(arg_ty, Type::Error) {
+                        self.constraints.push(SpannedConstraint::new(
+                            Constraint::Subtype {
+                                sub: Box::new(arg_ty),
+                                sup: Box::new(Type::Bool),
+                            },
+                            arg_span,
+                        ));
+                    }
+                    self.record_span_type(span, &Type::Bool);
+                    vals.push((Type::Bool, arg_row));
+                }
                 ChainTask::ApplyBinary { op, span } => {
                     let (right_ty, right_row) = vals.pop().expect("rhs value present");
                     let (left_ty, left_row) = vals.pop().expect("lhs value present");
@@ -1188,6 +1479,7 @@ impl HMInference {
                     vals.push(res);
                 }
                 ChainTask::ApplyMethodCall {
+                    receiver,
                     recv_module_name,
                     method,
                     args,
@@ -1195,6 +1487,7 @@ impl HMInference {
                 } => {
                     let (recv_ty, recv_row) = vals.pop().expect("method receiver present");
                     let res = self.infer_method_call_with_recv(
+                        Some(receiver),
                         recv_ty,
                         recv_row,
                         recv_module_name,
@@ -1814,7 +2107,9 @@ fn infer_lit(lit: &crate::common::Literal) -> Type {
     use crate::common::Literal;
     match lit {
         Literal::Int(_, _) => Type::Int,
+        Literal::TypedInt(_, dt, _) => Type::from_dtype(*dt),
         Literal::Float(_, _) => Type::Float,
+        Literal::TypedFloat(_, dt, _) => Type::from_dtype(*dt),
         Literal::String(_, _) => Type::String,
         Literal::Char(_, _) => Type::Char,
         Literal::Bool(_, _) => Type::Bool,

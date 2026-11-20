@@ -6,6 +6,8 @@
 
 use std::fmt;
 
+use crate::common::Span;
+
 /// Unified error type across Mora compilation, typechecking, VM, concurrency, and async I/O layers.
 ///
 /// v0.75.98 introduced the initial 4-variant pilot (`Typeck`, `Io`, `Serialization`, `Other`);
@@ -35,9 +37,59 @@ pub enum MoraError {
     Serialization(String),
     /// Generic catch-all error.
     Other(String),
+    /// Structured source-spanned wrapper attaching an exact [`Span`] to any [`MoraError`].
+    Spanned { span: Span, source: Box<MoraError> },
 }
 
 impl MoraError {
+    /// Attach a structured source [`Span`] to this error.
+    pub fn with_span(self, span: Span) -> Self {
+        Self::Spanned {
+            span,
+            source: Box::new(self),
+        }
+    }
+
+    /// Extract the attached source [`Span`], if any.
+    pub fn span(&self) -> Option<Span> {
+        match self {
+            Self::Spanned { span, .. } => Some(*span),
+            _ => None,
+        }
+    }
+
+    /// Convert a structured [`crate::typeck::TypeError`] into a spanned [`MoraError`].
+    pub fn from_type_error(err: &crate::typeck::TypeError) -> Self {
+        let formatted = crate::typeck::format_error(err);
+        let base = Self::Typeck(formatted);
+        if err.line > 0 {
+            base.with_span(Span::new(err.line, err.column))
+        } else {
+            base
+        }
+    }
+
+    /// Aggregate a slice of [`crate::typeck::TypeError`] diagnostics into a single [`MoraError`],
+    /// preserving the first diagnostic's [`Span`].
+    pub fn from_type_errors(errs: &[crate::typeck::TypeError]) -> Self {
+        if errs.len() == 1 {
+            return Self::from_type_error(&errs[0]);
+        }
+        let joined = errs
+            .iter()
+            .map(crate::typeck::format_error)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let base = Self::Typeck(joined);
+        if let Some(first) = errs.first()
+            && first.line > 0
+        {
+            base.with_span(Span::new(first.line, first.column))
+        } else {
+            base
+        }
+    }
+
     /// Stable lowercase variant identifier for diagnostics and telemetry.
     pub fn kind_name(&self) -> &'static str {
         match self {
@@ -51,6 +103,7 @@ impl MoraError {
             Self::Io(_) => "io",
             Self::Serialization(_) => "serialization",
             Self::Other(_) => "other",
+            Self::Spanned { source, .. } => source.kind_name(),
         }
     }
 
@@ -67,29 +120,43 @@ impl MoraError {
             | Self::Io(msg)
             | Self::Serialization(msg)
             | Self::Other(msg) => msg,
+            Self::Spanned { source, .. } => source.message(),
         }
     }
 
-    /// Return a new error with `prefix` prepended while preserving the structured variant.
+    /// Return a new error with `prefix` prepended while preserving the structured variant and span.
     pub fn with_prefix(&self, prefix: &str) -> Self {
-        let prefixed = format!("{prefix}{}", self.message());
         match self {
-            Self::Parse(_) => Self::Parse(prefixed),
-            Self::Typeck(_) => Self::Typeck(prefixed),
-            Self::Runtime(_) => Self::Runtime(prefixed),
-            Self::Task(_) => Self::Task(prefixed),
-            Self::Channel(_) => Self::Channel(prefixed),
-            Self::Cancelled(_) => Self::Cancelled(prefixed),
-            Self::Timeout(_) => Self::Timeout(prefixed),
-            Self::Io(_) => Self::Io(prefixed),
-            Self::Serialization(_) => Self::Serialization(prefixed),
-            Self::Other(_) => Self::Other(prefixed),
+            Self::Spanned { span, source } => Self::Spanned {
+                span: *span,
+                source: Box::new(source.with_prefix(prefix)),
+            },
+            _ => {
+                let prefixed = format!("{prefix}{}", self.message());
+                match self {
+                    Self::Parse(_) => Self::Parse(prefixed),
+                    Self::Typeck(_) => Self::Typeck(prefixed),
+                    Self::Runtime(_) => Self::Runtime(prefixed),
+                    Self::Task(_) => Self::Task(prefixed),
+                    Self::Channel(_) => Self::Channel(prefixed),
+                    Self::Cancelled(_) => Self::Cancelled(prefixed),
+                    Self::Timeout(_) => Self::Timeout(prefixed),
+                    Self::Io(_) => Self::Io(prefixed),
+                    Self::Serialization(_) => Self::Serialization(prefixed),
+                    Self::Other(_) => Self::Other(prefixed),
+                    Self::Spanned { .. } => unreachable!(),
+                }
+            }
         }
     }
 
     /// True if this error represents cooperative cancellation or deadline expiration.
     pub fn is_cancellation_or_timeout(&self) -> bool {
-        matches!(self, Self::Cancelled(_) | Self::Timeout(_))
+        match self {
+            Self::Cancelled(_) | Self::Timeout(_) => true,
+            Self::Spanned { source, .. } => source.is_cancellation_or_timeout(),
+            _ => false,
+        }
     }
 }
 
@@ -106,7 +173,14 @@ impl fmt::Display for MoraError {
             Self::Io(msg) => write!(f, "io error: {}", msg),
             Self::Serialization(msg) => write!(f, "serialization error: {}", msg),
             Self::Other(msg) => write!(f, "{}", msg),
+            Self::Spanned { source, .. } => write!(f, "{source}"),
         }
+    }
+}
+
+impl From<crate::typeck::TypeError> for MoraError {
+    fn from(err: crate::typeck::TypeError) -> Self {
+        Self::from_type_error(&err)
     }
 }
 

@@ -88,7 +88,7 @@ fn ev(body: &str) -> (i32, String) {
                 && !l.starts_with("AI:")
                 && !l.starts_with("AI 原语")
                 && !l.starts_with("显式 API")
-                && !l.starts_with("Trait 系统")
+                && !l.starts_with("Trait 系统") && !l.starts_with("并发与抽象")
                 && !l.starts_with("类型与执行")
                 && !l.starts_with("Built-in")
                 && !l.starts_with("v0.15 CLI")

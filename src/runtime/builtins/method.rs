@@ -523,6 +523,13 @@ pub(crate) fn eval_pure_method(
             args,
             false,
         )),
+        Value::Scalar(s) => Some(super::numeric::call_method_numeric(
+            &Value::Scalar(*s),
+            method,
+            args,
+            s.dtype().is_int(),
+        )),
+        Value::Tensor(t) => Some(crate::value::tensor::call_tensor_method(t, method, args)),
         _ => Some(Err(MoraError::Runtime(
             "Can only call methods on lists, dicts, strings, numbers, or builtin objects"
                 .to_string(),

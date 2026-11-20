@@ -34,6 +34,7 @@ pub const RUNTIME_BUILTIN_NAMES: &[&str] = &[
     "str",
     "swap",
     "tail",
+    "tensor",
     "type_of",
     "uncurry",
 ];

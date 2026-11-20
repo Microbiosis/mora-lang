@@ -136,6 +136,57 @@ pub(crate) fn remap_type_vars(ty: &Type, mapping: &HashMap<TypeVarId, TypeVarId>
                 .collect();
             Type::ForAll(bound.clone(), Box::new(remap_type_vars(inner, &filtered)))
         }
+        Type::Tensor {
+            dtype,
+            shape,
+            device,
+        } => {
+            let new_dtype = Box::new(remap_type_vars(dtype, mapping));
+            let new_shape = match shape {
+                crate::typeck::ShapeType::Unranked(Some(v)) => crate::typeck::ShapeType::Unranked(
+                    Some(mapping.get(v).cloned().unwrap_or_else(|| v.clone())),
+                ),
+                crate::typeck::ShapeType::Unranked(None) => {
+                    crate::typeck::ShapeType::Unranked(None)
+                }
+                crate::typeck::ShapeType::Ranked(dims) => crate::typeck::ShapeType::Ranked(
+                    dims.iter()
+                        .map(|d| match d {
+                            crate::typeck::DimExpr::Known(n) => crate::typeck::DimExpr::Known(*n),
+                            crate::typeck::DimExpr::Var(id) => {
+                                match mapping.get(&TypeVarId::Meta(*id)) {
+                                    Some(TypeVarId::Meta(nid)) => crate::typeck::DimExpr::Var(*nid),
+                                    Some(TypeVarId::Rigid(sym)) => {
+                                        crate::typeck::DimExpr::Symbolic(sym.clone())
+                                    }
+                                    None => crate::typeck::DimExpr::Var(*id),
+                                }
+                            }
+                            crate::typeck::DimExpr::Symbolic(sym) => {
+                                match mapping.get(&TypeVarId::Rigid(sym.clone())) {
+                                    Some(TypeVarId::Meta(nid)) => crate::typeck::DimExpr::Var(*nid),
+                                    Some(TypeVarId::Rigid(nsym)) => {
+                                        crate::typeck::DimExpr::Symbolic(nsym.clone())
+                                    }
+                                    None => crate::typeck::DimExpr::Symbolic(sym.clone()),
+                                }
+                            }
+                        })
+                        .collect(),
+                ),
+            };
+            let new_device = match device {
+                crate::typeck::DeviceType::Var(v) => crate::typeck::DeviceType::Var(
+                    mapping.get(v).cloned().unwrap_or_else(|| v.clone()),
+                ),
+                other => other.clone(),
+            };
+            Type::Tensor {
+                dtype: new_dtype,
+                shape: new_shape,
+                device: new_device,
+            }
+        }
         _ => ty.clone(),
     }
 }
@@ -223,6 +274,66 @@ fn instantiate_ty(
                 next_mapping.insert(v.clone(), fresh_id());
             }
             instantiate_ty(inner, &next_mapping, fresh_id)
+        }
+        Type::Tensor {
+            dtype,
+            shape,
+            device,
+        } => {
+            let new_dtype = Box::new(instantiate_ty(dtype, mapping, fresh_id));
+            let new_shape = match shape {
+                crate::typeck::ShapeType::Unranked(Some(v)) => crate::typeck::ShapeType::Unranked(
+                    Some(mapping.get(v).cloned().unwrap_or_else(|| v.clone())),
+                ),
+                crate::typeck::ShapeType::Unranked(None) => {
+                    crate::typeck::ShapeType::Unranked(None)
+                }
+                crate::typeck::ShapeType::Ranked(dims) => crate::typeck::ShapeType::Ranked(
+                    dims.iter()
+                        .map(|d| match d {
+                            crate::typeck::DimExpr::Known(n) => crate::typeck::DimExpr::Known(*n),
+                            crate::typeck::DimExpr::Var(id) => {
+                                match mapping.get(&TypeVarId::Meta(*id)) {
+                                    Some(TypeVarId::Meta(nid)) => crate::typeck::DimExpr::Var(*nid),
+                                    Some(TypeVarId::Rigid(sym)) => {
+                                        crate::typeck::DimExpr::Symbolic(sym.clone())
+                                    }
+                                    None => crate::typeck::DimExpr::Var(*id),
+                                }
+                            }
+                            crate::typeck::DimExpr::Symbolic(sym) => {
+                                if sym == "_" {
+                                    match fresh_id() {
+                                        TypeVarId::Meta(nid) => crate::typeck::DimExpr::Var(nid),
+                                        TypeVarId::Rigid(s) => crate::typeck::DimExpr::Symbolic(s),
+                                    }
+                                } else {
+                                    match mapping.get(&TypeVarId::Rigid(sym.clone())) {
+                                        Some(TypeVarId::Meta(nid)) => {
+                                            crate::typeck::DimExpr::Var(*nid)
+                                        }
+                                        Some(TypeVarId::Rigid(nsym)) => {
+                                            crate::typeck::DimExpr::Symbolic(nsym.clone())
+                                        }
+                                        None => crate::typeck::DimExpr::Symbolic(sym.clone()),
+                                    }
+                                }
+                            }
+                        })
+                        .collect(),
+                ),
+            };
+            let new_device = match device {
+                crate::typeck::DeviceType::Var(v) => crate::typeck::DeviceType::Var(
+                    mapping.get(v).cloned().unwrap_or_else(|| v.clone()),
+                ),
+                other => other.clone(),
+            };
+            Type::Tensor {
+                dtype: new_dtype,
+                shape: new_shape,
+                device: new_device,
+            }
         }
         _ => ty.clone(),
     }

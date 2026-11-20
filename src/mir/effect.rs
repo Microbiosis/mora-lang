@@ -140,6 +140,9 @@ pub mod ambient {
         "random_shuffle",
     ];
 
+    /// Stage 3B: Ambient effect label for in-place tensor storage mutation (`fill_`, `add_`, `mul_`).
+    pub const TENSOR_MUTATE_LABEL: &str = "tensor_mutate";
+
     /// `random.<method>(...)` 调用对应的 ambient effect 标签。
     /// 未知方法返回 None（调用方报 unknown method）。
     pub fn random_label_for_method(method: &str) -> Option<&'static str> {
@@ -156,7 +159,7 @@ pub mod ambient {
 
     /// 标签是否属于 ambient 集合（运行时根 handler 已兜底）。
     pub fn is_ambient_label(label: &str) -> bool {
-        RANDOM_LABELS.contains(&label)
+        RANDOM_LABELS.contains(&label) || label == TENSOR_MUTATE_LABEL
     }
 }
 

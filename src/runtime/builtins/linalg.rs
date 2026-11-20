@@ -10,11 +10,51 @@ use crate::value::Value;
 pub fn call_linalg_method(method: &str, args: &[Value]) -> MoraResult<Value> {
     match method {
         "dot" => {
+            if let (Some(Value::Tensor(a)), Some(Value::Tensor(b))) = (args.first(), args.get(1)) {
+                if a.shape.len() != 1 || b.shape.len() != 1 {
+                    return Err(MoraError::Runtime(format!(
+                        "linalg.dot requires 1D tensors, got {:?} and {:?}",
+                        a.shape, b.shape
+                    )));
+                }
+                return crate::value::tensor::eval_tensor_matmul(
+                    &Value::Tensor(std::sync::Arc::clone(a)),
+                    &Value::Tensor(std::sync::Arc::clone(b)),
+                );
+            }
             let a = expect_f64_vec(args.first(), "linalg.dot")?;
             let b = expect_f64_vec(args.get(1), "linalg.dot")?;
             Ok(Value::Float(dot(&a, &b)?))
         }
         "cross" => {
+            if let (Some(Value::Tensor(a)), Some(Value::Tensor(b))) = (args.first(), args.get(1)) {
+                if a.device != b.device {
+                    return Err(MoraError::Runtime(format!(
+                        "linalg.cross: device mismatch between '{}' and '{}'",
+                        a.device, b.device
+                    )));
+                }
+                if a.dtype != b.dtype {
+                    return Err(MoraError::Runtime(format!(
+                        "linalg.cross: dtype mismatch between Tensor<{}> and Tensor<{}>",
+                        a.dtype, b.dtype
+                    )));
+                }
+                if a.shape != [3] || b.shape != [3] {
+                    return Err(MoraError::Runtime(format!(
+                        "linalg.cross requires 1D tensors of shape [3], got {:?} and {:?}",
+                        a.shape, b.shape
+                    )));
+                }
+                let out = cross(&a.to_flat_vec(), &b.to_flat_vec())?;
+                return Ok(Value::Tensor(crate::value::tensor::Tensor::from_raw(
+                    out,
+                    vec![3],
+                    a.dtype,
+                    a.device.clone(),
+                    a.requires_grad || b.requires_grad,
+                )?));
+            }
             let a = expect_f64_vec(args.first(), "linalg.cross")?;
             let b = expect_f64_vec(args.get(1), "linalg.cross")?;
             Ok(Value::List(
@@ -22,23 +62,39 @@ pub fn call_linalg_method(method: &str, args: &[Value]) -> MoraResult<Value> {
             ))
         }
         "norm" => {
-            let a = expect_f64_vec(args.first(), "linalg.norm")?;
             let p = args
                 .get(1)
                 .and_then(|v| match v {
                     Value::Int(n) => Some(*n as f64),
                     Value::Float(n) => Some(*n),
+                    Value::Scalar(s) => Some(s.as_f64()),
                     _ => None,
                 })
                 .unwrap_or(2.0);
+            if let Some(Value::Tensor(t)) = args.first() {
+                if t.dtype.is_bool() {
+                    return Err(MoraError::Runtime(
+                        "linalg.norm cannot be computed on Tensor<bool>".to_string(),
+                    ));
+                }
+                let n = norm(&t.to_flat_vec(), p);
+                return Ok(Value::Float(n));
+            }
+            let a = expect_f64_vec(args.first(), "linalg.norm")?;
             Ok(Value::Float(norm(&a, p)))
         }
         "matmul" => {
+            if let (Some(Value::Tensor(_)), Some(Value::Tensor(_))) = (args.first(), args.get(1)) {
+                return crate::value::tensor::eval_tensor_matmul(&args[0], &args[1]);
+            }
             let a = expect_f64_matrix(args.first(), "linalg.matmul")?;
             let b = expect_f64_matrix(args.get(1), "linalg.matmul")?;
             matmul(&a, &b)
         }
         "transpose" => {
+            if let Some(Value::Tensor(t)) = args.first() {
+                return Ok(Value::Tensor(t.transpose(None, None)?));
+            }
             let a = expect_f64_matrix(args.first(), "linalg.transpose")?;
             Ok(transpose(&a))
         }
@@ -53,6 +109,7 @@ fn as_f64(v: &Value) -> Option<f64> {
     match v {
         Value::Int(n) => Some(*n as f64),
         Value::Float(n) => Some(*n),
+        Value::Scalar(s) => Some(s.as_f64()),
         _ => None,
     }
 }

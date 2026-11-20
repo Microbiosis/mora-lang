@@ -16,7 +16,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::common::BinaryOp;
+use crate::common::{BinaryOp, ScalarValue};
 use crate::error::{MoraError, MoraResult};
 use crate::value::{BuiltinKind, Value};
 
@@ -125,6 +125,7 @@ pub enum BuiltinFnId {
     Str,
     Swap,
     Tail,
+    Tensor,
     TypeOf,
     Uncurry,
 }
@@ -163,6 +164,7 @@ impl BuiltinFnId {
             "str" => Some(Self::Str),
             "swap" => Some(Self::Swap),
             "tail" => Some(Self::Tail),
+            "tensor" => Some(Self::Tensor),
             "type_of" => Some(Self::TypeOf),
             "uncurry" => Some(Self::Uncurry),
             _ => None,
@@ -202,6 +204,7 @@ impl BuiltinFnId {
             Self::Str => "str",
             Self::Swap => "swap",
             Self::Tail => "tail",
+            Self::Tensor => "tensor",
             Self::TypeOf => "type_of",
             Self::Uncurry => "uncurry",
         }
@@ -227,6 +230,8 @@ pub enum ControlConst {
     Bool(bool),
     Int(i64),
     Float(f64),
+    /// Wave 3 — Stage 3B: Explicit hardware-width scalar (`f32`, `f16`, `bf16`, `fp8`, `i4`..`i32`, `u8`..`u64`).
+    Scalar(ScalarValue),
     String(String),
     Char(char),
     BuiltinFn(BuiltinFnId),
@@ -241,6 +246,7 @@ impl ControlConst {
             Self::Bool(b) => Value::Bool(*b),
             Self::Int(i) => Value::Int(*i),
             Self::Float(f) => Value::Float(*f),
+            Self::Scalar(s) => Value::Scalar(*s),
             Self::String(s) => Value::String(s.clone()),
             Self::Char(c) => Value::Char(*c),
             Self::BuiltinFn(id) => Value::Builtin(match id {
@@ -261,6 +267,7 @@ impl ControlConst {
 pub enum UnaryOp {
     Truthy,
     Not,
+    Neg,
 }
 
 /// Kind of a compiled [`ControlFunction`].
@@ -354,6 +361,7 @@ pub enum CompiledPattern {
     Bool(bool),
     Int(i64),
     Float(f64),
+    Scalar(ScalarValue),
     Char(char),
     String(String),
     Tuple(Vec<CompiledPattern>),
@@ -876,10 +884,11 @@ impl ControlInst {
         match self {
             Self::Const(..)
             | Self::Copy(..)
-            | Self::Unary(..)
+            | Self::Unary(_, UnaryOp::Truthy | UnaryOp::Not, _)
             | Self::ListLit(..)
             | Self::DictLit(..)
             | Self::MakeDynTrait { .. } => Purity::Pure,
+            Self::Unary(_, UnaryOp::Neg, _) => Purity::Fallible,
             // Numeric ops can trap on type error, division by zero, or i64 overflow;
             // addition of floats is pure only when infallible, so classify Binary conservatively
             // unless folded on concrete valid constants. Wait: pure integer/float arithmetic on

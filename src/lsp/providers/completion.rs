@@ -56,6 +56,61 @@ const CANONICAL_KEYWORDS: &[&str] = &[
     "rollback",
 ];
 
+const STAGE3B_TYPES_AND_CTORS: &[(&str, &str)] = &[
+    ("f64", "64-bit IEEE 754 float (alias float)"),
+    ("f32", "32-bit IEEE 754 float"),
+    ("f16", "16-bit IEEE 754 half float"),
+    ("bf16", "16-bit Brain Float"),
+    ("fp8", "8-bit OCP FP8 E4M3FN"),
+    ("fp8_e4m3", "8-bit OCP FP8 E4M3FN"),
+    ("fp8_e5m2", "8-bit OCP FP8 E5M2"),
+    ("i64", "64-bit signed integer (alias int)"),
+    ("i32", "32-bit signed integer"),
+    ("i16", "16-bit signed integer"),
+    ("i8", "8-bit signed integer"),
+    ("i4", "4-bit signed quantized integer (-8..=7)"),
+    ("u64", "64-bit unsigned integer"),
+    ("u32", "32-bit unsigned integer"),
+    ("u16", "16-bit unsigned integer"),
+    ("u8", "8-bit unsigned integer"),
+    (
+        "Tensor",
+        "Tensor<DType, Shape, Device> first-class strided tensor",
+    ),
+    (
+        "Tensor::zeros",
+        "Tensor::zeros(shape, dtype?, device?, requires_grad?)",
+    ),
+    (
+        "Tensor::ones",
+        "Tensor::ones(shape, dtype?, device?, requires_grad?)",
+    ),
+    (
+        "Tensor::full",
+        "Tensor::full(shape, value, dtype?, device?, requires_grad?)",
+    ),
+    (
+        "Tensor::eye",
+        "Tensor::eye(n, m?, dtype?, device?, requires_grad?)",
+    ),
+    (
+        "Tensor::arange",
+        "Tensor::arange(start, end?, step?, dtype?, device?, requires_grad?)",
+    ),
+    (
+        "Tensor::randn",
+        "Tensor::randn(shape, dtype?, device?, requires_grad?)",
+    ),
+    (
+        "Tensor::rand",
+        "Tensor::rand(shape, dtype?, device?, requires_grad?)",
+    ),
+    (
+        "Tensor::from_list",
+        "Tensor::from_list(data, dtype?, device?, requires_grad?)",
+    ),
+];
+
 pub fn completion_v3(docs: &HashMap<String, DocumentState>, params: &Value) -> Value {
     let uri = match params
         .get("textDocument")
@@ -108,6 +163,12 @@ pub fn completion_v3(docs: &HashMap<String, DocumentState>, params: &Value) -> V
     for &(module_name, _) in crate::value::MODULE_OBJECTS {
         if seen.insert(module_name.to_string()) {
             items.push(make_completion(module_name, 9.0, Some("module")));
+        }
+    }
+
+    for &(sym, detail) in STAGE3B_TYPES_AND_CTORS {
+        if seen.insert(sym.to_string()) {
+            items.push(make_completion(sym, 7.0, Some(detail)));
         }
     }
 

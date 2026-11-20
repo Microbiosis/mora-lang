@@ -151,9 +151,26 @@ impl ParserV3 {
                 self.advance();
                 Some(crate::common::Literal::Int(val, self.span_of_current()))
             }
+            TokenType::TypedInt(val, dt) => {
+                let span = self.span_of_current();
+                if let Err(msg) = dt.check_int_range(val) {
+                    eprintln!(
+                        "Parse error: {} at line {}, column {}",
+                        msg, span.line, span.column
+                    );
+                    return None;
+                }
+                self.advance();
+                Some(crate::common::Literal::TypedInt(val, dt, span))
+            }
             TokenType::Float(val) => {
                 self.advance();
                 Some(crate::common::Literal::Float(val, self.span_of_current()))
+            }
+            TokenType::TypedFloat(val, dt) => {
+                let span = self.span_of_current();
+                self.advance();
+                Some(crate::common::Literal::TypedFloat(val, dt, span))
             }
             TokenType::String(s) => {
                 self.advance();
@@ -288,6 +305,9 @@ impl ParserV3 {
                     self.tokens.get(self.current + 1).map(|t| &t.token_type),
                     Some(TokenType::Less)
                 ) {
+                    if lower == "tensor" {
+                        return self.parse_tensor_type_annotation();
+                    }
                     self.advance();
                     self.advance();
                     let mut args: Vec<Type> = Vec::new();
@@ -331,12 +351,23 @@ impl ParserV3 {
                         }
                     };
                 }
+                if let Some(stored) = self
+                    .generic_params
+                    .iter()
+                    .find(|p| p.to_lowercase() == lower)
+                    .cloned()
+                {
+                    self.advance();
+                    return Some(Type::TypeVar(crate::typeck::TypeVarId::Rigid(stored)));
+                }
+                if let Some(dt) = crate::common::DType::from_name(&lower) {
+                    self.advance();
+                    return Some(Type::from_dtype(dt));
+                }
                 let ty = match lower.as_str() {
-                    "int" | "i4" | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => {
-                        Type::Int
-                    }
+                    "int" => Type::Int,
                     "number" => Type::Union(vec![Type::Int, Type::Float]),
-                    "float" | "f16" | "bf16" | "fp8" | "f32" | "f64" => Type::Float,
+                    "float" => Type::Float,
                     "string" => Type::String,
                     "char" => Type::Char,
                     "bool" => Type::Bool,
@@ -344,6 +375,7 @@ impl ParserV3 {
                     "context" => Type::Context,
                     "channel" => Type::Channel(Box::new(Type::Any)),
                     "task_handle" | "taskhandle" => Type::TaskHandle(Box::new(Type::Any)),
+                    "tensor" => Type::any_tensor(),
                     "any" => Type::Any,
                     "unknown" => Type::Unknown,
                     other => {
@@ -377,6 +409,179 @@ impl ParserV3 {
             _ => {
                 eprintln!(
                     "Parse error: expected type annotation at line {}",
+                    self.current_line()
+                );
+                None
+            }
+        }
+    }
+
+    /// Parse `Tensor<DType, Shape?, Device?>` / `tensor<DType, Shape?, Device?>`.
+    fn parse_tensor_type_annotation(&mut self) -> Option<crate::typeck::Type> {
+        use crate::typeck::{DeviceType, ShapeType, Type};
+        self.advance(); // consume 'Tensor' / 'tensor'
+        self.advance(); // consume '<'
+        let dtype = self.parse_type_annotation()?;
+        let (shape, device) = if self.match_token(&[TokenType::Comma]) {
+            let shape = self.parse_tensor_shape_annotation()?;
+            let device = if self.match_token(&[TokenType::Comma]) {
+                self.parse_tensor_device_annotation()?
+            } else {
+                DeviceType::Concrete(crate::common::Device::Cpu)
+            };
+            (shape, device)
+        } else {
+            (
+                ShapeType::Unranked(None),
+                DeviceType::Concrete(crate::common::Device::Cpu),
+            )
+        };
+        if !self.match_token(&[TokenType::Greater]) {
+            eprintln!(
+                "Parse error: expected '>' after Tensor type arguments at line {}",
+                self.current_line()
+            );
+            return None;
+        }
+        Some(Type::Tensor {
+            dtype: Box::new(dtype),
+            shape,
+            device,
+        })
+    }
+
+    fn parse_tensor_shape_annotation(&mut self) -> Option<crate::typeck::ShapeType> {
+        use crate::typeck::{DimExpr, ShapeType, TypeVarId};
+        if self.match_token_exact(TokenType::LBracket) {
+            let mut dims = Vec::new();
+            while !self.check(&TokenType::RBracket) && !self.is_at_end() {
+                let tok = self.peek()?.token_type.clone();
+                match tok {
+                    TokenType::Int(n) if n >= 0 => {
+                        self.advance();
+                        dims.push(DimExpr::Known(n as usize));
+                    }
+                    TokenType::TypedInt(n, _) if n >= 0 => {
+                        self.advance();
+                        dims.push(DimExpr::Known(n as usize));
+                    }
+                    TokenType::Identifier(sym) => {
+                        self.advance();
+                        dims.push(DimExpr::Symbolic(sym));
+                    }
+                    _ => {
+                        eprintln!(
+                            "Parse error: expected dimension size or symbolic name in tensor shape at line {}",
+                            self.current_line()
+                        );
+                        return None;
+                    }
+                }
+                if !self.match_token(&[TokenType::Comma]) {
+                    break;
+                }
+            }
+            self.consume(TokenType::RBracket, "Expected ']' in tensor shape")?;
+            Some(ShapeType::Ranked(dims))
+        } else if let Some(TokenType::Identifier(name)) = self.peek().map(|t| t.token_type.clone())
+        {
+            self.advance();
+            if name == "_" {
+                Some(ShapeType::Unranked(None))
+            } else {
+                let stored = self
+                    .generic_params
+                    .iter()
+                    .find(|p| p.eq_ignore_ascii_case(&name))
+                    .cloned()
+                    .unwrap_or(name);
+                Some(ShapeType::Unranked(Some(TypeVarId::Rigid(stored))))
+            }
+        } else {
+            eprintln!(
+                "Parse error: expected '[dim, ...]' or shape parameter in Tensor<...> at line {}",
+                self.current_line()
+            );
+            None
+        }
+    }
+
+    fn parse_tensor_device_annotation(&mut self) -> Option<crate::typeck::DeviceType> {
+        use crate::common::Device;
+        use crate::typeck::{DeviceType, TypeVarId};
+        let tok = self.peek()?.token_type.clone();
+        match tok {
+            TokenType::Identifier(name) => {
+                self.advance();
+                let lower = name.to_lowercase();
+                match lower.as_str() {
+                    "_" | "any" => Some(DeviceType::Any),
+                    "cpu" => Some(DeviceType::Concrete(Device::Cpu)),
+                    "cuda" => {
+                        let idx = if self.match_token_exact(TokenType::Colon) {
+                            match self.peek()?.token_type {
+                                TokenType::Int(n) if (0..=u16::MAX as i64).contains(&n) => {
+                                    self.advance();
+                                    n as u16
+                                }
+                                _ => {
+                                    eprintln!(
+                                        "Parse error: expected non-negative device index after 'cuda:' at line {}",
+                                        self.current_line()
+                                    );
+                                    return None;
+                                }
+                            }
+                        } else {
+                            0
+                        };
+                        Some(DeviceType::Concrete(Device::Cuda(idx)))
+                    }
+                    "metal" => {
+                        let idx = if self.match_token_exact(TokenType::Colon) {
+                            match self.peek()?.token_type {
+                                TokenType::Int(n) if (0..=u16::MAX as i64).contains(&n) => {
+                                    self.advance();
+                                    n as u16
+                                }
+                                _ => {
+                                    eprintln!(
+                                        "Parse error: expected non-negative device index after 'metal:' at line {}",
+                                        self.current_line()
+                                    );
+                                    return None;
+                                }
+                            }
+                        } else {
+                            0
+                        };
+                        Some(DeviceType::Concrete(Device::Metal(idx)))
+                    }
+                    _ => {
+                        let stored = self
+                            .generic_params
+                            .iter()
+                            .find(|p| p.eq_ignore_ascii_case(&name))
+                            .cloned()
+                            .unwrap_or(name);
+                        Some(DeviceType::Var(TypeVarId::Rigid(stored)))
+                    }
+                }
+            }
+            TokenType::String(s) => {
+                self.advance();
+                let dev = match Device::parse(&s) {
+                    Ok(d) => d,
+                    Err(msg) => {
+                        eprintln!("Parse error: {} at line {}", msg, self.current_line());
+                        return None;
+                    }
+                };
+                Some(DeviceType::Concrete(dev))
+            }
+            _ => {
+                eprintln!(
+                    "Parse error: expected device ('cpu', 'cuda:0', 'metal:0', or type parameter) in Tensor<...> at line {}",
                     self.current_line()
                 );
                 None

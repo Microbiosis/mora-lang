@@ -62,9 +62,16 @@ impl Xoshiro256 {
     }
 
     /// 返回 [0, 1) 范围的 f64
-    fn next_f64(&mut self) -> f64 {
+    pub(crate) fn next_f64(&mut self) -> f64 {
         // 取 53 位精度
         (self.next_u64() >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
+    }
+
+    /// 返回标准正态分布 N(0, 1) 的 f64（Box-Muller 变换）
+    pub(crate) fn next_gauss(&mut self) -> f64 {
+        let u1 = self.next_f64().max(f64::MIN_POSITIVE);
+        let u2 = self.next_f64();
+        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
     }
 
     /// 返回 [min, max) 范围的 i64（均匀）

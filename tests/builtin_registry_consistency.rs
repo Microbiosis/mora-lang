@@ -83,6 +83,7 @@ fn probe_source(name: &str) -> Option<&'static str> {
         "channel" => "let v: string = channel(1)\n",
         "context" => "let v: string = context()\n",
         "sleep" => "let v: string = sleep(0)\n",
+        "tensor" => "let v: string = tensor([1.0, 2.0])\n",
         // 返回类型随回调/元素变化 ⇒ 无法用固定探针判「被拒」，见 LOOSE。
         "car" | "cdr" | "cons" | "uncurry" | "apply" | "into" | "swap" | "compose" | "partial"
         | "merge_with" | "tail" | "macroexpand" | "curry" => "let v = NAME_PLACEHOLDER\n",
@@ -110,6 +111,7 @@ const CONCRETE_RETURN: &[&str] = &[
     "channel",
     "context",
     "sleep",
+    "tensor",
 ];
 
 /// 把探针里的占位符换成真实调用。

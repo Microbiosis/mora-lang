@@ -753,7 +753,19 @@ fn literal_to_const(lit: &Literal) -> ControlConst {
         Literal::String(s, _) => ControlConst::String(s.clone()),
         Literal::Char(c, _) => ControlConst::Char(*c),
         Literal::Int(i, _) => ControlConst::Int(*i),
+        Literal::TypedInt(i, dt, _) => {
+            match crate::common::ScalarValue::from_i64_checked(*i, *dt) {
+                Ok(s) => ControlConst::Scalar(s),
+                Err(_) => ControlConst::Int(dt.quantize_i64(*i)),
+            }
+        }
         Literal::Float(f, _) => ControlConst::Float(*f),
+        Literal::TypedFloat(f, dt, _) => {
+            match crate::common::ScalarValue::from_f64_quantized(*f, *dt) {
+                Some(s) => ControlConst::Scalar(s),
+                None => ControlConst::Float(dt.quantize_f64(*f)),
+            }
+        }
         Literal::Bool(b, _) => ControlConst::Bool(*b),
         Literal::Nil(_) => ControlConst::Nil,
     }
@@ -903,7 +915,19 @@ fn compile_pattern(
             Literal::Nil(_) => CompiledPattern::Nil,
             Literal::Bool(b, _) => CompiledPattern::Bool(*b),
             Literal::Int(i, _) => CompiledPattern::Int(*i),
+            Literal::TypedInt(i, dt, _) => {
+                match crate::common::ScalarValue::from_i64_checked(*i, *dt) {
+                    Ok(s) => CompiledPattern::Scalar(s),
+                    Err(_) => CompiledPattern::Int(dt.quantize_i64(*i)),
+                }
+            }
             Literal::Float(f, _) => CompiledPattern::Float(*f),
+            Literal::TypedFloat(f, dt, _) => {
+                match crate::common::ScalarValue::from_f64_quantized(*f, *dt) {
+                    Some(s) => CompiledPattern::Scalar(s),
+                    None => CompiledPattern::Float(dt.quantize_f64(*f)),
+                }
+            }
             Literal::Char(c, _) => CompiledPattern::Char(*c),
             Literal::String(s, _) => CompiledPattern::String(s.clone()),
         },
@@ -975,6 +999,9 @@ fn lower_expr_chain(
 
     enum ChainTask<'w> {
         Eval(&'w MirWitness),
+        EmitUnary {
+            op: UnaryOp,
+        },
         EmitBinary {
             op: &'w BinaryOp,
         },
@@ -1027,6 +1054,20 @@ fn lower_expr_chain(
     while let Some(task) = tasks.pop() {
         match task {
             ChainTask::Eval(w) => match &w.kind {
+                WitnessKind::Call {
+                    callee: WitnessCallee::Builtin(BuiltinOp::Neg),
+                    args,
+                } if args.len() == 1 => {
+                    tasks.push(ChainTask::EmitUnary { op: UnaryOp::Neg });
+                    tasks.push(ChainTask::Eval(&args[0]));
+                }
+                WitnessKind::Call {
+                    callee: WitnessCallee::Builtin(BuiltinOp::Not),
+                    args,
+                } if args.len() == 1 => {
+                    tasks.push(ChainTask::EmitUnary { op: UnaryOp::Not });
+                    tasks.push(ChainTask::Eval(&args[0]));
+                }
                 WitnessKind::Binary { left, op, right } => {
                     tasks.push(ChainTask::EmitBinary { op });
                     tasks.push(ChainTask::Eval(right));
@@ -1090,6 +1131,12 @@ fn lower_expr_chain(
                     }
                 },
             },
+            ChainTask::EmitUnary { op } => {
+                let src = vals.pop().expect("unary arg reg present");
+                let dst = stack.current_mut().alloc_reg();
+                stack.current_mut().emit(ControlInst::Unary(dst, op, src));
+                vals.push(dst);
+            }
             ChainTask::EmitBinary { op } => {
                 let rhs = vals.pop().expect("rhs reg present");
                 let lhs = vals.pop().expect("lhs reg present");
@@ -1217,6 +1264,12 @@ fn lower_expr(
             | WitnessKind::And { .. }
             | WitnessKind::Pipe { .. }
             | WitnessKind::MethodCall { .. }
+    ) || matches!(
+        &w.kind,
+        WitnessKind::Call {
+            callee: WitnessCallee::Builtin(BuiltinOp::Neg | BuiltinOp::Not),
+            args,
+        } if args.len() == 1
     ) {
         return lower_expr_chain(stack, prog, w);
     }
@@ -1827,6 +1880,7 @@ fn lower_expr_single(
 enum ResolvedCallee {
     Target(CalleeTarget),
     NotOp,
+    NegOp,
     AssertOp,
 }
 
@@ -1875,6 +1929,7 @@ fn resolve_callee_target(
                 BuiltinFnId::Len,
             )))),
             BuiltinOp::Not => Ok(Some(ResolvedCallee::NotOp)),
+            BuiltinOp::Neg => Ok(Some(ResolvedCallee::NegOp)),
             BuiltinOp::Assert => Ok(Some(ResolvedCallee::AssertOp)),
         },
         WitnessCallee::Method(..) => unreachable!("handled by caller"),
@@ -2155,6 +2210,17 @@ fn lower_call(
             stack
                 .current_mut()
                 .emit(ControlInst::Unary(dst, UnaryOp::Not, arg));
+            Ok(FlowState::Active(dst))
+        }
+        ResolvedCallee::NegOp => {
+            let arg = arg_regs
+                .into_iter()
+                .next()
+                .ok_or_else(|| MoraError::Parse("Unary `-` expects 1 argument".to_string()))?;
+            let dst = stack.current_mut().alloc_reg();
+            stack
+                .current_mut()
+                .emit(ControlInst::Unary(dst, UnaryOp::Neg, arg));
             Ok(FlowState::Active(dst))
         }
         ResolvedCallee::AssertOp => {

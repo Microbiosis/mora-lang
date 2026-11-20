@@ -91,6 +91,7 @@ enum ConstKey {
     Bool(bool),
     Int(i64),
     FloatBits(u64),
+    ScalarBits(crate::common::DType, u64),
     String(String),
     Char(char),
     BuiltinFn(BuiltinFnId),
@@ -102,6 +103,10 @@ fn const_key(c: &ControlConst) -> Option<ConstKey> {
         ControlConst::Bool(b) => Some(ConstKey::Bool(*b)),
         ControlConst::Int(i) => Some(ConstKey::Int(*i)),
         ControlConst::Float(f) => Some(ConstKey::FloatBits(f.to_bits())),
+        ControlConst::Scalar(s) => {
+            let (dt, bits) = s.bit_key();
+            Some(ConstKey::ScalarBits(dt, bits))
+        }
         ControlConst::String(s) => Some(ConstKey::String(s.clone())),
         ControlConst::Char(ch) => Some(ConstKey::Char(*ch)),
         ControlConst::BuiltinFn(id) => Some(ConstKey::BuiltinFn(*id)),
@@ -115,6 +120,7 @@ fn const_is_truthy(c: &ControlConst) -> bool {
         ControlConst::Bool(b) => *b,
         ControlConst::Int(i) => *i != 0,
         ControlConst::Float(f) => *f != 0.0 && !f.is_nan(),
+        ControlConst::Scalar(s) => s.is_truthy(),
         ControlConst::String(s) => !s.is_empty(),
         ControlConst::Char(c) => *c != '\0',
         ControlConst::BuiltinFn(_) | ControlConst::BuiltinModule(_) => true,
@@ -127,6 +133,7 @@ fn value_to_control_const(v: &Value) -> Option<ControlConst> {
         Value::Bool(b) => Some(ControlConst::Bool(*b)),
         Value::Int(i) => Some(ControlConst::Int(*i)),
         Value::Float(f) => Some(ControlConst::Float(*f)),
+        Value::Scalar(s) => Some(ControlConst::Scalar(*s)),
         Value::String(s) => Some(ControlConst::String(s.clone())),
         Value::Char(c) => Some(ControlConst::Char(*c)),
         _ => None,
@@ -187,14 +194,21 @@ fn const_and_copy_prop(func: &mut ControlFunction) -> bool {
                 }
                 ControlInst::Unary(dst, op, src) => {
                     if let Some(c) = consts.get(src).cloned() {
-                        let b = match op {
-                            UnaryOp::Truthy => const_is_truthy(&c),
-                            UnaryOp::Not => !const_is_truthy(&c),
+                        let folded_opt = match op {
+                            UnaryOp::Truthy => Some(ControlConst::Bool(const_is_truthy(&c))),
+                            UnaryOp::Not => Some(ControlConst::Bool(!const_is_truthy(&c))),
+                            UnaryOp::Neg => match c {
+                                ControlConst::Int(n) => n.checked_neg().map(ControlConst::Int),
+                                ControlConst::Float(f) => Some(ControlConst::Float(-f)),
+                                ControlConst::Scalar(s) => s.neg().ok().map(ControlConst::Scalar),
+                                _ => None,
+                            },
                         };
-                        let folded = ControlConst::Bool(b);
-                        consts.insert(*dst, folded.clone());
-                        *inst = ControlInst::Const(*dst, folded);
-                        changed = true;
+                        if let Some(folded) = folded_opt {
+                            consts.insert(*dst, folded.clone());
+                            *inst = ControlInst::Const(*dst, folded);
+                            changed = true;
+                        }
                     }
                 }
                 ControlInst::Binary(dst, lhs, op, rhs) => {

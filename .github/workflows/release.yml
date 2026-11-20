@@ -156,30 +156,22 @@ jobs:
           body: |
             # Mora ${{ github.ref_name }}
 
-            一个轻量级脚本语言，内建 AI 调用、HTTP server、MCP server、长期记忆、Agent 编排。
+            AI-native 静态类型语言，面向大模型底层、计算图与算子、大模型推理/训练与资源动态调控，兼具 Go 式云原生并发与纯 Mora HTTP/MCP 标准库。
 
             ## 核心特性
 
-            - **AI 调用是显式 API**: `ai.chat(p"...")` / `ai.critic(answer)` / `ai.tokens`
-            - **HTTP / MCP server 是显式构造器**: `Router::new()` + `router.listen(addr)` / `McpServer::new()` + `server.serve()`
-            - **可观测是语法块**: `observe trace do ... end` / `span "name" tags {k: "v"} do ... end`
-            - **单二进制多协议**: 同一个 `mora` 二进制内建 HTTP 与 MCP 两种服务入口，由脚本选择
-            - **模型配置是语法块**: `with model = "gpt-4o-mini", temperature = 0.7`
-            - **强类型系统**: HM 类型推断、泛型、trait、enum、struct
+            - **一等张量与 5 项静态检查**: `Tensor<DType, Shape, Device>`（`f64`/`f32`/`f16`/`bf16`/`fp8`/`i64`..`i4`），编译期执行 DType / Shape / Device / Resource / Effect 静态校验
+            - **原生计算图与自动微分**: `trace_dag` 算子融合（FlashAttention / RmsNormLinear / LinearAct / Elementwise）、反向 `grad` / 前向 `jvp` / 高阶 `grad^n` & HVP、零依赖 CUDA / Vulkan / Metal / SIMD 后端
+            - **显存与资源动态调控**: `kv_page_allocator`（PagedAttention 页表、CoW `fork_seq`、硬配额、优先级抢占与水位线回调）与 64B 对齐 `memory_pool`
+            - **Go 式云原生并发与标准库**: `spawn` / `channel<T>` / `select` / `context` / 异步 TCP，配套纯 Mora `std/net/http`（含 Router / Chunked / Keep-Alive / SSE）与 `std/mcp`
+            - **零源码单二进制编译**: `mora build` 将主模块与导入闭包预编译为 `MORABC02` 二进制 `ControlProgram` 载荷并生成独立可执行文件
 
             ## 快速开始
 
             ```bash
-            # 写一个 Mora 脚本
-            cat > hello.mora << 'EOF'
-            let router = Router::new()
-            let router = router.route("GET", "/chat", fn(req) => {status: "ok"})
-            router.listen("127.0.0.1:3000")
-            EOF
-
-            # 运行
-            mora hello.mora
-            # 另一终端: curl http://localhost:3000/chat
+            mora run examples/hm_basic_demo.mora
+            mora build examples/hm_basic_demo.mora -o demo
+            ./demo
             ```
 
             ## 文档

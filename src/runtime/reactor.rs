@@ -1,28 +1,29 @@
-//! Tokio-backed non-blocking async I/O reactor (`tokio::time` timers + `tokio::net` TCP listeners
-//! and streams + `tokio::io` async read/write multiplexing with cooperative cancellation) (Wave 2 — Stage W2.4).
+//! Zero-dependency non-blocking async I/O reactor (`sleep` / `timeout` timers + `std::net`
+//! non-blocking TCP listeners and streams + cooperative `TaskContext` cancellation).
 
 use std::future::Future;
-use std::net::SocketAddr;
+use std::io::{ErrorKind, Read, Write};
+use std::net::{
+    Shutdown, SocketAddr, TcpListener as StdTcpListener, TcpStream as StdTcpStream, ToSocketAddrs,
+};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, Notify};
-use tokio::time::{Duration, sleep, timeout};
-
+use crate::common::sync::Mutex;
 use crate::error::{MoraError, MoraResult};
-use crate::runtime::scheduler::{TaskContext, TaskScheduler};
+use crate::runtime::scheduler::{AsyncNotify, Select2, TaskContext, TaskScheduler, race2, sleep};
 
-/// Async TCP listener backed by [`tokio::net::TcpListener`] with cancellation support.
+/// Async TCP listener backed by non-blocking [`std::net::TcpListener`] with cancellation support.
 pub struct AsyncTcpListener {
-    inner: TcpListener,
+    inner: StdTcpListener,
 }
 
 impl AsyncTcpListener {
     /// Bind a non-blocking TCP listener on `addr` (e.g. `"127.0.0.1:0"`).
     pub async fn bind(addr: &str) -> MoraResult<Self> {
-        let inner = TcpListener::bind(addr).await?;
+        let inner = StdTcpListener::bind(addr)?;
+        inner.set_nonblocking(true)?;
         Ok(Self { inner })
     }
 
@@ -36,26 +37,36 @@ impl AsyncTcpListener {
         &self,
         ctx: Option<&TaskContext>,
     ) -> MoraResult<(AsyncTcpStream, SocketAddr)> {
-        if let Some(c) = ctx {
-            c.status()?;
-            tokio::select! {
-                biased;
-                err = c.cancelled() => Err(err),
-                accepted = self.inner.accept() => {
-                    let (stream, addr) = accepted?;
-                    Ok((AsyncTcpStream { inner: stream }, addr))
-                }
+        loop {
+            if let Some(c) = ctx {
+                c.status()?;
             }
-        } else {
-            let (stream, addr) = self.inner.accept().await?;
-            Ok((AsyncTcpStream { inner: stream }, addr))
+            match self.inner.accept() {
+                Ok((stream, addr)) => {
+                    stream.set_nonblocking(true)?;
+                    return Ok((AsyncTcpStream { inner: stream }, addr));
+                }
+                Err(e)
+                    if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted =>
+                {
+                    if let Some(c) = ctx {
+                        match race2(c.cancelled(), sleep(Duration::from_millis(1))).await {
+                            Select2::First(err) => return Err(err),
+                            Select2::Second(()) => {}
+                        }
+                    } else {
+                        sleep(Duration::from_millis(1)).await;
+                    }
+                }
+                Err(e) => return Err(MoraError::from(e)),
+            }
         }
     }
 }
 
-/// Async buffered-free TCP stream wrapper over [`tokio::net::TcpStream`].
+/// Async buffered-free TCP stream wrapper over non-blocking [`std::net::TcpStream`].
 pub struct AsyncTcpStream {
-    inner: TcpStream,
+    inner: StdTcpStream,
 }
 
 impl AsyncTcpStream {
@@ -68,26 +79,47 @@ impl AsyncTcpStream {
         if let Some(c) = ctx {
             c.status()?;
         }
-        let connect_fut = async {
+        let addr_owned = addr.to_string();
+        let sched = TaskScheduler::shared();
+        let spawn_ctx = ctx.cloned().unwrap_or_else(TaskContext::root);
+        let connect_handle = sched.spawn_blocking(&spawn_ctx, move |_c| {
+            let mut addrs = addr_owned.to_socket_addrs().map_err(MoraError::from)?;
+            let target = addrs.next().ok_or_else(|| {
+                MoraError::Io(format!("could not resolve socket address: {addr_owned}"))
+            })?;
+            let stream = match connect_timeout {
+                Some(dur) => StdTcpStream::connect_timeout(&target, dur).map_err(|e| {
+                    if e.kind() == ErrorKind::TimedOut {
+                        MoraError::Timeout(format!(
+                            "TCP connect to {addr_owned} timed out after {dur:?}"
+                        ))
+                    } else {
+                        MoraError::from(e)
+                    }
+                })?,
+                None => StdTcpStream::connect(target).map_err(MoraError::from)?,
+            };
+            stream.set_nonblocking(true)?;
+            Ok(stream)
+        });
+
+        let connect_fut = async move {
             match connect_timeout {
-                Some(dur) => match timeout(dur, TcpStream::connect(addr)).await {
-                    Ok(res) => res.map_err(MoraError::from),
-                    Err(_) => Err(MoraError::Timeout(format!(
+                Some(dur) => match race2(connect_handle.join(), sleep(dur)).await {
+                    Select2::First(res) => res,
+                    Select2::Second(()) => Err(MoraError::Timeout(format!(
                         "TCP connect to {addr} timed out after {dur:?}"
                     ))),
                 },
-                None => TcpStream::connect(addr).await.map_err(MoraError::from),
+                None => connect_handle.join().await,
             }
         };
 
         let stream = match ctx {
-            Some(c) => {
-                tokio::select! {
-                    biased;
-                    err = c.cancelled() => return Err(err),
-                    res = connect_fut => res?,
-                }
-            }
+            Some(c) => match race2(c.cancelled(), connect_fut).await {
+                Select2::First(err) => return Err(err),
+                Select2::Second(res) => res?,
+            },
             None => connect_fut.await?,
         };
         Ok(Self { inner: stream })
@@ -95,29 +127,58 @@ impl AsyncTcpStream {
 
     /// Write an entire byte slice asynchronously while honoring cancellation.
     pub async fn write_all(&mut self, data: &[u8], ctx: Option<&TaskContext>) -> MoraResult<()> {
-        if let Some(c) = ctx {
-            c.status()?;
-            tokio::select! {
-                biased;
-                err = c.cancelled() => Err(err),
-                res = self.inner.write_all(data) => Ok(res?),
+        let mut offset = 0usize;
+        while offset < data.len() {
+            if let Some(c) = ctx {
+                c.status()?;
             }
-        } else {
-            Ok(self.inner.write_all(data).await?)
+            match self.inner.write(&data[offset..]) {
+                Ok(0) => {
+                    return Err(MoraError::Io(
+                        "TCP write_all wrote 0 bytes (connection closed)".to_string(),
+                    ));
+                }
+                Ok(n) => offset += n,
+                Err(e)
+                    if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted =>
+                {
+                    if let Some(c) = ctx {
+                        match race2(c.cancelled(), sleep(Duration::from_millis(1))).await {
+                            Select2::First(err) => return Err(err),
+                            Select2::Second(()) => {}
+                        }
+                    } else {
+                        sleep(Duration::from_millis(1)).await;
+                    }
+                }
+                Err(e) => return Err(MoraError::from(e)),
+            }
         }
+        Ok(())
     }
 
     /// Read up to `buf.len()` bytes asynchronously while honoring cancellation (`0` on EOF).
     pub async fn read(&mut self, buf: &mut [u8], ctx: Option<&TaskContext>) -> MoraResult<usize> {
-        if let Some(c) = ctx {
-            c.status()?;
-            tokio::select! {
-                biased;
-                err = c.cancelled() => Err(err),
-                res = self.inner.read(buf) => Ok(res?),
+        loop {
+            if let Some(c) = ctx {
+                c.status()?;
             }
-        } else {
-            Ok(self.inner.read(buf).await?)
+            match self.inner.read(buf) {
+                Ok(n) => return Ok(n),
+                Err(e)
+                    if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted =>
+                {
+                    if let Some(c) = ctx {
+                        match race2(c.cancelled(), sleep(Duration::from_millis(1))).await {
+                            Select2::First(err) => return Err(err),
+                            Select2::Second(()) => {}
+                        }
+                    } else {
+                        sleep(Duration::from_millis(1)).await;
+                    }
+                }
+                Err(e) => return Err(MoraError::from(e)),
+            }
         }
     }
 
@@ -153,7 +214,11 @@ impl AsyncTcpStream {
 
     /// Half-close the write side of the TCP connection cleanly.
     pub async fn shutdown(&mut self) -> MoraResult<()> {
-        Ok(self.inner.shutdown().await?)
+        match self.inner.shutdown(Shutdown::Write) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == ErrorKind::NotConnected => Ok(()),
+            Err(e) => Err(MoraError::from(e)),
+        }
     }
 }
 
@@ -163,7 +228,7 @@ pub struct MoraTcpListener {
     inner: AsyncTcpListener,
     local_addr: String,
     closed: AtomicBool,
-    close_notify: Notify,
+    close_notify: AsyncNotify,
 }
 
 impl std::fmt::Debug for MoraTcpListener {
@@ -184,7 +249,7 @@ impl MoraTcpListener {
             inner,
             local_addr,
             closed: AtomicBool::new(false),
-            close_notify: Notify::new(),
+            close_notify: AsyncNotify::new(),
         }))
     }
 
@@ -211,14 +276,12 @@ impl MoraTcpListener {
             return Err(MoraError::Io("TCP listener is closed".to_string()));
         }
         let notified = self.close_notify.notified();
-        tokio::pin!(notified);
         if self.is_closed() {
             return Err(MoraError::Io("TCP listener is closed".to_string()));
         }
-        tokio::select! {
-            biased;
-            () = &mut notified => Err(MoraError::Io("TCP listener is closed".to_string())),
-            res = self.inner.accept(ctx) => {
+        match race2(notified, self.inner.accept(ctx)).await {
+            Select2::First(()) => Err(MoraError::Io("TCP listener is closed".to_string())),
+            Select2::Second(res) => {
                 let (stream, _peer) = res?;
                 MoraTcpStream::from_async(stream)
             }
@@ -226,18 +289,15 @@ impl MoraTcpListener {
     }
 }
 
-struct TcpStreamState {
-    stream: Option<AsyncTcpStream>,
-    read_buf: Vec<u8>,
-}
-
 /// First-class Mora runtime wrapper over [`AsyncTcpStream`] with buffered line/chunk reads,
-/// async writes, and [`TaskContext`] cancellation support.
+/// async writes, and lock-free `.close()` wakeup + [`TaskContext`] cancellation support.
 pub struct MoraTcpStream {
-    state: Mutex<TcpStreamState>,
+    raw: Mutex<Option<StdTcpStream>>,
+    read_buf: Mutex<Vec<u8>>,
     local_addr: String,
     peer_addr: String,
     closed: AtomicBool,
+    close_notify: AsyncNotify,
 }
 
 impl std::fmt::Debug for MoraTcpStream {
@@ -256,13 +316,12 @@ impl MoraTcpStream {
         let local_addr = stream.local_addr()?.to_string();
         let peer_addr = stream.peer_addr()?.to_string();
         Ok(Arc::new(Self {
-            state: Mutex::new(TcpStreamState {
-                stream: Some(stream),
-                read_buf: Vec::new(),
-            }),
+            raw: Mutex::new(Some(stream.inner)),
+            read_buf: Mutex::new(Vec::new()),
             local_addr,
             peer_addr,
             closed: AtomicBool::new(false),
+            close_notify: AsyncNotify::new(),
         }))
     }
 
@@ -291,6 +350,48 @@ impl MoraTcpStream {
         self.closed.load(Ordering::Acquire)
     }
 
+    async fn read_some(&self, buf: &mut [u8], ctx: Option<&TaskContext>) -> MoraResult<usize> {
+        loop {
+            if self.is_closed() {
+                return Err(MoraError::Io("TCP stream is closed".to_string()));
+            }
+            if let Some(c) = ctx {
+                c.status()?;
+            }
+            let res = {
+                let mut g = self.raw.lock();
+                let Some(s) = g.as_mut() else {
+                    return Err(MoraError::Io("TCP stream is closed".to_string()));
+                };
+                s.read(buf)
+            };
+            match res {
+                Ok(n) => return Ok(n),
+                Err(e)
+                    if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted =>
+                {
+                    let close_fut = self.close_notify.notified();
+                    if self.is_closed() {
+                        return Err(MoraError::Io("TCP stream is closed".to_string()));
+                    }
+                    let wait_tick = race2(close_fut, sleep(Duration::from_millis(1)));
+                    if let Some(c) = ctx {
+                        match race2(c.cancelled(), wait_tick).await {
+                            Select2::First(err) => return Err(err),
+                            Select2::Second(Select2::First(())) => {
+                                return Err(MoraError::Io("TCP stream is closed".to_string()));
+                            }
+                            Select2::Second(Select2::Second(())) => {}
+                        }
+                    } else if let Select2::First(()) = wait_tick.await {
+                        return Err(MoraError::Io("TCP stream is closed".to_string()));
+                    }
+                }
+                Err(e) => return Err(MoraError::from(e)),
+            }
+        }
+    }
+
     /// Read up to `max_bytes` bytes (draining internal line-buffer bytes first; empty on EOF).
     pub async fn read_bytes(
         &self,
@@ -303,17 +404,16 @@ impl MoraTcpStream {
         if max_bytes == 0 {
             return Ok(Vec::new());
         }
-        let mut guard = self.state.lock().await;
-        if !guard.read_buf.is_empty() {
-            let take = max_bytes.min(guard.read_buf.len());
-            let chunk: Vec<u8> = guard.read_buf.drain(..take).collect();
-            return Ok(chunk);
+        {
+            let mut rb = self.read_buf.lock();
+            if !rb.is_empty() {
+                let take = max_bytes.min(rb.len());
+                let chunk: Vec<u8> = rb.drain(..take).collect();
+                return Ok(chunk);
+            }
         }
-        let Some(stream) = guard.stream.as_mut() else {
-            return Err(MoraError::Io("TCP stream is closed".to_string()));
-        };
         let mut buf = vec![0u8; max_bytes.min(65536)];
-        let n = stream.read(&mut buf, ctx).await?;
+        let n = self.read_some(&mut buf, ctx).await?;
         buf.truncate(n);
         Ok(buf)
     }
@@ -330,29 +430,37 @@ impl MoraTcpStream {
         if max_bytes == 0 {
             return Ok(Vec::new());
         }
-        let mut guard = self.state.lock().await;
         loop {
-            if let Some(pos) = guard.read_buf.iter().position(|&b| b == b'\n') {
-                let end = (pos + 1).min(max_bytes);
-                let line: Vec<u8> = guard.read_buf.drain(..end).collect();
-                return Ok(line);
-            }
-            if guard.read_buf.len() >= max_bytes {
-                let line: Vec<u8> = guard.read_buf.drain(..max_bytes).collect();
-                return Ok(line);
-            }
-            let Some(stream) = guard.stream.as_mut() else {
-                if !guard.read_buf.is_empty() {
-                    return Ok(std::mem::take(&mut guard.read_buf));
+            {
+                let mut rb = self.read_buf.lock();
+                if let Some(pos) = rb.iter().position(|&b| b == b'\n') {
+                    let end = (pos + 1).min(max_bytes);
+                    let line: Vec<u8> = rb.drain(..end).collect();
+                    return Ok(line);
                 }
-                return Err(MoraError::Io("TCP stream is closed".to_string()));
-            };
-            let mut scratch = [0u8; 4096];
-            let n = stream.read(&mut scratch, ctx).await?;
-            if n == 0 {
-                return Ok(std::mem::take(&mut guard.read_buf));
+                if rb.len() >= max_bytes {
+                    let line: Vec<u8> = rb.drain(..max_bytes).collect();
+                    return Ok(line);
+                }
             }
-            guard.read_buf.extend_from_slice(&scratch[..n]);
+            let mut scratch = [0u8; 4096];
+            match self.read_some(&mut scratch, ctx).await {
+                Ok(0) => {
+                    let mut rb = self.read_buf.lock();
+                    return Ok(std::mem::take(&mut *rb));
+                }
+                Ok(n) => {
+                    let mut rb = self.read_buf.lock();
+                    rb.extend_from_slice(&scratch[..n]);
+                }
+                Err(err) => {
+                    let mut rb = self.read_buf.lock();
+                    if !rb.is_empty() && !err.is_cancellation_or_timeout() {
+                        return Ok(std::mem::take(&mut *rb));
+                    }
+                    return Err(err);
+                }
+            }
         }
     }
 
@@ -361,35 +469,74 @@ impl MoraTcpStream {
         if let Some(c) = ctx {
             c.status()?;
         }
-        let mut guard = self.state.lock().await;
-        let Some(stream) = guard.stream.as_mut() else {
-            return Err(MoraError::Io("TCP stream is closed".to_string()));
-        };
-        stream.write_all(data, ctx).await?;
+        let mut offset = 0usize;
+        while offset < data.len() {
+            if self.is_closed() {
+                return Err(MoraError::Io("TCP stream is closed".to_string()));
+            }
+            if let Some(c) = ctx {
+                c.status()?;
+            }
+            let res = {
+                let mut g = self.raw.lock();
+                let Some(s) = g.as_mut() else {
+                    return Err(MoraError::Io("TCP stream is closed".to_string()));
+                };
+                s.write(&data[offset..])
+            };
+            match res {
+                Ok(0) => {
+                    return Err(MoraError::Io("TCP stream write returned 0".to_string()));
+                }
+                Ok(n) => offset += n,
+                Err(e)
+                    if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted =>
+                {
+                    let close_fut = self.close_notify.notified();
+                    let wait_tick = race2(close_fut, sleep(Duration::from_millis(1)));
+                    if let Some(c) = ctx {
+                        match race2(c.cancelled(), wait_tick).await {
+                            Select2::First(err) => return Err(err),
+                            Select2::Second(Select2::First(())) => {
+                                return Err(MoraError::Io("TCP stream is closed".to_string()));
+                            }
+                            Select2::Second(Select2::Second(())) => {}
+                        }
+                    } else if let Select2::First(()) = wait_tick.await {
+                        return Err(MoraError::Io("TCP stream is closed".to_string()));
+                    }
+                }
+                Err(e) => return Err(MoraError::from(e)),
+            }
+        }
         Ok(data.len())
     }
 
     /// Half-close the write side of the TCP connection cleanly.
     pub async fn shutdown(&self) -> MoraResult<()> {
-        let mut guard = self.state.lock().await;
-        let Some(stream) = guard.stream.as_mut() else {
+        let mut g = self.raw.lock();
+        let Some(s) = g.as_mut() else {
             return Ok(());
         };
-        stream.shutdown().await
+        match s.shutdown(Shutdown::Write) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == ErrorKind::NotConnected => Ok(()),
+            Err(e) => Err(MoraError::from(e)),
+        }
     }
 
-    /// Close and drop the underlying TCP stream.
+    /// Close and drop the underlying TCP stream, waking any pending readers/writers immediately.
     pub async fn close(&self) {
         self.closed.store(true, Ordering::Release);
-        let mut guard = self.state.lock().await;
-        if let Some(mut s) = guard.stream.take() {
-            let _ = s.shutdown().await;
+        if let Some(s) = self.raw.lock().take() {
+            let _ = s.shutdown(Shutdown::Both);
         }
-        guard.read_buf.clear();
+        self.read_buf.lock().clear();
+        self.close_notify.notify_waiters();
     }
 }
 
-/// Async I/O reactor pairing Tokio timers, sockets, and structured connection multiplexing
+/// Async I/O reactor pairing native timers, sockets, and structured connection multiplexing
 /// onto a shared [`TaskScheduler`].
 #[derive(Clone, Debug)]
 pub struct AsyncIoReactor {
@@ -417,10 +564,9 @@ impl AsyncIoReactor {
     pub async fn sleep(&self, duration: Duration, ctx: Option<&TaskContext>) -> MoraResult<()> {
         if let Some(c) = ctx {
             c.status()?;
-            tokio::select! {
-                biased;
-                err = c.cancelled() => Err(err),
-                () = sleep(duration) => Ok(()),
+            match race2(c.cancelled(), sleep(duration)).await {
+                Select2::First(err) => Err(err),
+                Select2::Second(()) => Ok(()),
             }
         } else {
             sleep(duration).await;
@@ -428,7 +574,7 @@ impl AsyncIoReactor {
         }
     }
 
-    /// Execute a blocking I/O closure on the scheduler's Tokio blocking thread pool without
+    /// Execute a blocking I/O closure on the scheduler's blocking thread pool without
     /// starving async worker threads, interrupting cleanly if `ctx` is cancelled/timed out.
     pub async fn run_blocking_io<T, F>(&self, ctx: Option<&TaskContext>, op: F) -> MoraResult<T>
     where
@@ -438,19 +584,15 @@ impl AsyncIoReactor {
         if let Some(c) = ctx {
             c.status()?;
         }
-        let mut handle = self.scheduler.handle().spawn_blocking(op);
-        let joined = if let Some(c) = ctx {
-            tokio::select! {
-                biased;
-                err = c.cancelled() => return Err(err),
-                res = &mut handle => res,
+        let base_ctx = ctx.cloned().unwrap_or_else(TaskContext::root);
+        let handle = self.scheduler.spawn_blocking(&base_ctx, move |_c| op());
+        if let Some(c) = ctx {
+            match race2(c.cancelled(), handle.join()).await {
+                Select2::First(err) => Err(err),
+                Select2::Second(res) => res,
             }
         } else {
-            handle.await
-        };
-        match joined {
-            Ok(inner) => inner,
-            Err(join_err) => Err(MoraError::Io(format!("async I/O task aborted: {join_err}"))),
+            handle.join().await
         }
     }
 
@@ -468,9 +610,10 @@ impl AsyncIoReactor {
     where
         F: Future<Output = MoraResult<T>>,
     {
-        match timeout(duration, future).await {
-            Ok(inner) => inner,
-            Err(_) => Err(MoraError::Timeout(format!(
+        let _ = Instant::now();
+        match race2(future, sleep(duration)).await {
+            Select2::First(inner) => inner,
+            Select2::Second(()) => Err(MoraError::Timeout(format!(
                 "async I/O operation timed out after {duration:?}"
             ))),
         }
@@ -517,10 +660,6 @@ impl AsyncIoReactor {
                     accepted_count += 1;
                     let h = Arc::clone(&handler);
                     group.spawn(move |conn_ctx| async move { h(stream, peer, conn_ctx).await });
-                }
-                Err(err) if err.is_cancellation_or_timeout() => {
-                    group.abort_all();
-                    return Err(err);
                 }
                 Err(err) => {
                     group.abort_all();

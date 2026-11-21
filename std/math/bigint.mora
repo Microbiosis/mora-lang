@@ -1,0 +1,782 @@
+-- Mora Pure Standard Library: `std/math/bigint` (Wave 4 / Zero-Dependency Pure-Mora Implementation)
+-- Arbitrary-precision signed integer arithmetic implemented 100% in Mora using
+-- normalized little-endian base-10^9 limbs (`0 <= limb < 1_000_000_000`).
+-- Since `(10^9 - 1) * (10^9 - 1) + (10^9 - 1) < 10^18 < i64::MAX (~9.22e18)`,
+-- all limb-level additions, subtractions, multiplications, and short divisions
+-- are exact in 64-bit `int` without overflow.
+
+export let BIGINT_BASE = 1000000000
+
+export struct BigInt
+  sign: int = 0
+  limbs: list<int>
+end
+
+export struct LimbSmallDivRem
+  q: list<int>
+  r: int = 0
+end
+
+export struct LimbDivRem
+  q: list<int>
+  r: list<int>
+end
+
+export struct BigIntDivRem
+  q: BigInt
+  r: BigInt
+end
+
+export enum BigIntResult<T>
+  Ok(T)
+  Err(string)
+end
+
+-- Internal helper: strip trailing zero limbs (most-significant zeros in little-endian order).
+export task bigint_normalize_limbs(raw: list<int>): list<int>
+  let n = len(raw)
+  let keep = n
+  while keep > 0 and raw.get(keep - 1) == 0
+    assign keep = keep - 1
+  end
+  if keep == n then
+    return raw
+  end
+  return raw.take(keep)
+end
+
+export task bigint_from_parts(sign: int, raw_limbs: list<int>): BigInt
+  let norm = bigint_normalize_limbs(raw_limbs)
+  if len(norm) == 0 or sign == 0 then
+    let empty: list<int> = []
+    return BigInt(sign=0, limbs=empty)
+  end
+  let s = if sign < 0 then -1 else 1 end
+  return BigInt(sign=s, limbs=norm)
+end
+
+export task bigint_zero(): BigInt
+  let empty: list<int> = []
+  return BigInt(sign=0, limbs=empty)
+end
+
+export task bigint_one(): BigInt
+  return BigInt(sign=1, limbs=[1])
+end
+
+export task bigint_from_int(val: int): BigInt
+  if val == 0 then
+    return bigint_zero()
+  end
+  let sign = if val < 0 then -1 else 1 end
+  -- Handle i64::MIN (-9223372036854775808) without negating overflow
+  if val == -9223372036854775807 - 1 then
+    return BigInt(sign=-1, limbs=[854775808, 223372036, 9])
+  end
+  let mag = if val < 0 then -val else val end
+  let limbs: list<int> = []
+  while mag > 0
+    assign limbs = limbs.push(mag % BIGINT_BASE)
+    assign mag = mag / BIGINT_BASE
+  end
+  return BigInt(sign=sign, limbs=limbs)
+end
+
+export task bigint_is_zero(a: BigInt): bool
+  return a.sign == 0 or len(a.limbs) == 0
+end
+
+export task bigint_is_positive(a: BigInt): bool
+  return a.sign > 0 and len(a.limbs) > 0
+end
+
+export task bigint_is_negative(a: BigInt): bool
+  return a.sign < 0 and len(a.limbs) > 0
+end
+
+export task bigint_signum(a: BigInt): int
+  if bigint_is_zero(a) then
+    return 0
+  end
+  return a.sign
+end
+
+export task bigint_abs(a: BigInt): BigInt
+  if bigint_is_zero(a) then
+    return bigint_zero()
+  end
+  return BigInt(sign=1, limbs=a.limbs)
+end
+
+export task bigint_neg(a: BigInt): BigInt
+  if bigint_is_zero(a) then
+    return bigint_zero()
+  end
+  return BigInt(sign=-a.sign, limbs=a.limbs)
+end
+
+-- Compare unsigned limb magnitudes: returns -1 if a < b, 0 if a == b, 1 if a > b.
+export task bigint_cmp_limbs(a: list<int>, b: list<int>): int
+  let la = len(a)
+  let lb = len(b)
+  if la < lb then
+    return -1
+  end
+  if la > lb then
+    return 1
+  end
+  let i = la - 1
+  while i >= 0
+    let va = a.get(i)
+    let vb = b.get(i)
+    if va < vb then
+      return -1
+    end
+    if va > vb then
+      return 1
+    end
+    assign i = i - 1
+  end
+  return 0
+end
+
+export task bigint_cmp(a: BigInt, b: BigInt): int
+  let sa = bigint_signum(a)
+  let sb = bigint_signum(b)
+  if sa < sb then
+    return -1
+  end
+  if sa > sb then
+    return 1
+  end
+  if sa == 0 then
+    return 0
+  end
+  let mc = bigint_cmp_limbs(a.limbs, b.limbs)
+  return if sa > 0 then mc else -mc end
+end
+
+export task bigint_eq(a: BigInt, b: BigInt): bool
+  return bigint_cmp(a, b) == 0
+end
+
+export task bigint_lt(a: BigInt, b: BigInt): bool
+  return bigint_cmp(a, b) < 0
+end
+
+export task bigint_le(a: BigInt, b: BigInt): bool
+  return bigint_cmp(a, b) <= 0
+end
+
+export task bigint_gt(a: BigInt, b: BigInt): bool
+  return bigint_cmp(a, b) > 0
+end
+
+export task bigint_ge(a: BigInt, b: BigInt): bool
+  return bigint_cmp(a, b) >= 0
+end
+
+-- Add unsigned limb magnitudes.
+export task bigint_add_limbs(a: list<int>, b: list<int>): list<int>
+  let la = len(a)
+  let lb = len(b)
+  let n = if la > lb then la else lb end
+  let out: list<int> = []
+  let carry = 0
+  let i = 0
+  while i < n or carry > 0
+    let va = if i < la then a.get(i) else 0 end
+    let vb = if i < lb then b.get(i) else 0 end
+    let sum = va + vb + carry
+    assign out = out.push(sum % BIGINT_BASE)
+    assign carry = sum / BIGINT_BASE
+    assign i = i + 1
+  end
+  return bigint_normalize_limbs(out)
+end
+
+-- Subtract unsigned limb magnitudes where `a >= b`.
+export task bigint_sub_limbs(a: list<int>, b: list<int>): list<int>
+  let la = len(a)
+  let lb = len(b)
+  let out: list<int> = []
+  let borrow = 0
+  let i = 0
+  while i < la
+    let va = a.get(i)
+    let vb = if i < lb then b.get(i) else 0 end
+    let diff = va - vb - borrow
+    if diff < 0 then
+      assign diff = diff + BIGINT_BASE
+      assign borrow = 1
+    else
+      assign borrow = 0
+    end
+    assign out = out.push(diff)
+    assign i = i + 1
+  end
+  return bigint_normalize_limbs(out)
+end
+
+export task bigint_add(a: BigInt, b: BigInt): BigInt
+  if bigint_is_zero(a) then
+    return b
+  end
+  if bigint_is_zero(b) then
+    return a
+  end
+  if a.sign == b.sign then
+    return bigint_from_parts(a.sign, bigint_add_limbs(a.limbs, b.limbs))
+  end
+  let cmp = bigint_cmp_limbs(a.limbs, b.limbs)
+  if cmp == 0 then
+    return bigint_zero()
+  end
+  if cmp > 0 then
+    return bigint_from_parts(a.sign, bigint_sub_limbs(a.limbs, b.limbs))
+  end
+  return bigint_from_parts(b.sign, bigint_sub_limbs(b.limbs, a.limbs))
+end
+
+export task bigint_sub(a: BigInt, b: BigInt): BigInt
+  return bigint_add(a, bigint_neg(b))
+end
+
+-- Multiply unsigned limbs by a single small integer `0 <= m < BIGINT_BASE`.
+export task bigint_mul_limbs_small(a: list<int>, m: int): list<int>
+  if m == 0 or len(a) == 0 then
+    let empty: list<int> = []
+    return empty
+  end
+  if m == 1 then
+    return a
+  end
+  let out: list<int> = []
+  let carry = 0
+  let i = 0
+  let la = len(a)
+  while i < la or carry > 0
+    let va = if i < la then a.get(i) else 0 end
+    let prod = va * m + carry
+    assign out = out.push(prod % BIGINT_BASE)
+    assign carry = prod / BIGINT_BASE
+    assign i = i + 1
+  end
+  return bigint_normalize_limbs(out)
+end
+
+-- Add a single small integer `0 <= addend < BIGINT_BASE` to unsigned limbs.
+export task bigint_add_limbs_small(a: list<int>, addend: int): list<int>
+  if addend == 0 then
+    return a
+  end
+  if len(a) == 0 then
+    return [addend]
+  end
+  let out: list<int> = []
+  let carry = addend
+  let i = 0
+  let la = len(a)
+  while i < la or carry > 0
+    let va = if i < la then a.get(i) else 0 end
+    let sum = va + carry
+    assign out = out.push(sum % BIGINT_BASE)
+    assign carry = sum / BIGINT_BASE
+    assign i = i + 1
+  end
+  return bigint_normalize_limbs(out)
+end
+
+-- Multiply two unsigned limb arrays (`O(N * M)` schoolbook with 64-bit accumulators).
+export task bigint_mul_limbs(a: list<int>, b: list<int>): list<int>
+  let la = len(a)
+  let lb = len(b)
+  if la == 0 or lb == 0 then
+    let empty: list<int> = []
+    return empty
+  end
+  let acc: list<int> = []
+  let i = 0
+  while i < la
+    let ai = a.get(i)
+    if ai != 0 then
+      let term: list<int> = []
+      let z = 0
+      while z < i
+        assign term = term.push(0)
+        assign z = z + 1
+      end
+      let carry = 0
+      let j = 0
+      while j < lb or carry > 0
+        let bj = if j < lb then b.get(j) else 0 end
+        let prod = ai * bj + carry
+        assign term = term.push(prod % BIGINT_BASE)
+        assign carry = prod / BIGINT_BASE
+        assign j = j + 1
+      end
+      assign acc = bigint_add_limbs(acc, term)
+    end
+    assign i = i + 1
+  end
+  return bigint_normalize_limbs(acc)
+end
+
+export task bigint_mul(a: BigInt, b: BigInt): BigInt
+  if bigint_is_zero(a) or bigint_is_zero(b) then
+    return bigint_zero()
+  end
+  let sign = if a.sign == b.sign then 1 else -1 end
+  return bigint_from_parts(sign, bigint_mul_limbs(a.limbs, b.limbs))
+end
+
+-- Divide unsigned limbs by a small integer `1 <= d < BIGINT_BASE`.
+export task bigint_div_rem_limbs_small(a: list<int>, d: int): LimbSmallDivRem
+  let la = len(a)
+  if la == 0 then
+    let empty: list<int> = []
+    return LimbSmallDivRem(q=empty, r=0)
+  end
+  let q_rev: list<int> = []
+  let rem = 0
+  let i = la - 1
+  while i >= 0
+    let cur = rem * BIGINT_BASE + a.get(i)
+    assign q_rev = q_rev.push(cur / d)
+    assign rem = cur % d
+    assign i = i - 1
+  end
+  let q: list<int> = []
+  let k = len(q_rev) - 1
+  while k >= 0
+    assign q = q.push(q_rev.get(k))
+    assign k = k - 1
+  end
+  return LimbSmallDivRem(q=bigint_normalize_limbs(q), r=rem)
+end
+
+-- Unsigned multi-limb division `a / b` (`b != []`).
+-- Uses exact limb-wise shift + binary search over `[0, BIGINT_BASE - 1]` ($\le 30$ steps per limb).
+export task bigint_div_rem_limbs(a: list<int>, b: list<int>): LimbDivRem
+  let cmp = bigint_cmp_limbs(a, b)
+  if cmp < 0 then
+    let empty: list<int> = []
+    return LimbDivRem(q=empty, r=a)
+  end
+  if len(b) == 1 then
+    let small = bigint_div_rem_limbs_small(a, b.get(0))
+    let empty_r: list<int> = []
+    let r_limbs = if small.r == 0 then empty_r else [small.r] end
+    return LimbDivRem(q=small.q, r=r_limbs)
+  end
+
+  let rem: list<int> = []
+  let q_rev: list<int> = []
+  let i = len(a) - 1
+  while i >= 0
+    let d = a.get(i)
+    if len(rem) == 0 then
+      if d != 0 then
+        assign rem = [d]
+      end
+    else
+      let shifted: list<int> = [d]
+      for x in rem
+        assign shifted = shifted.push(x)
+      end
+      assign rem = shifted
+    end
+
+    if bigint_cmp_limbs(rem, b) < 0 then
+      assign q_rev = q_rev.push(0)
+    else
+      let lo = 1
+      let hi = BIGINT_BASE - 1
+      while lo < hi
+        let mid = (lo + hi + 1) / 2
+        let prod = bigint_mul_limbs_small(b, mid)
+        if bigint_cmp_limbs(prod, rem) <= 0 then
+          assign lo = mid
+        else
+          assign hi = mid - 1
+        end
+      end
+      assign q_rev = q_rev.push(lo)
+      let sub_prod = bigint_mul_limbs_small(b, lo)
+      assign rem = bigint_sub_limbs(rem, sub_prod)
+    end
+    assign i = i - 1
+  end
+
+  let q: list<int> = []
+  let k = len(q_rev) - 1
+  while k >= 0
+    assign q = q.push(q_rev.get(k))
+    assign k = k - 1
+  end
+  return LimbDivRem(q=bigint_normalize_limbs(q), r=bigint_normalize_limbs(rem))
+end
+
+-- Truncating division and remainder `(q, r)` such that `q * rhs + r == self` and `r` has the sign of `self`.
+export task bigint_div_rem(a: BigInt, b: BigInt): BigIntResult<BigIntDivRem>
+  if bigint_is_zero(b) then
+    return BigIntResult::Err("division by zero")
+  end
+  if bigint_is_zero(a) then
+    return BigIntResult::Ok(BigIntDivRem(q=bigint_zero(), r=bigint_zero()))
+  end
+  let qr = bigint_div_rem_limbs(a.limbs, b.limbs)
+  let q_sign = if a.sign == b.sign then 1 else -1 end
+  let q = bigint_from_parts(q_sign, qr.q)
+  let r = bigint_from_parts(a.sign, qr.r)
+  return BigIntResult::Ok(BigIntDivRem(q=q, r=r))
+end
+
+export task bigint_checked_div(a: BigInt, b: BigInt): BigIntResult<BigInt>
+  let res = bigint_div_rem(a, b)
+  return match res with
+    BigIntResult::Ok(pair) -> BigIntResult::Ok(pair.q)
+    BigIntResult::Err(e) -> BigIntResult::Err(e)
+  end
+end
+
+export task bigint_checked_rem(a: BigInt, b: BigInt): BigIntResult<BigInt>
+  if bigint_is_zero(b) then
+    return BigIntResult::Err("modulo by zero")
+  end
+  let res = bigint_div_rem(a, b)
+  return match res with
+    BigIntResult::Ok(pair) -> BigIntResult::Ok(pair.r)
+    BigIntResult::Err(e) -> BigIntResult::Err(e)
+  end
+end
+
+export task bigint_pow(base: BigInt, exp: int): BigInt
+  if exp <= 0 then
+    return bigint_one()
+  end
+  let result = bigint_one()
+  let cur = base
+  let e = exp
+  while e > 0
+    if e % 2 == 1 then
+      assign result = bigint_mul(result, cur)
+    end
+    assign e = e / 2
+    if e > 0 then
+      assign cur = bigint_mul(cur, cur)
+    end
+  end
+  return result
+end
+
+export task bigint_gcd(a: BigInt, b: BigInt): BigInt
+  let x = bigint_abs(a)
+  let y = bigint_abs(b)
+  while !bigint_is_zero(y)
+    let qr = bigint_div_rem_limbs(x.limbs, y.limbs)
+    assign x = y
+    assign y = bigint_from_parts(1, qr.r)
+  end
+  return x
+end
+
+export task bigint_lcm(a: BigInt, b: BigInt): BigInt
+  if bigint_is_zero(a) or bigint_is_zero(b) then
+    return bigint_zero()
+  end
+  let g = bigint_gcd(a, b)
+  let qr = bigint_div_rem_limbs(a.limbs, g.limbs)
+  let q = bigint_from_parts(1, qr.q)
+  return bigint_mul(q, bigint_abs(b))
+end
+
+export task bigint_mod_pow(base: BigInt, exp: BigInt, modulus: BigInt): BigIntResult<BigInt>
+  if !bigint_is_positive(modulus) then
+    return BigIntResult::Err("modular exponentiation requires a positive modulus")
+  end
+  if bigint_is_negative(exp) then
+    return BigIntResult::Err("modular exponentiation requires a non-negative exponent")
+  end
+  if bigint_eq(modulus, bigint_one()) then
+    return BigIntResult::Ok(bigint_zero())
+  end
+  let result = bigint_one()
+  let b_rem = bigint_div_rem_limbs(base.limbs, modulus.limbs).r
+  let cur = bigint_from_parts(1, b_rem)
+  if bigint_is_negative(base) and !bigint_is_zero(cur) then
+    assign cur = bigint_sub(modulus, cur)
+  end
+  let e_limbs = exp.limbs
+  while len(e_limbs) > 0
+    if e_limbs.get(0) % 2 == 1 then
+      let prod = bigint_mul(result, cur)
+      let r_limbs = bigint_div_rem_limbs(prod.limbs, modulus.limbs).r
+      assign result = bigint_from_parts(1, r_limbs)
+    end
+    let step = bigint_div_rem_limbs_small(e_limbs, 2)
+    assign e_limbs = step.q
+    if len(e_limbs) > 0 then
+      let sq = bigint_mul(cur, cur)
+      let sq_rem = bigint_div_rem_limbs(sq.limbs, modulus.limbs).r
+      assign cur = bigint_from_parts(1, sq_rem)
+    end
+  end
+  return BigIntResult::Ok(result)
+end
+
+export let BIGINT_DIGIT_LIST = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z"]
+
+export task bigint_char_to_digit(ch: string): int
+  let lower = ch.lower()
+  let idx = 0
+  while idx < 36
+    if BIGINT_DIGIT_LIST.get(idx) == lower then
+      return idx
+    end
+    assign idx = idx + 1
+  end
+  return -1
+end
+
+export task bigint_from_str_radix(input: string, radix: int): BigIntResult<BigInt>
+  if radix < 2 or radix > 36 then
+    return BigIntResult::Err("invalid radix " + json.stringify(radix) + ": expected 2..=36")
+  end
+  let trimmed = input.trim().replace("_", "")
+  let n = len(trimmed)
+  if n == 0 or trimmed == "+" or trimmed == "-" then
+    return BigIntResult::Err("invalid bigint literal: " + input)
+  end
+  let sign = 1
+  let body = trimmed
+  if trimmed.starts_with("-") then
+    assign sign = -1
+    assign body = join_chars(trimmed.split("").drop(2))
+  end
+  if trimmed.starts_with("+") then
+    assign body = join_chars(trimmed.split("").drop(2))
+  end
+  if len(body) == 0 then
+    return BigIntResult::Err("invalid bigint literal: " + input)
+  end
+  let limbs: list<int> = []
+  for ch in body.split("")
+    if ch != "" then
+      let d = bigint_char_to_digit(ch)
+      if d < 0 or d >= radix then
+        return BigIntResult::Err("invalid bigint literal: " + input)
+      end
+      assign limbs = bigint_mul_limbs_small(limbs, radix)
+      assign limbs = bigint_add_limbs_small(limbs, d)
+    end
+  end
+  return BigIntResult::Ok(bigint_from_parts(sign, limbs))
+end
+
+task join_chars(parts: list<string>): string
+  let out = ""
+  for p in parts
+    if p != "" then
+      assign out = out + p
+    end
+  end
+  return out
+end
+
+export task bigint_parse(input: string): BigIntResult<BigInt>
+  return bigint_from_str_radix(input, 10)
+end
+
+export task bigint_pad9(limb: int): string
+  let s = json.stringify(limb)
+  while len(s) < 9
+    assign s = "0" + s
+  end
+  return s
+end
+
+export task bigint_to_string(a: BigInt): string
+  if bigint_is_zero(a) then
+    return "0"
+  end
+  let prefix = if a.sign < 0 then "-" else "" end
+  let k = len(a.limbs) - 1
+  let out = prefix + json.stringify(a.limbs.get(k))
+  assign k = k - 1
+  while k >= 0
+    assign out = out + bigint_pad9(a.limbs.get(k))
+    assign k = k - 1
+  end
+  return out
+end
+
+export task bigint_to_radix_string(a: BigInt, radix: int): BigIntResult<string>
+  if radix < 2 or radix > 36 then
+    return BigIntResult::Err("invalid radix " + json.stringify(radix) + ": expected 2..=36")
+  end
+  if radix == 10 then
+    return BigIntResult::Ok(bigint_to_string(a))
+  end
+  if bigint_is_zero(a) then
+    return BigIntResult::Ok("0")
+  end
+  let prefix = if a.sign < 0 then "-" else "" end
+  let cur = a.limbs
+  let chars: list<string> = []
+  while len(cur) > 0
+    let qr = bigint_div_rem_limbs_small(cur, radix)
+    assign cur = qr.q
+    let rem = qr.r
+    assign chars = chars.push(BIGINT_DIGIT_LIST.get(rem))
+  end
+  let out = prefix
+  let i = len(chars) - 1
+  while i >= 0
+    assign out = out + chars.get(i)
+    assign i = i - 1
+  end
+  return BigIntResult::Ok(out)
+end
+
+export task bigint_to_i64_checked(a: BigInt): BigIntResult<int>
+  if bigint_is_zero(a) then
+    return BigIntResult::Ok(0)
+  end
+  let max_limbs = [854775807, 223372036, 9]
+  let min_limbs = [854775808, 223372036, 9]
+  if a.sign > 0 then
+    if bigint_cmp_limbs(a.limbs, max_limbs) > 0 then
+      return BigIntResult::Err("bigint(" + bigint_to_string(a) + ") out of i64 range")
+    end
+    let val = 0
+    let i = len(a.limbs) - 1
+    while i >= 0
+      assign val = val * BIGINT_BASE + a.limbs.get(i)
+      assign i = i - 1
+    end
+    return BigIntResult::Ok(val)
+  end
+  let cmp = bigint_cmp_limbs(a.limbs, min_limbs)
+  if cmp > 0 then
+    return BigIntResult::Err("bigint(" + bigint_to_string(a) + ") out of i64 range")
+  end
+  if cmp == 0 then
+    return BigIntResult::Ok(-9223372036854775807 - 1)
+  end
+  let val = 0
+  let i = len(a.limbs) - 1
+  while i >= 0
+    assign val = val * BIGINT_BASE + a.limbs.get(i)
+    assign i = i - 1
+  end
+  return BigIntResult::Ok(-val)
+end
+
+export task bigint_to_f64_lossy(a: BigInt): float
+  if bigint_is_zero(a) then
+    return 0.0
+  end
+  -- 10^308 overflows IEEE-754 f64 (> 35 base-10^9 limbs)
+  if len(a.limbs) > 35 then
+    return if a.sign < 0 then -math.INF else math.INF end
+  end
+  let acc = 0.0
+  let base_f = 1000000000.0
+  let i = len(a.limbs) - 1
+  while i >= 0
+    assign acc = acc * base_f + a.limbs.get(i) * 1.0
+    assign i = i - 1
+  end
+  return if a.sign < 0 then -acc else acc end
+end
+
+export impl BigInt
+  task to_string(self): string
+    return bigint_to_string(self)
+  end
+
+  task to_radix(self, radix: int): BigIntResult<string>
+    return bigint_to_radix_string(self, radix)
+  end
+
+  task is_zero(self): bool
+    return bigint_is_zero(self)
+  end
+
+  task is_positive(self): bool
+    return bigint_is_positive(self)
+  end
+
+  task is_negative(self): bool
+    return bigint_is_negative(self)
+  end
+
+  task signum(self): int
+    return bigint_signum(self)
+  end
+
+  task abs(self): BigInt
+    return bigint_abs(self)
+  end
+
+  task neg(self): BigInt
+    return bigint_neg(self)
+  end
+
+  task cmp(self, other: BigInt): int
+    return bigint_cmp(self, other)
+  end
+
+  task eq(self, other: BigInt): bool
+    return bigint_eq(self, other)
+  end
+
+  task add(self, other: BigInt): BigInt
+    return bigint_add(self, other)
+  end
+
+  task sub(self, other: BigInt): BigInt
+    return bigint_sub(self, other)
+  end
+
+  task mul(self, other: BigInt): BigInt
+    return bigint_mul(self, other)
+  end
+
+  task div_rem(self, other: BigInt): BigIntResult<BigIntDivRem>
+    return bigint_div_rem(self, other)
+  end
+
+  task checked_div(self, other: BigInt): BigIntResult<BigInt>
+    return bigint_checked_div(self, other)
+  end
+
+  task checked_rem(self, other: BigInt): BigIntResult<BigInt>
+    return bigint_checked_rem(self, other)
+  end
+
+  task pow(self, exp: int): BigInt
+    return bigint_pow(self, exp)
+  end
+
+  task gcd(self, other: BigInt): BigInt
+    return bigint_gcd(self, other)
+  end
+
+  task lcm(self, other: BigInt): BigInt
+    return bigint_lcm(self, other)
+  end
+
+  task mod_pow(self, exp: BigInt, modulus: BigInt): BigIntResult<BigInt>
+    return bigint_mod_pow(self, exp, modulus)
+  end
+
+  task to_i64_checked(self): BigIntResult<int>
+    return bigint_to_i64_checked(self)
+  end
+
+  task to_f64_lossy(self): float
+    return bigint_to_f64_lossy(self)
+  end
+end

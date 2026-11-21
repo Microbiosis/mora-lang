@@ -192,16 +192,6 @@ impl From<std::io::Error> for MoraError {
     }
 }
 
-impl From<tokio::task::JoinError> for MoraError {
-    fn from(e: tokio::task::JoinError) -> Self {
-        if e.is_cancelled() {
-            Self::Cancelled(e.to_string())
-        } else {
-            Self::Task(e.to_string())
-        }
-    }
-}
-
 // 注意：不再实现 `From<String> for MoraError` / `From<&str> for MoraError` /
 // `From<MoraError> for String` —— 所有调用方必须显式构造具体错误变体或调用 `.to_string()`。
 

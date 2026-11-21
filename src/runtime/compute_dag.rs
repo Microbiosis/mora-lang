@@ -23,7 +23,7 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use parking_lot::{Mutex, RwLock};
+use crate::common::sync::{Mutex, RwLock};
 
 use crate::common::{DType, Device};
 use crate::error::{MoraError, MoraResult};

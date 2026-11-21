@@ -1306,10 +1306,14 @@ fn resolve_channel_method(
                 match core.task_context.as_ref() {
                     Some(outer) => {
                         outer.status()?;
-                        tokio::select! {
-                            biased;
-                            err = outer.cancelled() => Err(err),
-                            res = ch.send_async(val, Some(&explicit_ctx)) => res,
+                        match crate::runtime::scheduler::race2(
+                            outer.cancelled(),
+                            ch.send_async(val, Some(&explicit_ctx)),
+                        )
+                        .await
+                        {
+                            crate::runtime::scheduler::Select2::First(err) => Err(err),
+                            crate::runtime::scheduler::Select2::Second(res) => res,
                         }
                     }
                     None => ch.send_async(val, Some(&explicit_ctx)).await,
@@ -1337,10 +1341,14 @@ fn resolve_channel_method(
                 match core.task_context.as_ref() {
                     Some(outer) => {
                         outer.status()?;
-                        tokio::select! {
-                            biased;
-                            err = outer.cancelled() => Err(err),
-                            res = ch.recv_async(Some(&explicit_ctx)) => res,
+                        match crate::runtime::scheduler::race2(
+                            outer.cancelled(),
+                            ch.recv_async(Some(&explicit_ctx)),
+                        )
+                        .await
+                        {
+                            crate::runtime::scheduler::Select2::First(err) => Err(err),
+                            crate::runtime::scheduler::Select2::Second(res) => res,
                         }
                     }
                     None => ch.recv_async(Some(&explicit_ctx)).await,

@@ -25,8 +25,6 @@ use mora::runtime::vm::execute_program;
 use mora::typeck::check_mir::{check_program_witnesses, infer_program_types};
 use mora::value::Value;
 use mora::value::tensor::{AlignedByteBuffer, Tensor};
-use proptest::prelude::*;
-
 fn typeck_errors(src: &str) -> Result<Vec<mora::typeck::TypeError>, String> {
     let (_prog, witnesses) = ParserV3::compile(src).map_err(|e| format!("COMPILE: {e}"))?;
     Ok(check_program_witnesses(&witnesses))
@@ -691,62 +689,77 @@ fn spanned_mora_error_and_lsp_tensor_support() {
 }
 
 // ============================================================================
-// Property-Based Verification (`proptest`): Hardware Codecs & Packed Buffers
+// Exhaustive & Property-Based Verification: Hardware Codecs & Packed Buffers
 // ============================================================================
 
-proptest! {
-    #[test]
-    fn prop_f16_bits_roundtrip_idempotent(bits in any::<u16>()) {
+#[test]
+fn prop_f16_bits_roundtrip_idempotent() {
+    for bits in 0u16..=u16::MAX {
         let decoded = f16_bits_to_f64(bits);
         let reencoded = f64_to_f16_bits(decoded);
         if decoded.is_nan() {
-            prop_assert!(f16_bits_to_f64(reencoded).is_nan());
+            assert!(f16_bits_to_f64(reencoded).is_nan());
         } else {
-            prop_assert_eq!(reencoded, bits);
+            assert_eq!(reencoded, bits);
         }
     }
+}
 
-    #[test]
-    fn prop_bf16_bits_roundtrip_idempotent(bits in any::<u16>()) {
+#[test]
+fn prop_bf16_bits_roundtrip_idempotent() {
+    for bits in 0u16..=u16::MAX {
         let decoded = bf16_bits_to_f64(bits);
         let reencoded = f64_to_bf16_bits(decoded);
         if decoded.is_nan() {
-            prop_assert!(bf16_bits_to_f64(reencoded).is_nan());
+            assert!(bf16_bits_to_f64(reencoded).is_nan());
         } else {
-            prop_assert_eq!(reencoded, bits);
+            assert_eq!(reencoded, bits);
         }
     }
+}
 
-    #[test]
-    fn prop_fp8_e4m3_and_e5m2_roundtrip_idempotent(bits in any::<u8>()) {
+#[test]
+fn prop_fp8_e4m3_and_e5m2_roundtrip_idempotent() {
+    for bits in 0u8..=u8::MAX {
         let d43 = fp8_e4m3_bits_to_f64(bits);
         let r43 = f64_to_fp8_e4m3_bits(d43);
         if d43.is_nan() {
-            prop_assert!(fp8_e4m3_bits_to_f64(r43).is_nan());
+            assert!(fp8_e4m3_bits_to_f64(r43).is_nan());
         } else {
-            prop_assert_eq!(r43, bits);
+            assert_eq!(r43, bits);
         }
 
         let d52 = fp8_e5m2_bits_to_f64(bits);
         let r52 = f64_to_fp8_e5m2_bits(d52);
         if d52.is_nan() {
-            prop_assert!(fp8_e5m2_bits_to_f64(r52).is_nan());
+            assert!(fp8_e5m2_bits_to_f64(r52).is_nan());
         } else {
-            prop_assert_eq!(r52, bits);
+            assert_eq!(r52, bits);
         }
     }
+}
 
-    #[test]
-    fn prop_i4_nibble_packed_buffer_roundtrip(elems in proptest::collection::vec(-8i8..=7i8, 1..=129)) {
+#[test]
+fn prop_i4_nibble_packed_buffer_roundtrip() {
+    let mut state = 0x2026_1120_3b00_0004u64;
+    let mut next_u64 = || {
+        state = state.wrapping_add(0x9e3779b97f4a7c15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        z ^ (z >> 31)
+    };
+    for len in 1..=129usize {
+        let elems: Vec<i8> = (0..len).map(|_| ((next_u64() % 16) as i8) - 8).collect();
         let mut buf = AlignedByteBuffer::zeroed(elems.len(), DType::I4);
-        prop_assert_eq!(buf.byte_len(), elems.len().div_ceil(2));
-        prop_assert_eq!((buf.aligned_byte_ptr() as usize) % 64, 0);
+        assert_eq!(buf.byte_len(), elems.len().div_ceil(2));
+        assert_eq!((buf.aligned_byte_ptr() as usize) % 64, 0);
         for (idx, &v) in elems.iter().enumerate() {
-            prop_assert_eq!(unpack_i4_nibble(pack_i4_nibble(v)), v);
+            assert_eq!(unpack_i4_nibble(pack_i4_nibble(v)), v);
             buf.set_f64(idx, v as f64);
         }
         for (idx, &v) in elems.iter().enumerate() {
-            prop_assert_eq!(buf.get_value(idx), Value::Scalar(ScalarValue::I4(v)));
+            assert_eq!(buf.get_value(idx), Value::Scalar(ScalarValue::I4(v)));
         }
     }
 }

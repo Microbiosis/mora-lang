@@ -110,6 +110,10 @@ All notable changes to Mora will be documented in this file.
   - **Vulkan 1.0 Compute 后端（`src/runtime/gpu/vulkan.rs`）**：动态加载 `vulkan-1.dll` / `libvulkan.so.1` / `libMoltenVK.dylib`，内置纯 Rust SPIR-V 1.0 `GLCompute` 二进制着色器生成器（`emit_spirv_fused_linear_f32` 支持 `MatMul` 及全部 6 种融合激活）与完整 `VkDevice`/`VkBuffer`/`VkCommandBuffer`/`vkCmdDispatch` 硬件管线（已在 RTX 5070 实机与 CUDA 经 `spawn` 并发同跑验证）。
   - **Apple Metal 后端（`src/runtime/gpu/metal.rs`）**：在 macOS 动态加载 `Metal.framework` + `libobjc.A.dylib`，支持运行期 MSL 着色器编译与 `MTLComputeCommandEncoder` 硬件派发。
   - 扩充 `Device::Vulkan(u16)`（`"vulkan"` / `"vulkan:N"`，含 HM 静态跨设备隔离与 `Tensor<f32, [2, 3], vulkan:0>` 类型标注），新增 `Tensor::devices()` / `Tensor::device_info(device?)` 完整打通运行期、HM 静态类型检查、LSP 补全及 `ComputeDag.backend_info()` 硬件遥测字段（`driver`/`gpu_name`/`vram_bytes`/`compute_capability`/`multiprocessors`/`hardware_accelerated`/`driver_version`）。
+- **全工作区第三方依赖彻底清零与纯 Mora `std/math/bigint` & `std/testing` 标准库（`tests/std_math_bigint_and_testing.rs`）**：
+  - 用 Mora 语言自身完整实现 `std/math/bigint.mora`（基于 $10^9$ 规格化小端 limbs 的任意精度有符号整数 `BigInt`：支持加/减/乘、二分长除 `div_rem`/`checked_div`/`checked_rem`、快速幂 `pow`、模幂 `mod_pow`、欧几里得 `gcd`/`lcm`、`2..=36` 任意进制解析与格式化、`to_i64_checked`/`to_f64_lossy` 及固有方法链）与 `std/testing.mora`（基于环境确定性 PRNG 的属性测试生成与校验器 `prop_check`/`prop_check2`），并内嵌至 `resolve_std_module`（移除旧 `num-bigint`/`num-traits` 包装 crate）。
+  - 新增 `src/common/sys.rs`（Unix POSIX C ABI 直连 `dlopen`/`dlsym`/`dlclose`/`setpgid`/`killpg`）与 `src/common/sync.rs`（基于 OS Futex 的无毒化恢复 `Mutex`/`RwLock` 与环安全 `<locked>` Debug 格式化），移除 `libc` 与 `parking_lot`。
+  - 在 `src/runtime/scheduler.rs`、`src/runtime/reactor.rs` 与 `src/runtime/builtins/exec.rs` 自研零依赖多线程 `Future` 调度器、最小堆后台定时器（`sleep`/`sleep_until`）、`AsyncNotify`、非阻塞 `std::net` 异步 TCP 监听器/流与 `AsyncSemaphore` 子进程并发池，彻底移除 `tokio` 与 `proptest`，达成 **`Cargo.toml` 生产与测试外部依赖双清零（0 第三方 crate）**。
 
 ## [0.104.x 历史记录] — `Int` 语义统一与早期过渡批次（D468–D491，已被 v0.110.0 统一取代）
 

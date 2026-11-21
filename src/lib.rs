@@ -32,12 +32,14 @@ pub mod typeck;
 pub mod value;
 
 /// Resolve embedded pure-Mora standard library module source by canonical specifier
-/// (e.g. `"std/net/http"`, `"std/mcp"`).
+/// (e.g. `"std/net/http"`, `"std/mcp"`, `"std/math/bigint"`, `"std/testing"`).
 pub fn resolve_std_module(spec: &str) -> Option<&'static str> {
     let norm = spec.trim().replace('\\', "/");
     match norm.as_str() {
         "std/net/http" | "std/net/http.mora" => Some(include_str!("../std/net/http.mora")),
         "std/mcp" | "std/mcp.mora" => Some(include_str!("../std/mcp.mora")),
+        "std/math/bigint" | "std/math/bigint.mora" => Some(include_str!("../std/math/bigint.mora")),
+        "std/testing" | "std/testing.mora" => Some(include_str!("../std/testing.mora")),
         _ => None,
     }
 }

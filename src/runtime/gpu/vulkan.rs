@@ -14,7 +14,7 @@ use std::ffi::{CStr, c_char, c_void};
 use std::ptr;
 use std::sync::Arc;
 
-use parking_lot::Mutex;
+use crate::common::sync::Mutex;
 
 use crate::common::{DType, Device};
 use crate::error::{MoraError, MoraResult};

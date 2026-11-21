@@ -1,7 +1,3 @@
-[workspace]
-members = [".", "std/math/bigint"]
-resolver = "2"
-
 [package]
 name = "mora"
 version = "0.110.0"
@@ -29,15 +25,10 @@ path = "src/bin/lsp.rs"
 # v0.110.0: 单二进制 `mora`（加 `mora-lsp`）；HTTP/MCP 等扩展包后续拆入独立标准库包。
 
 [dependencies]
-# v0.11: libc 用于进程控制、系统调用与底层内存原语
-libc = { version = "0.2", features = ["extra_traits"] }
-parking_lot = "0.12"
-# v0.50.0 (P0-B): tokio async runtime (reserved for Wave 2 TaskScheduler + AsyncIoReactor)
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "io-std", "process"] }
+# v0.110.0+: 生产环境零外部第三方依赖（OS FFI、Futex 同步原语、多线程 Future 调度器、时间轮与非阻塞 TCP Reactor 均自研内建）。
 
 [dev-dependencies]
-# v0.53: property-based testing for formal semantics verification
-proptest = "1.7"
+# v0.110.0+: 测试环境同样零外部第三方依赖（属性测试由 std/testing.mora 与确定性 SplitMix64 生成器自研内建）。
 
 [features]
 # v0.110.0: 统一单引擎执行（CFG-SSA MIR + stackful VM + Tokio TaskScheduler / AsyncIoReactor），

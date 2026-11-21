@@ -1,23 +1,345 @@
-//! Tokio-backed multi-thread task scheduler, structured concurrency groups, typed MPSC
-//! channels, multi-channel fair `select`, and hierarchical cooperative cancellation (Wave 2 — Stage W2.4).
+//! Zero-dependency native multi-thread task scheduler, structured concurrency groups,
+//! timer wheel/min-heap (`sleep` / `sleep_until`), typed MPSC & MPMC channels,
+//! multi-channel fair `select`, and hierarchical cooperative cancellation (`TaskContext`).
+//!
+//! Built from first principles (`AGENTS.md §0`) directly on Rust's standard library
+//! (`std::future`, `std::task`, `std::thread`, and `crate::common::sync`), with zero
+//! external runtime dependencies.
 
-use std::collections::VecDeque;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::future::Future;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
-use std::task::{Context as PollContext, Poll};
+use std::sync::{Arc, Condvar as StdCondvar, Mutex as StdMutex, OnceLock};
+use std::task::{Context as PollContext, Poll, Wake, Waker};
+use std::thread::{self, Thread};
+use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
-use tokio::runtime::{Builder, Handle, Runtime, RuntimeFlavor};
-use tokio::sync::{Notify, mpsc, watch};
-use tokio::task::{JoinHandle, JoinSet};
-use tokio::time::{Duration, Instant};
-
+use crate::common::sync::Mutex;
 use crate::error::{MoraError, MoraResult};
 use crate::runtime::CoreRuntime;
 use crate::runtime::vm::{execute_method_named, execute_value, execute_value_named};
 use crate::value::Value;
+
+// ─── Native Min-Heap Timer Driver (`sleep` / `sleep_until`) ─────────────────
+
+struct TimerState {
+    next_id: u64,
+    heap: BinaryHeap<Reverse<(Instant, u64)>>,
+    wakers: HashMap<u64, Waker>,
+}
+
+struct TimerDriver {
+    state: StdMutex<TimerState>,
+    cv: StdCondvar,
+}
+
+static TIMER_DRIVER: OnceLock<Arc<TimerDriver>> = OnceLock::new();
+
+fn timer_driver() -> &'static Arc<TimerDriver> {
+    TIMER_DRIVER.get_or_init(|| {
+        let driver = Arc::new(TimerDriver {
+            state: StdMutex::new(TimerState {
+                next_id: 1,
+                heap: BinaryHeap::new(),
+                wakers: HashMap::new(),
+            }),
+            cv: StdCondvar::new(),
+        });
+        let bg = Arc::clone(&driver);
+        thread::Builder::new()
+            .name("mora-timer".to_string())
+            .spawn(move || timer_loop(bg))
+            .expect("failed to spawn mora-timer thread");
+        driver
+    })
+}
+
+fn timer_loop(driver: Arc<TimerDriver>) {
+    loop {
+        let mut ready_wakers: Vec<Waker> = Vec::new();
+        let wait_dur: Option<Duration> = {
+            let mut st = driver.state.lock().unwrap_or_else(|p| p.into_inner());
+            let now = Instant::now();
+            while let Some(&Reverse((deadline, id))) = st.heap.peek() {
+                if deadline <= now {
+                    st.heap.pop();
+                    if let Some(w) = st.wakers.remove(&id) {
+                        ready_wakers.push(w);
+                    }
+                } else {
+                    break;
+                }
+            }
+            if !ready_wakers.is_empty() {
+                None
+            } else if let Some(&Reverse((next_dl, _))) = st.heap.peek() {
+                Some(next_dl.saturating_duration_since(now))
+            } else {
+                Some(Duration::from_secs(3600))
+            }
+        };
+
+        for w in ready_wakers {
+            w.wake();
+        }
+
+        if let Some(dur) = wait_dur {
+            let st = driver.state.lock().unwrap_or_else(|p| p.into_inner());
+            let now = Instant::now();
+            let should_wait = match st.heap.peek() {
+                Some(&Reverse((dl, _))) => dl > now,
+                None => true,
+            };
+            if should_wait {
+                let _ = driver.cv.wait_timeout(st, dur);
+            }
+        }
+    }
+}
+
+/// Future returned by [`sleep`] and [`sleep_until`].
+pub struct SleepFuture {
+    id: u64,
+    deadline: Instant,
+}
+
+impl Future for SleepFuture {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut PollContext<'_>) -> Poll<()> {
+        if Instant::now() >= self.deadline {
+            if self.id != 0 {
+                let drv = timer_driver();
+                let mut st = drv.state.lock().unwrap_or_else(|p| p.into_inner());
+                st.wakers.remove(&self.id);
+                self.id = 0;
+            }
+            return Poll::Ready(());
+        }
+        let drv = timer_driver();
+        let mut st = drv.state.lock().unwrap_or_else(|p| p.into_inner());
+        let wake_thread = st
+            .heap
+            .peek()
+            .is_none_or(|&Reverse((top_dl, _))| self.deadline < top_dl);
+        if self.id == 0 {
+            let id = st.next_id;
+            st.next_id += 1;
+            self.id = id;
+            st.heap.push(Reverse((self.deadline, id)));
+        }
+        st.wakers.insert(self.id, cx.waker().clone());
+        drop(st);
+        if wake_thread {
+            drv.cv.notify_one();
+        }
+        Poll::Pending
+    }
+}
+
+impl Drop for SleepFuture {
+    fn drop(&mut self) {
+        if self.id != 0 {
+            let drv = timer_driver();
+            let mut st = drv.state.lock().unwrap_or_else(|p| p.into_inner());
+            st.wakers.remove(&self.id);
+        }
+    }
+}
+
+/// Suspend asynchronously until `duration` has elapsed.
+pub fn sleep(duration: Duration) -> SleepFuture {
+    SleepFuture {
+        id: 0,
+        deadline: Instant::now()
+            .checked_add(duration)
+            .unwrap_or_else(Instant::now),
+    }
+}
+
+/// Suspend asynchronously until `deadline` is reached.
+pub(crate) fn sleep_until(deadline: Instant) -> SleepFuture {
+    SleepFuture { id: 0, deadline }
+}
+
+// ─── Biased Future Race Combinators (replacing `tokio::select!`) ─────────────
+
+pub(crate) async fn race2<A, B, FA, FB>(fa: FA, fb: FB) -> Select2<A, B>
+where
+    FA: Future<Output = A>,
+    FB: Future<Output = B>,
+{
+    let mut fa = std::pin::pin!(fa);
+    let mut fb = std::pin::pin!(fb);
+    std::future::poll_fn(|cx| {
+        if let Poll::Ready(a) = fa.as_mut().poll(cx) {
+            return Poll::Ready(Select2::First(a));
+        }
+        if let Poll::Ready(b) = fb.as_mut().poll(cx) {
+            return Poll::Ready(Select2::Second(b));
+        }
+        Poll::Pending
+    })
+    .await
+}
+
+// ─── Native AsyncNotify (replacing `tokio::sync::Notify`) ───────────────────
+
+#[derive(Default)]
+struct NotifyInner {
+    epoch: u64,
+    permits: usize,
+    next_waiter_id: u64,
+    waiters: Vec<(u64, Option<Waker>, bool)>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct AsyncNotify {
+    inner: Arc<Mutex<NotifyInner>>,
+}
+
+impl fmt::Debug for NotifyInner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NotifyInner")
+            .field("epoch", &self.epoch)
+            .field("permits", &self.permits)
+            .finish()
+    }
+}
+
+use std::fmt;
+
+pub(crate) struct NotifiedFuture {
+    inner: Arc<Mutex<NotifyInner>>,
+    start_epoch: u64,
+    waiter_id: u64,
+}
+
+impl AsyncNotify {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(NotifyInner::default())),
+        }
+    }
+
+    pub(crate) fn notified(&self) -> NotifiedFuture {
+        let mut st = self.inner.lock();
+        st.next_waiter_id += 1;
+        let wid = st.next_waiter_id;
+        let epoch = st.epoch;
+        st.waiters.push((wid, None, false));
+        NotifiedFuture {
+            inner: Arc::clone(&self.inner),
+            start_epoch: epoch,
+            waiter_id: wid,
+        }
+    }
+
+    pub(crate) fn notify_one(&self) {
+        let waker = {
+            let mut st = self.inner.lock();
+            if let Some(entry) = st.waiters.iter_mut().find(|(_, _, woken)| !*woken) {
+                entry.2 = true;
+                entry.1.take()
+            } else {
+                st.permits += 1;
+                None
+            }
+        };
+        if let Some(w) = waker {
+            w.wake();
+        }
+    }
+
+    pub(crate) fn notify_waiters(&self) {
+        let wakers: Vec<Waker> = {
+            let mut st = self.inner.lock();
+            st.epoch = st.epoch.wrapping_add(1);
+            let mut out = Vec::new();
+            for entry in &mut st.waiters {
+                entry.2 = true;
+                if let Some(w) = entry.1.take() {
+                    out.push(w);
+                }
+            }
+            out
+        };
+        for w in wakers {
+            w.wake();
+        }
+    }
+}
+
+impl Future for NotifiedFuture {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut PollContext<'_>) -> Poll<()> {
+        let mut st = self.inner.lock();
+        if st.epoch != self.start_epoch {
+            let wid = self.waiter_id;
+            st.waiters.retain(|(id, _, _)| *id != wid);
+            drop(st);
+            self.waiter_id = 0;
+            return Poll::Ready(());
+        }
+        if let Some(pos) = st
+            .waiters
+            .iter()
+            .position(|(id, _, _)| *id == self.waiter_id)
+        {
+            if st.waiters[pos].2 {
+                st.waiters.swap_remove(pos);
+                drop(st);
+                self.waiter_id = 0;
+                return Poll::Ready(());
+            }
+            if st.permits > 0 {
+                st.permits -= 1;
+                st.waiters.swap_remove(pos);
+                drop(st);
+                self.waiter_id = 0;
+                return Poll::Ready(());
+            }
+            st.waiters[pos].1 = Some(cx.waker().clone());
+        } else if st.permits > 0 {
+            st.permits -= 1;
+            return Poll::Ready(());
+        }
+        Poll::Pending
+    }
+}
+
+impl Drop for NotifiedFuture {
+    fn drop(&mut self) {
+        if self.waiter_id != 0 {
+            let mut st = self.inner.lock();
+            if let Some(pos) = st
+                .waiters
+                .iter()
+                .position(|(id, _, _)| *id == self.waiter_id)
+            {
+                let was_woken = st.waiters[pos].2;
+                st.waiters.swap_remove(pos);
+                if was_woken {
+                    if let Some(other) = st.waiters.iter_mut().find(|(_, _, w)| !*w) {
+                        other.2 = true;
+                        if let Some(w) = other.1.take() {
+                            drop(st);
+                            w.wake();
+                        }
+                    } else {
+                        st.permits += 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ─── Hierarchical Cooperative Cancellation (`TaskContext`) ──────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CancelReason {
@@ -25,14 +347,49 @@ enum CancelReason {
     TimedOut(String),
 }
 
-/// Hierarchical cooperative cancellation and deadline propagation token (`watch`-backed).
+impl CancelReason {
+    fn to_error(&self) -> MoraError {
+        match self {
+            Self::Cancelled(msg) => MoraError::Cancelled(msg.clone()),
+            Self::TimedOut(msg) => MoraError::Timeout(msg.clone()),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct CancelCell {
+    reason: Mutex<Option<CancelReason>>,
+    notify: AsyncNotify,
+}
+
+impl CancelCell {
+    fn set_once(&self, reason: CancelReason) {
+        let changed = {
+            let mut slot = self.reason.lock();
+            if slot.is_some() {
+                false
+            } else {
+                *slot = Some(reason);
+                true
+            }
+        };
+        if changed {
+            self.notify.notify_waiters();
+        }
+    }
+
+    fn get(&self) -> Option<CancelReason> {
+        self.reason.lock().clone()
+    }
+}
+
+/// Hierarchical cooperative cancellation and deadline propagation token.
 ///
 /// Parent cancellations and deadlines propagate downward to every descendant context,
 /// while cancelling a child context leaves its parent unaffected.
 #[derive(Clone, Debug)]
 pub struct TaskContext {
-    tx: Arc<watch::Sender<Option<CancelReason>>>,
-    rx: watch::Receiver<Option<CancelReason>>,
+    cell: Arc<CancelCell>,
     deadline: Option<Instant>,
     parent: Option<Arc<TaskContext>>,
 }
@@ -46,10 +403,8 @@ impl Default for TaskContext {
 impl TaskContext {
     /// Create a root cancellation context with no deadline.
     pub fn root() -> Self {
-        let (tx, rx) = watch::channel(None);
         Self {
-            tx: Arc::new(tx),
-            rx,
+            cell: Arc::new(CancelCell::default()),
             deadline: None,
             parent: None,
         }
@@ -57,10 +412,8 @@ impl TaskContext {
 
     /// Derive a linked child context that inherits cancellation and deadlines from `self`.
     pub fn child(&self) -> Self {
-        let (tx, rx) = watch::channel(None);
         Self {
-            tx: Arc::new(tx),
-            rx,
+            cell: Arc::new(CancelCell::default()),
             deadline: None,
             parent: Some(Arc::new(self.clone())),
         }
@@ -75,15 +428,7 @@ impl TaskContext {
 
     /// Trigger cooperative cancellation across this context and all descendant contexts.
     pub fn cancel(&self, reason: impl Into<String>) {
-        let msg = reason.into();
-        let _ = self.tx.send_if_modified(|slot| {
-            if slot.is_some() {
-                false
-            } else {
-                *slot = Some(CancelReason::Cancelled(msg.clone()));
-                true
-            }
-        });
+        self.cell.set_once(CancelReason::Cancelled(reason.into()));
     }
 
     /// Compute the earliest effective deadline across `self` and all ancestor contexts.
@@ -113,21 +458,14 @@ impl TaskContext {
             cur = ctx.parent.as_deref();
         }
         for ctx in chain.into_iter().rev() {
-            if let Some(reason) = ctx.rx.borrow().as_ref() {
+            if let Some(reason) = ctx.cell.get() {
                 return Err(reason.to_error());
             }
             if let Some(dl) = ctx.deadline
                 && now >= dl
             {
                 let msg = "task deadline exceeded".to_string();
-                let _ = ctx.tx.send_if_modified(|slot| {
-                    if slot.is_some() {
-                        false
-                    } else {
-                        *slot = Some(CancelReason::TimedOut(msg.clone()));
-                        true
-                    }
-                });
+                ctx.cell.set_once(CancelReason::TimedOut(msg.clone()));
                 return Err(MoraError::Timeout(msg));
             }
         }
@@ -141,90 +479,89 @@ impl TaskContext {
 
     /// Return true when both context handles refer to the same underlying cancellation cell.
     pub fn same_handle(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.tx, &other.tx)
+        Arc::ptr_eq(&self.cell, &other.cell)
     }
 
     fn cancelled_inner(&self) -> Pin<Box<dyn Future<Output = MoraError> + Send + '_>> {
         Box::pin(async move {
-            if let Err(err) = self.status() {
-                return err;
-            }
-            let mut rx = self.rx.clone();
-            let nearest_deadline = self.deadline();
-            let parent_fut: Pin<Box<dyn Future<Output = MoraError> + Send + '_>> =
-                match &self.parent {
-                    Some(parent) => Box::pin(parent.cancelled()),
+            loop {
+                if let Err(err) = self.status() {
+                    return err;
+                }
+                let notified = self.cell.notify.notified();
+                if let Err(err) = self.status() {
+                    return err;
+                }
+                let parent_fut: Pin<Box<dyn Future<Output = MoraError> + Send + '_>> =
+                    match &self.parent {
+                        Some(parent) => Box::pin(parent.cancelled()),
+                        None => Box::pin(std::future::pending()),
+                    };
+                let nearest_deadline = self.deadline();
+                let timeout_fut: Pin<Box<dyn Future<Output = ()> + Send>> = match nearest_deadline {
+                    Some(dl) => Box::pin(sleep_until(dl)),
                     None => Box::pin(std::future::pending()),
                 };
-            let timeout_fut: Pin<Box<dyn Future<Output = ()> + Send>> = match nearest_deadline {
-                Some(dl) => Box::pin(tokio::time::sleep_until(dl)),
-                None => Box::pin(std::future::pending()),
-            };
 
-            tokio::select! {
-                biased;
-                res = rx.wait_for(|v| v.is_some()) => {
-                    match res {
-                        Ok(guard) => guard
-                            .as_ref()
-                            .map(CancelReason::to_error)
-                            .unwrap_or_else(|| MoraError::Cancelled("context cancelled".to_string())),
-                        Err(_) => self
-                            .status()
-                            .err()
-                            .unwrap_or_else(|| MoraError::Cancelled("context sender dropped".to_string())),
-                    }
-                }
-                parent_err = parent_fut => parent_err,
-                () = timeout_fut => {
-                    let msg = "task deadline exceeded".to_string();
-                    let _ = self.tx.send_if_modified(|slot| {
-                        if slot.is_some() {
-                            false
-                        } else {
-                            *slot = Some(CancelReason::TimedOut(msg.clone()));
-                            true
+                let self_or_parent = race2(notified, parent_fut);
+                match race2(self_or_parent, timeout_fut).await {
+                    Select2::First(Select2::First(())) => {
+                        if let Err(err) = self.status() {
+                            return err;
                         }
-                    });
-                    MoraError::Timeout(msg)
+                    }
+                    Select2::First(Select2::Second(parent_err)) => return parent_err,
+                    Select2::Second(()) => {
+                        let msg = "task deadline exceeded".to_string();
+                        self.cell.set_once(CancelReason::TimedOut(msg.clone()));
+                        return MoraError::Timeout(msg);
+                    }
                 }
             }
         })
     }
 }
 
-impl CancelReason {
-    fn to_error(&self) -> MoraError {
-        match self {
-            Self::Cancelled(msg) => MoraError::Cancelled(msg.clone()),
-            Self::TimedOut(msg) => MoraError::Timeout(msg.clone()),
-        }
-    }
-}
+// ─── Native Async MPSC Channels (`ChannelSender` / `ChannelReceiver`) ───────
 
-enum SenderInner<T> {
-    Bounded(mpsc::Sender<T>),
-    Unbounded(mpsc::UnboundedSender<T>),
-}
-
-impl<T> Clone for SenderInner<T> {
-    fn clone(&self) -> Self {
-        match self {
-            Self::Bounded(tx) => Self::Bounded(tx.clone()),
-            Self::Unbounded(tx) => Self::Unbounded(tx.clone()),
-        }
-    }
+struct MpscState<T> {
+    capacity: Option<usize>,
+    queue: VecDeque<T>,
+    closed: bool,
+    sender_count: usize,
+    recv_waker: Option<Waker>,
+    send_wakers: VecDeque<(u64, Waker)>,
+    next_send_id: u64,
 }
 
 /// Multi-producer channel sender supporting bounded backpressure, unbounded queuing, and cancellation.
 pub struct ChannelSender<T> {
-    inner: SenderInner<T>,
+    state: Arc<Mutex<MpscState<T>>>,
 }
 
 impl<T> Clone for ChannelSender<T> {
     fn clone(&self) -> Self {
+        self.state.lock().sender_count += 1;
         Self {
-            inner: self.inner.clone(),
+            state: Arc::clone(&self.state),
+        }
+    }
+}
+
+impl<T> Drop for ChannelSender<T> {
+    fn drop(&mut self) {
+        let wake = {
+            let mut st = self.state.lock();
+            st.sender_count = st.sender_count.saturating_sub(1);
+            if st.sender_count == 0 {
+                st.closed = true;
+                st.recv_waker.take()
+            } else {
+                None
+            }
+        };
+        if let Some(w) = wake {
+            w.wake();
         }
     }
 }
@@ -232,111 +569,156 @@ impl<T> Clone for ChannelSender<T> {
 impl<T> ChannelSender<T> {
     /// Attempt to send without suspending, surfacing `MoraError::Channel` on full or closed endpoints.
     pub fn try_send(&self, value: T) -> MoraResult<()> {
-        match &self.inner {
-            SenderInner::Bounded(tx) => tx.try_send(value).map_err(|err| match err {
-                mpsc::error::TrySendError::Full(_) => {
-                    MoraError::Channel("channel is full".to_string())
-                }
-                mpsc::error::TrySendError::Closed(_) => {
-                    MoraError::Channel("send on closed channel".to_string())
-                }
-            }),
-            SenderInner::Unbounded(tx) => tx
-                .send(value)
-                .map_err(|_| MoraError::Channel("send on closed channel".to_string())),
+        let wake = {
+            let mut st = self.state.lock();
+            if st.closed {
+                return Err(MoraError::Channel("send on closed channel".to_string()));
+            }
+            if let Some(cap) = st.capacity
+                && st.queue.len() >= cap
+            {
+                return Err(MoraError::Channel("channel is full".to_string()));
+            }
+            st.queue.push_back(value);
+            st.recv_waker.take()
+        };
+        if let Some(w) = wake {
+            w.wake();
         }
+        Ok(())
     }
 
     /// Asynchronously send `value`, waiting on bounded capacity until delivered or closed.
     pub async fn send(&self, value: T) -> MoraResult<()> {
-        match &self.inner {
-            SenderInner::Bounded(tx) => tx
-                .send(value)
-                .await
-                .map_err(|_| MoraError::Channel("send on closed channel".to_string())),
-            SenderInner::Unbounded(tx) => tx
-                .send(value)
-                .map_err(|_| MoraError::Channel("send on closed channel".to_string())),
+        let mut val_opt = Some(value);
+        let mut waiter_id = 0u64;
+        let res = std::future::poll_fn(|cx| {
+            let mut st = self.state.lock();
+            if st.closed {
+                return Poll::Ready(Err(MoraError::Channel(
+                    "send on closed channel".to_string(),
+                )));
+            }
+            let can_send = st.capacity.is_none_or(|cap| st.queue.len() < cap);
+            if can_send {
+                if waiter_id != 0 {
+                    st.send_wakers.retain(|(id, _)| *id != waiter_id);
+                    waiter_id = 0;
+                }
+                st.queue.push_back(val_opt.take().expect("value present"));
+                let rw = st.recv_waker.take();
+                drop(st);
+                if let Some(w) = rw {
+                    w.wake();
+                }
+                return Poll::Ready(Ok(()));
+            }
+            if waiter_id == 0 {
+                st.next_send_id += 1;
+                waiter_id = st.next_send_id;
+                st.send_wakers.push_back((waiter_id, cx.waker().clone()));
+            } else if let Some(entry) = st.send_wakers.iter_mut().find(|(id, _)| *id == waiter_id) {
+                entry.1 = cx.waker().clone();
+            } else {
+                st.send_wakers.push_back((waiter_id, cx.waker().clone()));
+            }
+            Poll::Pending
+        })
+        .await;
+        if waiter_id != 0 {
+            let mut st = self.state.lock();
+            st.send_wakers.retain(|(id, _)| *id != waiter_id);
         }
+        res
     }
 
     /// Asynchronously send `value` while honouring cooperative cancellation or deadlines on `ctx`.
     pub async fn send_ctx(&self, value: T, ctx: &TaskContext) -> MoraResult<()> {
         ctx.status()?;
-        tokio::select! {
-            biased;
-            err = ctx.cancelled() => Err(err),
-            res = self.send(value) => res,
+        match race2(ctx.cancelled(), self.send(value)).await {
+            Select2::First(err) => Err(err),
+            Select2::Second(res) => res,
         }
     }
 
     /// Return `true` if the receiving half has been closed or dropped.
     pub fn is_closed(&self) -> bool {
-        match &self.inner {
-            SenderInner::Bounded(tx) => tx.is_closed(),
-            SenderInner::Unbounded(tx) => tx.is_closed(),
-        }
+        self.state.lock().closed
     }
-}
-
-enum ReceiverInner<T> {
-    Bounded(mpsc::Receiver<T>),
-    Unbounded(mpsc::UnboundedReceiver<T>),
 }
 
 /// Single-consumer channel receiver supporting async receive, non-blocking poll, close, and `select_channels`.
 pub struct ChannelReceiver<T> {
-    inner: ReceiverInner<T>,
+    state: Arc<Mutex<MpscState<T>>>,
+}
+
+impl<T> Drop for ChannelReceiver<T> {
+    fn drop(&mut self) {
+        self.close();
+    }
 }
 
 impl<T> ChannelReceiver<T> {
     /// Poll the channel without suspending (`Ok(None)` when empty, `Err(Channel)` when disconnected).
     pub fn try_recv(&mut self) -> MoraResult<Option<T>> {
-        let res = match &mut self.inner {
-            ReceiverInner::Bounded(rx) => rx.try_recv(),
-            ReceiverInner::Unbounded(rx) => rx.try_recv(),
-        };
-        match res {
-            Ok(v) => Ok(Some(v)),
-            Err(mpsc::error::TryRecvError::Empty) => Ok(None),
-            Err(mpsc::error::TryRecvError::Disconnected) => {
-                Err(MoraError::Channel("channel closed".to_string()))
+        let mut st = self.state.lock();
+        if let Some(val) = st.queue.pop_front() {
+            let sw = st.send_wakers.pop_front().map(|(_, w)| w);
+            drop(st);
+            if let Some(w) = sw {
+                w.wake();
             }
+            return Ok(Some(val));
+        }
+        if st.closed {
+            Err(MoraError::Channel("channel closed".to_string()))
+        } else {
+            Ok(None)
         }
     }
 
     /// Asynchronously receive the next item or return `MoraError::Channel` when closed.
     pub async fn recv(&mut self) -> MoraResult<T> {
-        let next = match &mut self.inner {
-            ReceiverInner::Bounded(rx) => rx.recv().await,
-            ReceiverInner::Unbounded(rx) => rx.recv().await,
-        };
+        let next = std::future::poll_fn(|cx| self.poll_recv_item(cx)).await;
         next.ok_or_else(|| MoraError::Channel("channel closed".to_string()))
     }
 
     /// Asynchronously receive while racing against cooperative cancellation/deadlines in `ctx`.
     pub async fn recv_ctx(&mut self, ctx: &TaskContext) -> MoraResult<T> {
         ctx.status()?;
-        tokio::select! {
-            biased;
-            err = ctx.cancelled() => Err(err),
-            res = self.recv() => res,
+        match race2(ctx.cancelled(), self.recv()).await {
+            Select2::First(err) => Err(err),
+            Select2::Second(res) => res,
         }
     }
 
     /// Prevent further sends while still allowing buffered messages to drain via [`Self::recv`].
     pub fn close(&mut self) {
-        match &mut self.inner {
-            ReceiverInner::Bounded(rx) => rx.close(),
-            ReceiverInner::Unbounded(rx) => rx.close(),
+        let wakers: Vec<Waker> = {
+            let mut st = self.state.lock();
+            st.closed = true;
+            st.send_wakers.drain(..).map(|(_, w)| w).collect()
+        };
+        for w in wakers {
+            w.wake();
         }
     }
 
     fn poll_recv_item(&mut self, cx: &mut PollContext<'_>) -> Poll<Option<T>> {
-        match &mut self.inner {
-            ReceiverInner::Bounded(rx) => rx.poll_recv(cx),
-            ReceiverInner::Unbounded(rx) => rx.poll_recv(cx),
+        let mut st = self.state.lock();
+        if let Some(val) = st.queue.pop_front() {
+            let sw = st.send_wakers.pop_front().map(|(_, w)| w);
+            drop(st);
+            if let Some(w) = sw {
+                w.wake();
+            }
+            return Poll::Ready(Some(val));
         }
+        if st.closed {
+            return Poll::Ready(None);
+        }
+        st.recv_waker = Some(cx.waker().clone());
+        Poll::Pending
     }
 }
 
@@ -347,30 +729,201 @@ pub enum Select2<A, B> {
     Second(B),
 }
 
+// ─── Native Work-Queue Executor, `TaskHandle` & `TaskGroup` ─────────────────
+
+struct ThreadParkWaker {
+    thread: Thread,
+    unparked: AtomicBool,
+}
+
+impl Wake for ThreadParkWaker {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.unparked.store(true, Ordering::Release);
+        self.thread.unpark();
+    }
+}
+
+type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
+
+struct SharedTaskState<T> {
+    done: AtomicBool,
+    aborted: AtomicBool,
+    result: Mutex<Option<MoraResult<T>>>,
+    notify: AsyncNotify,
+    future_slot: Mutex<Option<BoxFuture<()>>>,
+}
+
+impl<T> SharedTaskState<T> {
+    fn complete(&self, res: MoraResult<T>) {
+        {
+            let mut g = self.result.lock();
+            if g.is_none() {
+                *g = Some(res);
+            }
+        }
+        self.done.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    fn abort(&self) {
+        let was_aborted = self.aborted.swap(true, Ordering::AcqRel);
+        // Immediately drop the boxed future if not currently being polled on a worker thread.
+        if let Some(mut g) = self.future_slot.try_lock() {
+            let _ = g.take();
+        }
+        if !was_aborted {
+            self.complete(Err(MoraError::Cancelled("task aborted".to_string())));
+        }
+    }
+}
+
+struct ExecutorTask {
+    queued: AtomicBool,
+    aborted: Arc<AtomicBool>,
+    future_slot: Arc<Mutex<Option<BoxFuture<()>>>>,
+    pool: Arc<ExecutorPool>,
+}
+
+struct ExecutorPool {
+    queue: StdMutex<VecDeque<Arc<ExecutorTask>>>,
+    cv: StdCondvar,
+    shutdown: AtomicBool,
+}
+
+impl ExecutorPool {
+    fn new(worker_threads: usize) -> Arc<Self> {
+        let pool = Arc::new(Self {
+            queue: StdMutex::new(VecDeque::new()),
+            cv: StdCondvar::new(),
+            shutdown: AtomicBool::new(false),
+        });
+        for i in 0..worker_threads.max(1) {
+            let p = Arc::clone(&pool);
+            thread::Builder::new()
+                .name(format!("mora-worker-{i}"))
+                .spawn(move || worker_loop(p))
+                .expect("failed to spawn mora-worker thread");
+        }
+        pool
+    }
+
+    fn enqueue(&self, task: Arc<ExecutorTask>) {
+        if !task.queued.swap(true, Ordering::AcqRel) {
+            let mut q = self.queue.lock().unwrap_or_else(|p| p.into_inner());
+            q.push_back(task);
+            drop(q);
+            self.cv.notify_one();
+        }
+    }
+}
+
+impl Drop for ExecutorPool {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        self.cv.notify_all();
+    }
+}
+
+impl Wake for ExecutorTask {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        if self.aborted.load(Ordering::Acquire) {
+            if let Some(mut g) = self.future_slot.try_lock() {
+                let _ = g.take();
+            }
+            return;
+        }
+        self.pool.enqueue(Arc::clone(self));
+    }
+}
+
+fn worker_loop(pool: Arc<ExecutorPool>) {
+    loop {
+        let task = {
+            let mut q = pool.queue.lock().unwrap_or_else(|p| p.into_inner());
+            loop {
+                if let Some(t) = q.pop_front() {
+                    break Some(t);
+                }
+                if pool.shutdown.load(Ordering::Acquire) {
+                    break None;
+                }
+                q = pool.cv.wait(q).unwrap_or_else(|p| p.into_inner());
+            }
+        };
+        let Some(task) = task else {
+            return;
+        };
+        task.queued.store(false, Ordering::Release);
+        if task.aborted.load(Ordering::Acquire) {
+            let _ = task.future_slot.lock().take();
+            continue;
+        }
+        let mut fut_opt = task.future_slot.lock().take();
+        if let Some(mut fut) = fut_opt.take() {
+            let waker = Waker::from(Arc::clone(&task));
+            let mut cx = PollContext::from_waker(&waker);
+            match catch_unwind(AssertUnwindSafe(|| fut.as_mut().poll(&mut cx))) {
+                Ok(Poll::Ready(())) => {}
+                Ok(Poll::Pending) => {
+                    if !task.aborted.load(Ordering::Acquire) {
+                        *task.future_slot.lock() = Some(fut);
+                        // Re-check in case a wake arrived while the future was checked out
+                        if task.queued.load(Ordering::Acquire) {
+                            pool.cv.notify_one();
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+    }
+}
+
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "task panicked".to_string()
+    }
+}
+
 /// Handle to an independently spawned task executed by [`TaskScheduler`].
 pub struct TaskHandle<T> {
-    handle: JoinHandle<MoraResult<T>>,
+    shared: Arc<SharedTaskState<T>>,
     ctx: TaskContext,
 }
 
-impl<T> TaskHandle<T> {
-    /// Await completion of the spawned task, mapping Tokio join panics/cancellations to [`MoraError`].
+impl<T: Send + 'static> TaskHandle<T> {
+    /// Await completion of the spawned task, mapping panics/cancellations to [`MoraError`].
     pub async fn join(self) -> MoraResult<T> {
-        match self.handle.await {
-            Ok(res) => res,
-            Err(join_err) => Err(MoraError::from(join_err)),
+        loop {
+            let notified = self.shared.notify.notified();
+            if let Some(res) = self.shared.result.lock().take() {
+                return res;
+            }
+            notified.await;
         }
     }
 
-    /// Cancel the task's cooperative [`TaskContext`] and request Tokio task abort.
+    /// Cancel the task's cooperative [`TaskContext`] and request task abort.
     pub fn abort(&self) {
         self.ctx.cancel("task aborted");
-        self.handle.abort();
+        self.shared.abort();
     }
 
-    /// Inspect whether the underlying Tokio task has completed.
+    /// Inspect whether the underlying task has completed.
     pub fn is_finished(&self) -> bool {
-        self.handle.is_finished()
+        self.shared.done.load(Ordering::Acquire)
     }
 
     /// Borrow the cooperative [`TaskContext`] bound to this task.
@@ -379,14 +932,21 @@ impl<T> TaskHandle<T> {
     }
 }
 
-/// Structured concurrency task group backed by [`tokio::task::JoinSet`].
+/// Structured concurrency task group.
 ///
 /// Dropping a `TaskGroup` automatically aborts any still-running child tasks, preventing
 /// orphan background tasks and future leaks.
-pub struct TaskGroup<T: 'static> {
-    set: JoinSet<MoraResult<T>>,
+pub struct TaskGroup<T: Send + 'static> {
+    handles: VecDeque<TaskHandle<T>>,
+    group_notify: Arc<AsyncNotify>,
     ctx: TaskContext,
-    handle: Handle,
+    scheduler: TaskScheduler,
+}
+
+impl<T: Send + 'static> Drop for TaskGroup<T> {
+    fn drop(&mut self) {
+        self.abort_all();
+    }
 }
 
 impl<T: Send + 'static> TaskGroup<T> {
@@ -396,8 +956,11 @@ impl<T: Send + 'static> TaskGroup<T> {
         F: FnOnce(TaskContext) -> Fut,
         Fut: Future<Output = MoraResult<T>> + Send + 'static,
     {
-        let child_ctx = self.ctx.child();
-        self.set.spawn_on(build(child_ctx), &self.handle);
+        let g_notify = Arc::clone(&self.group_notify);
+        let handle = self
+            .scheduler
+            .spawn_with_notify(&self.ctx, build, Some(g_notify));
+        self.handles.push_back(handle);
     }
 
     /// Spawn a synchronous/blocking computation onto the scheduler's blocking thread pool.
@@ -405,28 +968,43 @@ impl<T: Send + 'static> TaskGroup<T> {
     where
         F: FnOnce(TaskContext) -> MoraResult<T> + Send + 'static,
     {
-        let child_ctx = self.ctx.child();
-        self.set
-            .spawn_blocking_on(move || f(child_ctx), &self.handle);
+        let g_notify = Arc::clone(&self.group_notify);
+        let handle = self
+            .scheduler
+            .spawn_blocking_with_notify(&self.ctx, f, Some(g_notify));
+        self.handles.push_back(handle);
     }
 
     /// Await the next completed task in completion order, aborting remaining tasks on cancellation.
     pub async fn join_next(&mut self) -> Option<MoraResult<T>> {
+        if self.handles.is_empty() {
+            return None;
+        }
         if let Err(reason) = self.ctx.status() {
-            self.set.abort_all();
+            self.abort_all();
             return Some(Err(reason));
         }
-        tokio::select! {
-            biased;
-            err = self.ctx.cancelled() => {
-                self.set.abort_all();
-                Some(Err(err))
+        loop {
+            let notified = self.group_notify.notified();
+            if let Some(pos) = self.handles.iter().position(|h| h.is_finished()) {
+                let h = self.handles.remove(pos).expect("index valid");
+                let res = h
+                    .shared
+                    .result
+                    .lock()
+                    .take()
+                    .unwrap_or_else(|| Err(MoraError::Cancelled("task aborted".to_string())));
+                return Some(res);
             }
-            next = self.set.join_next() => {
-                match next? {
-                    Ok(res) => Some(res),
-                    Err(join_err) => Some(Err(MoraError::from(join_err))),
+            if self.handles.is_empty() {
+                return None;
+            }
+            match race2(self.ctx.cancelled(), notified).await {
+                Select2::First(err) => {
+                    self.abort_all();
+                    return Some(Err(err));
                 }
+                Select2::Second(()) => {}
             }
         }
     }
@@ -439,7 +1017,7 @@ impl<T: Send + 'static> TaskGroup<T> {
                 Ok(v) => results.push(v),
                 Err(err) => {
                     self.ctx.cancel(err.message());
-                    self.set.abort_all();
+                    self.abort_all();
                     return Err(err);
                 }
             }
@@ -450,48 +1028,46 @@ impl<T: Send + 'static> TaskGroup<T> {
     /// Cooperatively cancel and abort all tasks currently registered in this group.
     pub fn abort_all(&mut self) {
         self.ctx.cancel("task group aborted");
-        self.set.abort_all();
+        while let Some(h) = self.handles.pop_front() {
+            h.abort();
+        }
     }
 }
 
-/// Canonical multi-threaded Tokio task scheduler shared across [`CoreRuntime`] clones.
-#[derive(Clone, Debug)]
+/// Canonical multi-threaded native task scheduler shared across [`CoreRuntime`] clones.
+#[derive(Clone)]
 pub struct TaskScheduler {
-    runtime: Arc<Runtime>,
+    pool: Arc<ExecutorPool>,
+}
+
+impl fmt::Debug for TaskScheduler {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TaskScheduler").finish()
+    }
 }
 
 static SHARED_SCHEDULER: OnceLock<Arc<TaskScheduler>> = OnceLock::new();
 
 impl Default for TaskScheduler {
     fn default() -> Self {
-        Self::new().expect("default tokio multi-thread runtime must initialize")
+        Self::new().expect("default TaskScheduler must initialize")
     }
 }
 
 impl TaskScheduler {
-    /// Construct an isolated multi-thread Tokio scheduler.
+    /// Construct an isolated multi-thread scheduler.
     pub fn new() -> MoraResult<Self> {
-        let runtime = Builder::new_multi_thread()
-            .enable_all()
-            .thread_name("mora-worker")
-            .build()
-            .map_err(|e| MoraError::Task(format!("failed to create tokio runtime: {e}")))?;
-        Ok(Self {
-            runtime: Arc::new(runtime),
-        })
+        let threads = thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .clamp(2, 16);
+        Self::with_worker_threads(threads)
     }
 
     /// Construct a multi-thread scheduler with an explicit worker thread count (>= 1).
     pub fn with_worker_threads(worker_threads: usize) -> MoraResult<Self> {
-        let threads = worker_threads.max(1);
-        let runtime = Builder::new_multi_thread()
-            .worker_threads(threads)
-            .enable_all()
-            .thread_name("mora-worker")
-            .build()
-            .map_err(|e| MoraError::Task(format!("failed to create tokio runtime: {e}")))?;
         Ok(Self {
-            runtime: Arc::new(runtime),
+            pool: ExecutorPool::new(worker_threads.max(1)),
         })
     }
 
@@ -503,30 +1079,25 @@ impl TaskScheduler {
         )
     }
 
-    /// Borrow the underlying Tokio runtime [`Handle`].
-    pub fn handle(&self) -> Handle {
-        self.runtime.handle().clone()
-    }
-
-    /// Drive an async future to completion safely from synchronous contexts, multi-thread
-    /// Tokio worker threads (`block_in_place`), or current-thread Tokio runtimes (scoped bridge).
+    /// Drive an async future to completion safely on the current thread.
     pub fn block_on<F>(&self, future: F) -> F::Output
     where
-        F: Future + Send,
-        F::Output: Send,
+        F: Future,
     {
-        match Handle::try_current() {
-            Ok(current) if current.runtime_flavor() == RuntimeFlavor::MultiThread => {
-                tokio::task::block_in_place(|| self.runtime.block_on(future))
+        let park_waker = Arc::new(ThreadParkWaker {
+            thread: thread::current(),
+            unparked: AtomicBool::new(false),
+        });
+        let waker = Waker::from(Arc::clone(&park_waker));
+        let mut cx = PollContext::from_waker(&waker);
+        let mut fut = std::pin::pin!(future);
+        loop {
+            if let Poll::Ready(out) = fut.as_mut().poll(&mut cx) {
+                return out;
             }
-            Ok(_) => std::thread::scope(|scope| {
-                let rt = Arc::clone(&self.runtime);
-                scope
-                    .spawn(move || rt.block_on(future))
-                    .join()
-                    .expect("scoped tokio bridge thread panicked")
-            }),
-            Err(_) => self.runtime.block_on(future),
+            while !park_waker.unparked.swap(false, Ordering::Acquire) {
+                thread::park();
+            }
         }
     }
 
@@ -540,36 +1111,49 @@ impl TaskScheduler {
                 "bounded channel capacity must be at least 1".to_string(),
             ));
         }
-        let (tx, rx) = mpsc::channel(capacity);
+        let state = Arc::new(Mutex::new(MpscState {
+            capacity: Some(capacity),
+            queue: VecDeque::with_capacity(capacity.min(64)),
+            closed: false,
+            sender_count: 1,
+            recv_waker: None,
+            send_wakers: VecDeque::new(),
+            next_send_id: 0,
+        }));
         Ok((
             ChannelSender {
-                inner: SenderInner::Bounded(tx),
+                state: Arc::clone(&state),
             },
-            ChannelReceiver {
-                inner: ReceiverInner::Bounded(rx),
-            },
+            ChannelReceiver { state },
         ))
     }
 
     /// Create an unbounded FIFO channel returning `(ChannelSender, ChannelReceiver)`.
     pub fn unbounded_channel<T>(&self) -> (ChannelSender<T>, ChannelReceiver<T>) {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let state = Arc::new(Mutex::new(MpscState {
+            capacity: None,
+            queue: VecDeque::new(),
+            closed: false,
+            sender_count: 1,
+            recv_waker: None,
+            send_wakers: VecDeque::new(),
+            next_send_id: 0,
+        }));
         (
             ChannelSender {
-                inner: SenderInner::Unbounded(tx),
+                state: Arc::clone(&state),
             },
-            ChannelReceiver {
-                inner: ReceiverInner::Unbounded(rx),
-            },
+            ChannelReceiver { state },
         )
     }
 
     /// Create a new structured concurrency [`TaskGroup`] bound to `ctx` (or root context).
     pub fn group<T: Send + 'static>(&self, ctx: Option<TaskContext>) -> TaskGroup<T> {
         TaskGroup {
-            set: JoinSet::new(),
+            handles: VecDeque::new(),
+            group_notify: Arc::new(AsyncNotify::new()),
             ctx: ctx.unwrap_or_else(TaskContext::root),
-            handle: self.handle(),
+            scheduler: self.clone(),
         }
     }
 
@@ -580,26 +1164,117 @@ impl TaskScheduler {
         F: FnOnce(TaskContext) -> Fut,
         Fut: Future<Output = MoraResult<T>> + Send + 'static,
     {
+        self.spawn_with_notify(ctx, build, None)
+    }
+
+    fn spawn_with_notify<T, F, Fut>(
+        &self,
+        ctx: &TaskContext,
+        build: F,
+        group_notify: Option<Arc<AsyncNotify>>,
+    ) -> TaskHandle<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(TaskContext) -> Fut,
+        Fut: Future<Output = MoraResult<T>> + Send + 'static,
+    {
         let child_ctx = ctx.child();
         let fut = build(child_ctx.clone());
-        let handle = self.runtime.spawn(fut);
+        let aborted = Arc::new(AtomicBool::new(false));
+        let future_slot: Arc<Mutex<Option<BoxFuture<()>>>> = Arc::new(Mutex::new(None));
+        let shared = Arc::new(SharedTaskState {
+            done: AtomicBool::new(false),
+            aborted: AtomicBool::new(false),
+            result: Mutex::new(None),
+            notify: AsyncNotify::new(),
+            future_slot: Mutex::new(None),
+        });
+        let shared_for_task = Arc::clone(&shared);
+        let aborted_for_task = Arc::clone(&aborted);
+        let wrapped: BoxFuture<()> = Box::pin(async move {
+            let mut inner = Box::pin(fut);
+            let outcome = std::future::poll_fn(|cx| {
+                if shared_for_task.aborted.load(Ordering::Acquire) {
+                    aborted_for_task.store(true, Ordering::Release);
+                    return Poll::Ready(Err(MoraError::Cancelled("task aborted".to_string())));
+                }
+                match catch_unwind(AssertUnwindSafe(|| inner.as_mut().poll(cx))) {
+                    Ok(Poll::Ready(res)) => Poll::Ready(res),
+                    Ok(Poll::Pending) => Poll::Pending,
+                    Err(payload) => Poll::Ready(Err(MoraError::Task(format!(
+                        "task panicked: {}",
+                        panic_payload_message(payload)
+                    )))),
+                }
+            })
+            .await;
+            shared_for_task.complete(outcome);
+            if let Some(gn) = group_notify {
+                gn.notify_waiters();
+            }
+        });
+        *future_slot.lock() = Some(wrapped);
+        let exec_task = Arc::new(ExecutorTask {
+            queued: AtomicBool::new(false),
+            aborted,
+            future_slot,
+            pool: Arc::clone(&self.pool),
+        });
+        self.pool.enqueue(exec_task);
         TaskHandle {
-            handle,
+            shared,
             ctx: child_ctx,
         }
     }
 
-    /// Offload blocking CPU work onto Tokio's blocking pool with cooperative cancellation context.
+    /// Offload blocking CPU work onto a dedicated worker thread with cooperative cancellation context.
     pub fn spawn_blocking<T, F>(&self, ctx: &TaskContext, f: F) -> TaskHandle<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(TaskContext) -> MoraResult<T> + Send + 'static,
+    {
+        self.spawn_blocking_with_notify(ctx, f, None)
+    }
+
+    fn spawn_blocking_with_notify<T, F>(
+        &self,
+        ctx: &TaskContext,
+        f: F,
+        group_notify: Option<Arc<AsyncNotify>>,
+    ) -> TaskHandle<T>
     where
         T: Send + 'static,
         F: FnOnce(TaskContext) -> MoraResult<T> + Send + 'static,
     {
         let child_ctx = ctx.child();
         let inner_ctx = child_ctx.clone();
-        let handle = self.runtime.spawn_blocking(move || f(inner_ctx));
+        let shared = Arc::new(SharedTaskState {
+            done: AtomicBool::new(false),
+            aborted: AtomicBool::new(false),
+            result: Mutex::new(None),
+            notify: AsyncNotify::new(),
+            future_slot: Mutex::new(None),
+        });
+        let shared_bg = Arc::clone(&shared);
+        thread::spawn(move || {
+            if shared_bg.aborted.load(Ordering::Acquire) {
+                shared_bg.complete(Err(MoraError::Cancelled("task aborted".to_string())));
+            } else {
+                let outcome = match catch_unwind(AssertUnwindSafe(|| f(inner_ctx))) {
+                    Ok(res) => res,
+                    Err(payload) => Err(MoraError::Task(format!(
+                        "task panicked: {}",
+                        panic_payload_message(payload)
+                    ))),
+                };
+                shared_bg.complete(outcome);
+            }
+            if let Some(gn) = group_notify {
+                gn.notify_waiters();
+            }
+        });
         TaskHandle {
-            handle,
+            shared,
             ctx: child_ctx,
         }
     }
@@ -623,8 +1298,6 @@ impl TaskScheduler {
     }
 
     /// Run a batch of synchronous jobs concurrently and collect results in exact input index order.
-    ///
-    /// Used by `VmEngine`'s `parallel` worker execution as well as structured fan-out workloads.
     pub fn run_indexed_batch<T, F>(
         &self,
         jobs: Vec<F>,
@@ -642,7 +1315,7 @@ impl TaskScheduler {
             .map(TaskContext::child)
             .unwrap_or_else(TaskContext::root);
         group_ctx.status()?;
-        let mut group: TaskGroup<(usize, T)> = self.group(Some(group_ctx.clone()));
+        let mut group: TaskGroup<(usize, T)> = self.group(Some(group_ctx));
         for (idx, job) in jobs.into_iter().enumerate() {
             group.spawn_blocking(move |task_ctx| job(task_ctx).map(|val| (idx, val)));
         }
@@ -670,10 +1343,7 @@ impl TaskScheduler {
         FA: Future<Output = A>,
         FB: Future<Output = B>,
     {
-        tokio::select! {
-            a = fa => Select2::First(a),
-            b = fb => Select2::Second(b),
-        }
+        race2(fa, fb).await
     }
 
     /// Perform fair round-robin `select` across multiple open [`ChannelReceiver`]s,
@@ -716,19 +1386,16 @@ impl TaskScheduler {
         });
 
         match ctx {
-            Some(c) => {
-                tokio::select! {
-                    biased;
-                    reason = c.cancelled() => Err(reason),
-                    res = recv_fut => res,
-                }
-            }
+            Some(c) => match race2(c.cancelled(), recv_fut).await {
+                Select2::First(reason) => Err(reason),
+                Select2::Second(res) => res,
+            },
             None => recv_fut.await,
         }
     }
 
     /// Spawn a first-class Mora callable returning a cloneable [`MoraTaskHandle`].
-    pub fn spawn_mora_value(
+    pub(crate) fn spawn_mora_value(
         &self,
         callee: Value,
         args: Vec<Value>,
@@ -739,7 +1406,7 @@ impl TaskScheduler {
     }
 
     /// Spawn a callable Mora value with named keyword arguments on an isolated VM task.
-    pub fn spawn_mora_value_named(
+    pub(crate) fn spawn_mora_value_named(
         &self,
         callee: Value,
         args: Vec<Value>,
@@ -756,20 +1423,8 @@ impl TaskScheduler {
         })
     }
 
-    /// Spawn a method invocation (`receiver.method(args...)`) on an isolated VM task.
-    pub fn spawn_mora_method(
-        &self,
-        receiver: Value,
-        method: String,
-        args: Vec<Value>,
-        core: &CoreRuntime,
-        ctx: &TaskContext,
-    ) -> Arc<MoraTaskHandle> {
-        self.spawn_mora_method_named(receiver, method, args, Vec::new(), core, ctx)
-    }
-
     /// Spawn a method invocation with named keyword arguments on an isolated VM task.
-    pub fn spawn_mora_method_named(
+    pub(crate) fn spawn_mora_method_named(
         &self,
         receiver: Value,
         method: String,
@@ -793,19 +1448,20 @@ impl TaskScheduler {
     {
         let child_ctx = ctx.child();
         let inner_ctx = child_ctx.clone();
-        let blocking_handle = self.runtime.spawn_blocking(move || f(inner_ctx));
         let task_handle = Arc::new(MoraTaskHandle {
             ctx: child_ctx,
             done: AtomicBool::new(false),
             result: Mutex::new(None),
-            waiter: Notify::new(),
-            watcher_handle: Mutex::new(None),
+            waiter: AsyncNotify::new(),
         });
         let watcher_shared = Arc::clone(&task_handle);
-        let watcher = self.runtime.spawn(async move {
-            let outcome = match blocking_handle.await {
+        thread::spawn(move || {
+            let outcome = match catch_unwind(AssertUnwindSafe(|| f(inner_ctx))) {
                 Ok(res) => res,
-                Err(join_err) => Err(MoraError::from(join_err)),
+                Err(payload) => Err(MoraError::Task(format!(
+                    "task panicked: {}",
+                    panic_payload_message(payload)
+                ))),
             };
             {
                 let mut g = watcher_shared.result.lock();
@@ -816,7 +1472,6 @@ impl TaskScheduler {
             watcher_shared.done.store(true, Ordering::Release);
             watcher_shared.waiter.notify_waiters();
         });
-        *task_handle.watcher_handle.lock() = Some(watcher);
         task_handle
     }
 }
@@ -827,8 +1482,7 @@ pub struct MoraTaskHandle {
     ctx: TaskContext,
     done: AtomicBool,
     result: Mutex<Option<MoraResult<Value>>>,
-    waiter: Notify,
-    watcher_handle: Mutex<Option<JoinHandle<()>>>,
+    waiter: AsyncNotify,
 }
 
 impl MoraTaskHandle {
@@ -846,13 +1500,10 @@ impl MoraTaskHandle {
                 }
             }
             match caller_ctx {
-                Some(ctx) => {
-                    tokio::select! {
-                        biased;
-                        err = ctx.cancelled() => return Err(err),
-                        () = notified => {}
-                    }
-                }
+                Some(ctx) => match race2(ctx.cancelled(), notified).await {
+                    Select2::First(err) => return Err(err),
+                    Select2::Second(()) => {}
+                },
                 None => notified.await,
             }
         }
@@ -869,9 +1520,6 @@ impl MoraTaskHandle {
         }
         self.done.store(true, Ordering::Release);
         self.waiter.notify_waiters();
-        if let Some(h) = self.watcher_handle.lock().take() {
-            h.abort();
-        }
     }
 
     /// Return whether the spawned task has settled.
@@ -901,7 +1549,7 @@ enum TicketOutcome {
 struct SelectTicket {
     id: u64,
     state: Mutex<TicketOutcome>,
-    notify: Notify,
+    notify: AsyncNotify,
 }
 
 impl SelectTicket {
@@ -909,7 +1557,7 @@ impl SelectTicket {
         Arc::new(Self {
             id: NEXT_SELECT_TICKET_ID.fetch_add(1, Ordering::Relaxed),
             state: Mutex::new(TicketOutcome::Waiting),
-            notify: Notify::new(),
+            notify: AsyncNotify::new(),
         })
     }
 
@@ -957,13 +1605,11 @@ impl SelectTicket {
         match &*g {
             TicketOutcome::Waiting | TicketOutcome::Cancelled => None,
             TicketOutcome::Claimed { arm, value } => Some(Ok((*arm, value.clone()))),
-            TicketOutcome::Error { message, .. } => Some(Err(MoraError::Channel(message.clone()))),
+            TicketOutcome::Error { message } => Some(Err(MoraError::Channel(message.clone()))),
         }
     }
 }
 
-/// Atomically pair two distinct `SelectTicket`s in strict ascending ticket-ID order
-/// (guaranteed cycle-free lock hierarchy: channel -> min_id -> max_id).
 fn try_claim_ticket_pair(
     sender: &SelectTicket,
     sender_arm: usize,
@@ -1281,20 +1927,20 @@ impl MoraChannel {
             return outcome.map(|_| ());
         }
         match ctx {
-            Some(c) => {
-                tokio::select! {
-                    biased;
-                    () = notified => ticket.take_outcome().unwrap_or(Ok((0, Value::Nil))).map(|_| ()),
-                    err = c.cancelled() => {
-                        ticket.cancel_if_waiting();
-                        if let Some(outcome) = ticket.take_outcome() {
-                            outcome.map(|_| ())
-                        } else {
-                            Err(err)
-                        }
+            Some(c) => match race2(notified, c.cancelled()).await {
+                Select2::First(()) => ticket
+                    .take_outcome()
+                    .unwrap_or(Ok((0, Value::Nil)))
+                    .map(|_| ()),
+                Select2::Second(err) => {
+                    ticket.cancel_if_waiting();
+                    if let Some(outcome) = ticket.take_outcome() {
+                        outcome.map(|_| ())
+                    } else {
+                        Err(err)
                     }
                 }
-            }
+            },
             None => {
                 notified.await;
                 ticket
@@ -1333,23 +1979,20 @@ impl MoraChannel {
             return outcome.map(|(_, v)| v);
         }
         match ctx {
-            Some(c) => {
-                tokio::select! {
-                    biased;
-                    () = notified => ticket
-                        .take_outcome()
-                        .unwrap_or_else(|| Err(MoraError::Channel("channel closed".to_string())))
-                        .map(|(_, v)| v),
-                    err = c.cancelled() => {
-                        ticket.cancel_if_waiting();
-                        if let Some(outcome) = ticket.take_outcome() {
-                            outcome.map(|(_, v)| v)
-                        } else {
-                            Err(err)
-                        }
+            Some(c) => match race2(notified, c.cancelled()).await {
+                Select2::First(()) => ticket
+                    .take_outcome()
+                    .unwrap_or_else(|| Err(MoraError::Channel("channel closed".to_string())))
+                    .map(|(_, v)| v),
+                Select2::Second(err) => {
+                    ticket.cancel_if_waiting();
+                    if let Some(outcome) = ticket.take_outcome() {
+                        outcome.map(|(_, v)| v)
+                    } else {
+                        Err(err)
                     }
                 }
-            }
+            },
             None => {
                 notified.await;
                 ticket
@@ -1407,7 +2050,6 @@ pub async fn select_arms(
     let mut earliest_timeout: Option<(usize, Instant)> = None;
     let now = Instant::now();
 
-    // First record default and earliest timeout deadline without blocking channels.
     for (idx, arm) in arms.iter().enumerate() {
         match arm {
             SelectBranch::Default if default_arm.is_none() => default_arm = Some(idx),
@@ -1422,13 +2064,6 @@ pub async fn select_arms(
         }
     }
 
-    // Notice! To guard against self-rendezvous when a single `select` specifies BOTH
-    // Send(ch, v) and Recv(ch) on the same unbuffered channel, only temporarily register
-    // after probing — Wait: we handle that via `try_claim_ticket_pair` checking `sender.id != receiver.id`,
-    // AND wait: `poll_or_park_recv` previously skipped & dropped self send_waiters via `pop_front` if it popped them!
-    // Check that! When probing channels here, a channel appearing in both Send and Recv of the same `select`
-    // only leaves non-self waiters untouched if we probe all arms cleanly without dropping same-ticket waiters!
-    // Wait: let's handle same-ticket waiters safely inside `poll_or_park_recv`: don't drop same-ticket waiters!
     let mut cleanup_guard = TicketCleanupGuard {
         ticket: Arc::clone(&ticket),
         channels: Vec::new(),
@@ -1476,7 +2111,6 @@ pub async fn select_arms(
     }
     cleanup_guard.channels = watched_channels;
 
-    // If a 0ms timeout already elapsed and no channel arm won synchronously, fire timeout first.
     if let Some((t_idx, dl)) = earliest_timeout
         && Instant::now() >= dl
     {
@@ -1487,7 +2121,6 @@ pub async fn select_arms(
         return Ok((t_idx, Value::Nil));
     }
 
-    // If `default` is present and no channel arm was immediately ready, pick `default`.
     if let Some(d_idx) = default_arm {
         ticket.cancel_if_waiting();
         if let Some(outcome) = ticket.take_outcome() {
@@ -1503,53 +2136,47 @@ pub async fn select_arms(
 
     let timeout_fut: Pin<Box<dyn Future<Output = usize> + Send>> = match earliest_timeout {
         Some((t_idx, dl)) => Box::pin(async move {
-            tokio::time::sleep_until(dl).await;
+            sleep_until(dl).await;
             t_idx
         }),
         None => Box::pin(std::future::pending()),
     };
 
     match ctx {
-        Some(c) => {
-            tokio::select! {
-                biased;
-                () = notified => ticket
-                    .take_outcome()
-                    .unwrap_or_else(|| Err(MoraError::Channel("channel closed".to_string()))),
-                t_idx = timeout_fut => {
-                    ticket.cancel_if_waiting();
-                    if let Some(outcome) = ticket.take_outcome() {
-                        outcome
-                    } else {
-                        Ok((t_idx, Value::Nil))
-                    }
-                }
-                err = c.cancelled() => {
-                    ticket.cancel_if_waiting();
-                    if let Some(outcome) = ticket.take_outcome() {
-                        outcome
-                    } else {
-                        Err(err)
-                    }
+        Some(c) => match race2(race2(notified, timeout_fut), c.cancelled()).await {
+            Select2::First(Select2::First(())) => ticket
+                .take_outcome()
+                .unwrap_or_else(|| Err(MoraError::Channel("channel closed".to_string()))),
+            Select2::First(Select2::Second(t_idx)) => {
+                ticket.cancel_if_waiting();
+                if let Some(outcome) = ticket.take_outcome() {
+                    outcome
+                } else {
+                    Ok((t_idx, Value::Nil))
                 }
             }
-        }
-        None => {
-            tokio::select! {
-                biased;
-                () = notified => ticket
-                    .take_outcome()
-                    .unwrap_or_else(|| Err(MoraError::Channel("channel closed".to_string()))),
-                t_idx = timeout_fut => {
-                    ticket.cancel_if_waiting();
-                    if let Some(outcome) = ticket.take_outcome() {
-                        outcome
-                    } else {
-                        Ok((t_idx, Value::Nil))
-                    }
+            Select2::Second(err) => {
+                ticket.cancel_if_waiting();
+                if let Some(outcome) = ticket.take_outcome() {
+                    outcome
+                } else {
+                    Err(err)
                 }
             }
-        }
+        },
+        None => match race2(notified, timeout_fut).await {
+            Select2::First(()) => ticket
+                .take_outcome()
+                .unwrap_or_else(|| Err(MoraError::Channel("channel closed".to_string()))),
+            Select2::Second(t_idx) => {
+                ticket.cancel_if_waiting();
+                if let Some(outcome) = ticket.take_outcome() {
+                    outcome
+                } else {
+                    Ok((t_idx, Value::Nil))
+                }
+            }
+        },
     }
 }
 
@@ -1567,14 +2194,12 @@ mod tests {
         assert!(child.status().is_ok());
         assert!(grandchild.status().is_ok());
 
-        // Cancelling a sibling child must not cancel root or other children.
         let sibling = root.child();
         sibling.cancel("sibling stopped");
         assert!(sibling.status().is_err());
         assert!(root.status().is_ok());
         assert!(child.status().is_ok());
 
-        // Cancelling root propagates through all descendants.
         root.cancel("shutdown");
         assert_eq!(
             child.status().unwrap_err(),
@@ -1631,7 +2256,7 @@ mod tests {
             let s = sched
                 .select2(
                     async {
-                        tokio::time::sleep(Duration::from_millis(5)).await;
+                        sleep(Duration::from_millis(5)).await;
                         "later"
                     },
                     async { "immediate" },
@@ -1666,7 +2291,7 @@ mod tests {
         assert!(deadline_ctx.deadline().is_some());
 
         let handle = sched.spawn(&root, |ctx| async move {
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            sleep(Duration::from_millis(200)).await;
             ctx.status()?;
             Ok(99usize)
         });

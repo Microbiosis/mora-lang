@@ -1,23 +1,99 @@
-//! `exec.*` builtin implementation — unified onto Tokio's async process reactor
-//! (`tokio::process::Command`, `tokio::sync::Semaphore`, `tokio::task::JoinSet`)
-//! via `CoreRuntime::reactor().scheduler().block_on(...)`, honoring `FsContext::cwd()`,
-//! `TaskContext` cooperative cancellation, per-command timeout, and process-group teardown.
+//! `exec.*` builtin implementation — zero-dependency native async process runner
+//! built on `std::process::Command`, `TaskScheduler`, `TaskGroup`, and a native
+//! `AsyncSemaphore`, honoring `FsContext::cwd()`, `TaskContext` cooperative cancellation,
+//! per-command timeout, and process-group teardown.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::Read;
 use std::path::PathBuf;
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::task::{Poll, Waker};
+use std::thread;
 use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
-use tokio::process::Command;
-use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 
+use crate::common::sync::Mutex;
 use crate::error::{MoraError, MoraResult};
 use crate::runtime::CoreRuntime;
-use crate::runtime::scheduler::TaskContext;
+use crate::runtime::scheduler::{Select2, TaskContext, TaskScheduler, race2, sleep};
 use crate::value::Value;
+
+// ─── Native Async Semaphore ──────────────────────────────────────────────────
+
+struct SemaphoreState {
+    permits: usize,
+    waiters: VecDeque<(u64, Waker)>,
+    next_id: u64,
+}
+
+struct AsyncSemaphore {
+    state: Mutex<SemaphoreState>,
+}
+
+struct OwnedSemaphorePermit {
+    sem: Arc<AsyncSemaphore>,
+}
+
+impl Drop for OwnedSemaphorePermit {
+    fn drop(&mut self) {
+        let waker = {
+            let mut st = self.sem.state.lock();
+            st.permits += 1;
+            st.waiters.pop_front().map(|(_, w)| w)
+        };
+        if let Some(w) = waker {
+            w.wake();
+        }
+    }
+}
+
+impl AsyncSemaphore {
+    fn new(permits: usize) -> Self {
+        Self {
+            state: Mutex::new(SemaphoreState {
+                permits,
+                waiters: VecDeque::new(),
+                next_id: 0,
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    fn available_permits(&self) -> usize {
+        self.state.lock().permits
+    }
+
+    async fn acquire_owned(self: Arc<Self>) -> OwnedSemaphorePermit {
+        let mut waiter_id = 0u64;
+        std::future::poll_fn(|cx| {
+            let mut st = self.state.lock();
+            if st.permits > 0 {
+                st.permits -= 1;
+                if waiter_id != 0 {
+                    st.waiters.retain(|(id, _)| *id != waiter_id);
+                }
+                return Poll::Ready(());
+            }
+            if waiter_id == 0 {
+                st.next_id += 1;
+                waiter_id = st.next_id;
+                st.waiters.push_back((waiter_id, cx.waker().clone()));
+            } else if let Some(entry) = st.waiters.iter_mut().find(|(id, _)| *id == waiter_id) {
+                entry.1 = cx.waker().clone();
+            } else {
+                st.waiters.push_back((waiter_id, cx.waker().clone()));
+            }
+            Poll::Pending
+        })
+        .await;
+        OwnedSemaphorePermit { sem: self }
+    }
+}
 
 /// Parallel command execution outcome for a single command entry.
 #[derive(Debug, Clone)]
@@ -95,8 +171,7 @@ impl Drop for ActivePidsGuard {
     }
 }
 
-/// `exec.parallel(cmds, max_concurrent?, timeout_ms?)` driven directly by `AsyncIoReactor`'s
-/// Tokio multi-threaded runtime with `tokio::process::Command` and `tokio::sync::Semaphore`.
+/// `exec.parallel(cmds, max_concurrent?, timeout_ms?)` driven by `TaskScheduler` and `AsyncSemaphore`.
 fn exec_parallel(core: &mut CoreRuntime, args: &[Value]) -> MoraResult<Value> {
     if args.is_empty() {
         return Err(MoraError::Runtime(
@@ -172,6 +247,7 @@ fn exec_parallel(core: &mut CoreRuntime, args: &[Value]) -> MoraResult<Value> {
     let cwd = core.fs_context().cwd().to_path_buf();
     let sched = Arc::clone(core.reactor().scheduler());
     sched.block_on(exec_parallel_async(
+        sched.clone(),
         cmds,
         max_concurrent,
         timeout,
@@ -181,63 +257,31 @@ fn exec_parallel(core: &mut CoreRuntime, args: &[Value]) -> MoraResult<Value> {
 }
 
 async fn exec_parallel_async(
+    sched: Arc<TaskScheduler>,
     cmds: Vec<String>,
     max_concurrent: usize,
     timeout: Option<Duration>,
     cwd: PathBuf,
     task_ctx: Option<TaskContext>,
 ) -> MoraResult<Value> {
-    let sem = Arc::new(Semaphore::new(max_concurrent.max(1)));
+    let sem = Arc::new(AsyncSemaphore::new(max_concurrent.max(1)));
     let active_pids = Arc::new(Mutex::new(HashSet::new()));
     let guard = ActivePidsGuard {
         active_pids: Arc::clone(&active_pids),
     };
     let cwd_arc = Arc::new(cwd);
 
-    let mut set: JoinSet<ParallelResult> = JoinSet::new();
+    let mut group = sched.group::<ParallelResult>(task_ctx.clone());
     for (idx, cmd_str) in cmds.into_iter().enumerate() {
         let sem = Arc::clone(&sem);
         let active_pids = Arc::clone(&active_pids);
         let cwd = Arc::clone(&cwd_arc);
         let ctx = task_ctx.clone();
-        set.spawn(async move {
+        group.spawn(move |_child_ctx| async move {
             let permit = match ctx.as_ref() {
-                Some(c) => {
-                    tokio::select! {
-                        biased;
-                        _ = c.cancelled() => {
-                            return ParallelResult {
-                                idx,
-                                cmd: cmd_str,
-                                stdout: String::new(),
-                                stderr: String::new(),
-                                exit_code: None,
-                                elapsed_ms: 0,
-                                pid: 0,
-                                error: Some("cancelled".to_string()),
-                            };
-                        }
-                        res = sem.acquire_owned() => match res {
-                            Ok(p) => p,
-                            Err(_) => {
-                                return ParallelResult {
-                                    idx,
-                                    cmd: cmd_str,
-                                    stdout: String::new(),
-                                    stderr: String::new(),
-                                    exit_code: None,
-                                    elapsed_ms: 0,
-                                    pid: 0,
-                                    error: Some("semaphore closed".to_string()),
-                                };
-                            }
-                        }
-                    }
-                }
-                None => match sem.acquire_owned().await {
-                    Ok(p) => p,
-                    Err(_) => {
-                        return ParallelResult {
+                Some(c) => match race2(c.cancelled(), Arc::clone(&sem).acquire_owned()).await {
+                    Select2::First(_) => {
+                        return Ok(ParallelResult {
                             idx,
                             cmd: cmd_str,
                             stdout: String::new(),
@@ -245,50 +289,27 @@ async fn exec_parallel_async(
                             exit_code: None,
                             elapsed_ms: 0,
                             pid: 0,
-                            error: Some("semaphore closed".to_string()),
-                        };
+                            error: Some("cancelled".to_string()),
+                        });
                     }
+                    Select2::Second(p) => p,
                 },
+                None => Arc::clone(&sem).acquire_owned().await,
             };
             let result = run_single_cmd_async(idx, cmd_str, cwd, timeout, ctx, active_pids).await;
             drop(permit);
-            result
+            Ok(result)
         });
     }
 
     let mut results = Vec::new();
-    loop {
-        if let Some(ref c) = task_ctx {
-            tokio::select! {
-                biased;
-                cancel_err = c.cancelled() => {
-                    guard.abort_all();
-                    set.abort_all();
-                    return Err(cancel_err);
-                }
-                joined = set.join_next() => match joined {
-                    Some(Ok(res)) => results.push(res),
-                    Some(Err(je)) if je.is_cancelled() => {}
-                    Some(Err(je)) => {
-                        guard.abort_all();
-                        set.abort_all();
-                        return Err(MoraError::Task(format!("exec.parallel: task panicked: {je}")));
-                    }
-                    None => break,
-                }
-            }
-        } else {
-            match set.join_next().await {
-                Some(Ok(res)) => results.push(res),
-                Some(Err(je)) if je.is_cancelled() => {}
-                Some(Err(je)) => {
-                    guard.abort_all();
-                    set.abort_all();
-                    return Err(MoraError::Task(format!(
-                        "exec.parallel: task panicked: {je}"
-                    )));
-                }
-                None => break,
+    while let Some(joined) = group.join_next().await {
+        match joined {
+            Ok(res) => results.push(res),
+            Err(err) => {
+                guard.abort_all();
+                group.abort_all();
+                return Err(err);
             }
         }
     }
@@ -298,7 +319,6 @@ async fn exec_parallel_async(
     Ok(Value::List(results.iter().map(|r| r.to_value()).collect()))
 }
 
-/// Run a single command asynchronously on Tokio's process driver with timeout & cancellation.
 async fn run_single_cmd_async(
     idx: usize,
     cmd_str: String,
@@ -335,15 +355,14 @@ async fn run_single_cmd_async(
         .current_dir(cwd.as_ref())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .stderr(Stdio::piped());
 
     #[cfg(unix)]
     {
         // SAFETY: pre_exec executes between fork and exec; only calls async-signal-safe setpgid.
         unsafe {
             command.pre_exec(|| {
-                libc::setpgid(0, 0);
+                crate::common::sys::unix::setpgid(0, 0);
                 Ok(())
             });
         }
@@ -354,7 +373,7 @@ async fn run_single_cmd_async(
         command.creation_flags(0x0000_0200);
     }
 
-    let child = match command.spawn() {
+    let mut child = match command.spawn() {
         Ok(c) => c,
         Err(e) => {
             return ParallelResult {
@@ -369,69 +388,78 @@ async fn run_single_cmd_async(
             };
         }
     };
-    let pid = child.id().unwrap_or(0);
+    let pid = child.id();
     if pid != 0 {
         active_pids.lock().insert(pid);
     }
 
-    let wait_fut = child.wait_with_output();
-    tokio::pin!(wait_fut);
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    let stdout_thread = thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(ref mut out) = stdout_pipe {
+            let _ = out.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let stderr_thread = thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(ref mut err) = stderr_pipe {
+            let _ = err.read_to_end(&mut buf);
+        }
+        buf
+    });
 
-    let output_res: MoraResult<std::process::Output> = match (timeout, task_ctx.as_ref()) {
-        (None, None) => wait_fut
-            .await
-            .map_err(|e| MoraError::Io(format!("wait failed: {e}"))),
-        (Some(dur), None) => {
-            let sleep_fut = tokio::time::sleep(dur);
-            tokio::pin!(sleep_fut);
-            tokio::select! {
-                res = &mut wait_fut => res.map_err(|e| MoraError::Io(format!("wait failed: {e}"))),
-                _ = &mut sleep_fut => {
-                    kill_process_group_async(pid).await;
-                    let _ = tokio::time::timeout(Duration::from_millis(KILL_GRACE_MS), &mut wait_fut).await;
-                    Err(MoraError::Timeout(format!("timeout after {}ms", dur.as_millis())))
-                }
-            }
+    let deadline = timeout.and_then(|dur| start.checked_add(dur));
+    let status_res: MoraResult<std::process::ExitStatus> = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {}
+            Err(e) => break Err(MoraError::Io(format!("wait failed: {e}"))),
         }
-        (None, Some(ctx)) => {
-            tokio::select! {
-                biased;
-                err = ctx.cancelled() => {
-                    kill_process_group_async(pid).await;
-                    let _ = tokio::time::timeout(Duration::from_millis(KILL_GRACE_MS), &mut wait_fut).await;
-                    Err(err)
-                }
-                res = &mut wait_fut => res.map_err(|e| MoraError::Io(format!("wait failed: {e}"))),
-            }
+        if let Some(ref ctx) = task_ctx
+            && let Err(err) = ctx.status()
+        {
+            kill_process_group_sync(pid);
+            let _ = child.kill();
+            let _ = child.wait();
+            break Err(err);
         }
-        (Some(dur), Some(ctx)) => {
-            let sleep_fut = tokio::time::sleep(dur);
-            tokio::pin!(sleep_fut);
-            tokio::select! {
-                biased;
-                err = ctx.cancelled() => {
-                    kill_process_group_async(pid).await;
-                    let _ = tokio::time::timeout(Duration::from_millis(KILL_GRACE_MS), &mut wait_fut).await;
-                    Err(err)
-                }
-                _ = &mut sleep_fut => {
-                    kill_process_group_async(pid).await;
-                    let _ = tokio::time::timeout(Duration::from_millis(KILL_GRACE_MS), &mut wait_fut).await;
-                    Err(MoraError::Timeout(format!("timeout after {}ms", dur.as_millis())))
-                }
-                res = &mut wait_fut => res.map_err(|e| MoraError::Io(format!("wait failed: {e}"))),
-            }
+        if let Some(dl) = deadline
+            && Instant::now() >= dl
+        {
+            kill_process_group_sync(pid);
+            let _ = child.kill();
+            let _ = child.wait();
+            let ms = timeout.map(|d| d.as_millis()).unwrap_or(0);
+            break Err(MoraError::Timeout(format!("timeout after {ms}ms")));
         }
+        sleep(Duration::from_millis(2)).await;
     };
 
     if pid != 0 {
         active_pids.lock().remove(&pid);
     }
 
-    let output = match output_res {
-        Ok(out) => out,
+    match status_res {
+        Ok(status) => {
+            let out_bytes = stdout_thread.join().unwrap_or_default();
+            let err_bytes = stderr_thread.join().unwrap_or_default();
+            ParallelResult {
+                idx,
+                cmd: cmd_str,
+                stdout: String::from_utf8_lossy(&out_bytes).into_owned(),
+                stderr: String::from_utf8_lossy(&err_bytes).into_owned(),
+                exit_code: status.code(),
+                elapsed_ms: start.elapsed().as_millis() as u64,
+                pid,
+                error: None,
+            }
+        }
         Err(err) => {
-            return ParallelResult {
+            // Bound pipe drain by KILL_GRACE_MS on killed process groups
+            let _ = sleep(Duration::from_millis(KILL_GRACE_MS.min(20))).await;
+            ParallelResult {
                 idx,
                 cmd: cmd_str,
                 stdout: String::new(),
@@ -440,27 +468,9 @@ async fn run_single_cmd_async(
                 elapsed_ms: start.elapsed().as_millis() as u64,
                 pid,
                 error: Some(err.message().to_string()),
-            };
+            }
         }
-    };
-
-    ParallelResult {
-        idx,
-        cmd: cmd_str,
-        stdout: String::from_utf8_lossy_owned(output.stdout),
-        stderr: String::from_utf8_lossy_owned(output.stderr),
-        exit_code: output.status.code(),
-        elapsed_ms: start.elapsed().as_millis() as u64,
-        pid,
-        error: None,
     }
-}
-
-async fn kill_process_group_async(pid: u32) {
-    if pid == 0 {
-        return;
-    }
-    let _ = tokio::task::spawn_blocking(move || kill_process_group_sync(pid)).await;
 }
 
 #[cfg(unix)]
@@ -468,9 +478,9 @@ fn kill_process_group_sync(pid: u32) {
     if pid == 0 {
         return;
     }
-    // SAFETY: libc::killpg direct syscall to tear down the isolated process group.
+    // SAFETY: POSIX `killpg` direct syscall to tear down the isolated process group.
     unsafe {
-        libc::killpg(pid as i32, libc::SIGKILL);
+        crate::common::sys::unix::killpg(pid as i32, crate::common::sys::unix::SIGKILL);
     }
 }
 
@@ -479,7 +489,7 @@ fn kill_process_group_sync(pid: u32) {
     if pid == 0 {
         return;
     }
-    let _ = std::process::Command::new("taskkill")
+    let _ = Command::new("taskkill")
         .args(["/F", "/T", "/PID", &pid.to_string()])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -724,31 +734,27 @@ mod tests_v043_exec {
     }
 
     #[test]
-    fn tokio_semaphore_high_contention_completes_and_conserves_permits() {
+    fn native_semaphore_high_contention_completes_and_conserves_permits() {
         const TASKS: usize = 32;
         const ITERS: usize = 200;
         const PERMITS: usize = 4;
 
         let core = CoreRuntime::default();
-        let sem = Arc::new(Semaphore::new(PERMITS));
-        let remaining = core.reactor().scheduler().block_on(async {
-            let mut set = JoinSet::new();
+        let sched = Arc::clone(core.reactor().scheduler());
+        let sem = Arc::new(AsyncSemaphore::new(PERMITS));
+        let remaining = sched.block_on(async {
+            let mut group = sched.group::<()>(None);
             for _ in 0..TASKS {
                 let s = Arc::clone(&sem);
-                set.spawn(async move {
+                group.spawn(move |_c| async move {
                     for _ in 0..ITERS {
-                        let permit = Arc::clone(&s)
-                            .acquire_owned()
-                            .await
-                            .expect("semaphore open");
-                        tokio::task::yield_now().await;
+                        let permit = Arc::clone(&s).acquire_owned().await;
                         drop(permit);
                     }
+                    Ok(())
                 });
             }
-            while let Some(res) = set.join_next().await {
-                res.expect("task succeeded");
-            }
+            group.join_all().await.expect("group succeeded");
             sem.available_permits()
         });
         assert_eq!(remaining, PERMITS);

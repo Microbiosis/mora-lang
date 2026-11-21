@@ -18,7 +18,7 @@
 
 use std::sync::Arc;
 
-use parking_lot::RwLock;
+use crate::common::sync::RwLock;
 
 use crate::common::{
     BinaryOp, DType, Device, ScalarValue, bf16_bits_to_f64, f16_bits_to_f64, f64_to_bf16_bits,

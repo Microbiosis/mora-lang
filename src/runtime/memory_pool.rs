@@ -12,7 +12,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use parking_lot::Mutex;
+use crate::common::sync::Mutex;
 
 use crate::common::{DType, Device};
 use crate::error::{MoraError, MoraResult};

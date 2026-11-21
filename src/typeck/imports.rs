@@ -350,11 +350,46 @@ fn sanitize(ty: &Type) -> Type {
         Type::Result_(ok, err) => Type::Result_(Box::new(sanitize(ok)), Box::new(sanitize(err))),
         Type::Tuple(elems) => Type::Tuple(elems.iter().map(|e| Box::new(sanitize(e))).collect()),
         Type::Cons(h, t) => Type::Cons(Box::new(sanitize(h)), Box::new(sanitize(t))),
-        Type::Arrow(i, o, row) => {
-            Type::Arrow(Box::new(sanitize(i)), Box::new(sanitize(o)), row.clone())
-        }
+        Type::Arrow(i, o, row) => Type::Arrow(
+            Box::new(sanitize_param(i)),
+            Box::new(sanitize(o)),
+            sanitize_row(row),
+        ),
         Type::Union(members) => Type::Union(members.iter().map(sanitize).collect()),
         _ => ty.clone(),
+    }
+}
+
+fn sanitize_row(row: &crate::mir::effect::EffectRow) -> crate::mir::effect::EffectRow {
+    use crate::mir::effect::EffectRow;
+    match row {
+        EffectRow::Empty | EffectRow::Var(_) => EffectRow::Empty,
+        EffectRow::Cons(label, tail) => {
+            EffectRow::Cons(label.clone(), Box::new(sanitize_row(tail)))
+        }
+    }
+}
+
+fn sanitize_param(ty: &Type) -> Type {
+    match ty {
+        Type::Arrow(_, _, _) => Type::Any,
+        Type::Tuple(elems) => {
+            Type::Tuple(elems.iter().map(|e| Box::new(sanitize_param(e))).collect())
+        }
+        _ => sanitize(ty),
+    }
+}
+
+fn sanitize_param_keeping(ty: &Type, kept: &[TypeVarId]) -> Type {
+    match ty {
+        Type::Arrow(_, _, _) => Type::Any,
+        Type::Tuple(elems) => Type::Tuple(
+            elems
+                .iter()
+                .map(|e| Box::new(sanitize_param_keeping(e, kept)))
+                .collect(),
+        ),
+        _ => sanitize_keeping(ty, kept),
     }
 }
 
@@ -385,9 +420,9 @@ fn sanitize_keeping(ty: &Type, kept: &[TypeVarId]) -> Type {
             Box::new(sanitize_keeping(t, kept)),
         ),
         Type::Arrow(i, o, row) => Type::Arrow(
-            Box::new(sanitize_keeping(i, kept)),
+            Box::new(sanitize_param_keeping(i, kept)),
             Box::new(sanitize_keeping(o, kept)),
-            row.clone(),
+            sanitize_row(row),
         ),
         Type::Union(members) => {
             Type::Union(members.iter().map(|m| sanitize_keeping(m, kept)).collect())

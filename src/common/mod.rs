@@ -4,6 +4,8 @@
 
 pub mod dtype;
 pub mod lock;
+pub mod sync;
+pub mod sys;
 pub mod trait_info;
 
 pub use dtype::{

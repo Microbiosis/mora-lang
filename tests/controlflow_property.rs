@@ -72,7 +72,88 @@
 //! - 分支/循环体内用**赋值** `a = …` 而非 `let a = …`：`let` 在块内是新的
 //!   绑定，不保证逃逸出块；赋值改的是外层变量，语义无歧义。
 
-use proptest::prelude::*;
+// ─── 零外部依赖确定性递归属性生成器 ──────────────────────────────────
+
+struct PropRng(u64);
+
+impl PropRng {
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e3779b97f4a7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        z ^ (z >> 31)
+    }
+
+    fn gen_usize(&mut self, upper: usize) -> usize {
+        (self.next_u64() as usize) % upper
+    }
+
+    fn gen_i16(&mut self, lo: i16, hi: i16) -> i16 {
+        let span = (hi as i32 - lo as i32) as u64;
+        lo + (self.next_u64() % span) as i16
+    }
+
+    fn gen_term(&mut self, depth: usize) -> Term {
+        if depth == 0 || self.gen_usize(3) > 0 {
+            if self.gen_usize(2) == 0 {
+                Term::Var(self.gen_usize(3))
+            } else {
+                Term::Const(self.gen_i16(-20, 20))
+            }
+        } else {
+            let op = if self.gen_usize(2) == 0 { '+' } else { '-' };
+            Term::Bin(
+                op,
+                Box::new(self.gen_term(depth - 1)),
+                Box::new(self.gen_term(depth - 1)),
+            )
+        }
+    }
+
+    fn gen_cond(&mut self) -> Cond {
+        let v = self.gen_usize(3);
+        let n = self.gen_i16(-25, 25);
+        match self.gen_usize(3) {
+            0 => Cond::Gt(v, n),
+            1 => Cond::Lt(v, n),
+            _ => Cond::Eq(v, n),
+        }
+    }
+
+    fn gen_stmts(&mut self, depth: usize, in_loop: bool) -> Vec<Stmt> {
+        let len = 1 + self.gen_usize(3);
+        let mut out = Vec::with_capacity(len);
+        for _ in 0..len {
+            let s = if depth == 0 {
+                if in_loop {
+                    match self.gen_usize(5) {
+                        0 => Stmt::Break,
+                        1 => Stmt::Continue,
+                        _ => Stmt::Assign(self.gen_usize(3), self.gen_term(2)),
+                    }
+                } else {
+                    Stmt::Assign(self.gen_usize(3), self.gen_term(2))
+                }
+            } else {
+                let pick = self.gen_usize(if in_loop { 6 } else { 4 });
+                match pick {
+                    0 => Stmt::If(
+                        self.gen_cond(),
+                        self.gen_stmts(depth - 1, in_loop),
+                        self.gen_stmts(depth - 1, in_loop),
+                    ),
+                    1 => Stmt::For(self.gen_usize(4) as f64, self.gen_stmts(depth - 1, true)),
+                    4 => Stmt::Break,
+                    5 => Stmt::Continue,
+                    _ => Stmt::Assign(self.gen_usize(3), self.gen_term(2)),
+                }
+            };
+            out.push(s);
+        }
+        out
+    }
+}
 
 // ─── 生成的程序结构 ──────────────────────────────────────────────────
 
@@ -266,68 +347,6 @@ fn reference(stmts: &[Stmt], init: [f64; 3]) -> f64 {
     env[0] + env[1] * 2.0 + env[2] * 3.0
 }
 
-// ─── proptest 生成策略 ───────────────────────────────────────────────
-
-fn arb_term() -> impl Strategy<Value = Term> {
-    let leaf = prop_oneof![
-        (0usize..3).prop_map(Term::Var),
-        (-20i16..20).prop_map(Term::Const),
-    ];
-    // 直接生成 `+` / `-`，**不要** `any::<char>()` 再 prop_filter ——
-    // 那会拒掉 7/8 的取值，proptest 迅速耗尽 65536 次 local reject 上限。
-    // 闭包内重新构造策略，避免闭包借用函数内的局部变量。
-    leaf.prop_recursive(2, 12, 3, |inner| {
-        let op = prop_oneof![Just('+'), Just('-')];
-        (op, inner.clone(), inner.clone())
-            .prop_map(|(op, l, r)| Term::Bin(op, Box::new(l), Box::new(r)))
-    })
-}
-
-fn arb_cond() -> impl Strategy<Value = Cond> {
-    prop_oneof![
-        (0usize..3, any::<i16>()).prop_map(|(i, n)| Cond::Gt(i, n)),
-        (0usize..3, any::<i16>()).prop_map(|(i, n)| Cond::Lt(i, n)),
-        (0usize..3, any::<i16>()).prop_map(|(i, n)| Cond::Eq(i, n)),
-    ]
-}
-
-fn assign() -> impl Strategy<Value = Stmt> {
-    (0usize..3, arb_term()).prop_map(|(v, t)| Stmt::Assign(v, t))
-}
-
-/// **`for` 体内的语句集** —— 额外含 `break` / `continue`（此处必有绑定目标）。
-///
-/// 循环次数刻意取小值（0..4）：参考求值器要真的迭代，成本线性可控。
-fn arb_loop_stmts() -> impl Strategy<Value = Vec<Stmt>> {
-    let leaf = prop_oneof![
-        assign().prop_map(|s| vec![s]),
-        Just(vec![Stmt::Break]),
-        Just(vec![Stmt::Continue]),
-    ];
-    leaf.prop_recursive(3, 40, 4, |inner| {
-        prop_oneof![
-            (arb_cond(), inner.clone(), inner.clone())
-                .prop_map(|(c, t, e)| vec![Stmt::If(c, t, e)]),
-            (0i16..4, inner.clone()).prop_map(|(n, b)| vec![Stmt::For(n as f64, b)]),
-        ]
-    })
-}
-
-/// **顶层语句集** —— **不含** `break` / `continue`。
-///
-/// 这一点是硬性的：顶层（或任何不在 for 体内的位置）出现 `break` 在 Mora
-/// 里没有绑定目标，参考侧也无法定义其含义。分成两套递归策略就是这个约束。
-fn arb_stmts() -> impl Strategy<Value = Vec<Stmt>> {
-    let leaf = assign().prop_map(|s| vec![s]);
-    leaf.prop_recursive(3, 40, 4, |inner| {
-        prop_oneof![
-            (arb_cond(), inner.clone(), inner.clone())
-                .prop_map(|(c, t, e)| vec![Stmt::If(c, t, e)]),
-            (0i16..4, arb_loop_stmts()).prop_map(|(n, b)| vec![Stmt::For(n as f64, b)]),
-        ]
-    })
-}
-
 fn count_jumps(stmts: &[Stmt]) -> (usize, usize) {
     let (mut brk, mut cont) = (0, 0);
     for s in stmts {
@@ -470,22 +489,16 @@ fn continue_propagates_out_of_if() {
     );
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig {
-        cases: 256,
-        .. ProptestConfig::default()
-    })]
-
-
-    /// 随机控制流程序：解释器结果必须等于参考求值器。
-    ///
-    /// 末表达式恒在所有 `if/else` 与 `for` **之后**（E1 的原始位置），
-    /// 因此本测试对「汇合点被饿死」这类缺陷敏感。
-    #[test]
-    fn control_flow_matches_reference(stmts in arb_stmts()) {
-        use std::sync::atomic::Ordering;
-        // 统计本例含多少 break / continue —— 用来**核对生成器确实发射了跳转**，
-        // 而不是「因为没生成才全绿」。用 `--nocapture` 跑即可看到。
+/// 随机控制流程序：解释器结果必须等于参考求值器（256 例确定性随机生成）。
+///
+/// 末表达式恒在所有 `if/else` 与 `for` **之后**（E1 的原始位置），
+/// 因此本测试对「汇合点被饿死」这类缺陷敏感。
+#[test]
+fn control_flow_matches_reference() {
+    use std::sync::atomic::Ordering;
+    let mut rng = PropRng(0x2026_1120_cf00_0256);
+    for _case in 0..256 {
+        let stmts = rng.gen_stmts(3, false);
         let (b, c) = count_jumps(&stmts);
         JUMP_STATS.fetch_add(b + c, Ordering::Relaxed);
         SAMPLE_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -501,16 +514,19 @@ proptest! {
         let expected = reference(&stmts, init);
 
         let (prog, _w) = mora::parser_v3::ParserV3::compile(&src)
-            .map_err(|e| TestCaseError::fail(format!("compile failed:\n{src}\nerror: {e}")))?;
+            .unwrap_or_else(|e| panic!("compile failed:\n{src}\nerror: {e}"));
         let mut core = mora::runtime::CoreRuntime::default();
-        let got = mora::runtime::vm::execute_program(std::sync::Arc::new(prog), &mut core)
-            .map(|(v, _)| v);
-        let got = got.map_err(|e| TestCaseError::fail(format!("run failed:\n{src}\nerror: {e}")))?;
+        let (got, _) = mora::runtime::vm::execute_program(std::sync::Arc::new(prog), &mut core)
+            .unwrap_or_else(|e| panic!("run failed:\n{src}\nerror: {e}"));
 
-        // `prop_assert_eq!` 的消息里不能插值局部变量，先拼好再传。
-        let msg = format!(
+        assert_eq!(
+            format!("{got:?}"),
+            format!("Float({expected:?})"),
             "解释器与参考求值器不一致\n--- program ---\n{src}\n--- stmts ---\n{stmts:#?}"
         );
-        prop_assert_eq!(format!("{got:?}"), format!("Float({expected:?})"), "{}", msg);
     }
+    assert!(
+        JUMP_STATS.load(Ordering::Relaxed) > 0,
+        "256 例随机程序应包含至少一处 break/continue 跳转"
+    );
 }

@@ -4,7 +4,7 @@
 //! interpreter.rs 不再持有这些定义的副本，而是通过 `pub use crate::value::*`
 //! 重新导出。此处是唯一定义点。
 
-use parking_lot::Mutex;
+use crate::common::sync::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 

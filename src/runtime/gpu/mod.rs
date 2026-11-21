@@ -145,7 +145,12 @@ impl DynLib {
         {
             let handle = {
                 // SAFETY: `c_name` is a valid NUL-terminated C string passed to POSIX `dlopen`.
-                unsafe { libc::dlopen(c_name.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) }
+                unsafe {
+                    crate::common::sys::unix::dlopen(
+                        c_name.as_ptr(),
+                        crate::common::sys::unix::RTLD_NOW | crate::common::sys::unix::RTLD_LOCAL,
+                    )
+                }
             };
             if handle.is_null() {
                 None
@@ -171,7 +176,7 @@ impl DynLib {
         #[cfg(unix)]
         let ptr = {
             // SAFETY: `self.handle` is a live `dlopen` handle and `cstr` is NUL-terminated.
-            unsafe { libc::dlsym(self.handle, cstr.as_ptr()) }
+            unsafe { crate::common::sys::unix::dlsym(self.handle, cstr.as_ptr()) }
         };
         if ptr.is_null() {
             return None;
@@ -195,7 +200,7 @@ impl Drop for DynLib {
             {
                 // SAFETY: `self.handle` was returned by `dlopen` and is closed once on Drop.
                 unsafe {
-                    libc::dlclose(self.handle);
+                    crate::common::sys::unix::dlclose(self.handle);
                 }
             }
         }

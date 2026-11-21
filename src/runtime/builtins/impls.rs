@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use parking_lot::Mutex;
+use crate::common::sync::Mutex;
 
 use super::*;
 use crate::error::{MoraError, MoraResult};

@@ -1,0 +1,84 @@
+-- Mora Pure Standard Library: `std/testing` (Deterministic Property-Based Testing & Assertions in Mora)
+-- Replaces external property-testing frameworks with a zero-dependency pure-Mora generator
+-- and property verification runner powered by Mora's deterministic ambient PRNG (`random.*`).
+
+export struct PropSummary
+  name: string = ""
+  passed: bool = true
+  runs: int = 0
+  seed: int = 42
+  failed_case: int = -1
+end
+
+export task gen_int(lo: int = -1000000, hi: int = 1000000)
+  return fn()
+    if hi <= lo then
+      return lo
+    end
+    return random.rand_int(lo, hi + 1)
+  end
+end
+
+export task gen_non_zero_int(lo: int = -1000000, hi: int = 1000000)
+  return fn()
+    let v = random.rand_int(lo, hi + 1)
+    if v == 0 then
+      return 1
+    end
+    return v
+  end
+end
+
+export task gen_float(lo: float = -1000.0, hi: float = 1000.0)
+  return fn()
+    return random.rand_float(lo, hi)
+  end
+end
+
+export task gen_bool()
+  return fn()
+    return random.rand_int(0, 2) == 1
+  end
+end
+
+export task gen_list_int(min_len: int = 0, max_len: int = 16, lo: int = -100, hi: int = 100)
+  return fn()
+    let n = random.rand_int(min_len, max_len + 1)
+    let out: list<int> = []
+    let i = 0
+    while i < n
+      assign out = out.push(random.rand_int(lo, hi + 1))
+      assign i = i + 1
+    end
+    return out
+  end
+end
+
+export task prop_check(name: string, gen_fn, pred_fn, runs: int = 64, seed: int = 20261120): PropSummary
+  random.seed(seed)
+  let i = 0
+  while i < runs
+    let sample = gen_fn()
+    let ok = pred_fn(sample)
+    if !ok then
+      return PropSummary(name=name, passed=false, runs=i + 1, seed=seed, failed_case=i)
+    end
+    assign i = i + 1
+  end
+  return PropSummary(name=name, passed=true, runs=runs, seed=seed, failed_case=-1)
+end
+
+export task prop_check2(name: string, gen_a, gen_b, pred_fn, runs: int = 64, seed: int = 20261120): PropSummary
+  random.seed(seed)
+  let i = 0
+  while i < runs
+    let a = gen_a()
+    let b = gen_b()
+    let ok = pred_fn(a, b)
+    if !ok then
+      return PropSummary(name=name, passed=false, runs=i + 1, seed=seed, failed_case=i)
+    end
+    assign i = i + 1
+  end
+  return PropSummary(name=name, passed=true, runs=runs, seed=seed, failed_case=-1)
+end

@@ -119,14 +119,14 @@ fn task_group_structured_concurrency_panic_and_abort_on_drop() {
                 Ok(())
             });
             // Yield briefly so the spawned task starts polling and installs _guard
-            tokio::time::sleep(Duration::from_millis(15)).await;
+            mora::runtime::scheduler::sleep(Duration::from_millis(15)).await;
         }
         // Poll up to 500ms for tokio runtime to drop the aborted future stack
         for _ in 0..50 {
             if aborted.load(Ordering::SeqCst) {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            mora::runtime::scheduler::sleep(Duration::from_millis(10)).await;
         }
         assert!(
             aborted.load(Ordering::SeqCst),
@@ -158,7 +158,7 @@ fn bounded_and_unbounded_channels_backpressure_close_and_cancel() {
             Ok(())
         });
 
-        tokio::time::sleep(Duration::from_millis(15)).await;
+        mora::runtime::scheduler::sleep(Duration::from_millis(15)).await;
         assert!(
             !send_handle.is_finished(),
             "sender must block until buffer drains"
@@ -243,7 +243,7 @@ fn select_channels_fair_round_robin_and_select2() {
 
         let s2 = sched
             .select2(async { "fast" }, async {
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                mora::runtime::scheduler::sleep(Duration::from_millis(50)).await;
                 "slow"
             })
             .await;
@@ -293,7 +293,7 @@ fn hierarchical_task_context_cancellation_and_deadline() {
         let waiter = sched.spawn(&TaskContext::root(), move |_| async move {
             MoraResult::<()>::Err(cb.cancelled().await)
         });
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        mora::runtime::scheduler::sleep(Duration::from_millis(10)).await;
         parent.cancel("root shutdown");
         waiter.join().await.expect_err("cascade err")
     });
@@ -428,7 +428,7 @@ spin
     let handle = sched.spawn_mora_task(closure, vec![], &core_for_task, &task_ctx);
 
     let err = sched.block_on(async move {
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        mora::runtime::scheduler::sleep(Duration::from_millis(20)).await;
         cancel_trigger.cancel("user cancelled infinite loop");
         handle.join().await.expect_err("spin must abort on cancel")
     });
@@ -462,7 +462,7 @@ tx_spin
     let tx_handle = tx_sched.spawn_mora_task(tx_closure, vec![], &tx_core_for_task, &tx_ctx);
 
     let tx_err = tx_sched.block_on(async move {
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        mora::runtime::scheduler::sleep(Duration::from_millis(20)).await;
         tx_cancel.cancel("cancel inside transaction");
         tx_handle
             .join()

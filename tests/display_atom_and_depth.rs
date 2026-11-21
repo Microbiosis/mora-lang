@@ -49,7 +49,7 @@
 //! ## ④ 为什么**不**直接把它改成 `Display`
 //!
 //! ⚠ 若把 `{:?}` 换成 `{}`（`Display`）：第 130 行 `arc.lock()` 持有的锁，
-//! 会**在同一把 `parking_lot::Mutex` 上重入**（自引用 atom 的 Display 臂
+//! 会**在同一把 `mora::common::sync::Mutex` 上重入**（自引用 atom 的 Display 臂
 //! 再次 `arc.lock()`）⇒ **死锁**。
 //!
 //! ⇒ 这是**设计取舍**（一致性 vs 环安全），按 D382 先例**只报告不擅动**。
@@ -68,7 +68,8 @@ use mora::value::list::List;
 /// 用法：`let arc = Arc::new(Mutex::new(Value::Nil));`
 /// 然后 `*arc.lock() = Value::Atom(arc.clone())`。
 fn self_referential_atom() -> Value {
-    let arc: Arc<parking_lot::Mutex<Value>> = Arc::new(parking_lot::Mutex::new(Value::Nil));
+    let arc: Arc<mora::common::sync::Mutex<Value>> =
+        Arc::new(mora::common::sync::Mutex::new(Value::Nil));
     *arc.lock() = Value::Atom(arc.clone());
     Value::Atom(arc)
 }
@@ -89,7 +90,8 @@ fn d393_self_referential_atom_terminates_with_locked_placeholder() {
 /// **环内嵌在列表里**也必须终止（`atom → [atom]` 闭环）。
 #[test]
 fn d393_cyclic_atom_through_list_terminates() {
-    let arc: Arc<parking_lot::Mutex<Value>> = Arc::new(parking_lot::Mutex::new(Value::Nil));
+    let arc: Arc<mora::common::sync::Mutex<Value>> =
+        Arc::new(mora::common::sync::Mutex::new(Value::Nil));
     // 先让 atom 指向自身，再造一个含该 atom 的列表，最后让 atom 指向该列表
     // ⇒ atom → list → atom（同一条 Arc）构成真环。
     *arc.lock() = Value::Atom(arc.clone());
@@ -108,21 +110,21 @@ fn d393_atom_body_uses_debug_syntax_today() {
     let cases: &[(&str, Value, &[&str])] = &[
         (
             "列表",
-            Value::Atom(Arc::new(parking_lot::Mutex::new(Value::List(List::from(
-                vec![Value::Float(1.0), Value::Float(2.0)],
-            ))))),
+            Value::Atom(Arc::new(mora::common::sync::Mutex::new(Value::List(
+                List::from(vec![Value::Float(1.0), Value::Float(2.0)]),
+            )))),
             &["List", "Float"],
         ),
         (
             "字符串",
-            Value::Atom(Arc::new(parking_lot::Mutex::new(Value::String(
+            Value::Atom(Arc::new(mora::common::sync::Mutex::new(Value::String(
                 "hi".into(),
             )))),
             &["String"],
         ),
         (
             "浮点",
-            Value::Atom(Arc::new(parking_lot::Mutex::new(Value::Float(42.0)))),
+            Value::Atom(Arc::new(mora::common::sync::Mutex::new(Value::Float(42.0)))),
             &["42"],
         ),
     ];

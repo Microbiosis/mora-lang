@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use parking_lot::Mutex;
+use crate::common::sync::Mutex;
 
 use crate::error::{MoraError, MoraResult};
 use crate::mir::control::{

@@ -2,7 +2,23 @@
 
 All notable changes to Mora will be documented in this file.
 
-## [0.110.1] — 注释校准：全仓注释对齐 v0.110.0 现行架构
+## [0.110.1] — 注释校准 + `mora install` HTTP 状态校验修复 + 会话级产物出库
+
+### `mora install` 修复：HTTP 状态此前**完全没有被校验**（行为变更）
+
+- **缺陷**：`curl -L -o dest url` 默认**不因 HTTP 错误失败** —— 404 / 502 的响应体（错误页）被原样写进目标文件，curl 退出码仍是 **0** ⇒ CLI 打印 `Installed`、写入 `mora.lock`：**404/502 被当成安装成功**，错误页以「已安装的包」形态留在 `vendor/`。本机实测：`curl -L -o` 对 404 返回 exit 0 且落盘 26 字节错误页；`-f` 则返回 exit 22 且不落盘。
+- **修复**：新增 `src/cli/install.rs`（从 `main.rs` 抽出 `install_package` / `command_exists` / `update_lock`），确立四条契约 —— **只认 2xx**、**原子落地**（先写 `<dest>.part`，校验通过后 `rename`）、**失败即清理**（暂存文件必删，错误页不可能落盘）、**失败退出码非 0**（此前失败也返回 0）。
+  - curl 路径改为 `curl -L -sS -f -o <dest> -w "%{http_code}"`：`-f` 禁止错误响应体落盘，`-w` 输出真实状态码，由 `status_is_success`（2xx）判定；
+  - wget 路径以退出码判失败，并从 stderr 的 `ERROR 404: Not Found.` 解析状态码后报出；
+  - 包名解析同步修正：`http://h/pkg.mora?token=abc` 现在得到 `pkg`（此前会落盘成 `vendor/pkg.mora?token=abc.mora`）；
+  - `mora.lock` 仅在安装成功后写入。
+- **判据**：新增 `tests/install_http_status.rs`（本地 HTTP 服务 + 真实 `mora install`）—— 404 / 502 ⇒ 退出码非 0、不打印 `Installed`、`vendor/` 下不留任何文件、不产生 `mora.lock`；200 ⇒ 退出码 0、包内容逐字落盘、`mora.lock` 登记 URL。单元测试覆盖包名解析 / 2xx 判定 / curl 与 wget 状态码解析。
+
+### 会话级产物出库
+
+- `build_output.txt` / `clippy_output.txt` / `fmt_output.txt`（构建门禁输出缓存）、`mora_logo_preview.png`（AI 图片生成产物）、`scripts/audit_stats.py`（会话级审计脚本）、`.v2c/plugin_root`（本机 ZCode 插件缓存路径）、`tests/.mimosa/hook-*/`（Mimosa 扫描缓存）—— 全部**取消 git 跟踪**（文件保留在本机），`.gitignore` 补 `.v2c/`。`git ls-files -ci --exclude-standard` 现为空。
+
+### 注释校准：全仓注释对齐 v0.110.0 现行架构
 
 对齐 v0.110.0 三项架构变更后的**全仓注释事实源**。**仅注释改动，可执行代码零变更**（146 文件，+907 / −941 行）。
 

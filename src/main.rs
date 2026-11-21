@@ -2,7 +2,6 @@
 //! 共享编译与路径辅助位于 `mora::cli`，本文件保留顶层入口与命令分派。
 
 use std::env;
-use std::fs;
 use std::path::Path;
 use std::process;
 
@@ -105,7 +104,9 @@ fn dispatch() -> i32 {
                 eprintln!("Usage: mora install <url>");
                 process::exit(1);
             }
-            install_package(&args[2]);
+            // 安装失败必须以非 0 退出码结束（HTTP 4xx/5xx、传输失败、
+            // 目标不可写……），否则脚本/CI 会把「装了个错误页」当成成功。
+            return mora::cli::install::install_package(&args[2]);
         }
         // v0.08.5 fix: `mora run <file>` 子命令——之前 `run` 被当作文件名
         "run" => {
@@ -123,77 +124,6 @@ fn dispatch() -> i32 {
     0
 }
 
-fn install_package(url: &str) {
-    let vendor_dir = "vendor";
-    if !Path::new(vendor_dir).exists() {
-        fs::create_dir(vendor_dir).expect("Failed to create vendor directory");
-    }
-
-    // Extract package name from URL
-    let pkg_name = url.split('/').next_back().unwrap_or(url);
-    let pkg_name = pkg_name.strip_suffix(".mora").unwrap_or(pkg_name);
-    let dest = format!("{}/{}.mora", vendor_dir, pkg_name);
-
-    println!("Installing {} from {}...", pkg_name, url);
-
-    // Try curl first, then wget
-    let result = if command_exists("curl") {
-        std::process::Command::new("curl")
-            .args(["-L", "-o", &dest, url])
-            .output()
-    } else if command_exists("wget") {
-        std::process::Command::new("wget")
-            .args(["-O", &dest, url])
-            .output()
-    } else {
-        println!("Neither curl nor wget found. Please install one of them.");
-        println!("Or manually download {} to {}", dest, url);
-        return;
-    };
-
-    match result {
-        Ok(output) => {
-            if output.status.success() {
-                println!("Installed {} -> {}", pkg_name, dest);
-                // Update lock file
-                update_lock(pkg_name, url);
-            } else {
-                eprintln!(
-                    "Failed to download: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-        }
-        Err(e) => {
-            eprintln!("Failed to run download command: {}", e);
-        }
-    }
-}
-
-fn command_exists(cmd: &str) -> bool {
-    // Windows 用 where，Unix 用 which
-    #[cfg(target_os = "windows")]
-    {
-        std::process::Command::new("where")
-            .arg(cmd)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        std::process::Command::new("which")
-            .arg(cmd)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    }
-}
-
 fn print_banner() {
     eprintln!(
         "Mora v{} — AI-native statically-typed language",
@@ -207,19 +137,6 @@ fn print_banner() {
         "  类型与执行: Span-tracked HM typeck + algebraic effects (perform/handle) + Control SSA IR / stackful VM"
     );
     eprintln!();
-}
-
-fn update_lock(pkg_name: &str, url: &str) {
-    let lock_path = "mora.lock";
-    let mut content = String::new();
-    if Path::new(lock_path).exists() {
-        content = fs::read_to_string(lock_path).unwrap_or_default();
-    }
-    let entry = format!("{} = \"{}\"\n", pkg_name, url);
-    if !content.contains(pkg_name) {
-        content.push_str(&entry);
-        fs::write(lock_path, content).expect("Failed to write lock file");
-    }
 }
 
 fn run_file(path: &str, opt_level: Option<mora::mir::control::OptLevel>) {

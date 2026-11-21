@@ -2,46 +2,6 @@
 
 All notable changes to Mora will be documented in this file.
 
-## [0.110.1] — 注释校准 + `mora install` HTTP 状态校验修复 + 会话级产物出库
-
-### `mora install` 修复：HTTP 状态此前**完全没有被校验**（行为变更）
-
-- **缺陷**：`curl -L -o dest url` 默认**不因 HTTP 错误失败** —— 404 / 502 的响应体（错误页）被原样写进目标文件，curl 退出码仍是 **0** ⇒ CLI 打印 `Installed`、写入 `mora.lock`：**404/502 被当成安装成功**，错误页以「已安装的包」形态留在 `vendor/`。本机实测：`curl -L -o` 对 404 返回 exit 0 且落盘 26 字节错误页；`-f` 则返回 exit 22 且不落盘。
-- **修复**：新增 `src/cli/install.rs`（从 `main.rs` 抽出 `install_package` / `command_exists` / `update_lock`），确立四条契约 —— **只认 2xx**、**原子落地**（先写 `<dest>.part`，校验通过后 `rename`）、**失败即清理**（暂存文件必删，错误页不可能落盘）、**失败退出码非 0**（此前失败也返回 0）。
-  - curl 路径改为 `curl -L -sS -f -o <dest> -w "%{http_code}"`：`-f` 禁止错误响应体落盘，`-w` 输出真实状态码，由 `status_is_success`（2xx）判定；
-  - wget 路径以退出码判失败，并从 stderr 的 `ERROR 404: Not Found.` 解析状态码后报出；
-  - 包名解析同步修正：`http://h/pkg.mora?token=abc` 现在得到 `pkg`（此前会落盘成 `vendor/pkg.mora?token=abc.mora`）；
-  - `mora.lock` 仅在安装成功后写入。
-- **判据**：新增 `tests/install_http_status.rs`（本地 HTTP 服务 + 真实 `mora install`）—— 404 / 502 ⇒ 退出码非 0、不打印 `Installed`、`vendor/` 下不留任何文件、不产生 `mora.lock`；200 ⇒ 退出码 0、包内容逐字落盘、`mora.lock` 登记 URL。单元测试覆盖包名解析 / 2xx 判定 / curl 与 wget 状态码解析。
-
-### `vendor/` 历史残留自动清扫（补 v0.110.1 之前的遗留物）
-
-- **背景**：v0.110.1 之前的 `mora install` 不校验 HTTP 状态 ⇒ 404/502 的**错误页响应体**被写进 `vendor/<pkg>.mora` 并登记进 `mora.lock`。这些文件在磁盘上与「正常安装的包」**无从区分**，直到有人真的 import 它。
-- **清扫判据**（两条同时满足才删）：① **不是合法的 Mora 程序**（`ParserV3::compile` 失败 —— 装出来的包必须能编译）；② **是本工具装出来的**（登记在 `mora.lock`）**或**内容带 HTTP 错误页特征（文件**本身**以 `<!DOCTYPE html` / `<html` / `502 Bad Gateway` 等开头）。
-  - 第 ① 条保证**项目自带的样例包不会被误删**（如本仓 `vendor/hello.mora` —— 能编译即保留）；
-  - 第 ② 条保证**用户手写但写坏的包不会被越权删除**（既不在登记表、也不像错误页 ⇒ 一律保留）；
-  - 判定用 `compile`（解析 + 降低）而**不是**类型检查：包 `import` 兄弟模块时类型检查会因模块缺失报错，但那是**环境问题**、不是文件损坏。
-- **新增 `src/cli/vendor.rs`**：`mora.lock` 的读写（`LockFile`）+ 清扫（`sweep_vendor`）+ 残留判定；全部 `pub(crate)`，不扩公开 API 面。
-- **触发方式**：① **每次 `mora install` 前自动清扫**（工具自己造成的垃圾，由工具自己收拾）；② 新增 `mora install --clean` 显式只清扫不安装。
-- **连带清理**：被删包在 `mora.lock` 里的死条目一并清除；清扫报告逐条点名被删的包与被清的条目。
-- **判据**：新增 `tests/vendor_prune.rs` —— 错误页残留被删、正常包保留、用户写坏的文件保留、`mora.lock` 死条目被清、install 前自动清扫生效、干净目录上的 `--clean` 是 no-op（不凭空造出登记表）。
-
-### 会话级产物出库
-
-- `build_output.txt` / `clippy_output.txt` / `fmt_output.txt`（构建门禁输出缓存）、`mora_logo_preview.png`（AI 图片生成产物）、`scripts/audit_stats.py`（会话级审计脚本）、`.v2c/plugin_root`（本机 ZCode 插件缓存路径）、`tests/.mimosa/hook-*/`（Mimosa 扫描缓存）—— 全部**取消 git 跟踪**（文件保留在本机），`.gitignore` 补 `.v2c/`。`git ls-files -ci --exclude-standard` 现为空。
-
-### 注释校准：全仓注释对齐 v0.110.0 现行架构
-
-对齐 v0.110.0 三项架构变更后的**全仓注释事实源**。**仅注释改动，可执行代码零变更**（146 文件，+907 / −941 行）。
-
-- **模块头统一**为 `//! v0.110.0: <当前职责一句话>` + 现行架构/不变量段落，删除「vX 把 A 从 B 迁到 C」流水账：覆盖 `src/{typeck,mir,parser_v3,runtime,lsp,flow,value,common}`、`build.rs`、`Cargo.toml`、`examples/`、`scripts/`。
-- **清零退役引用**：`tokio` / `parking_lot` / `num-bigint` / `proptest` 依赖叙事、`src/interpreter/` 门面、AST（`ast_v2` / `MirExpr`）、9 层 FCFG·EHIR·DAG·JIT、`Interpreter`、`MirInst`、`EmitContext`、`h_app_def` / `h_assign` / `h_index_assign` 等 handler、`Value::TeaApp`、`Value::Agent`、`http_server` / `compress` / `audit` 模块、已下线的 `mora-std-bigint` crate 与 Rust 侧 `BigInt`。
-- **修正事实性错误**（逐条 grep 核实后改正）：`WitnessKind` 实为 47 变体（原写 30）、`BuiltinKind` 13 变体（原写 26）、`MODULE_OBJECTS` 7 项（原写 23）、`len` 返回 `Type::Int`（原写 `Float`）、`DISPLAY_MAX_DEPTH`（原写 `MAX_DEPTH`）、`compute_dag` 为「4 种融合算子 / 3 遍 pass」（原写 4-pass）、`run_fs` 走阻塞线程池（原写非阻塞）、`Type::TypeVar` 现为 `TypeVarId`（原写 `char`）。
-- **保留并标注有价值的考古**：自研 `Mutex` 的 `<locked>` 环断开器机制、D302/D320/D361 等历史事故复盘仍保留，但失效路径引用改指现行链路（`ControlInst::IndexAssign` → `runtime::vm::value_ops` 等），并统一加「历史」标记。
-- **文档面同步**：`AGENTS.md`（Tokio 调度器、`proptest` dev-dep、已不存在的 `mora-std-bigint` crate）、`README.md`、`docs/mora-spec.md`（`tokio::process::Command` 等）、`docs/learning-plan.md`、`docs/architecture-diagram.md`、`docs/influences.md`。
-- **验证**：`cargo fmt --all -- --check` ✅；`cargo clippy --all-targets --all-features -- -D warnings` ✅ 零告警；`cargo test --all-targets` ✅ 1519 passed / 0 failed；`git diff -U0` 过滤确认可执行代码改动 **0 行**。
-- 说明：`[0.110.0]` 章节保留其发布时点的历史叙述（含当时的 `tokio` / `parking_lot` / `mora-std-bigint` 表述），不做追溯改写；`docs/_archive/**` 与根目录历史审计报告同理保留原样。
-
 ## [0.110.0] — 全波次（Wave 1–4 + P1/P2）架构重铸与 AI-Native 静态类型语言定版
 
 重新校准并完整兑现 Mora 核心定位：**AI-native 静态类型语言，面向大模型底层、计算图与算子、大模型推理/训练与资源动态调控，同时具备 Go 式云原生并发属性并对 HTTP 与 MCP 服务提供语言原语级友好支持**。
@@ -154,6 +114,48 @@ All notable changes to Mora will be documented in this file.
   - 用 Mora 语言自身完整实现 `std/math/bigint.mora`（基于 $10^9$ 规格化小端 limbs 的任意精度有符号整数 `BigInt`：支持加/减/乘、二分长除 `div_rem`/`checked_div`/`checked_rem`、快速幂 `pow`、模幂 `mod_pow`、欧几里得 `gcd`/`lcm`、`2..=36` 任意进制解析与格式化、`to_i64_checked`/`to_f64_lossy` 及固有方法链）与 `std/testing.mora`（基于环境确定性 PRNG 的属性测试生成与校验器 `prop_check`/`prop_check2`），并内嵌至 `resolve_std_module`（移除旧 `num-bigint`/`num-traits` 包装 crate）。
   - 新增 `src/common/sys.rs`（Unix POSIX C ABI 直连 `dlopen`/`dlsym`/`dlclose`/`setpgid`/`killpg`）与 `src/common/sync.rs`（基于 OS Futex 的无毒化恢复 `Mutex`/`RwLock` 与环安全 `<locked>` Debug 格式化），移除 `libc` 与 `parking_lot`。
   - 在 `src/runtime/scheduler.rs`、`src/runtime/reactor.rs` 与 `src/runtime/builtins/exec.rs` 自研零依赖多线程 `Future` 调度器、最小堆后台定时器（`sleep`/`sleep_until`）、`AsyncNotify`、非阻塞 `std::net` 异步 TCP 监听器/流与 `AsyncSemaphore` 子进程并发池，彻底移除 `tokio` 与 `proptest`，达成 **`Cargo.toml` 生产与测试外部依赖双清零（0 第三方 crate）**。
+
+> **2026-11-21 同版本号重新发布**：本版本初次发布后并入了「注释校准」与
+> 「`mora install` HTTP 状态校验 + `vendor/` 残留自动清扫」两项修复，
+> 以**同一版本号**重新发布 —— 文末「发布后修复」四小节记录了这次重发的内容。
+
+### 发布后修复 · `mora install` 校验 HTTP 状态（行为变更）
+
+- **缺陷**：`curl -L -o dest url` 默认**不因 HTTP 错误失败** —— 404 / 502 的响应体（错误页）被原样写进目标文件，curl 退出码仍是 **0** ⇒ CLI 打印 `Installed`、写入 `mora.lock`：**404/502 被当成安装成功**，错误页以「已安装的包」形态留在 `vendor/`。本机实测：`curl -L -o` 对 404 返回 exit 0 且落盘 26 字节错误页；`-f` 则返回 exit 22 且不落盘。
+- **修复**：新增 `src/cli/install.rs`（从 `main.rs` 抽出 `install_package` / `command_exists` / `update_lock`），确立四条契约 —— **只认 2xx**、**原子落地**（先写 `<dest>.part`，校验通过后 `rename`）、**失败即清理**（暂存文件必删，错误页不可能落盘）、**失败退出码非 0**（此前失败也返回 0）。
+  - curl 路径改为 `curl -L -sS -f -o <dest> -w "%{http_code}"`：`-f` 禁止错误响应体落盘，`-w` 输出真实状态码，由 `status_is_success`（2xx）判定；
+  - wget 路径以退出码判失败，并从 stderr 的 `ERROR 404: Not Found.` 解析状态码后报出；
+  - 包名解析同步修正：`http://h/pkg.mora?token=abc` 现在得到 `pkg`（此前会落盘成 `vendor/pkg.mora?token=abc.mora`）；
+  - `mora.lock` 仅在安装成功后写入。
+- **判据**：新增 `tests/install_http_status.rs`（本地 HTTP 服务 + 真实 `mora install`）—— 404 / 502 ⇒ 退出码非 0、不打印 `Installed`、`vendor/` 下不留任何文件、不产生 `mora.lock`；200 ⇒ 退出码 0、包内容逐字落盘、`mora.lock` 登记 URL。单元测试覆盖包名解析 / 2xx 判定 / curl 与 wget 状态码解析。
+
+### 发布后修复 · `vendor/` 历史残留自动清扫（补旧版 `install` 留下的遗留物）
+
+- **背景**：初次发布时的 `mora install` 不校验 HTTP 状态 ⇒ 404/502 的**错误页响应体**被写进 `vendor/<pkg>.mora` 并登记进 `mora.lock`。这些文件在磁盘上与「正常安装的包」**无从区分**，直到有人真的 import 它。
+- **清扫判据**（两条同时满足才删）：① **不是合法的 Mora 程序**（`ParserV3::compile` 失败 —— 装出来的包必须能编译）；② **是本工具装出来的**（登记在 `mora.lock`）**或**内容带 HTTP 错误页特征（文件**本身**以 `<!DOCTYPE html` / `<html` / `502 Bad Gateway` 等开头）。
+  - 第 ① 条保证**项目自带的样例包不会被误删**（如本仓 `vendor/hello.mora` —— 能编译即保留）；
+  - 第 ② 条保证**用户手写但写坏的包不会被越权删除**（既不在登记表、也不像错误页 ⇒ 一律保留）；
+  - 判定用 `compile`（解析 + 降低）而**不是**类型检查：包 `import` 兄弟模块时类型检查会因模块缺失报错，但那是**环境问题**、不是文件损坏。
+- **新增 `src/cli/vendor.rs`**：`mora.lock` 的读写（`LockFile`）+ 清扫（`sweep_vendor`）+ 残留判定；全部 `pub(crate)`，不扩公开 API 面。
+- **触发方式**：① **每次 `mora install` 前自动清扫**（工具自己造成的垃圾，由工具自己收拾）；② 新增 `mora install --clean` 显式只清扫不安装。
+- **连带清理**：被删包在 `mora.lock` 里的死条目一并清除；清扫报告逐条点名被删的包与被清的条目。
+- **判据**：新增 `tests/vendor_prune.rs` —— 错误页残留被删、正常包保留、用户写坏的文件保留、`mora.lock` 死条目被清、install 前自动清扫生效、干净目录上的 `--clean` 是 no-op（不凭空造出登记表）。
+
+### 发布后修复 · 会话级产物出库
+
+- `build_output.txt` / `clippy_output.txt` / `fmt_output.txt`（构建门禁输出缓存）、`mora_logo_preview.png`（AI 图片生成产物）、`scripts/audit_stats.py`（会话级审计脚本）、`.v2c/plugin_root`（本机 ZCode 插件缓存路径）、`tests/.mimosa/hook-*/`（Mimosa 扫描缓存）—— 全部**取消 git 跟踪**（文件保留在本机），`.gitignore` 补 `.v2c/`。`git ls-files -ci --exclude-standard` 现为空。
+
+### 发布后修复 · 全仓注释对齐 v0.110.0 现行架构
+
+对齐 v0.110.0 三项架构变更后的**全仓注释事实源**。**仅注释改动，可执行代码零变更**（146 文件，+907 / −941 行）。
+
+- **模块头统一**为 `//! v0.110.0: <当前职责一句话>` + 现行架构/不变量段落，删除「vX 把 A 从 B 迁到 C」流水账：覆盖 `src/{typeck,mir,parser_v3,runtime,lsp,flow,value,common}`、`build.rs`、`Cargo.toml`、`examples/`、`scripts/`。
+- **清零退役引用**：`tokio` / `parking_lot` / `num-bigint` / `proptest` 依赖叙事、`src/interpreter/` 门面、AST（`ast_v2` / `MirExpr`）、9 层 FCFG·EHIR·DAG·JIT、`Interpreter`、`MirInst`、`EmitContext`、`h_app_def` / `h_assign` / `h_index_assign` 等 handler、`Value::TeaApp`、`Value::Agent`、`http_server` / `compress` / `audit` 模块、已下线的 `mora-std-bigint` crate 与 Rust 侧 `BigInt`。
+- **修正事实性错误**（逐条 grep 核实后改正）：`WitnessKind` 实为 47 变体（原写 30）、`BuiltinKind` 13 变体（原写 26）、`MODULE_OBJECTS` 7 项（原写 23）、`len` 返回 `Type::Int`（原写 `Float`）、`DISPLAY_MAX_DEPTH`（原写 `MAX_DEPTH`）、`compute_dag` 为「4 种融合算子 / 3 遍 pass」（原写 4-pass）、`run_fs` 走阻塞线程池（原写非阻塞）、`Type::TypeVar` 现为 `TypeVarId`（原写 `char`）。
+- **保留并标注有价值的考古**：自研 `Mutex` 的 `<locked>` 环断开器机制、D302/D320/D361 等历史事故复盘仍保留，但失效路径引用改指现行链路（`ControlInst::IndexAssign` → `runtime::vm::value_ops` 等），并统一加「历史」标记。
+- **文档面同步**：`AGENTS.md`（Tokio 调度器、`proptest` dev-dep、已不存在的 `mora-std-bigint` crate）、`README.md`、`docs/mora-spec.md`（`tokio::process::Command` 等）、`docs/learning-plan.md`、`docs/architecture-diagram.md`、`docs/influences.md`。
+- **验证**：`cargo fmt --all -- --check` ✅；`cargo clippy --all-targets --all-features -- -D warnings` ✅ 零告警；`cargo test --all-targets` ✅ 1519 passed / 0 failed；`git diff -U0` 过滤确认可执行代码改动 **0 行**。
+- 说明：本章节的**主体**保留其发布时点的历史叙述（含当时的 `tokio` / `parking_lot` / `mora-std-bigint` 表述），不做追溯改写；`docs/_archive/**` 与根目录历史审计报告同理保留原样。
 
 ## [0.104.x 历史记录] — `Int` 语义统一与早期过渡批次（D468–D491，已被 v0.110.0 统一取代）
 

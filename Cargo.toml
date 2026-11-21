@@ -1,6 +1,6 @@
 [package]
 name = "mora"
-version = "0.110.1"
+version = "0.110.0"
 edition = "2024"
 # build.rs 从 Cargo.toml 读取 CARGO_PKG_VERSION 并注入 MORAGIT_VERSION 环境变量
 build = "build.rs"

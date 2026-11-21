@@ -1,6 +1,15 @@
-//! Iterative heap-framed stackful VM executing [`ControlProgram`] with native
+//! v0.110.0: Iterative heap-framed stackful VM executing [`ControlProgram`] with native
 //! delimited continuations, zero-recursion TCO, isolated ACID transactions, and
-//! deterministic `parallel` worker merges (Wave 2 — Stage W2.3).
+//! deterministic `parallel` worker merges.
+//!
+//! Invariants:
+//! - `self.frames` is the only Mora call stack. A Mora-level call never consumes a Rust
+//!   stack frame, so nesting depth is bounded by heap memory, not by the C stack.
+//! - A tail call reuses the current frame in place (`ControlTerminator::TailCall`), so a
+//!   self-recursive tail-call loop keeps the frame stack length constant.
+//! - `parallel` worker batches run on the shared zero-dependency `TaskScheduler`; worker
+//!   environments, module globals, and shared closure cells are merged back in
+//!   deterministic declaration order under the configured [`MergeStrategy`].
 
 use std::collections::HashMap;
 use std::sync::Arc;

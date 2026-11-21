@@ -1,4 +1,4 @@
-//! v0.91: stats.* — 统计 builtin（APL/StreamIt 启发）
+//! v0.110.0: `stats.*` — 统计 builtin（APL/StreamIt 启发）
 //!
 //! 所有函数接受 list`<number>`，结果为 Float（除 min/max 可保留原元素类型）。
 //! 设计原则：复用 broadcast 后的 list，避免重新实现数值提取。
@@ -90,8 +90,8 @@ pub fn call_stats_method(method: &str, args: &[Value]) -> MoraResult<Value> {
             // 两处各自为政，正是本条只改这里的原因。
             //
             // 判定为缺陷而非设计，依据有二（缺一不可）：
-            //   ① `docs/mora-spec.md:981` 签名写的是 **`list, int`** —— 小数
-            //      本就不该进；而 `typeck/dispatch.rs:680` 只登记**元数**不校验
+            //   ① `docs/mora-spec.md:1044` 签名写的是 **`list, int`** —— 小数
+            //      本就不该进；而 `typeck/dispatch.rs:555-559` 只登记**元数**不校验
             //      参数类型，故收口是**唯一**能拦的地方；
             //   ② 本函数**自己的错误消息**写着 "bins must be an integer" ——
             //      消息承诺 integer、行为接受 2.5，**自相矛盾**。

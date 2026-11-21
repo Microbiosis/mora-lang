@@ -1,13 +1,11 @@
-//! v0.55: Builtin dispatch table.
+//! v0.110.0: Builtin dispatch table — the canonical registry of builtin,
+//! operator and method signatures.
 //!
 //! This module is the single source of truth for built-in functions,
 //! type-level operators (binary, comparison), and method-dispatch
-//! tables. The v0.55 Hindley-Milner engine in [`crate::typeck::hm`]
+//! tables. The Hindley-Milner engine in [`crate::typeck::hm`]
 //! consumes the `Signatures` so registered builtins and types are
 //! recognized by the checker.
-//!
-//! v0.75.47: 移除对已删除 v2 `TypeChecker` 的引用（v0.55 去 AST 化时
-//! 删除，注释残留；此处不再引该类型以免 rustdoc broken link）。
 //!
 //! It is also where `method_return_type` lives, which used to live in
 //! `typeck::mod` and was the source of a back-reference from
@@ -16,7 +14,7 @@
 
 use crate::typeck::Type;
 
-///  Function signature used by the v0.55 builtin registry.
+///  Function signature used by the builtin registry.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Signature {
     /// v0.x parameter list as `(name, type)` pairs.
@@ -67,7 +65,7 @@ impl Signature {
 
 ///  Return the canonical builtin registry. This is a flat snapshot;
 ///  the underlying collection is intentionally immutable from the
-///  outside so both checkers can read it without contention.
+///  outside so the checker can read it without contention.
 pub fn builtin_signatures() -> Vec<(String, Signature)> {
     vec![
         (
@@ -138,18 +136,14 @@ pub fn builtin_signatures() -> Vec<(String, Signature)> {
         ),
         // len(x) for string / list / dict
         //
-        // v0.104.6 修正：返回类型此前写 `Type::Float`，而运行期一直返
-        // `Value::Int`。这不是「类型标注宽松」的无关紧要问题 —— 它让 typeck
-        // **拒绝正确标注、接受错误标注**：
+        // 返回 `Type::Int` —— 与运行期的 `Value::Int` 一致。两侧必须同侧，
+        // 否则 typeck 会**拒绝正确标注、接受错误标注**：
         //     let n: Int   = len(xs)   → Type error: expected int, got float
         //     let n: Float = len(xs)   → 通过，但运行期拿到的是 Int
-        // （实测两条都经真实 CLI `mora run`，前者 exit 2。）
         //
-        // 根因是 `len` 的返回类型有**两处互相矛盾的声明**：
-        // `typeck/hm/builtin.rs:40` 写的是 `Type::Int`（正确），本文件写
-        // `Type::Float`（错误）；而 `HMInference::builtin_callee_ty` 开头就
-        // 「prefer the canonical dispatch registry」，即本表优先，于是错误
-        // 的那份盖住了正确的那份。
+        // builtin `len` 的函数签名只登记一份（本文件的 builtin 表）：HM 侧经
+        // `dispatch::lookup_builtin` 取的是同一份（`hm::builtin`），不存在
+        // 第二处 `len` 声明互相覆盖。
         (
             "len".to_string(),
             Signature::new(
@@ -612,11 +606,10 @@ pub fn module_method_names(module: &str) -> Vec<&'static str> {
 
 /// v0.104.6 D69：**模块对象**的方法签名，按**模块名**索引。
 ///
-/// 与 [`method_signature`] 的区别：后者按 `Type` 索引，而 `infer_var`
-/// 把 23 个模块对象里的 20 个解析成 `Type::Unknown`（`Type` 里根本没有
-/// `MathModule` / `JsonModule` / `FileModule` … 变体，只有 `AiModule` /
-/// `RandomModule` / `Agent`），于是模块方法调用的返回类型全部退化成
-/// 永不解算的 TypeVar —— `let v: String = math.floor(1.5)` 被静默接受。
+/// 与 [`method_signature`] 的区别：后者按 `Type` 索引（`Type::BuiltinModule`
+/// 分支转调本表），本表按**模块名**索引 —— `infer_var` 把模块裸名解析成
+/// `Type::BuiltinModule(name)`（`random` 为 `Type::RandomModule`），
+/// 模块方法调用的返回类型即由此表给出。
 ///
 /// 形参一律写 `Any`：**本表只负责给出结果类型**，不收紧实参（收紧实参需要
 /// 与运行期 `call_*_method` 的逐分支校验逐条对齐，收益与风险不成比例）。
@@ -780,16 +773,8 @@ fn method_signature_builtin(receiver: &Type, method: &str) -> Option<Signature> 
         // 两个分支（`(Value::List, Value::Int)` / `(Value::List, Value::Float)`，
         // 两者都走 `checked_index`）对齐。
         //
-        // 此前声明 `Type::Int` 单边，而**本语言所有数值字面量都是 `Float`**
-        // （D1 已确立：`len()` 返 Int 是全语言唯一的 Int 来源）——于是
-        // `xs.get(1)`、`xs.get(len(xs) - 1)` 这类**最自然的写法直接编译不过**
-        // （`Type error: expected int, got float`），而等价的 `xs[1]` 却能过
-        // （`[]` 在 typeck 里没有签名，落 `Any` 放行）。**同一操作的两种写法，
-        // 一种通一种不通。**
-        //
-        // `tests/equivalent_spellings.rs` 里恰好有 `list_index_vs_get` 这条
-        // 配对却一直「通过」——因为该文件的 `run` 只调 `ParserV3::compile` +
-        // `execute`，**完全绕过 typeck**。已一并补上（见该文件）。
+        // 收窄成单边会让同一操作的两种写法出现分歧（`xs.get(1)` 被拒，而
+        // 等价的 `xs[1]` 落 `Any` 放行），故收 Int | Float。
         (Type::List(elem), "get") => Some(Signature::new(
             vec![
                 ("self".to_string(), receiver.clone()),
@@ -801,7 +786,7 @@ fn method_signature_builtin(receiver: &Type, method: &str) -> Option<Signature> 
             (**elem).clone(),
         )),
         // v0.104.6：以下三条 `len` 方法签名此前声明 `Type::Float`，与运行期的
-        // `Value::Int` 不符（详见上方 builtin 签名处的完整说明）。
+        // `Value::Int` 不符（详见上方 builtin `len` 签名的说明）。
         (Type::List(_), "len") => Some(Signature::new(
             vec![("self".to_string(), receiver.clone())],
             Type::Int,
@@ -1418,9 +1403,9 @@ fn method_signature_via_type(receiver: &Type, method: &str) -> Option<Signature>
     }
 }
 
-///  Return the result type of a method call. Mirrors the v0.x dispatch
-///  table. Returns `Type::Any` for unknown combinations so callers can
-///  fall back gracefully.
+///  Return the result type of a method call. Mirrors the dispatch
+///  tables above. Returns `Type::Unknown` for unknown combinations so
+///  callers can fall back gracefully.
 pub fn method_return_type(receiver: &Type, method: &str) -> Type {
     if let Some(sig) = method_signature_builtin(receiver, method) {
         return sig.return_type;

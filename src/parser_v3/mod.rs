@@ -1,7 +1,8 @@
-//! v0.92: Parser V3 - Witness-native MIR parser（MirExpr 中间层已删除）
+//! v0.110.0: `ParserV3` —— witness-native 语法前端（tokens → `MirWitness`，零 AST 中间层）。
 //!
-//! **Zero AST v2 dependencies** - Direct tokens → MirWitness conversion
-//! This is the final parser implementation that completely replaces Parser v2.
+//! 单遍递归下降：源码 → `Vec<MirWitness>`（携带精确 `Span`）。它是唯一的前端，
+//! 产出的见证树直接进入 `mir::control::lower_program`（→ `ControlProgram` SSA IR）
+//! 与 `typeck::check_mir::check_program_witnesses`（→ HM 类型检查），并被 LSP 消费。
 
 use crate::common::{BinaryOp, Literal, Span};
 use crate::error::{MoraError, MoraResult};
@@ -9,14 +10,14 @@ use crate::lexer::{Token, TokenType};
 use crate::mir::witness::{MirWitness, WitnessKind, WitnessParam};
 
 mod emit;
-mod emit_definitions; // v0.92 P1.3: definition emit methods split from emit.rs
-mod syntax; // v0.92 P1.4: pattern/type-annotation parsers (from parse.rs)
-mod tokens; // v0.92 P1.4: token-stream navigation primitives (from parse.rs)
+mod emit_definitions; // 顶层与局部定义解析
+mod syntax; // 模式 / 类型注解解析
+mod tokens; // token 流游标原语
 
 /// v0.104.6 D25：源码嵌套深度上限（同时用于词法括号深度与 witness 树深度）。
 ///
-/// 背景：`ParserV3` 是标准递归下降实现，而下游（witness → typeck / DAG /
-/// optimize / LSP 折叠）全部**递归遍历**同一棵树。Windows 主线程栈默认
+/// 背景：`ParserV3` 是标准递归下降实现，而下游（witness → typeck / lowering /
+/// LSP 折叠）全部**递归遍历**同一棵树。Windows 主线程栈默认
 /// 仅 1 MB，于是「20~32 层普通嵌套」就让编译器**硬崩**（`thread 'main' has
 /// overflowed its stack`，abort、无退出码、无可读信息），`mora --check`
 /// 同样崩 —— 因为它调的就是同一个 `ParserV3::compile`。
@@ -37,8 +38,8 @@ pub const MAX_NESTING_DEPTH: usize = 512;
 /// 为什么光有括号深度闸不够：`1+1+1+…+1` 与 `s[0][0]…` 这两类**括号深度
 /// 恒为 1**（`(` 只开一次、`[` 每次都闭合），但 `emit_term_w` /
 /// `emit_call_tail_w` 是 `while` 循环而非递归，每轮把 witness 往**左深**
-/// 方向加一层，产出深度 n 的树；而下游（typeck / DAG 构建 / optimize /
-/// LSP 折叠）全部**递归**遍历它。括号闸完全看不见这种形态：
+/// 方向加一层，产出深度 n 的树；而下游（typeck / lowering / LSP 折叠）全部
+/// **递归**遍历它。括号闸完全看不见这种形态：
 ///
 /// ```text
 /// print(1+1+1+…+1)        # 括号深度 1，witness 深度 n
@@ -111,9 +112,9 @@ fn token_bracket_depth(tokens: &[Token]) -> (usize, (usize, usize)) {
 
 /// witness 树最大深度（迭代显式栈，自身不递归因而不会爆栈）。
 ///
-/// 复用既有的 `MirWitness::child_witnesses()`（`witness.rs:275`）—— 它按
-/// 求值顺序枚举全部子 witness，30 个 `WitnessKind` 变体全覆盖，新增变体时
-/// 编译器会强制补齐该 match，故本函数不会「漏数变体」而漏判。
+/// 复用既有的 `MirWitness::child_witnesses()` —— 它按求值顺序枚举全部子
+/// witness，47 个 `WitnessKind` 变体全覆盖，新增变体时编译器会强制补齐该
+/// match，故本函数不会「漏数变体」而漏判。
 ///
 /// 返回 `(最大深度, 该最深节点的 span)`。
 fn witness_depth(roots: &[MirWitness]) -> (usize, Span) {
@@ -138,16 +139,17 @@ fn witness_depth(roots: &[MirWitness]) -> (usize, Span) {
 }
 
 /// Parse-time scope flags tracked across nested function-like boundaries
-/// (`task` / `closure` / `macro` / `worker` / `transaction` / `match` arm guard & body /
-/// `parallel` / `with`). Isolated bodies reset `is_program_top` to `false` and
-/// `parse_loop_depth` to `0`, restored unconditionally on exit.
+/// (`task` / `closure` / `macro` / `worker` / `parallel` / `transaction` /
+/// `no_grad` / `select` arm / `match` arm guard & body). Isolated bodies reset
+/// `is_program_top` to `false` and `parse_loop_depth` to `0`, restored
+/// unconditionally on exit.
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct ParserScope {
     pub(super) is_program_top: bool,
     pub(super) parse_loop_depth: usize,
 }
 
-///  ParserV3 - Clean-room MIR parser with no AST legacy baggage
+///  ParserV3 —— witness-native 语法前端（零 AST 中间层）
 pub struct ParserV3 {
     tokens: Vec<Token>,
     current: usize,
@@ -220,13 +222,12 @@ impl ParserV3 {
         result
     }
 
-    /// v0.75.40: 单遍编译入口（阶段 3 完整融合）。
+    /// 单遍解析入口：只跑词法 + 深度闸 + 语法分析，产出 `MirWitness` 列表
+    /// （**不执行 lowering**）。
     ///
-    /// parse 函数直接 emit MirInst 到内部 EmitContext，并行产出
-    /// MirWitness 树，MirExpr 中间层消失（执行路径零 MirExpr）。
-    /// 差分测试（tests/compile_differential.rs）锁定与 parse→lower 等价。
-    /// W2.3: 仅运行词法 + 深度闸 + 语法分析产出 `MirWitness` 列表（不执行 lowering）。
-    /// LSP / `mora --check` / REPL / `eval` 动态绑定降维使用此入口避免无谓重降或误报。
+    /// LSP / `mora --check` / REPL / `eval` 动态绑定走此入口，避免无谓重降或误报。
+    /// 管线结构测试见 `tests/compile_differential.rs`（校验 `compile` 产出的
+    /// `ControlProgram` 通过 `verify_program`）。
     pub fn parse_witnesses(source: &str) -> MoraResult<Vec<crate::mir::witness::MirWitness>> {
         Self::parse_witnesses_with_modules(source, None)
     }
@@ -236,8 +237,7 @@ impl ParserV3 {
         virtual_modules: Option<&std::collections::HashMap<String, String>>,
     ) -> MoraResult<Vec<crate::mir::witness::MirWitness>> {
         use crate::lexer::Lexer;
-        // 空输入或仅含注释的输入 → 显式 Err（与 proptest 期望对齐：
-        // 成功编译必须产生非空 body，否则 prop_assert 失败）。
+        // 空输入或仅含注释的输入 → 显式返回 Parse 错误（成功编译必须产生非空可执行语句）。
         let trimmed = source.trim();
         if trimmed.is_empty() || trimmed.chars().all(|c| c == '-' || c.is_whitespace()) {
             return Err(MoraError::Parse(
@@ -310,7 +310,7 @@ impl ParserV3 {
         Vec<crate::mir::witness::MirWitness>,
     )> {
         let witnesses = Self::parse_witnesses_with_modules(source, virtual_modules)?;
-        // W2.3: 单一路径直出 ControlProgram（retired 9-layer FCFG/SSA/VM）。
+        // 单一路径直出 ControlProgram：witness → lowering，无中间 IR 层。
         let prog = crate::mir::control::lower_program(&witnesses)?;
         Ok((prog, witnesses))
     }
@@ -337,12 +337,9 @@ impl ParserV3 {
     }
 }
 
-/// emit_match_arm_w 的产出：指令侧 (pat_str/guard/body_mir/val_reg)
-/// + witness 侧 WitnessArm。结构体分组避免五元组返回（type_complexity）。
+/// emit_match_arm_w 的产出：只保留 witness 侧 —— 守卫与体都只以 **witness**
+/// 形态存在（`WitnessArm { pattern, guard, body }`）。
 struct EmittedMatchArm {
-    /// v0.104.6 D474：只保留 witness —— 守卫与体都只以 **witness** 形态存在
-    /// （`WitnessArm { pattern, guard, body }`）。Mir 侧的 `pat_str` /
-    /// `guard` / `body_mir` / `val_reg` 四个字段整体作废。
     witness: crate::mir::witness::WitnessArm,
 }
 
@@ -362,8 +359,8 @@ impl std::error::Error for ParseError {}
 /// dedicated token types, but they can appear in identifier positions
 /// (method names, variable references after `.` or `::`).
 ///
-/// v0.75.19: 与 lexer 关键字表同步收敛 — 移除已删除 token 的 arm
-/// （词面是语法集，MirInst 原语由手工构造驱动，运行时原语集不变）。
+/// 与 lexer 关键字表同步收敛 —— 只保留仍在语法集内的 token 分支
+/// （词面是语法集，运行时原语集不变）。
 fn token_to_identifier_name(tt: &TokenType) -> Option<&'static str> {
     match tt {
         TokenType::Task => Some("task"),
@@ -407,7 +404,7 @@ mod tests {
         for src in ["", "   ", "\n\n", "--- 只有注释\n", "-----"] {
             assert!(
                 !compiles(src),
-                "空/纯注释输入必须报错（否则 proptest 的非空 body 约束会红）：{src:?}"
+                "空/纯注释输入必须报错（成功编译必须产生非空语句体）：{src:?}"
             );
         }
     }

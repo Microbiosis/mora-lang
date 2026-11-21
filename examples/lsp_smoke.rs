@@ -1,14 +1,14 @@
-//! Mora LSP
+//! Mora LSP 端到端冒烟测试客户端（`lsp_smoke`）
 //!
-//!  binary  LSP
-//!   1.  mora-lsp
-//!   2.  initialize
-//!   3.  initialized
-//!   4.  textDocument/didOpen  typeck
-//!   5.  publishDiagnostics
-//!   6.  shutdown + exit
+//! 启动真实的 `mora-lsp` 二进制并通过 stdio JSON-RPC 2.0 协议验证完整生命周期：
+//!   1. 启动 `mora-lsp` 子进程
+//!   2. 发送 `initialize` 请求并校验 `capabilities`
+//!   3. 发送 `initialized` 通知
+//!   4. 发送 `textDocument/didOpen` 触发统一 HM 静态类型检查
+//!   5. 接收并校验 `textDocument/publishDiagnostics` 诊断通知与各 LSP Provider 响应
+//!   6. 发送 `shutdown` + `exit` 并校验进程 0 退出码
 //!
-//!  cargo run --example lsp_smoke  mora-lsp
+//! 用法：`cargo run --release --example lsp_smoke -- ./target/release/mora-lsp`
 
 use std::io::{BufReader, Read, Write};
 use std::process::{Command, Stdio};

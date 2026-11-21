@@ -1,12 +1,14 @@
-//! Trait / impl / skill MIR dispatch 路径测试 (v0.77 重命名自 tier0_trait_mir.rs)
+//! Trait / impl / skill 分派路径测试 (v0.77 重命名自 tier0_trait_mir.rs)
 //!
-//! v0.77 重构：删除 4 个 source-grep 静态合约测试（MirInst::TraitDef.method_bodies
+//! v0.77 重构：删除 4 个 source-grep 静态合约测试（`MirInst::TraitDef.method_bodies`
 //! 存在性、MirInst::SkillDef.task_bodies 存在性等 — 任何重命名都会假阳性断裂）。
 //! 保留 1 个 runtime 集成测试。
 //!
-//! α.11 起，MirInst::TraitDef / ImplDef / SkillDef 携带 prelowered MirFunction
-//! body（method_bodies / task_bodies / verify_body），dispatch 见 mir_body: Some
-//! 走 execute，不回退到 arena-based call_task_inner AST 路径。
+//! ⚠ **历史说明**：上文的 `MirInst::TraitDef` / `MirInst::ImplDef` /
+//! `MirInst::SkillDef` 与 `MirFunction` 属**已退役**的 9 层 IR（v0.110.0 删除）。
+//! 现存链路是 `WitnessKind::TraitDef`（`src/mir/witness.rs`）→ `mir::control::lower`
+//! 生成 `ControlFunction`（`FunctionKind::TraitDefault` / trait 方法体），
+//! dispatch 由 `src/runtime/builtins/traits.rs` 完成。
 
 use mora::parser_v3::ParserV3;
 use mora::runtime::CoreRuntime;

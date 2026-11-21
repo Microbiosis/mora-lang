@@ -1,14 +1,12 @@
-//! v0.53: Let-Generalization for HM Type Inference
+//! v0.110.0: Let-Generalization for HM Type Inference
 //!
 //! Implements the generalization rule for let bindings:
 //! Γ ⊢ e : τ, FV(Γ) = {α₁, ..., αₙ}
 //!
 //! Γ ⊢ let x = e in body : ∀α₁...αₙ.τ
 //!
-//! v0.75.17: 真正的量化实现 — `replace_with_generics` 现在产出
-//! `Type::ForAll(vars, inner)`（此前注释 "can't represent ∀ without
-//! changing Type enum"，Type 枚举已加 ForAll 变体）。同时新增 `instantiate`
-//! 把 ForAll 展开为 fresh TypeVar（标准 HM 的 let-polymorphism 展开规则）。
+//! 量化结果用 `Type::ForAll(vars, inner)` 表示，`instantiate` 把它展开为
+//! fresh TypeVar（标准 HM 的 let-polymorphism 展开规则）。
 
 use std::collections::{HashMap, HashSet};
 

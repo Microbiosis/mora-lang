@@ -13,7 +13,12 @@
 //! 只输出 `A`；`a` 与 `B` 两条**都没执行**。阈值实测恰好是 **100**
 //! （`99i + 0i` 正常，`100i + 0i` 起失效）。
 //!
-//! ## 根因（`src/mir/optimize/dag_rule.rs`）
+//! ## 根因（**历史**：`src/mir/optimize/dag_rule.rs`）
+//!
+//! ⚠ **历史快照**：`src/mir/optimize/` 整条 DAG 规则栈（`dag_rule.rs` /
+//! `rule.rs`）已随 v0.110.0 的 9 层 IR 一并退役；现存优化器是
+//! `src/mir/control/opt.rs`（常量折叠 / 拷贝传播 / GVN-CSE / LICM / CFU 化简 /
+//! DCE），其中**没有**恒等化简（`x + 0 → x`）这条规则 —— 与下述「代价」一致。
 //!
 //! `AlgebraicSimplifyDagRule` 的 `ReplaceWithSource` 分支是 **`MirInst::Copy`
 //! 时代的遗留物** —— `Copy` 在 v0.55 已删除（见 `optimize/rule.rs` 的

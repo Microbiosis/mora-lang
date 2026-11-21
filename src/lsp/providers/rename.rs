@@ -1,4 +1,11 @@
-//! v0.25: LSP rename provider（重命名）。
+//! v0.110.0: LSP rename provider —— 产出会改写用户文件的 `WorkspaceEdit`。
+//!
+//! 编辑点 = 同名 `let` / `fn` 定义 + 全部读点；`MirWitness` 的 span 起点落在整条语句上，
+//! 故需按标识符**完整词**双向就近查找定位到标识符本身 —— 两头都找不到就放弃这一处
+//! （宁可不改，也不要改错字符）。
+//!
+//! 坐标不变式：出站 `range` 的 `character` 必须是 **UTF-16 码元** —— 这是唯一会
+//! 改写用户文件的 provider，列号错一位就会改坏文件。
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 

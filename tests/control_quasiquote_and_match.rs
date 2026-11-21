@@ -6,6 +6,12 @@
 //! 完整机制：`h_quasiquote`（L112，Lisp 同源语法）与
 //! `h_match_expr`（L17）的「无 arm 匹配」分支。
 //!
+//! ⚠ **历史快照**：上文引用的 `src/mir/handlers/`（`control.rs` / `values.rs` /
+//! `effects.rs`）与 `h_quasiquote` / `h_match_expr` 属**已退役**的 9 层 IR
+//! （v0.110.0 删除）。今天 quasiquote 由 `WitnessKind::Quasiquote` →
+//! `mir::control::lower` 处理，match/guard 由 merge 块 + 模式绑定后的求值守卫
+//! 实现；本文件保留的断言（现行语义）仍然有效。
+//!
 //! ## quasiquote 的记号是 `,,`（**不是** `,@`）
 //!
 //! `docs/mora-spec.md:916` 明写：

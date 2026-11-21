@@ -1,4 +1,11 @@
-//! v0.25: LSP hover provider（悬停信息）。
+//! v0.110.0: LSP hover provider —— 显示光标处符号的种类与 HM 类型。
+//!
+//! 类型来源按优先级回退：源码里的显式 `: <Type>` 标注 → `typeck::check_mir::infer_program_types`
+//! 的绑定（当前行 → 之前最近声明 → 任意同名声明）→ 表达式 span 类型 → 顶层环境 /
+//! 内建或模块签名 → `<inferred>`。
+//!
+//! 坐标不变式：入站 `character` 是 **UTF-16 码元**，需经 `utf16_to_char_col` 换算成
+//! char 索引；出站 `character` 同样按 UTF-16 码元给出。
 
 use std::collections::{BTreeMap, HashMap};
 

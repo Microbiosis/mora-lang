@@ -3,13 +3,13 @@
 //! ## 背景
 //!
 //! D78 补了 6 个 spec §12 内建后，对 **38 个运行期可调用的裸内建**（名单的唯一
-//! 事实源是 `interpreter/dispatch.rs::call_function` 的分派表）逐个做了实证普查：
+//! 事实源是**历史** `interpreter/dispatch.rs::call_function` 的分派表，今为 `runtime/builtins/registry.rs::RUNTIME_BUILTIN_NAMES`）逐个做了实证普查：
 //! **故意写一个错的标注，看 typeck 是否拒绝**。
 //!
 //! - 标注被拒 → 有签名
 //! - 标注被接受 → 结果类型是未解算的 `TypeVar`，标注形同虚设
 //!
-//! ## 本轮补的 5 条（返回类型逐条核对自 `builtin_impls.rs` 的 `Ok(Value::…)`）
+//! ## 本轮补的 5 条（返回类型逐条核对自**历史** `builtin_impls.rs`，今 `runtime/builtins/impls.rs` 的 `Ok(Value::…)`）
 //!
 //! | 内建 | 运行期 | 声明 |
 //! |---|---|---|

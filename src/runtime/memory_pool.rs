@@ -7,7 +7,7 @@
 //!   under memory pressure before failing closed with an explicit quota-exceeded error.
 //! - Rising-edge watermark callbacks (`on_watermark(threshold, cb)` / `clear_watermarks`) executed
 //!   outside the pool lock on the stackful VM frame stack (`CombinatorFrame::WatermarkCallbacks`).
-//! - Thread-safe via `parking_lot::Mutex` across `spawn`ed concurrent tasks.
+//! - Thread-safe via `crate::common::sync::Mutex` across `spawn`ed concurrent tasks.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;

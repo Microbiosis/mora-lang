@@ -1,15 +1,22 @@
 //! 增量 memo 对 `dict` 输入的指纹 —— 防「同长度不同内容」返回陈旧值。
 //!
+//! ⚠ **历史快照（2026-09-28 的缺陷记录）**：当时的增量 memo 执行栈
+//! （`src/mir/vm/engine.rs` 的 `value_fp` / `InputFp` / `is_memoizable_pure`
+//! 白名单）已随 v0.110.0 的 9 层 IR 一并退役；今天的执行内核是
+//! `ControlProgram` SSA + 堆帧 VM（`src/runtime/vm/`），**没有**增量 memo。
+//! 本文件保留的是**当时复现该缺陷的程序形态与断言**，它们至今仍用来钉住
+//! 「`d["a"]` 与 `d.get("a")` 语义一致」这一现行行为。
+//!
 //! ## 缺陷（2026-09-28 修）
 //!
-//! `src/mir/vm/engine.rs` 的 `value_fp` 对 `Value::Dict` 曾只取**长度**：
+//! 当时的 `value_fp` 对 `Value::Dict` 曾只取**长度**：
 //!
 //! ```ignore
 //! Value::Dict(d) => InputFp::Str(d.len(), 0)
 //! ```
 //!
-//! 而 `MirInst::Index(..)` **在 `is_memoizable_pure` 白名单里**，`d["a"]` 正好
-//! 降级成 `Index`。于是循环里
+//! 而 `MirInst::Index(..)`（**历史**指令名）**在 `is_memoizable_pure` 白名单里**，
+//! `d["a"]` 正好降级成 `Index`。于是循环里
 //!
 //! ```text
 //! let n = 0

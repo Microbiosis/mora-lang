@@ -1,17 +1,14 @@
-//! v0.75.38: MirWitness — 轻量树骨架（typeck/LSP 消费面）。
+//! v0.110.0: `MirWitness` —— 前端语法见证树（供 `mir::control::lower_program`、统一 HM 类型检查与 LSP 消费）。
 //!
-//! 去 AST 化终局的中间层：ParserV3 直接 emit MirInst（阶段 3），
-//! 但 typeck（HM 推断）与 LSP（folding/semantic/definition/rename）
-//! 需要语法树骨架。`MirWitness` 是 canonical 纯树结构（kind + span），
-//! **无执行语义**——执行永远走 MirInst。
+//! `ParserV3` 单遍解析源码生成 `Vec<MirWitness>`（携带精确 `Span`），随后：
+//! 1. `mir::control::lower_program` 将其降低为显式基本块 `ControlProgram` SSA IR；
+//! 2. `typeck::check_mir::check_program_witnesses` 在其上执行统一 HM 约束求解与 5 项 AI-Native 静态检查；
+//! 3. `lsp::providers` 在其上提供语法结构与符号导航。
 //!
-//! v0.92: 原 `MirExpr` 平行世界已完全删除。MirWitness 曾是镜像
-//! `MirExprKind` 的产物，如今是唯一的 parse-tree 类型；`from_expr` 等
-//! 前向转换函数已随 MirExpr 一并移除。
-//! - **独立 WitnessKind 枚举**（30 变体，captured_env 已删零消费死字段）。
+//! - **独立 WitnessKind 枚举**（47 变体，captured_env 已删零消费死字段）。
 //!
-//! 复合类型同步镜像：WitnessCallee（MirCallee）、WitnessArm（MatchArm）、
-//! WitnessParam（Param）、WitnessPattern（Pattern）。
+//! 复合类型（见证树的结构化分支）：WitnessCallee（调用目标）、WitnessArm（匹配臂）、
+//! WitnessParam（形参）、WitnessPattern（模式）。
 
 use crate::common::{BinaryOp, Literal, Span};
 
@@ -22,7 +19,7 @@ pub struct MirWitness {
     pub span: Span,
 }
 
-/// Witness 树节点种类 — 30 变体（captured_env 已删）。
+/// Witness 树节点种类 — 47 变体（captured_env 已删）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum WitnessKind {
     Literal(Literal),
@@ -147,7 +144,7 @@ pub enum WitnessKind {
         body: Box<MirWitness>,
     },
     Import(String),
-    // v0.80: algebraic effects witness（Stage 2/4 落地）。
+    // v0.80: algebraic effects witness。
     //   Perform: 触发一个具名 effect。
     //   Handle: 安装 handler 围栏。
     Perform {
@@ -166,14 +163,14 @@ pub enum WitnessKind {
         body: Box<MirWitness>,
     },
     Sequence(Vec<MirWitness>),
-    // v0.88: Quasiquote（反引号 `expr + ,unquote / ,,unquote-splice）
+    // v0.88: Quasiquote（反引号 `expr + ,unquote / ,,unquote-splice)
     /// segments 用 MirWitness 编码：Quote = Literal(String),
     /// Unquote = 被求值的子表达式 witness,
-    /// UnquoteSplice = 子表达式 witness + Literal(Boolean("splice")) 标记。
+    /// UnquoteSplice = 子表达式 witness + Literal(Bool(true)) 标记。
     Quasiquote {
         segments: Vec<MirWitness>,
     },
-    // v0.98: 显式 effect 签名声明（纯类型层 —— 不产 MirInst）。
+    // v0.98: 显式 effect 签名声明（纯类型层 —— 只被 typeck 消费）。
     //   `effect Name(Hint, ...) : Hint`   参数契约 + 结果契约
     //   `effect Name(Hint, ...)`          仅参数契约（结果 = Any）
     EffectSig {
@@ -192,25 +189,26 @@ pub enum WitnessKind {
         decl: Box<MirWitness>,
     },
 
-    // ── v0.104.6 D472：9 层管线补齐 ──
+    // ── worker / transaction / eval / aggregate 的见证表示 ──
     //
-    // 此前这 4 类构造在 witness 层**完全没有表示** —— parser 只发射 MirInst、
-    // 把结构信息丢进一个扁平的 `Sequence`。于是 9 层降级链
-    // （witness → FCFG → MIR）**结构上就拿不到**它们，
-    // `worker` / `transaction` / `eval` / `aggregate` 必然回落旧路径。
+    // 这 4 类构造必须在 witness 层有**结构化表示**：此前它们被压扁进一个
+    // 扁平的 `Sequence`，结构信息（worker 批次、补偿段、断言期望集、贡献值）
+    // **结构上就拿不到**，lower 只能回落成普通语句序列。
     //
-    // 补齐后，9 层成为**唯一**编译路径的前提才成立。
-    /// worker 块 —— 与 `MirInst::Worker { name, body }` 同构。
+    // 补齐后，lowering 才能把它们直接降成 `ControlInst::Parallel` /
+    // `ControlInst::Transaction` / `ControlInst::EvalAssert`，或按约定
+    // 求值出贡献值。
+    /// worker 块 —— lower 为 `ControlInst::Parallel` 的单个 `ParallelSegment::WorkerBatch`。
     Worker {
         name: String,
         body: Box<MirWitness>,
     },
-    /// transaction 块 —— 与 `MirInst::Transaction { body, compensation }` 同构。
+    /// transaction 块 —— lower 为 `ControlInst::Transaction { body_fn, comp_fn, .. }`。
     Transaction {
         body: Box<MirWitness>,
         compensation: Box<MirWitness>,
     },
-    /// eval 断言 —— 与 `MirInst::Eval { name, given_reg, expects, ... }` 对应。
+    /// eval 断言 —— lower 为 `ControlInst::EvalAssert`。
     Eval {
         name: String,
         given: Box<MirWitness>,
@@ -218,31 +216,27 @@ pub enum WitnessKind {
         tolerance: Option<f64>,
         replay_path: Option<String>,
     },
-    /// aggregate 贡献 —— 与 `MirInst::Aggregate { name, value }` 对应。
+    /// aggregate 贡献 —— lower 直接求值 `value`，语句值即贡献值。
     Aggregate {
         name: String,
         value: Box<MirWitness>,
     },
 
-    /// 管道 `x |> f` —— 承载 `MirInst::Pipe` 的两个操作数。
+    /// 管道 `x |> f` —— 承载 `ControlInst::Pipe` 的两个操作数。
     ///
-    /// v0.104.6 D472：此前管道在 witness 层被脱糖成 `Call`
-    /// （`typeck/hm/infer.rs` 的 v0.75.20 记档：「`|` 在 parse_pipe 脱糖为
-    /// Call（right(left)），HM 走 infer_call」，并据此把 `WitnessKind::Pipe`
-    /// 当"死变体"移除）—— 但 **emit 路径发射的是 `MirInst::Pipe` 指令**。
-    /// 两者不同构 ⇒ 9 层降维出 `Call`、emit 出 `Pipe`，差分必红
-    /// （实测 `let x = 1 |> print`：pipeline 6 条 / original 7 条）。
-    /// 补回该变体，让指令与 witness 重新同构。
+    /// witness 层必须保留独立的 `Pipe` 变体（而非脱糖成 `Call`）：否则
+    /// typeck 与 lowering 两侧看到的结构不同构。
     ///
-    /// 类型推断口径**保持不变**（见 `typeck/hm/mod.rs`）：右侧是裸标识符 ⇒
-    /// 值应用 `f(x)`；右侧是任意表达式 ⇒ 内建 `|>(x, expr)`。
+    /// 类型推断口径（见 `typeck/hm/mod.rs`）：右侧是裸标识符 ⇒ 按具名调用
+    /// `f(x)` 求解；右侧是任意表达式 ⇒ 先求值右侧，再把左侧作为唯一实参
+    /// 施加于它。
     Pipe {
         left: Box<MirWitness>,
         right: Box<MirWitness>,
     },
-    /// `commit` 语句 —— 与 `MirInst::Commit` 同构（unit 指令）。
+    /// `commit` 语句 —— lower 为 unit 指令 `ControlInst::Commit`。
     Commit,
-    /// `rollback` 语句 —— 与 `MirInst::Rollback` 同构（unit 指令）。
+    /// `rollback` 语句 —— lower 为 unit 指令 `ControlInst::Rollback`。
     Rollback,
     /// `spawn <target>` — launches an isolated concurrent task returning `TaskHandle<R>`.
     Spawn {
@@ -348,7 +342,7 @@ pub enum WitnessSelectArm {
     },
 }
 
-/// 调用目标 — 镜像 MirCallee。
+/// 调用目标 —— 函数名 / 变量 / 方法 / 求值表达式 / 内建操作码。
 #[derive(Debug, Clone, PartialEq)]
 pub enum WitnessCallee {
     Name(String),
@@ -844,8 +838,7 @@ impl Drop for MirWitness {
     }
 }
 
-/// v0.92: builtin 操作码（原在 `mir/expr/mod.rs`）。
-/// WitnessCallee::Builtin 与 typeck HM 推断消费；与表达式树无关，故迁至 witness 层。
+/// builtin 操作码 —— 由 `WitnessCallee::Builtin` 携带，供 typeck HM 推断消费。
 #[derive(Debug, Clone, PartialEq)]
 pub enum BuiltinOp {
     Print,
@@ -855,7 +848,7 @@ pub enum BuiltinOp {
     Length,
 }
 
-/// Match arm — 镜像 MatchArm。
+/// Match arm —— 模式 + 可选守卫 + 臂体。
 #[derive(Debug, Clone, PartialEq)]
 pub struct WitnessArm {
     pub pattern: WitnessPattern,
@@ -863,7 +856,7 @@ pub struct WitnessArm {
     pub body: MirWitness,
 }
 
-/// Pattern 变体 — 镜像 Pattern。
+/// Pattern 变体 —— 通配 / 变量 / 字面量 / 元组 / 列表 / dict / 类型标注 / 枚举变体 / 结构体。
 #[derive(Debug, Clone, PartialEq)]
 pub enum WitnessPattern {
     Wildcard,
@@ -901,7 +894,7 @@ pub enum WitnessPattern {
     },
 }
 
-/// 参数 — 镜像 Param。
+/// 参数 —— 形参名 + 可选类型注解 + 可选默认值 witness。
 #[derive(Debug, Clone, PartialEq)]
 pub struct WitnessParam {
     pub name: String,
@@ -914,8 +907,7 @@ mod tests {
     use super::*;
     use crate::common::{BinaryOp, Literal};
 
-    // v0.92: MirExpr → MirWitness 正向转换已删除（parser 直接产出 witness）。
-    // 以下测试改为 witness-native 构造，验证 witness 树自身的结构不变量。
+    // 见证树测试：直接以 witness-native 构造，验证 witness 树自身的结构不变量。
 
     fn lit(n: i64) -> MirWitness {
         MirWitness {

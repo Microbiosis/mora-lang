@@ -1,14 +1,9 @@
-//! v0.92: 数值方法辅助函数（自 dispatch.rs 拆分），委托给 `math.*` builtin。
+//! v0.110.0: 数值方法辅助函数，委托给 `math.*` builtin。
 
 use crate::error::{MoraError, MoraResult};
 use crate::value::Value;
 
-// ===================================================================
-// v0.26: compose_prompt / tail 辅助函数 (在 dispatch.rs 末尾)
-// ===================================================================
-
-/// 把 Value 转 String (用于 section.text 字段读取)
-// v0.91: 数值方法链（x.abs() / x.sqrt() / x.sin() 等）。
+/// 数值方法链（x.abs() / x.sqrt() / x.sin() 等）。
 // `is_int` 标记输入是否为 Int 类型（决定某些方法是否保留 Int 类型）。
 //
 // 设计：复用 math.* builtin 同一底层函数，避免双实现。

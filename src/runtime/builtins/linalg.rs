@@ -1,4 +1,4 @@
-//! v0.91: linalg.* — 基础线性代数（APL/NumPy 启发）
+//! v0.110.0: `linalg.*` — 基础线性代数（APL/NumPy 启发）
 //!
 //! 向量表示为 `list<number>`，矩阵为 `list<list<number>>`。
 //! 不引入新类型，复用 list — 与 §3 既有列表广播/reshape 风格一致。
@@ -186,7 +186,7 @@ fn expect_f64_matrix(arg: Option<&Value>, ctx: &str) -> MoraResult<Vec<Vec<f64>>
     // `matmul([[1,2],[3,4,5]],[[1,0],[0,1]])` → `[[1.0,2.0],[3.0,4.0]]`（第 3 列没了）。
     //
     // 为什么是**缺陷**而非「宽松接受」：
-    // ① `docs/mora-spec.md:993-994` 的签名是 `list<list>` → `list<list>`，
+    // ① `docs/mora-spec.md:1056-1057` 的签名是 `list<list>` → `list<list>`，
     //    返回类型承诺**一个矩阵**，而参差输入的「结果」根本不是调用方
     //    写下的那个矩阵 —— **静默改变数据形状**（与 D325 `reshape`
     //    丢数据是同一类，D325 已定为缺陷）；

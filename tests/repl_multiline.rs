@@ -3,7 +3,8 @@
 //! ## 现象
 //!
 //! `mora --repl` 用 `read_line` **一行一行**读，每行独立走
-//! `ParserV3::compile`（`src/interpreter/mod.rs:736-748`），**没有多行累积**。
+//! `ParserV3::compile`（**历史** `src/interpreter/mod.rs:736-748`；今
+//! `src/parser_v3/mod.rs`），**没有多行累积**。
 //! 于是 REPL 里最基本的东西用不了：
 //!
 //! ```text

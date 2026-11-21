@@ -1,12 +1,7 @@
-//! v0.55: Parser V3 / MirWitness LSP data accessor.
+//! v0.110.0: `ParserV3` / `MirWitness` LSP 文档解析与符号提取入口。
 //!
-//! `parsed_doc_v3` is the MirWitness counterpart of the historical
-//! `parsed_doc_v2` helper. Every LSP provider in this folder should pull
-//! its parsed data through this function so the cache, the parser, and
-//! the typeck layer stay in sync.
-//!
-//! v0.75.42: 单遍编译 — ParserV3::compile 直接产出 witness（零 MirExpr
-//! 桥接），解析失败返回 None（与旧 parse 路径一致）。
+//! 所有 LSP Provider（hover / completion / definition / references / rename / symbols /
+//! semantic tokens / folding / formatting）统一通过本模块获取 `MirWitness` 树与符号位置。
 
 use std::collections::HashMap;
 

@@ -9,7 +9,7 @@
 //! |---|---|---|---|
 //! | ~~`mir/jit.rs`~~ | ~~10~~ | — | **Wave 2 W2.1 已删除**（x86-64 子集 toy JIT 退休） |
 //! | ~~`mir/lmir_to_mir.rs`~~ | ~~1~~ | — | **v0.104.6 已删除**（见下） |
-//! | `sandbox/container.rs` / `interpreter/builtins/exec.rs` | 2 | ✅ | **`#[cfg(unix)]`，Windows 上不编译** |
+//! | **历史** `sandbox/container.rs` / `interpreter/builtins/exec.rs`（今 `runtime/builtins/exec.rs`） | 2 | ✅ | **`#[cfg(unix)]`，Windows 上不编译** |
 //!
 //! ⇒ 高危 unsafe 集中在 JIT，而 JIT 的**生产路径是关闭的**。
 //!

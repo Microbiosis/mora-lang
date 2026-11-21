@@ -12,7 +12,7 @@
 //! ```
 //!
 //! 同一个列表，**装进 atom 就变成 Rust 枚举语法**（`List` / `Float` / `String`）。
-//! `display.rs:131` 与 `:201` 都用 `{:?}`。
+//! `display.rs:99` 与 `:253` 都用 `{:?}`。
 //!
 //! ## ② 深度限制**根本没覆盖 Atom** —— 文档声称的防护不存在
 //!
@@ -23,7 +23,7 @@
 //! 但 `Atom` 分支走 `{:?}`，**根本不经过 `fmt_inner` 的深度检查** ——
 //! 递归由派生 `Debug` 完成，`MAX_DEPTH` 对它**无效**。
 //!
-//! ## ③ 那为什么自引用 atom **不会**崩？—— 靠 parking_lot 自己的 Debug
+//! ## ③ 那为什么自引用 atom **不会**崩？—— 靠 `common::sync::Mutex` 自己的 Debug
 //!
 //! 实测：`swap(a, fn(x) => a end)` 把 atom 指向自身后 `print(a)` 得到
 //!
@@ -31,31 +31,33 @@
 //! after=<atom Atom(Mutex { data: <locked> })>
 //! ```
 //!
-//! **`<locked>`** 是 parking_lot 的 `Mutex: Debug` 在 `try_lock()` 失败时的输出
+//! **`<locked>`** 是 `crate::common::sync::Mutex` 的 `Debug` 实现在 `try_lock()`
+//! 失败时写出的占位（`src/common/sync.rs:97-107` 的 `Debug` 分支 +
+//! `src/common/sync.rs:20-24` 的 `LockedPlaceholder`）
 //! ⇒ 重入同一把锁时不再下钻，**意外**形成环断开器。
 //!
 //! ⚠ **牙齿验证推翻了我的第一版归因**：我原以为断开环的是
-//! `display.rs:130` 的 `let v = arc.lock();`。把该处改成
+//! `display.rs:98` 的 `let v = arc.lock();`。把该处改成
 //! `arc.lock().clone()`（**解锁后**再格式化）后，自引用 atom 判据
-//! **照样全绿** —— 真正取锁的是 parking_lot 的 Debug 自己。
+//! **照样全绿** —— 真正取锁的是 `common::sync::Mutex` 的 Debug 自己。
 //!
 //! 可佐证：非环的 `atom(0)` 会显示 `Float(0.0)`（说明锁可取时它渲染数据），
 //! 只有重入取不到才退化成 `<locked>`。
 //!
 //! ⇒ **深度限制覆盖 List/Dict，环安全覆盖 Atom**，二者机制不同，
-//! 且环安全依赖的是**第三方 crate 的 Debug 实现细节**。
+//! 且环安全依赖的是**本仓 `common::sync::Mutex` 的 Debug 实现细节**。
 //! 判据把「自引用 atom 必须终止」钉死 —— 它才是真正要守的东西。
 //!
 //! ## ④ 为什么**不**直接把它改成 `Display`
 //!
-//! ⚠ 若把 `{:?}` 换成 `{}`（`Display`）：第 130 行 `arc.lock()` 持有的锁，
+//! ⚠ 若把 `{:?}` 换成 `{}`（`Display`）：第 98 行 `arc.lock()` 持有的锁，
 //! 会**在同一把 `mora::common::sync::Mutex` 上重入**（自引用 atom 的 Display 臂
 //! 再次 `arc.lock()`）⇒ **死锁**。
 //!
 //! ⇒ 这是**设计取舍**（一致性 vs 环安全），按 D382 先例**只报告不擅动**。
 //! 本判据把「**安全**」这条现有保证钉死：任何改动都必须先解决环安全。
 //!
-//! （死锁路径是**代码层推断**，依据 `display.rs:130` 持锁 + 同臂重入；
+//! （死锁路径是**代码层推断**，依据 `display.rs:98` 持锁 + 同臂重入；
 //!   **刻意未实测** —— 实测会让测试进程永久挂死。）
 
 use std::sync::Arc;

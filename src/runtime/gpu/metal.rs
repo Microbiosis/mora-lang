@@ -1,6 +1,6 @@
-//! Wave 4 P2-2: Native Apple Metal Framework (`Metal.framework`) Hardware Backend (macOS).
+//! v0.110.0: Native Apple Metal Framework (`Metal.framework`) Hardware Backend (macOS).
 //!
-//! Architecture (`AGENTS.md §0`):
+//! Architecture:
 //! - Zero compile-time SDK / Cargo dependencies: on `#[cfg(target_os = "macos")]`, dynamically loads
 //!   `/System/Library/Frameworks/Metal.framework/Metal` and `/usr/lib/libobjc.A.dylib`, obtains the
 //!   default `MTLDevice` via `MTLCreateSystemDefaultDevice()`, compiles Mora's MSL (Metal Shading

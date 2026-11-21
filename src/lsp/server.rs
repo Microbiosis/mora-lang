@@ -2,7 +2,8 @@
 //!
 //! 设计：
 //! - 单线程同步循环：read → parse → dispatch → write response
-//! - DocumentManager 持有打开文档（uri → 文本 + AST + typeck errors）
+//! - DocumentState 持有打开文档（uri → 文本 + 版本号 + 最新一次 HM 类型诊断；
+//!   `MirWitness` 树按需现算、不缓存）
 //! - 路由表：method 字符串 → handler 函数
 //!
 //! 不实现：cancel（v1 协议太复杂）、progress（用不上）、window/workDoneProgress。
@@ -300,7 +301,7 @@ impl Server {
     }
 
     // ============================================================
-    // 各 LSP method 的占位实现 — 真正逻辑在 providers 模块
+    // 各 LSP method 的转发 — 真正逻辑在 providers 模块
     // ============================================================
     fn handle_hover(&self, params: Value) -> crate::error::MoraResult<Value> {
         let docs = lock_or_recover(&self.docs, "lsp_docs");

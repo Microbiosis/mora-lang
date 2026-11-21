@@ -1,6 +1,8 @@
-//! v0.75.62: Value Display 实现 + fmt_inner 深度限制格式化 — 自 value.rs
-//! 拆出（D6 单文件惯例）。纯格式化逻辑，零 BuiltinKind/Environment 依赖；
-//! impl 在子模块内实现父模块类型（同 crate 允许）。
+//! v0.110.0: `Value` 的 `Display` 实现 + 深度限制格式化（`fmt_inner`）。
+//!
+//! 纯格式化逻辑，零 `BuiltinKind` / `Environment` 依赖；`impl` 在子模块内
+//! 实现父模块类型（同 crate 允许）。深度上限与自引用环的断开机制见
+//! [`DISPLAY_MAX_DEPTH`] 的说明。
 
 use super::Value;
 
@@ -51,15 +53,12 @@ impl std::fmt::Display for Value {
                 // `HashMap`，迭代序每进程随机）。与 `flow::json::value_to_json`
                 // 及 http/mcp 服务器的 `BTreeMap` 做法对齐。
                 //
-                // ⚠ v0.104.6 D291：这句话**只对 dict 的键序成立**，不要
-                // 推及整条序列化路径 —— 两个手写序列化器对**值**并不等价：
-                //   `BigInt`：`flow::value_to_json` 写**裸数字**（实跑确认），
-                //            `http_server::value_to_json` 写**带引号字符串**；
-                //   读方向：`flow::json::json_to_value` 区分 Int/Float/BigInt，
-                //            `http_server::json_lsp_to_value` 把
-                //            `JsonValue::Number(n)` 一律变成 `Value::Float`。
-                // （D291 已记录；运行时影响当时**未证实** —— 那两个映射函数
-                //  是私有的，且 http 服务没有可回显 `Value` 的端点。）
+                // ⚠ v0.104.6 D291：这句话**只对 dict 的键序成立** ——
+                // 键序由本实现自己排序保证；**值**的序列化不在这里做。
+                // 整条 JSON 路径只有一套内核：`flow::json::value_to_json`
+                // 写值（整数写**裸数字**，不加引号），读方向
+                // `flow::json::json_to_value` 区分 Int/Float。
+                // （LSP 侧复用同一套解析状态机，见 `lsp::json`。）
                 write!(f, "{{")?;
                 let mut entries: Vec<(&String, &Value)> = map.iter().collect();
                 entries.sort_by(|a, b| a.0.cmp(b.0));
@@ -228,30 +227,19 @@ impl std::fmt::Display for Value {
 }
 
 /// v0.36 (P2-3.14): depth-limited Display helper. Walks a Value recursively
-/// but stops at MAX_DEPTH (default 16) to prevent stack overflow on
+/// but stops at `DISPLAY_MAX_DEPTH` (16) to prevent stack overflow on
 /// **deeply nested** `List` / `Dict`。
 ///
 /// ⚠ v0.104.6 D393 更正：原文写「prevent stack overflow on
 /// recursive/cyclic structures (**e.g. Atom containing self**)」——
 /// **该括号内的说法不成立**。
 ///
-/// `Atom` 分支走 `{:?}`，**完全不经过本函数的深度检查**（递归由派生
-/// `Debug` 完成，`MAX_DEPTH` 对它无效）。自引用 atom 之所以**不会**
-/// 无限递归，真正起作用的是 **parking_lot 自己的 `Mutex: Debug`**：
-/// 它在 `try_lock()` 失败时打印 `<locked>` 而**不再下钻**
-/// ⇒ 意外形成环断开器。
+/// `Atom` 分支走 `{:?}`，递归由 `crate::common::sync::Mutex` 的 `Debug` 实现完成：
+/// 当 `Mutex::Debug` 调用 `self.try_lock()` 发现同一线程已持有锁（如自引用 `Atom`）时，
+/// 直接打印 `<locked>` 占位而不再下钻，从而在自引用环上保证确定性终止。
 ///
-/// ⚠ 环断开器**不是**本文件 atom 臂的 `arc.lock()`。牙齿验证把该处改成
-/// `arc.lock().clone()`（**解锁后**再格式化）后，自引用 atom 判据**照样全绿**
-/// —— 因为 parking_lot 的 Debug **自己**取锁，重入时它自己取不到。
-/// （可佐证：非环的 `atom(0)` 会显示 `Float(0.0)`，说明锁可取时它会渲染数据；
-///   只有重入取不到才退化成 `<locked>`。）
-///
-/// ⇒ 因此：**深度限制覆盖 List/Dict，环安全覆盖 Atom**，二者机制不同，
-/// 且环安全依赖的是**第三方 crate 的 Debug 实现细节**。
-/// 判据 `tests/display_atom_and_depth.rs` 钉住「自引用 atom 必须终止」；
-/// 若 parking_lot 换掉 Debug 实现，或有人把 atom 臂改成 `Display` 语义，
-/// 该判据会立刻红。
+/// ⇒ **深度限制（`DISPLAY_MAX_DEPTH`）覆盖 `List`/`Dict`，`try_lock()` 环断开器覆盖 `Atom`**，
+/// 判据 `tests/display_atom_and_depth.rs` 持续验证自引用 `Atom` 的终止性与 `<locked>` 输出。
 const DISPLAY_MAX_DEPTH: usize = 16;
 
 fn fmt_inner(f: &mut std::fmt::Formatter<'_>, v: &Value, depth: usize) -> std::fmt::Result {

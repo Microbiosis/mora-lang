@@ -1,18 +1,17 @@
-//! v0.20: 自由函数（自 interpreter.rs 抽出）。
+//! v0.110.0: 核心值运算、真值判定、JSON 编解码入口与精确数值塔分派（`src/flow.rs`）。
 //!
-//! **Move-only refactor** — 代码自 src/interpreter.rs **迁移**（非复制）：
-//! interpreter.rs 不再持有这些函数的副本，而是通过 `use crate::flow::*`
-//! 重新导出。此处是唯一定义点。
+//! 为编译期常量折叠（`mir::control::opt`）与运行期堆帧 VM（`runtime::vm`）
+//! 提供单一共享的算术、比较、容器广播与 JSON 转换语义。
 
 use crate::common::{BinaryOp, Literal};
 use crate::error::MoraError;
 use crate::value::Value;
 
-// v0.104.6 D468：数值塔自 flow.rs 拆出（数值语义自成一个模块，
-// 见 `numeric/mod.rs` 的模块文档）。
+// 数值塔自 flow.rs 拆出（数值语义自成一个模块，见 `numeric/mod.rs`
+// 的模块文档）。
 //
 // 拆分的理由不是"文件太大"，而是**数值语义需要独立的不变量**：
-// 每个数值域（Int/Float/BigInt）必须拥有自己的精确算术，跨塔混算
+// 每个数值域（`Int`/`Float`）必须拥有自己的精确算术，跨塔混算
 // 必须经可表示性守卫。原先这些规则散落在 flow.rs 的各个 match 臂里，
 // 且共用一条 `Fn(f64, f64) -> f64` 回调 —— **从签名上就不允许**
 // Int 走精确路径，于是 `a - 0i` 与 `a + 0i` 在 2^53 边界给出不同结果。
@@ -21,12 +20,16 @@ use crate::value::Value;
 // 字符串/列表运算；数值运算的具体语义全部委托给 `numeric`。
 pub mod numeric;
 
-/// 判断值是否为真 — MIR 条件分支的单一真值源（v0.75.83 收敛）。
+/// 判断值是否为真 — 运行时 VM 条件分支与真值运算的**单一真值源**。
 ///
 /// 语义：Bool 取自身；Nil/Int(0)/Float(0.0)/空 String/空 List/空 Dict 为
 /// falsy；其余为 truthy。此前存在两份实现：本函数（缺 Int 分支，Int(0)
-/// 落 `_ => true` 误判为真）与 mir/vm.rs 版（List/Dict 恒真，空容器误判
-/// 为真）——两处语义分叉是隐蔽 bug 温床，已收敛为本单一实现。
+/// 落 `_ => true` 误判为真）与旧 VM（`mir/vm`，已随旧执行栈退役删除）里的
+/// 另一份（List/Dict 恒真，空容器误判为真）——两处语义分叉是隐蔽 bug
+/// 温床，已收敛为本单一实现。
+///
+/// （编译期常量折叠另有一份 `mir::control::opt::const_is_truthy`，作用在
+/// MIR 常量域 `ControlConst` 上，不经过本函数。）
 pub fn is_truthy(value: &Value) -> bool {
     match value {
         Value::Nil => false,
@@ -227,8 +230,8 @@ pub fn eval_binary_tracked(
         BinaryOp::Add => match (&left, &right) {
             // ── 数值加法：委托数值塔（D468）──
             //
-            // 此前这一臂自己实现了一整套提升规则（Int/Float/BigInt 的
-            // 六种组合 + `coerce_mixed`），与 `numeric_op` 的规则
+            // 此前这一臂自己实现了一整套提升规则（Int/Float 的四种
+            // 组合 + `coerce_mixed`），与 `numeric_op` 的规则
             // **各写各的** —— 同一对操作数在 `Add` 与 `Sub` 下行为不同。
             // 现在两者共用数值塔的同一套分派。
             (Value::Int(_), Value::Int(_))
@@ -248,7 +251,7 @@ pub fn eval_binary_tracked(
                     //（等长时逐元素、不等长才拼接，于是同一运算的结果取决于
                     // 长度 —— `[] + [1i]` 得 `[1]` 而 `[1i] + [2i]` 得 `[nil]`）。
                     // 委托后与标量加法同一套规则（Int+Int / Int+Float /
-                    // Float+Float / BigInt 提升 / 字符串拼接），语义收敛。
+                    // Float+Float / 字符串拼接），语义收敛。
                     //
                     // v0.104.6 D468：改用 `broadcast_with`（唯一实现）。
                     broadcast_with(
@@ -271,7 +274,7 @@ pub fn eval_binary_tracked(
             // 注释各写一整套历史），现已收敛为**唯一实现**
             // `broadcast_with`（见下方）。
             //
-            // 递归派发之后标量侧覆盖 Int/Float/BigInt，元素侧自动获得 `Add`
+            // 递归派发之后标量侧覆盖 Int/Float，元素侧自动获得 `Add`
             // 支持的全部组合。真正无意义的元素对（如 `Bool + Float`）
             // 落 `unwrap_or(Nil)`，与既有约定一致。
             (Value::List(list), scalar @ (Value::Float(_) | Value::Int(_))) => broadcast_with(
@@ -540,8 +543,8 @@ pub fn values_equal(a: &Value, b: &Value) -> bool {
         // 1   == 1     → Bool(true)    ← 对照正常
         // ```
         //
-        // 本函数的文档本就写着「与 `Value::eq` 的 … arm 保持一致」（v0.91 补
-        // BigInt 时就是这么对齐的），Char 属同类漏项。spec :1312 也明列
+        // 本函数的文档本就写着「与 `Value::eq` 的 … arm 保持一致」（v0.91
+        // 补数值臂对齐时就是这么对齐的），Char 属同类漏项。spec :1312 也明列
         // 「`char` 字符相等」。
         (Value::Char(a), Value::Char(b)) => a == b,
         (Value::Bool(a), Value::Bool(b)) => a == b,
@@ -637,10 +640,10 @@ fn container_elem_eq(a: &Value, b: &Value) -> bool {
 
 /// v0.104.6 D246：`Value` → 数字的**唯一**提取点。
 ///
-/// D231 已在 `compress::json` 立过同样的规矩（「`Value` → `f64` 的唯一提取点」
-/// /「新增数值提取**必须**走它，否则同样违约」），但它住在 `compress` 里，
-/// **`interpreter` 够不着** —— 于是 `ai_helpers::extract_usage` 直接手写
-/// `if let Value::Float(n)`，**违反了 D231 自己立的约束**。
+/// D231 已在 JSON 层的收口模块里立过同样的规矩（「`Value` → `f64` 的唯一
+/// 提取点」/「新增数值提取**必须**走它，否则同样违约」），但它住在 JSON 层，
+/// **运行时层够不着** —— 于是 AI 辅助层直接手写 `if let Value::Float(n)`，
+/// **违反了 D231 自己立的约束**。
 ///
 /// ⇒ 收口必须放在**所有**需要它的地方都能到达的位置，而不只是最先发现它
 /// 的那个模块。
@@ -649,7 +652,8 @@ fn container_elem_eq(a: &Value, b: &Value) -> bool {
 /// - dict 字面量给 `Float`（D98）
 /// - `json.parse` / 外部 API 响应给 `Int`（D129）
 ///
-/// [`crate::compress::json::value_as_f64`] 现在转发到此，保持原路径可用。
+/// 整数侧**没有**大整数域：Rust 侧只有 `i64`，任意精度整数是独立标准库
+/// `std/math/bigint`（纯 Mora 实现），不进 `Value`。
 pub fn value_as_f64(v: &Value) -> Option<f64> {
     match v {
         Value::Int(i) => Some(*i as f64),
@@ -682,7 +686,7 @@ pub fn value_as_usize(v: &Value) -> Option<usize> {
     Some(n as usize)
 }
 
-/// AST Literal 转运行时 Value
+/// 字面量 → 运行时 `Value`（`crate::common::Literal` → `Value`）。
 pub fn literal_to_value_static(lit: &Literal) -> Value {
     match lit {
         Literal::String(s, _) => Value::String(s.clone()),
@@ -883,8 +887,8 @@ mod tests {
     // ─ v0.52 regression: json_to_value 空格 bug ────
     // pre-existing: parse_json_value 在 line 414 trim_start() 但 return 的 consumed
     // 不含 trim 字节数，导致 dict 内有空格时解析错位（"Expected ',' in dict"）
-    // 这是 v0.51 P0-3 修 Send 派发时发现的（见 src/runtime/infra.rs:extract_send_tasks
-    // 注释里 hand-write 解析以绕开此 bug）
+    // 这是 v0.51 P0-3 修 Send 派发时发现的（见旧 `runtime::infra` 的
+    // `extract_send_tasks` 注释里 hand-write 解析以绕开此 bug）
 
     #[test]
     fn json_to_value_dict_no_space() {

@@ -40,13 +40,12 @@ impl ParserV3 {
     }
 
     // ===================================================================
-    // v0.75.40: emit 家族 — 单遍编译（表达式 → MirInst + MirWitness）
+    // emit 家族 — 单遍解析（token → MirWitness）
     // ===================================================================
-    // 镜像 parse 链的优先级结构，但在构造处直接 emit 指令 + 建 witness。
-    // 指令序列与 lower.rs 逐字节等价（差分测试锁定）。每函数返回结果
-    // 寄存器 Reg（表达式）或 ()（语句）。
+    // 按语法优先级结构直接构造见证树；本层**不发射任何指令** ——
+    // 指令序列由 `mir::control::lower` 从见证树 lowering 而来。
 
-    /// 顶层语句分发 — 镜像 parse_expression_statement。
+    /// 顶层语句分发。
     /// 顶层语句 → witness（嵌套树，emit 时直接构建）。
     fn emit_statement_w(&mut self) -> Option<MirWitness> {
         match self.peek()?.token_type {
@@ -91,7 +90,7 @@ impl ParserV3 {
             {
                 self.emit_statement_expr_w()
             }
-            // v0.80: algebraic effects 完整语法（Stage 2/4 落地）
+            // v0.80: algebraic effects 完整语法
             //   handle Effect { body } { handler } end
             //   perform Effect(args)
             // 不引入新 TokenType（不抢旧 identifier），与 transaction/eval 同模式。
@@ -128,21 +127,21 @@ impl ParserV3 {
         }
     }
 
-    /// 表达式入口（witness 嵌套版）— 镜像 parse_assignment（含赋值检测）。
+    /// 表达式入口（含赋值检测）。
     pub(super) fn emit_expr_w(&mut self) -> Option<MirWitness> {
         // v0.104.2: `if` 出现在**表达式位置**（spec §7.1 的核心示例）
         //     let x = if cond then "a" else "b" end
         // 以及 §7.3 的 `if i == 3 then continue end` 值形态。
-        // `emit_if_w` 返回 (结果寄存器, witness)，与其它表达式产出同契约。
+        // `emit_if_w` 与其它表达式产出同契约，直接给出 witness。
         //
         // 注：此前这条接线被「合并点永不就绪」的执行器缺陷阻塞（`if` 之后的
-        // 语句会静默消失、退出码 0）；该缺陷已随 `dag.rs` 的
-        // 「entry 取 pc 0 可达节点」修复而消除（常量折叠后的 else 死块不再
-        // 与函数入口并列成为入口），故此处可以安全接线。
+        // 语句会静默消失、退出码 0）；该缺陷已随执行器「entry 取 pc 0 可达
+        // 节点」的修复而消除（常量折叠后的 else 死块不再与函数入口并列成为
+        // 入口），故此处可以安全接线。
         if self.check(&TokenType::If) {
             return self.emit_if_w();
         }
-        // v0.80: algebraic effects 表达式位置 dispatch（Stage 2.0）。
+        // v0.80: algebraic effects 表达式位置 dispatch。
         // 表达式位置出现的 `handle` / `perform` 不是变量名 —— 走专门 emission。
         if let Some(TokenType::Identifier(s)) = self.peek().map(|t| &t.token_type).cloned() {
             if s == "handle" {
@@ -493,7 +492,7 @@ impl ParserV3 {
         Some(lhs)
     }
 
-    /// 调用链（witness 嵌套版）— 镜像 parse_call（函数/方法/索引/DynTrait）。
+    /// 调用链（函数 / 方法 / 索引 / DynTrait）。
     fn emit_call_w(&mut self) -> Option<MirWitness> {
         // `Type::member(args)` 关联调用（例如 Enum::Variant / Trait::new），
         // 编译为按名调用 "Type::member"，由 `runtime::vm::builtins` 分发。
@@ -762,8 +761,7 @@ impl ParserV3 {
         Some((wits, named))
     }
 
-    /// 主表达式 — 镜像 parse_primary。
-    /// 主表达式 — 镜像 parse_primary。返回 (结果寄存器, 嵌套 witness)。
+    /// 主表达式 — 产出嵌套 witness。
     /// v0.75.41: witness 递归构建（子节点嵌进父节点，typeck/LSP 消费树形）。
     fn emit_primary_w(&mut self) -> Option<MirWitness> {
         if self.is_spawn_form() {
@@ -815,9 +813,8 @@ impl ParserV3 {
             //
             // **spec 两处明确定义了它**（`docs/mora-spec.md:109` 的类型表
             // `| char | 'a' |`，以及 EBNF `literal = NUMBER | … | CHAR | …`
-            // 见 :1270），词法器也**早已支持**（`lexer.rs:357` 的 `'`
-            // 分支 → `TokenType::Char(ch)`），`parser_v3/rel.rs:533` 的声明式
-            // term 解析**也接了** —— 但主表达式发射器这里唯独漏了，于是
+            // 见 :1397），词法器也**早已支持**（`lexer.rs` 的 `'` 分支 →
+            // `TokenType::Char(ch)`），但主表达式发射器这里曾唯独漏了，于是
             //
             // ```text
             // let c = 'a'   →  Failed to parse at line 2（真实 CLI exit 2）
@@ -1038,7 +1035,7 @@ impl ParserV3 {
     ///   6. 深度 0 时遇到 Newline → quasiquote 结束（EOF 由 is_at_end 自然终止）
     ///   7. 静态源码片段用 source_byte_at 切片
     ///
-    /// 运行时 h_quasiquote 遍历 segments：Quote 直接拼接，Unquote 取寄存器值
+    /// 运行时 `eval_quasiquote` 遍历 segments：Quote 直接拼接，Unquote 取寄存器值
     /// 经 Mora Display 格式化，UnquoteSplice 取 List 展平为逗号分隔代码。
     /// 最终 dst 写入 Value::Code(重组源码字符串)，与 quote(expr) 返回类型一致。
     fn emit_quasiquote_w(&mut self) -> Option<MirWitness> {
@@ -1082,10 +1079,6 @@ impl ParserV3 {
                         if end > capture_start {
                             let text = &self.source[capture_start..end];
                             if !text.is_empty() {
-                                // v0.104.6 D474：原先此处还往 **Mir 层**的
-                                // `segments` 推一份 `QuasiquoteSegment::Quote` ——
-                                // 那份 vec 只为发射 `MirInst::Quasiquote` 而存在，
-                                // parser 只产 witness 后整体作废。
                                 witness_segments.push(MirWitness {
                                     kind: WitnessKind::Literal(Literal::String(
                                         text.to_string(),
@@ -1100,30 +1093,18 @@ impl ParserV3 {
                         {
                             let w = self.emit_expr_w()?;
                             if is_splice {
-                                // v0.104.6 D474：原先此处 `segments.push(…UnquoteSplice(reg))`
-                                // —— `segments` 是 **Mir 层**的 `Vec<QuasiquoteSegment>`，
-                                // 只为发射 `MirInst::Quasiquote` 而存在。parser 只产
-                                // witness 后它整体作废；splice 标记早已写进
-                                // `witness_segments`（见下）。
-                                //
                                 // v0.104.6 D278：把 splice 标记**写进 witness**。
                                 //
-                                // 修前这里只 `witness_segments.push(w)` —— 标记只进了
-                                // `segments`（emit.rs 自己用），witness 里**一个字节都没留**。
-                                // ⇒ witness 层的 splice 段与普通 unquote 段**完全不可区分**，
-                                // `witness_to_fcfg` 只能按 Unquote 处理（把值 stringify），
-                                // 9 层路径把 `` `,,xs `` 渲染成 `List([1.0, 2.0, 3.0])`
-                                // 而 emit.rs 路径给 `1, 2, 3` —— 且**差分判它通过**。
-                                //
-                                // 标记形态沿用 `witness_to_fcfg.rs` 里**早已写好**的
-                                // 消费约定（`Literal(Boolean(true))` 独占一段）。
+                                // 标记形态：`Literal(Bool(true))` 独占一段 ——
+                                // `mir::control::lower` 按此把它后面的子表达式
+                                // 降成 `ControlQqSegment::UnquoteSplice`。
                                 let mark_span = self.span_of_current();
                                 witness_segments.push(MirWitness {
                                     kind: WitnessKind::Literal(Literal::Bool(true, mark_span)),
                                     span: mark_span,
                                 });
                             } else {
-                                // v0.104.6 D474：同上 —— Mir 层的 `segments` 作废。
+                                // 非 splice 段：不产出标记，直接推子表达式 witness。
                             }
                             witness_segments.push(w);
                             if let Some(next) = self.peek() {
@@ -1372,9 +1353,9 @@ impl ParserV3 {
 
     /// v0.80: perform Effect(arg1, arg2, ...) 解析。
     ///
-    /// syntax: `perform EffectName(args)?` — args 是 `emit_expr_w` 列表。
+    /// syntax: `perform Effect(arg1, arg2, ...)` — args 是 `emit_expr_w` 列表。
     /// 不引入新 TokenType（按 Identifier 路径分发，避免抢旧 identifier）。
-    /// Stage 2.x 升级：未生效 perform 编译期 typeck 拦截（Stage 2.3 row-poly HM）。
+    /// 未被 handler 覆盖的 perform 由 typeck 在编译期拦截（row-poly HM 效果边界断言）。
     fn emit_perform_w(&mut self) -> Option<MirWitness> {
         let span = self.span_of_current();
         self.advance(); // 'perform'
@@ -1392,64 +1373,31 @@ impl ParserV3 {
             }
             self.consume(TokenType::RParen, "Expected ')' after perform args")?;
         }
-        // v0.104.6 D472：本函数此前**只产 witness、不发指令** ——
-        // 于是顶层裸 `perform` 在旧路径上**静默 no-op**（`g = perform Ai("x")`
-        // 把 `g` 绑成寄存器 0 的旧值，用户写的 effect 请求被无声吞掉）。
-        // `h_perform` 的契约（`handlers/effects.rs`：无匹配 handler 时
-        // 返回 "unhandled effect" 错误）与此**直接矛盾**，且 typeck 也**未**
-        // 拦截裸 perform（实测 `--check` 报 "No type errors found"）。
-        //
-        // 9 层管线一直是发射 `MirInst::Perform` 的 —— 两边行为分叉正是
-        // `perform_bare` 差分红的根因。此处补齐发射，两侧行为一致。
+        // v0.104.6 D472：裸 `perform` 必须有结构化见证 ——
+        // 否则顶层裸 `perform` 会静默 no-op（`g = perform Ai("x")` 把 `g` 绑成
+        // 旧值，用户写的 effect 请求被无声吞掉）。见证层补齐后，
+        // `mir::control::lower` 将其降成 `ControlTerminator::Perform`，
+        // 由 VM 在无匹配 handler 时报 "unhandled effect"。
         Some(MirWitness {
             kind: WitnessKind::Perform { effect, args },
             span,
         })
     }
 
-    /// v0.80: handle Effect { body } { handler } 完整解析 + 嵌套 EmitContext 切换。
+    /// v0.80: handle Effect { body } { handler } 完整解析。
     ///
     /// syntax: `handle Effect { body_stmts } { handler_stmts }`（花括号形式）。
-    /// body 与 handler 各自独立 EmitContext（独立寄存器空间），与 TaskDef 一致。
+    /// body 与 handler 是两棵独立的见证子树，各自单独解析成块。
     /// 不引入新 TokenType（按 Identifier 路径分发）。
-    /// Stage 2.x 升级：handler 可使用 `resume k resume-value` 续名续 + 标 typing。
+    /// handler 可使用 `resume k resume-value` 续名续 + 标 typing。
     ///
-    /// 返回 `(k_dst, witness)`：**`k_dst` 就是 `MirInst::Handle` 写入、
-    /// `h_handle` 填值、且 `let` 绑定应当引用的那个寄存器**。
-    ///
-    /// v0.104.6 D35：此前本函数只返回 witness，表达式位置只能硬编码
-    /// `0` 当结果寄存器（见 `emit_expr_w` 的 `map(|w| (0, w))`），
-    /// 于是 `let r = handle …` 编译成 `Define("r", 0)` —— 绑的是一个
-    /// **从来没人写过的**寄存器 0。DAG 执行器的就绪门槛
-    /// `node_ready(Define) = reg_ready[0]` 恒 false → Define 永不激活 →
-    /// 它所在的 **Sequence 链**从此断裂 → 其后**所有** Effect 节点
-    /// （含 `print`）静默消失，无报错、退出码 0。而 `handle` 作**语句**
-    /// 时正常，因为那时没人引用那个返回值。
-    ///
-    /// v0.104.6 D35/D36（**未修，如实记录**）：本函数只返回 witness，
-    /// 表达式位置因此硬编码 `(0, w)` 当结果寄存器。单遍路径下这会让
-    /// `let r = handle …` 的绑定指向错误/无人生产的寄存器（D36）；
-    /// 9 层路径不受影响（`witness_to_fcfg` 另行分配并写入 `Node::Handle`
-    /// 的 `dst`，见 D35 的修复）。
-    ///
-    /// **曾试过让本函数返回 `(k_dst, witness)` 并把真实 k_dst 交出去 ——
-    /// 已回退**：那样单遍路径的单层 handle 确实修好了，但 emit.rs 产出的
-    /// 指令序列随之变化（内层 handle 的指令不再被回滚截掉，多出一条），
-    /// 与 9 层管线的 `differential_check` 从「通过」变成「失败」
-    /// （实测 `pipeline_mir=14 original_mir=15`，`inst[1]: pipeline="Define"
-    /// original="Handle"`）→ 生产路径回落到 emit.rs，而回落路径的**嵌套**
-    /// handle 仍然坏 —— 即**把原本正常的 9 层嵌套 handle 弄坏了**。
-    /// 净负面，故回退。要真正修 D36 得先让两条路径在嵌套 handle 上产出
-    /// 一致的指令序列，那是 D36 的前置工作。
+    /// 见证层只保留 `WitnessKind::Handle { effect, body, handler, k_param }`，
+    /// `k_param` 固定为 `"resume"`；指令序列由 `mir::control::lower` 生成
+    /// （`ControlInst::Handle` + `ControlTerminator::Perform`）。
     fn emit_handle_w(&mut self) -> Option<MirWitness> {
         let span = self.span_of_current();
         self.advance(); // 'handle'
         let effect = self.consume_identifier("Expected effect name after 'handle'")?;
-        // v0.90: 死代码平铺回滚 — brace block 解析经 emit_statement_expr_w
-        // 会把 body/handler 指令平铺进主 EmitContext，但 Handle 携带的是
-        // 嵌套 MirFunction（下方 lower_block_witness_to_mir 独立 lower）。
-        // 平铺副本是死代码（每 handle 浪费 body+handler 条指令，且 handler
-        // 平铺会引用未绑定的 __arg0）。解析后回滚，只保留 witness 子树。
         // body 块（必须花括号形式）
         self.consume(TokenType::LBrace, "Expected '{' after effect name")?;
         let body_w = self.emit_brace_block_w()?;
@@ -1458,36 +1406,6 @@ impl ParserV3 {
         self.consume(TokenType::LBrace, "Expected '{' for handler block")?;
         let handler_w = self.emit_brace_block_w()?;
         self.consume(TokenType::RBrace, "Expected '}' after handler block")?;
-        // 回滚平铺发射（witness 已捕获，寄存器号复用）
-        //
-        // 回滚平铺发射（witness 已捕获，寄存器号复用）
-        //
-        // v0.104.6 D36（**未修，如实记录**）：body/handler 的**平铺副本**确实
-        // 是死代码（注释所述），但其中混着**嵌套构造刚发射的真实指令** ——
-        // 最典型的是 body 里再写一个 `handle`。此处 `truncate(saved_len)`
-        // 一刀切，把内层刚发射的 `MirInst::Handle` 一起截掉。探针实测
-        // （`let r = handle a { handle b {6}{8} } {7}`）：
-        //
-        // ```text
-        // 内层 b: saved_len=0 平铺期间产生 2 条: ["Const(0,6.0)", "Const(1,8.0)"]
-        // 外层 a: saved_len=0 平铺期间产生 2 条: ["Handle{effect:\"b\"}", "Const(1,7.0)"]
-        //                                            ↑ 内层的真实指令就在外层的回滚范围内
-        // ```
-        //
-        // 同时 `next_reg = saved_next_reg` 让**内外层 `k_dst` 撞同一个编号**
-        // （实测内层 k_dst=0、外层也是 0）。
-        //
-        // **曾试过在此保留 `MirInst::Handle` 指令 + 让 next_reg 只回退到保留
-        // 指令占用的最大编号 —— 已回退**：那样内层指令保住了、嵌套 handle 的
-        // 内层值不再丢，但 emit.rs 产出的指令序列随之变化（多一条 Handle），
-        // 与 9 层管线的 `differential_check` 从「通过」变「失败」
-        // （`pipeline_mir=14 original_mir=15`，`inst[1]: pipeline="Define"
-        // original="Handle"`）→ **生产路径回落到 emit.rs**，而回落路径的
-        // 嵌套 handle 仍不完整 —— 即**把原本正常的 9 层嵌套 handle 弄坏**，
-        // 净负面。
-        //
-        // v0.104.6 D474: handle body/handler stay purely in witness form;
-        // backend lowering happens later in pipeline/compile.
         Some(MirWitness {
             kind: WitnessKind::Handle {
                 effect,
@@ -1566,9 +1484,9 @@ impl ParserV3 {
         let span = self.span_of_current();
         self.advance(); // 'if'
         let cond_w = self.emit_expr_w()?;
-        // v0.75.79: if 结果经寄存器传递（Copy dst=src）——不再经 env 临时名
+        // v0.75.79: if 结果走**值传递**（块参数）—— 不再经 env 临时名
         // `__if_result`（Assign 写未定义变量静默失败，分支值丢失）。
-        // 分支值写各自 reg，尾端 Copy 到公共 dst，跳转使仅选中分支可达。
+        // lower 侧把各分支汇入同一个 merge 块，选中分支的值作为块参数。
 
         // v0.92: 三种分支语法统一收敛：
         //   1. `then expr`        — then 关键字分支（单表达式）
@@ -1628,8 +1546,8 @@ impl ParserV3 {
             //   `if c1 { a } else if c2 { b }`（值形态）**不可解析**，
             // 而 `if c1 { a } else { b }` 可解析 —— 同一语法的两级深浅
             // 一边通一边不通。
-            // 现在：`else if` 递归走 `emit_if_w`（它同样返回结果寄存器，
-            // 与块体路径的 `Copy(dst, r)` 契约一致）。
+            // 现在：`else if` 递归走 `emit_if_w`（它同样返回嵌套 witness，
+            // 与块体路径共用同一契约）。
             let else_is_if = self.check(&TokenType::If);
             let w = if else_is_if {
                 self.emit_if_w()?
@@ -1701,16 +1619,15 @@ impl ParserV3 {
         }
     }
 
-    /// emit 一个块（{} 或换行到 end），返回 (最后结果寄存器, 块 witness)。
+    /// emit 一个块（{} 或换行到 end），返回块 witness。
     /// 块 witness：单条语句取该语句的 witness；多条语句嵌套为 Sequence。
     pub(super) fn emit_block_w(&mut self) -> Option<MirWitness> {
         let span = self.span_of_current();
         let mut stmt_wits = Vec::new();
         if self.match_token_exact(TokenType::LBrace) {
-            // v0.75.78: 与 parse_block_body/else 分支对称 —— 块内语句间允许
-            // 换行（`if c {\n  stmt\n}`）。修复前 `{` 后不跳换行，多行
-            // brace 块在 compile 主路径解析失败（旧 parse 路径可解析，
-            // 差分测试只覆盖单行 if，未暴露）。
+            // v0.75.78: 块内语句间允许换行（`if c {\n  stmt\n}`）。修复前
+            // `{` 后不跳换行，多行 brace 块解析失败（差分测试只覆盖单行 if，
+            // 未暴露）。
             while self.match_token(&[TokenType::Newline]) {}
             while !self.check(&TokenType::RBrace) && !self.is_at_end() {
                 let w = self.emit_statement_expr_w()?;
@@ -1785,11 +1702,10 @@ impl ParserV3 {
         }
     }
 
-    /// 块内语句 → (结果寄存器, witness)（表达式语句返回其 dst，其余返回 0）。
-    /// 嵌套语句级分发 — 镜像 parse 侧语句级构造分发（Let 优先 > Match > If > For > While）。
+    /// 块内语句 → witness。
+    /// 嵌套语句级分发（Let 优先 > Match > If > For > While）。
     /// v0.75.78: 补齐 Let/If/Match/For/While 分发 — 修复前嵌套上下文（task 体、
-    /// 闭包体、for 体）中这些构造直接落 emit_expr_w → 解析失败（compile
-    /// 主路径自 v0.75.40 起缺此分发，旧 parse 路径支持）。
+    /// 闭包体、for 体）中这些构造直接落 emit_expr_w → 解析失败。
     /// v0.75.81: 事务家族（transaction/commit/rollback）+ eval 断言接入
     /// 语句分发（lexer 无对应关键字，经 peek_is_identifier 识别，try/while
     /// 先例）。
@@ -1857,11 +1773,8 @@ impl ParserV3 {
             TokenType::Identifier(n) if n == "commit" => {
                 let span = self.span_of_current();
                 self.advance(); // 'commit'
-                // v0.104.2: 返回**真实分配**的寄存器并写入 Nil —— `Commit`
-                // 是 unit 指令（无 dst），此前直接返回哨兵 `0`。事务体是独立
-                // 寄存器空间，`transaction commit end` 里它一个寄存器都没分配，
-                // 于是 `Some((0, _))` 被当作 body 的末值寄存器 → 返回语句引用
-                // reg 0 → execute 拿到 n_regs=0 的函数 → `node_ready` 越界 panic。
+                // v0.104.2: `commit` 是 unit 语句 —— 见证层只带一个空变体，
+                // `mir::control::lower` 降成无 dst 的 `ControlInst::Commit`。
                 let w = MirWitness {
                     kind: WitnessKind::Commit,
                     span,
@@ -1871,8 +1784,7 @@ impl ParserV3 {
             TokenType::Identifier(n) if n == "rollback" => {
                 let span = self.span_of_current();
                 self.advance(); // 'rollback'
-                // 同 commit：返回真实寄存器（rollback 通过 dispatch 返回 Err
-                // 中断，该寄存器不会被读到，但保持与 commit 同一形状）。
+                // 同 commit：降成无 dst 的 `ControlInst::Rollback`。
                 let w = MirWitness {
                     kind: WitnessKind::Rollback,
                     span,
@@ -1895,30 +1807,12 @@ impl ParserV3 {
         let iter_w = self.emit_expr_w()?;
 
         // v0.104.6 D474：循环深度 +1，让体里的 `break`/`continue` 通过
-        // 「是否在循环内」的解析期判据。深度记在 `EmitContext` 里 —— 嵌套的
-        // 函数体（task / closure / …）换用全新 `EmitContext`，深度自动归零。
+        // 「是否在循环内」的解析期判据。深度记在 `ParserScope` 里 —— 嵌套的
+        // 函数体（task / closure / …）深度自动归零。
         self.scope.parse_loop_depth += 1;
         let body_res = self.emit_block_w();
         self.scope.parse_loop_depth -= 1;
         let body_w = body_res?;
-        // v0.104.6 缺陷修复：只回填**本层**登记的 break/continue 索引。
-        //
-        // 旧实现是 `for i in body_start..body_end` 全区间扫描重写标签。该区间在
-        // 嵌套循环下**包含内层循环的全部指令** —— 外层回填会把内层已正确指向
-        // 内层出口/内层增量的标签覆盖成外层的，于是：
-        //   - 嵌套 `break`    → 内层 break 跳到了外层出口 → 外层只跑一轮；
-        //   - 嵌套 `continue` → 被改成外层 for 的增量位置 → 控制流失控，
-        //     整个程序静默结束（无任何输出、退出码 0）。
-        // 详见 `EmitContext::break_slots` 的文档。
-
-        // v0.104.2: `continue` 的目标是**增量指令**，不是 `loop_label`。
-        //
-        // **缺陷（`for i in [1,2,3]` + `if i == 2 { continue }` 挂死）**：
-        // `continue` 此前被后修补成 `loop_label` —— 即条件判定处，**跳过了
-        // 循环变量增量**。`i` 因此永不前进，条件恒为「未越界」→ 无限循环。
-        // （`break` 无此问题：它的目标是循环出口。）
-        // 语义上 `continue` = 「跳过本次迭代剩余 body」，而「下一次迭代」
-        // 在本 lowering 里必须先执行增量，故目标应为刚发出的这条 BinaryOp。
         let w = MirWitness {
             kind: WitnessKind::Loop {
                 var,
@@ -1964,11 +1858,10 @@ impl ParserV3 {
     /// end
     /// ```
     ///
-    /// 镜像 h_transaction 语义：body 独立寄存器空间（子上下文），
-    /// body 内 `rollback` 经 MirInst::Rollback 返回 Err → run_isolated 得
-    /// Err → 执行 compensation 后抛 "Transaction rolled back"；`commit`
-    /// 为 no-op（MirInst::Commit → Ok）。body 终止于 `compensation` 或 `end`。
-    /// witness = Sequence(body + compensation 语句)（无值语句，typeck 得 Nil）。
+    /// 事务语义：body 独立成子函数，body 内 `rollback` 降成 `ControlInst::Rollback`
+    /// → VM 抛 "Transaction rolled back" → 执行 compensation 后向上抛错；
+    /// `commit` 降成 `ControlInst::Commit`（无操作）。body 终止于 `compensation`
+    /// 或 `end`。witness = Sequence(body + compensation 语句)（无值语句，typeck 得 Nil）。
     fn emit_transaction_w(&mut self) -> Option<MirWitness> {
         let span = self.span_of_current();
         self.advance(); // 'transaction'
@@ -2020,8 +1913,9 @@ impl ParserV3 {
     /// eval ["name"] given_expr, expect1, expect2, ...
     /// ```
     /// 首 token 为字符串字面量时作为断言名；given 与各 expect 为表达式。
-    /// 经 h_eval 执行：given 与每个 expect 逐一比较（tolerance 未设），
-    /// 任一不等报错（断言失败）。witness = 空 Sequence（无值语句）。
+    /// `mir::control::lower` 降成 `ControlInst::EvalAssert`：VM 用 `eval_assert`
+    /// 把 given 与每个 expect 逐一比较（tolerance 未设），任一不等报错（断言失败）。
+    /// 语句值为 given 表达式的值（见下方注释）。
     fn emit_eval_w(&mut self) -> Option<MirWitness> {
         let span = self.span_of_current();
         self.advance(); // 'eval'
@@ -2038,10 +1932,10 @@ impl ParserV3 {
             let w = self.emit_expr_w()?;
             expect_wits.push(w);
         }
-        // v0.104.6 D472：① witness 携带 given / expects（此前被丢弃）⇒
-        // 9 层降级链产不出 `MirInst::Eval`（`eval_bare` 回落的根因）。
+        // v0.104.6 D472：① witness 携带 given / expects（此前被丢弃）——
+        //    否则 lowering 无从生成 `ControlInst::EvalAssert` 的期望集。
         //
-        // ② 语句的返回值 = **given 表达式的值**（`given_reg`），**不是** Nil。
+        // ② 语句的返回值 = **given 表达式的值**，**不是** Nil。
         //    ⚠ 这一条必须**逐字保留**：`eval("1")` 在表达式位被 eval 语句
         //    分派接住（spec §14.2 的 `eval_expr` 产生式），其值按 spec
         //    期望是 `String("1")` —— 即 **given 的值**。若改成「恒为 Nil」，
@@ -2059,23 +1953,22 @@ impl ParserV3 {
         })
     }
 
-    /// v0.75.83: aggregate 语句 — 向 per-super-step 聚合器贡献值。
+    /// v0.75.83: aggregate 语句 — 向聚合器贡献值。
     ///
     /// ```mora
     /// aggregate name, value_expr
     /// ```
-    /// name 为聚合器名（引擎 config.aggregators 声明，reducer Add/Max/Min/
-    /// Last/Concat）；value_expr 为贡献值。经 h_aggregate push 到 MirHost
-    /// 缓冲，Pregel 引擎超步末收集归约。witness = 空 Sequence（无值语句）。
+    /// name 为聚合器名，value_expr 为贡献值。见证层携带贡献值的表达式；
+    /// `mir::control::lower` 直接求值该表达式并以其值为语句值
+    /// （聚合器名当前不参与 lowering）。
     fn emit_aggregate_w(&mut self) -> Option<MirWitness> {
         let span = self.span_of_current();
         self.advance(); // 'aggregate'
         let name = self.consume_identifier("Expected aggregator name after 'aggregate'")?;
         self.consume(TokenType::Comma, "Expected ',' after aggregator name")?;
         let value_w = self.emit_expr_w()?;
-        // v0.104.6 D472：① witness 携带贡献值的表达式（此前被丢弃）⇒
-        // 9 层产不出 `MirInst::Aggregate`；② 语句的返回值 = **贡献值的值**
-        // （与 eval 同形，逐字保留原语义）。
+        // v0.104.6 D472：① witness 携带贡献值的表达式（此前被丢弃）；
+        // ② 语句的返回值 = **贡献值的值**（与 eval 同形，逐字保留原语义）。
         Some(MirWitness {
             kind: WitnessKind::Aggregate {
                 name,
@@ -2188,21 +2081,10 @@ impl ParserV3 {
             }
             self.consume(TokenType::RBrace, "Expected '}' after match arms")?;
         }
-        // v0.104: match 的结果寄存器必须位于**外层函数**的寄存器空间，且所有
-        // arm 共用它（`h_match_expr` 把选中 arm 的返回值写进 `regs[output_reg]`；
-        // `MirInst::dst()` 对 MatchExpr 取的正是 `arms.last().3`）。
-        //
-        // 缺陷：此前把每个 arm 的**arm 局部**结果寄存器（`arm_val_reg`，来自
-        // arm 自己的 `EmitContext`，编号自 0 起）当作 output_reg。arm 寄存器
-        // 空间与外层无关，编号常超出外层 `n_regs` → `h_match_expr` 越界 panic
-        //（"index out of bounds: the len is 2 but the index is 4"）；即便不越界，
-        // 结果也写进了外层从未读取的寄存器。另有一个 `dst` 被分配并返回，却
-        // 没有任何 arm 写它 —— 消费者读到的恒为 Nil。
-        // 统一为「先分配外层 dst，再让所有 arm 指向它」（与 fcfg_lower 的
-        // `lower_match` 同契约）。
-        // v0.104.6 D474：原先此处还有一个 **Mir 侧**的 `arms` vec
-        // （`(pat_str, guard, body_mir, val_reg)` 四元组），供发射
-        // `MirInst::MatchExpr` 用 —— parser 只产 witness 后整体作废。
+        // match 的结果由**外层**的合并块承载：所有 arm 汇入同一个 merge 块，
+        // 选中 arm 的值作为该块的块参数。见证层只需给出
+        // `WitnessKind::Match { scrutinee, arms }`，块结构由
+        // `mir::control::lower` 的 `lower_match` 生成。
         let w = MirWitness {
             kind: WitnessKind::Match {
                 scrutinee: Box::new(scrutinee_w),
@@ -2221,12 +2103,12 @@ impl ParserV3 {
         let is_arrow = |t: &TokenType| matches!(t, TokenType::FatArrow | TokenType::Arrow);
         // v0.87: Detect optional "when <guard_expr>" before the arm arrow
         //
-        // v0.104.3 修复：守卫与 arm body 同构 —— 发射成**延迟求值**的
-        // MirFunction，由 `h_match_expr` 在**模式绑定之后**调用。
+        // v0.104.3 修复：守卫与 arm body 同构 —— 都是**延迟求值**的子表达式，
+        // 由 `mir::control::lower` 在**模式绑定之后**求值（`lower_match` 把
+        // guard 放在 matched 块内）。
         //
-        // 缺陷：守卫此前在外层寄存器空间求值，而守卫通常引用**模式绑定变量**
-        //（`x when x > 0`）—— 绑定只发生在 `h_match_expr` 匹配成功之时
-        //（`self_match_pattern` 把 val define 进 env）。外层求值时该变量尚不
+        // 守卫此前在外层作用域求值，而守卫通常引用**模式绑定变量**
+        //（`x when x > 0`）—— 绑定只发生在匹配成功之后。外层求值时该变量尚不
         // 存在 → 读到 Nil → `is_truthy(Nil) == false` → **该 arm 恒被跳过**，
         // `when` 完全失效。实测 `match -5i { x when x > 0i => "positive"
         // x when x < 0i => "negative" _ => "zero" }` 返回 "positive"；
@@ -2275,9 +2157,9 @@ impl ParserV3 {
     }
 
     /// v0.85: `as dyn Trait` coercion（§3.5 spec 承诺）。
-    /// 检测当前 token 序列为 `as dyn <TraitName>`，emit MirInst::DynTrait
-    /// 指令，将 src_reg 的 plain value 包装为 Value::TraitObject。
-    /// 未检测到则原样返回。
+    /// 检测当前 token 序列为 `as dyn <TraitName>`，产出
+    /// `WitnessKind::DynTrait` —— lower 侧据此把 plain value 包装为
+    /// `Value::TraitObject`。未检测到则原样返回。
     fn emit_dyn_coercion(&mut self, src_w: MirWitness) -> Option<MirWitness> {
         if self.check(&TokenType::As) {
             self.advance(); // 'as'
@@ -2378,7 +2260,8 @@ impl ParserV3 {
     ///
     /// 解析内部声明后从其 witness 提取产生的绑定名，包一层
     /// `WitnessKind::Export`（typeck 侧据此计算导入可见性；lower 侧据此 emit
-    /// `MirInst::ExportMark`，运行时写入环境导出集）。
+    /// `ControlInst::ExportGlobal` / `ControlInst::ExportDyn`，运行时把名字
+    /// 写入环境导出集）。
     fn emit_export_w(&mut self) -> Option<MirWitness> {
         let span = self.span_of_current();
         self.advance(); // 'export'

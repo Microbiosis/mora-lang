@@ -1,12 +1,15 @@
-//! Wave 3 — Stage 3C: Reverse-mode Automatic Differentiation (`AutogradContext` / `AutogradTape`).
+//! v0.110.0: Reverse-mode Automatic Differentiation (`AutogradContext` / `AutogradTape`).
 //!
-//! Architecture (AGENTS.md §0):
+//! Architecture:
 //! - Per-`CoreRuntime` explicit tape stack (zero global or thread-local state, fully isolated
 //!   across `spawn`ed concurrent tasks).
 //! - Supports arbitrary Mora control flow, `struct`/`impl` layers, multi-dim zero-copy slices,
 //!   activations (`relu`/`gelu`/`silu`/`tanh`/`sigmoid`), normalizations (`softmax`/`rms_norm`/
 //!   `layer_norm`), contractions (`@` 1D/2D/ND batched), reductions (`sum`/`mean`), and `no_grad`
 //!   scoping with unwinding safety.
+//! - A tape records every differentiable primitive it sees; reverse-mode VJP accumulation
+//!   (`AutogradTape::backward`) and forward-mode JVP propagation (`AutogradTape::forward_jvp`)
+//!   replay that tape, so `grad` / `value_and_grad` / `jvp` all read one primitive set.
 
 use std::sync::Arc;
 

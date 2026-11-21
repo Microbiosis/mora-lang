@@ -1,9 +1,9 @@
-//! v0.91: math.* — 标量数学 builtin（APL/StreamIt 启发）
+//! v0.110.0: `math.*` — 标量数学 builtin（APL/StreamIt 启发）
 //!
 //! 设计原则：
 //! - 函数式 API（`math.sin(x)`）— 与现有 builtin 风格一致
-//! - 方法式 API（`x.sin()`）由 `dispatch.rs::call_method_int/float` 直接实现
-//!   以避免双实现（参见 dispatch.rs 内对应函数）
+//! - 方法式 API（`x.sin()`）经 `builtins::numeric::call_method_numeric` 转发到
+//!   本模块同一底层函数，以避免双实现
 //! - 数值参数：Int/Float 接受；结果 Int 输入返回 Int（int 路径），Float 输入返回 Float
 //! - 常量以模块属性形式暴露：`math.PI / math.E / math.TAU / math.INF / math.NAN`
 
@@ -84,9 +84,9 @@ pub fn call_math_method(method: &str, args: &[Value]) -> MoraResult<Value> {
         "NAN" => Ok(Value::Float(f64::NAN)),
 
         // ── 类型谓词（zero-arg 之外的浮点检查方法）──
-        // v0.104.6 D331：三个谓词补 `BigInt` 分支 —— 此前只匹配
-        // `Float` / `Int`，于是 `math.is_finite(1n)` 报「requires a numeric
-        // argument」，**而 `1n` 显然是 number**（`docs/mora-spec.md:970` 的
+        // v0.104.6 D331：三个谓词补齐数值分支 —— 此前只匹配
+        // `Float` / `Int`，于是低位宽整数标量报「requires a numeric
+        // argument」，**而它显然是 number**（`docs/mora-spec.md:1033` 的
         // 签名就是 `number -> bool`）。理由见下方 `unary_preserve` 的注释。
         "is_nan" => match args.first() {
             Some(Value::Float(x)) => Ok(Value::Bool(x.is_nan())),
@@ -238,35 +238,24 @@ fn binary_float<F: Fn(f64, f64) -> f64>(args: &[Value], f: F) -> MoraResult<Valu
 
 /// 保留类型：Int → Int(同值)，Float → Float(变换后)
 ///
-/// v0.104.6 D331：补 `BigInt` 分支 —— 此前**只**匹配 `Int` / `Float`，
-/// 于是取整一族的六个函数（`abs` / `sign` / `floor` / `ceil` / `round` /
-/// `trunc`）**全部拒绝 BigInt**：
+/// 取整一族的六个函数（`abs` / `sign` / `floor` / `ceil` / `round` /
+/// `trunc`）必须**保持输入的数值类型**：`math.abs(-42)` 得 `Int(-42)`
+/// 而不是 `Float(-42.0)`（`docs/mora-spec.md:1029-1030` 的签名是
+/// `number -> number`，并注明「保留 Int 类型」）。因此它们不走
+/// `unary_float`，而由本函数按值形态分派：
+/// - `Int` → 在 `i64` 域上算，精确无损；
+/// - `Float` → 在 `f64` 域上算；
+/// - `Scalar` → 浮点 dtype 走其自身的浮点域；整数 dtype 装得下 `i64` 时走
+///   整数域，装不下 `i64`（如超 `i64::MAX` 的 `u64`）则原样返回，
+///   不做有损转换；
+/// - `Tensor` → 逐元素走浮点域。
 ///
+/// ⚠ 关键：**不能**先把整数转成 f64 再取整。`f64` 只有 53 位尾数，
+/// 经一趟 f64 就会丢精度，且**静默**：
 /// ```text
-/// math.abs(-5n)     → math: numeric argument required   ← 而 -5n 显然是 number
-/// math.floor(2.7n)  → 同上
-/// math.sqrt(4n)     → 2.0                                 ← 同一个模块，认了
+/// math.floor(9223372036854775807)  →  经 f64 会得 9223372036854775808.0
 /// ```
-///
-/// **为什么是缺陷而不是设计**（三条独立证据）：
-/// ① `docs/mora-spec.md:966-967` 的签名是 **`number -> number`**，
-///    `number` 涵盖 BigInt；
-/// ② `math.rs` **自己**的 `expect_number`（第 116 行）就认 BigInt，
-///    且 CHANGELOG v0.150 那条**把它当成同族做对了的样板**明写：
-///    「**必选**数值实参走 `math.rs::expect_number`，认 `Int`/`Float`/`BigInt`」；
-/// ③ 实测 20 个走 `expect_number` 的函数**全部**接受 BigInt，9 个走
-///    `unary_preserve` / 手写 match 的**全部**拒绝 —— 分界线与
-///    「用哪个提取函数」**逐个吻合**，不是按语义分类的结果。
-///
-/// ⇒ 是**实现层的分裂**，不是语言层面的取舍。
-///
-/// ⚠ 关键：**不能**把 BigInt 转成 f64 再取整。`f64` 只有 53 位尾数，
-/// 而 BigInt 任意精度 —— 经一趟 f64 就会丢精度，且**静默**：
-/// ```text
-/// math.floor(9999999999999999999999n)  →  经 f64 会得 10000000000000000000000.0
-/// ```
-/// 所以 BigInt 分支**直接在整数域上算**，用 `BigInt` 自己的除法取整。
-/// 只有 `sign` 需要看符号、不需要算术。
+/// 所以整数分支**直接在整数域上算**，只有 `sign` 需要看符号、不需要算术。
 fn unary_preserve(
     args: &[Value],
     int_fn: fn(i64) -> i64,

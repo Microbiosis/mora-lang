@@ -9,10 +9,10 @@
 //!
 //! | # | 现象 | 修前实测 | 修后 | 根因位置 |
 //! |---|------|----------|------|----------|
-//! | D1 | `range` 实参非 `Float` 时**静默取默认值** | `for i in range(0, len(xs))` 求和 = **0.0**（应 15.0） | 15.0 | `builtin_impls.rs::call_builtin_range` |
-//! | D2 | 字符串 `len()` 数 **UTF-8 字节** | `len("中文字")` = **9** | 3 | `call_builtin_len` / `method_dispatch.rs` |
-//! | D3 | 字符串索引 `s[i]` **源码层完全不可用** | `s[0]` → `ERR: cannot index String("abc") with Float(0.0)` | `Char('a')` | `mir/vm.rs::index_value` |
-//! | D4 | `int()` / `float()` / `bool()` 只存在于 typeck | `ERR: Undefined function or task: int` | `Int(42)` | `interpreter/dispatch.rs` |
+//! | D1 | `range` 实参非 `Float` 时**静默取默认值** | `for i in range(0, len(xs))` 求和 = **0.0**（应 15.0） | 15.0 | `runtime/builtins/impls.rs::call_builtin_range` |
+//! | D2 | 字符串 `len()` 数 **UTF-8 字节** | `len("中文字")` = **9** | 3 | `call_builtin_len` / `runtime/builtins/method.rs` |
+//! | D3 | 字符串索引 `s[i]` **源码层完全不可用** | `s[0]` → `ERR: cannot index String("abc") with Float(0.0)` | `Char('a')` | `runtime/vm/value_ops.rs::index_value` |
+//! | D4 | `int()` / `float()` / `bool()` 只存在于 typeck | `ERR: Undefined function or task: int` | `Int(42)` | `runtime/builtins/impls.rs` |
 //!
 //! ## D1 为什么最危险
 //!
@@ -35,10 +35,10 @@
 //!
 //! 与 v0.104.6 修掉的 `str()` **完全同源**：`typeck/hm/builtin.rs:48-56` 与
 //! `typeck/dispatch.rs:177-189` 登记了 `int` / `float` / `bool` 的签名，
-//! 于是任何用到它们的程序都能过类型检查；运行期 `dispatch.rs` 的
-//! `match name` 里却没有对应分支，落到兜底的环境查找报
+//! 于是任何用到它们的程序都能过类型检查；运行期 `runtime/builtins/impls.rs`
+//! 的 `BuiltinFnId` 分派里却没有对应分支，落到兜底的环境查找报
 //! `Undefined function or task: …`。`str()` 之所以还多藏了一阵，是被
-//! 执行器缺陷 E1 连带掩盖（见 `builtin_impls.rs::call_builtin_str` 的注释）；
+//! 执行器缺陷 E1 连带掩盖（见 `runtime/builtins/impls.rs::call_builtin_str` 的注释）；
 //! `int/float/bool` 则是从一开始就没有任何测试碰过。
 
 use mora::test_support::TempFile;
@@ -825,7 +825,7 @@ fn prompt_string_syntax_is_retired() {
 // ─────────────────────────────────────────────────────────────────────
 
 /// `import` 编译被导入的模块时走**裸 `ParserV3::compile` 的 witness 路径**
-/// （不过 9 层管线），而 witness 把读索引编码成 `Call("[]")`、lower 此前
+/// （不过**历史** 9 层管线 —— 该管线已于 v0.110.0 随旧 MIR 一并删除），而 witness 把读索引编码成 `Call("[]")`、lower 此前
 /// 未解码 → `Undefined function or task: []`。
 ///
 /// 判据必须走**真实 CLI** —— Rust 侧只能模拟裸路径，`import` 这个生产
@@ -892,8 +892,10 @@ fn phantom_types_are_not_writable_as_annotations() {
         "Router",
         "McpServer",
         // ⚠ v0.104.6 D85：`Agent` 已从本名单**移出** —— 它**不是**幽灵类型。
-        // `Value::Agent` 存在，且 `agent.create(name, cfg)` 真实产出它
-        // （`method_dispatch.rs` 的 `(BuiltinKind::Agent, "create")` arm）。
+        // （**历史**：`Value::Agent` 与 `BuiltinKind::Agent` 当时确实存在，
+        //  `agent.create(name, cfg)` 由 `method_dispatch.rs` 的
+        //  `(BuiltinKind::Agent, "create")` arm 真实产出；二者已随 v0.110.0
+        //  移除 —— 今日 `Agent` 连类型都不是，移出名单依然正确。）
         // D85 给它补了 typeck 签名后，parser 白名单也加了 `agent`，
         // 于是 `let v: Agent = …` 从「解析期被挡」变成「类型检查期被拒」——
         // 拒绝仍在，只是换了层。留在名单里会让本测试报

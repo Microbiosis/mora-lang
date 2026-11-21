@@ -1,11 +1,11 @@
-//! v0.55: Public entry point for witness-based type checking.
+//! v0.110.0: Public entry point for witness-based type checking.
 //!
 //! `check_program_witnesses` drives the Hindley-Milner inference engine
 //! directly off `&[MirWitness]` and returns the collected diagnostics. It
 //! is the single source of truth for CLI `mora --check` and LSP
 //! `textDocument/publishDiagnostics`.
 //!
-//! v0.75.18: 模块感知 — 顶层 `import "path"` 的目标文件符号在 typeck
+//! 模块感知 — 顶层 `import "path"` 的目标文件符号在 typeck
 //! 阶段预解析（visited 防环）并合并进 HM env，import 的符号不再报
 //! UnboundVariable。路径解析与运行时 `mir_import` 一致（cwd 相对）。
 
@@ -17,12 +17,11 @@ use super::hm::TypeError as HmError;
 
 ///  Run HM inference across the program (witness 输入) and return any
 ///  diagnostics. 阶段 3 目标形态：parse 直接产出 witness，typeck 直接
-/// 消费 witness（零 MirExpr 桥接）。
+/// 消费 witness（无表达式中间层桥接）。
 ///
-/// v0.75.86：共享 inner helper（`check_program_witnesses_inner`）——
-/// 双向集成（[`check_program_witnesses`]）复用 import +
-/// HM infer_program，仅在前后插入双向预扫 + 重复错误过滤。
-/// v0.75.87: match exhaustiveness 检查已根除（保留 HM 推理路径）。
+/// 入口链：`check_program_witnesses` → `check_program_witnesses_with_modules`
+/// → 共享 inner helper `check_program_witnesses_inner`（import 符号预扫 +
+/// HM `infer_program`）。
 pub fn check_program_witnesses(witnesses: &[crate::mir::witness::MirWitness]) -> Vec<TypeError> {
     check_program_witnesses_with_modules(witnesses, None)
 }

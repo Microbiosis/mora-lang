@@ -1,14 +1,11 @@
-//! v0.20: 运行时值/环境/控制流核心类型（自 interpreter.rs 抽出）。
-//!
-//! **Move-only refactor** — 代码自 src/interpreter.rs **迁移**（非复制）：
-//! interpreter.rs 不再持有这些定义的副本，而是通过 `pub use crate::value::*`
-//! 重新导出。此处是唯一定义点。
+//! v0.110.0: 运行时核心值表示（`Value`）、词法环境（`Environment`）、一等张量（`tensor`）、
+//! 分块持久化列表（`list`）与外部宿主对象契约（`HostObject`）。
 
 use crate::common::sync::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-// v0.104.6: 不可变分块列表（`Rc` 结构共享）—— `Value::List` 的目标表示。
+// 不可变分块列表（块用 `Arc` 共享）—— `Value::List` 的实际表示。
 pub mod list;
 /// Wave 3 — Stage 3B: 一等连续对齐内存 `Tensor<DType, Shape, Device>` 与零拷贝步幅视图。
 pub mod tensor;
@@ -396,7 +393,7 @@ impl PartialEq for Value {
     }
 }
 
-mod display; // v0.75.62: Value Display + fmt_inner（纯格式化，自 value.rs 拆出）
+mod display; // Value Display + fmt_inner（纯格式化，无 BuiltinKind/Environment 依赖）
 
 // ─── Merge Strategy ─────────────────────────────────────────
 /// v0.59: CRDT-inspired merge strategies for concurrent state.
@@ -436,8 +433,8 @@ impl MergeStrategy {
 
 impl Value {
     /// 返回值可用的方法名列表（`methods_of(value)` builtin 用）。
-    /// v0.75.47: 从 flow.rs::get_methods_for_value 下沉 —— 内禀属性贴近
-    /// 数据定义（Lua 5.4 元表同源思想），dispatch 不再跨模块查方法表。
+    /// 内禀属性贴近数据定义（Lua 5.4 元表同源思想），dispatch 不再跨模块
+    /// 查方法表。
     pub fn methods(&self) -> Vec<String> {
         let names: &[&str] = match self {
             Value::String(_) => &[
@@ -732,7 +729,8 @@ pub struct Environment {
     /// 语义（spec §10.2）：`export` 标记的符号对 import 者可见，未标记的
     /// 是模块私有。两条入口写同一存储：
     /// 1. [`Environment::define`] 的 `exported` 参数；
-    /// 2. `MirInst::ExportMark` 指令（`export <decl>` 的运行时落点）。
+    /// 2. `ControlInst::ExportGlobal` / `ControlInst::ExportDyn` 指令
+    ///    （`export <decl>` 的运行时落点，见 `mir::control::ir` 与 `runtime::vm::engine`）。
     pub exports: std::collections::HashSet<String>,
 }
 
@@ -779,7 +777,7 @@ impl Environment {
         self.values.insert(name, value);
     }
 
-    /// 把名字标记为对外公开（`MirInst::ExportMark` 的落点）。
+    /// 把名字标记为对外公开（`ControlInst::ExportGlobal` / `ControlInst::ExportDyn` 的落点）。
     pub fn mark_exported(&mut self, name: &str) {
         self.exports.insert(name.to_string());
     }
@@ -1172,9 +1170,10 @@ mod tests {
     #[test]
     fn value_is_send_sync() {
         // v0.104.6 D484：`Value` 的若干变体带 **IR 层载荷**
-        // （`Arc<MirFunction>` / `Arc<CoreFunction>` / `Arc<Mutex<…>>` …）
-        // ⇒ `Value` 必须仍是 `Send + Sync`（`http_server` 跨 task 共享 Value；
-        // `Value::Closure` 的注释明写「Arc 而非 Rc 以保留 Value: Send + Sync」）。
+        // （`Arc<ControlProgram>` / `Arc<Mutex<…>>` / 通道 / 任务句柄 …）
+        // ⇒ `Value` 必须仍是 `Send + Sync`（运行时 VM 跨 task 共享 Value；
+        // `Value::Closure` 的载荷用 `Arc` 而非 `Rc`，正是为了保住
+        // `Value: Send + Sync`）。
         //
         // 此前这条**只写在注释里、没有任何断言** ⇒ 新增变体若引入不可 Send 的
         // 载荷（如 `Rc`），要等到跨线程用它的测试**炸在运行期**才暴露。

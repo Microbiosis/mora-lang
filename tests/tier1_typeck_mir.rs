@@ -1,6 +1,6 @@
 //! v0.55: Tier-1 typeck integration tests against Parser V3.
 //!
-//! These tests verify that the HM inference engine across all MirExprKind
+//! These tests verify that the HM inference engine across all `WitnessKind`
 //! variants surfaces diagnostics in the shape consumed by CLI `--check`
 //! and the LSP server.
 

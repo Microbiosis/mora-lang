@@ -4,13 +4,14 @@
 //!
 //! `.shape()` / `.flatten()` / `.reshape()` / `.push()` / `.pop()` / stats 链
 //! 都是 `docs/mora-spec.md` §1047-1061 明确列出的**语言面**，但改动它们的
-//! 实现（`src/interpreter/method_dispatch.rs::call_method_list`）时，
+//! 实现（**历史** `src/interpreter/method_dispatch.rs::call_method_list`，
+//! 今 `src/runtime/builtins/method.rs::call_method_list_pure`）时，
 //! `tests/` 与 `examples/` 里**一条断言都没有** —— 「编译通过 + 套件全绿」
 //! 证明不了任何语义。
 //!
 //! 本文件的期望值不是拍脑袋写的：2026-09-28 清理 `call_method_list` 里 6 处
 //! 对「已按值接管的 `list`」的多余 clone 之后，对该文件做了**语义 A/B**
-//! （`git stash push -- src/interpreter/method_dispatch.rs` 切回 HEAD 原版
+//! （**历史**：`git stash push -- src/interpreter/method_dispatch.rs` 切回 HEAD 原版
 //! 再跑同一批 32 个用例），**32/32 逐字节相同**。故这批值是「改动前后一致」
 //! 的既有行为，可以安全地作为基线钉住。
 //!

@@ -33,7 +33,7 @@
 //!
 //! 字段访问分支先要求「这个名字**不是**一个已知方法」
 //! （`method_signature(recv, method).is_none()`）。方法优先于字段，与运行期
-//! `method_dispatch` 的分派顺序一致。
+//! `runtime::builtins::method` 的分派顺序一致。
 //!
 //! ## 为什么不修 D55
 //!

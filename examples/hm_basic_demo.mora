@@ -1,16 +1,13 @@
--- HM Type Inference Demo - Mora-lang
--- HM inference is the default type checker (no flag needed since v0.75.29
--- removed the dead MORA_HM=1 switch -- see CHANGELOG v0.75.29).
+-- HM Type Inference Demo — Mora v0.110.0
+-- Unified Span-tracked Hindley-Milner type inference runs automatically
+-- before execution and via `mora --check examples/hm_basic_demo.mora`.
 --
 -- Run:  cargo run -- examples/hm_basic_demo.mora
 --
--- v0.104.6: 本文件此前用 Rust 风格闭包 (`num => { ... }`) 与 `#` 注释写成，
--- 与 Mora 语法（`fn(x) ... end` / `--` 注释，见 spec §14.2/§14.3）不符，
--- 自 v0.55 ParserV3 迁移起**从未能运行**。现已改写为可执行的 Mora 源码。
--- 两处按语言实际语义调整（不是笔误）：
---   * 柯里化示例改为「闭包作为实参」——Mora 的 `fn(a) fn(b) ... end`
---     （返回闭包的闭包）目前会静默失效，故不作为教学示例；
---   * 字典示例只用同值类型——Mora 字典是同构的，混合值类型会被 typeck 拒绝。
+-- Key v0.110.0 static type semantics:
+--   * Unsuffixed integer literals (`42`) infer as exact 64-bit `int`;
+--     floating-point literals (`3.14159`) infer as `float`.
+--   * Lists and dictionaries are homogeneous (`list<T>`, `dict<K, V>`).
 
 -- ===================================================================
 -- Example 1: Basic Literal Inference

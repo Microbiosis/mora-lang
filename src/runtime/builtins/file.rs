@@ -2,7 +2,7 @@
 //!
 //! 所有路径经由 `CoreRuntime::fs_context` 校验为不可绕过的 `CheckedPath`，
 //! 所有阻塞文件系统操作通过 `CoreRuntime::reactor`（`AsyncIoReactor::run_fs`）
-//! 调度到受限 Tokio 阻塞线程池执行，并在 `TaskContext` 取消/超时时协作中断；
+//! 调度到自研阻塞线程池执行，并在 `TaskContext` 取消/超时时协作中断；
 //! `file.cwd` / `file.chdir` 仅维护运行时独立的 `virtual_cwd`，彻底消除进程级
 //! `std::env::set_current_dir` 的并发竞态与沙箱逃逸。
 

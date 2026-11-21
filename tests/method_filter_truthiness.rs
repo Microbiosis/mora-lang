@@ -1,7 +1,8 @@
 //! v0.104.6 D374 —— `method_dispatch` 的 **`filter` 真值路径**（D358 修复的
 //! 端到端确认）+ `take` 的 count 守卫（否定轮，无产品变更）
 //!
-//! `src/interpreter/method_dispatch.rs`（1199 行）**零 panic 点**，
+//! **历史** `src/interpreter/method_dispatch.rs`（今 `src/runtime/builtins/method.rs`，
+//! 543 行）**零 panic 点**，
 //! 19 个既有判据覆盖 list/dict/string 的方法面。
 //! 此前未覆盖的是 **`filter` 接受非 bool 谓词返回值**这条路径 ——
 //! 而它正是 D358 修的 `is_truthy`（`BigInt(0)` 误判为真）的**真实消费者**。

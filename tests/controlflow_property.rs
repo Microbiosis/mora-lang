@@ -1,4 +1,7 @@
-//! 解释器**控制流属性测试**（proptest）—— 随机程序 × 参考求值器对拍。
+//! 解释器**控制流属性测试**（零依赖确定性生成器）—— 随机程序 × 参考求值器对拍。
+//!
+//! v0.110.0 起**不再依赖 `proptest`**：生成器是本文件自带的 `PropRng`
+//! （SplitMix64，见下方 `impl PropRng`），种子固定 ⇒ 完全可复现。
 //!
 //! ## 为什么是这一类
 //!
@@ -18,7 +21,7 @@
 //!
 //! 末表达式恒在所有 `if/else` 与 `for` **之后**。把 `partition_blocks` 的
 //! E1 修复临时关掉（裸 pc 跳转目标不再当块首 + 不补块边界 `Control` 边），
-//! 本测试立刻失败，proptest 收缩出的最小反例是：
+//! 本测试立刻失败，生成器给出的最小反例是：
 //!
 //! ```text
 //! let a = 1
@@ -374,10 +377,9 @@ fn count_jumps(stmts: &[Stmt]) -> (usize, usize) {
 
 /// 256 例随机程序里**实际出现过**的跳转次数（由属性测试本体累加）。
 ///
-/// 为什么是「累加 + 打印 + 把实测值记进文件头」而不是写成断言：proptest 的
-/// `Strategy::new_tree` 需要一个 `Rng`，而 1.11 里 `TestRunner::rng` 已是
-/// **私有字段**、`proptest::rng` 模块也不再公开 —— 为统计生成器覆盖率去和
-/// 库的内部 API 缠斗，投入产出不划算。下面的确定性用例负责保证
+/// 为什么是「累加 + 打印 + 把实测值记进文件头」而不是写成断言：自研生成器
+/// （`PropRng`）只提供 `next_u64`，没有树形收缩接口 —— 为统计生成器覆盖率
+/// 去和库的内部 API 缠斗，投入产出不划算。下面的确定性用例负责保证
 /// break/continue 的语义**一定**被真正执行到。
 static JUMP_STATS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static SAMPLE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

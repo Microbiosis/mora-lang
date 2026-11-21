@@ -1,11 +1,15 @@
-//! Canonical Heap-Framed Stackful Virtual Machine (`src/runtime/vm/`) (Wave 2 — Stage W2.3).
+//! v0.110.0: Canonical Heap-Framed Stackful Virtual Machine (`src/runtime/vm/`).
 //!
-//! Replaces both recursive `Interpreter` host callbacks and linear `src/mir/vm/`
-//! with one explicit `Vec<CallFrame>` engine executing [`ControlProgram`]:
+//! The single execution kernel of the language: one explicit `Vec<CallFrame>` engine running
+//! [`ControlProgram`] SSA IR, reached only through the single production path
+//! `ParserV3::compile → MirWitness[] → mir::control::lower_program → ControlProgram →
+//! typeck::check_mir::check_program_witnesses → runtime::vm::execute_program`.
 //! - Zero C-stack recursion across nested Mora calls, combinators (`map`/`filter`/`reduce`),
 //!   `eval`, `macroexpand`, and `import`
 //! - True O(1)-frame tail call optimization (`ControlTerminator::TailCall`)
 //! - Native deep multi-shot delimited continuations (`ControlTerminator::Perform` + `HandleBarrier`)
+//! - Exactly one compilation tier and one execution kernel: there is no AST, interpreter, or
+//!   JIT tier left to fall back to.
 
 pub mod builtins;
 pub mod continuation;

@@ -1,8 +1,15 @@
-//! Heap-allocated stackful VM frames, upvalues, module globals, and delimited continuations.
+//! v0.110.0: Heap-allocated stackful VM frames, upvalues, module globals, and delimited continuations.
 //!
 //! All types are `Send + Sync` so `Value` (including `Closure`, `Task`, `Macro`, and
-//! `Continuation`) can safely cross thread boundaries for `parallel` worker scopes and
-//! future coroutine schedulers (Wave 2 — Stage W2.3 / W2.4).
+//! `Continuation`) can safely cross thread boundaries for `parallel` worker scopes and the
+//! shared zero-dependency [`crate::runtime::scheduler::TaskScheduler`].
+//!
+//! Invariants:
+//! - A [`ScriptFrame`] owns its local slots and register file; a local captured by an inner
+//!   closure becomes a heap [`UpvalueCell`] so the closure observes the defining frame's
+//!   later mutations.
+//! - A [`CapturedContinuation`] is multi-shot: it owns the frames stacked above the matching
+//!   [`HandleBarrierState`], and resuming clones them back instead of consuming the capture.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -183,7 +190,7 @@ pub enum CombinatorFrame {
     },
     /// `swap(atom, f)` writeback awaiting `f(old)` return value.
     Swap { atom: Arc<Mutex<Value>> },
-    /// Wave 3 Stage 3C: Reverse-mode autograd wrapper around a differentiated function call.
+    /// Reverse-mode autograd wrapper around a differentiated function call.
     AutogradEval {
         tape_id: u64,
         leaf_nodes: Vec<usize>,
@@ -192,26 +199,26 @@ pub enum CombinatorFrame {
         scalar_flags: Vec<Option<crate::common::DType>>,
         return_value: bool,
     },
-    /// Wave 4: Forward-mode JVP evaluation (`jvp(f, primals, tangents)`).
+    /// Forward-mode JVP evaluation (`jvp(f, primals, tangents)`).
     JvpEval {
         tape_id: u64,
         leaf_nodes: Vec<usize>,
         leaf_tangents: Vec<Arc<crate::value::tensor::Tensor>>,
         scalar_out_dtype: Option<crate::common::DType>,
     },
-    /// Wave 4: Compute graph tracing wrapper (`trace_dag(f, example_inputs...)`).
+    /// Compute graph tracing wrapper (`trace_dag(f, example_inputs...)`).
     TraceDagEval {
         tape_id: u64,
         leaf_nodes: Vec<usize>,
     },
-    /// Wave 3 Stage 3C: Evaluates omitted `struct` field default initializers on the VM stack.
+    /// Evaluates omitted `struct` field default initializers on the VM stack.
     StructInit {
         def: Arc<crate::value::StructDefRuntime>,
         fields: HashMap<String, Value>,
         pending_defaults: Vec<(String, FnId)>,
         current_field: String,
     },
-    /// Wave 4 P1: Dispatches rising-edge memory watermark callbacks outside allocator locks
+    /// Dispatches rising-edge memory watermark callbacks outside allocator locks
     /// on the stackful VM frame stack before yielding `final_result`.
     WatermarkCallbacks {
         final_result: Value,
@@ -268,7 +275,7 @@ pub enum CallFrame {
     Parallel(ParallelFrame),
     /// Wraps propagated errors with a diagnostic prefix (e.g. macro invocation errors).
     ErrorContext { prefix: String },
-    /// Wave 3 Stage 3C: Restores `autograd.no_grad_depth` on normal return or error unwind.
+    /// Restores `autograd.no_grad_depth` on normal return or error unwind.
     NoGradGuard,
 }
 

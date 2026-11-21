@@ -129,7 +129,7 @@ mod tests {
         .expect("merge_with should succeed");
     }
 
-    /// v0.75.52: BuiltinKind::from_name 静态表覆盖（P6）—— 26 kind 全可查，
+    /// BuiltinKind::from_name 覆盖检查 —— 内建自由函数名与模块前缀全可查，
     /// 未登记名返回 None（fallback）。
     #[test]
     fn builtin_kind_from_name_coverage() {

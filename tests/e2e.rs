@@ -349,7 +349,7 @@ fn e2e_match_arm_body_need_not_match_scrutinee() {
 ///
 /// 缺陷：守卫曾被发射进一个随即丢弃的子 EmitContext，其寄存器在外层 `regs`
 /// 中从未被写过 → `h_match_expr` 读到 Nil → **守卫恒假、`when` 完全失效**，
-/// match 落到后续 arm；且 9 层管线在 `witness_to_fcfg` 里把守卫硬编码为
+/// match 落到后续 arm；且**历史** 9 层管线在 `witness_to_fcfg` 里把守卫硬编码为
 /// `None`，整个丢弃。原 fixture 的 7 组取值恰好让**首个** arm 的守卫为真，
 /// 故在缺陷下也"通过" —— 属侥幸。fixture 末尾新增的 ①②③ 把「必须落在哪个
 /// arm」做成唯一正确解，守卫失效时结果明确错误，并由本测试断言。
@@ -410,7 +410,7 @@ fn e2e_task_define_and_call_runs() {
 
 /// macro_def.mora：macro 定义 + 展开 + 调用。
 /// v0.83: 验证 parser emit_macro_def_w 保留宏体（子 EmitContext 编译），
-/// Value::Macro { body: Arc<MirFunction> } 存储宏体，
+/// Value::Macro { name, params, program, fn_id, globals } 存储宏体，
 /// call_builtin_fallback 以 args 绑定 params，子 env execute 执行 body。
 /// 此前 Value::Macro 仅存 name+params（无 body），调用方报错"not implemented"。
 #[test]

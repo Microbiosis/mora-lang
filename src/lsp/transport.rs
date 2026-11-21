@@ -5,7 +5,7 @@
 //!   `\r\n`
 //!   `<N bytes of UTF-8 JSON>`
 //!
-//! 这里纯同步、单线程，不引入 tokio。LSP server 整体是"循环 read message, dispatch, write response"。
+//! 这里采用纯同步单线程 stdio 消息循环（read message → dispatch → write response），并强制校验 `MAX_CONTENT_LENGTH` 防 OOM。
 //! 对于编辑器这种场景吞吐够用；如果以后真要性能，再上 async。
 
 use std::io::{self, Read, Write};

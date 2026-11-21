@@ -4,14 +4,15 @@
 //! **分叉**，并指出 `tests/signature_no_over_tightening.rs`（D81）只固化了
 //! **上限**那一侧（「不得拒绝多余实参」），**下限**长期无覆盖。
 //!
-//! 本条把那次「**一个**实例」升级为**全称核对**：`dispatch.rs` 里
+//! 本条把那次「**一个**实例」升级为**全称核对**：`typeck/dispatch.rs` 里
 //! `min_arity >= 2` 的**全部 31 个**方法，逐个用 **Rust API 直接调用**
 //! （绕过 typeck）验证「少传一个实参时，运行期确实拒绝」。
 //!
 //! ## 为什么必须**绕过 typeck**
 //!
 //! typeck 的 `min_arity` 正是被核对的对象 —— 走脚本层会在**编译期**被挡，
-//! 永远看不到运行期行为。而 `Interpreter::call_*_method` 全部是 `pub`
+//! 永远看不到运行期行为。而 `runtime::builtins::{call_math_method, call_stats_method,
+//! call_linalg_method, call_file_method, call_exec_method}` 全部是 `pub`
 //! ⇒ 可以直接喂不足的实参，**观测运行期的真实下限**。
 //!
 //! 期望值不是读代码推断的，而是**本文件自己跑出来的**（见各条的实测数字）。

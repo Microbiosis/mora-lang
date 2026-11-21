@@ -169,7 +169,7 @@ perform my_effect()
 
 #[test]
 fn interpreters_are_isolated_across_threads() {
-    // 两个线程各自的 Interpreter：同种子 → 同序列，互不干扰。
+    // 两个线程各自的运行时状态（CoreRuntime）：同种子 → 同序列，互不干扰。
     // v0.91 全局 Mutex 语义下两条线程共享同一序列，本断言在交错下
     // 不稳定；v0.99 状态按值隔离后成为稳定性质。
     let h1 = std::thread::spawn(|| {

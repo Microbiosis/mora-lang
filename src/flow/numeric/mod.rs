@@ -1,6 +1,6 @@
-//! v0.104.6 D468：Mora 核心数值塔（Int / Float）。
+//! v0.110.0: Mora 核心数值塔（`Int` / `Float`）—— 按操作数类型分派到各自的域。
 //!
-//! （v0.110.0 起 `BigInt` 已下沉至独立标准库 `std/math/bigint`。）
+//! 任意精度大整数不在本塔内：它是独立标准库 `std/math/bigint`（纯 Mora 实现）。
 
 pub mod float;
 pub mod guard;

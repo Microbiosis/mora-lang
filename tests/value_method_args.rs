@@ -2,9 +2,9 @@
 //!
 //! ## 为什么 D150/D152 没抓到
 //!
-//! 那两轮的普查关键字是 `args.get(` 且路径限 `src/interpreter/builtins/` ——
+//! 那两轮的普查关键字是 `args.get(` 且路径限**历史** `src/interpreter/builtins/`（今 `src/runtime/builtins/`）——
 //! 那是**命名空间函数**面。而 `xs.get(i)` / `xs.take(n)` / `xs.reshape(r,c)` /
-//! `xs.crush_json(max)` 走的是**值方法**面（`method_dispatch.rs`），
+//! `xs.crush_json(max)` 走的是**值方法**面（**历史** `method_dispatch.rs`，今 `runtime/builtins/method.rs`），
 //! 写法是 `.and_then(|v| match v { Value::Float(n) => …, _ => None })`。
 //!
 //! **教训：普查的范围比缺陷的机制更窄时，绿灯是假的。**

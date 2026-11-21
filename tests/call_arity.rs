@@ -37,8 +37,8 @@
 //!
 //! | 位置 | 修前 |
 //! |------|------|
-//! | `mir/handlers/values.rs::h_call` 的 **task_registry** 分支 | **完全没有** arity 校验，缺参静默填 `Nil` |
-//! | `interpreter/dispatch.rs` 的 `Value::Task` / `Value::Closure` / `builtin_impls.rs` 的 `Value::Macro` | 只查 `args.len() < params.len()`，**多余实参静默丢弃** |
+//! | **历史** `mir/handlers/values.rs::h_call` 的 **task_registry** 分支（`src/mir/handlers/` 已随 9 层 IR 于 v0.110.0 一并删除） | **完全没有** arity 校验，缺参静默填 `Nil` |
+//! | **历史** `interpreter/dispatch.rs` 的 `Value::Task` / `Value::Closure` / `builtin_impls.rs` 的 `Value::Macro`（今统一由 `runtime/vm/continuation.rs::materialize_frame_named` 校验 arity） | 只查 `args.len() < params.len()`，**多余实参静默丢弃** |
 //!
 //! 对照组：内建与方法在 typeck 层有正确的 `Expected N arguments, got M`；
 //! 闭包少参也早就有 `closure expects N args, got M`。**只有 task 的这两处是洞**。

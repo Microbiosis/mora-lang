@@ -165,7 +165,7 @@ pub(crate) fn sleep_until(deadline: Instant) -> SleepFuture {
     SleepFuture { id: 0, deadline }
 }
 
-// ─── Biased Future Race Combinators (replacing `tokio::select!`) ─────────────
+// ─── Biased Future Race Combinators (first-ready branch wins) ────────────────
 
 pub(crate) async fn race2<A, B, FA, FB>(fa: FA, fb: FB) -> Select2<A, B>
 where
@@ -186,7 +186,7 @@ where
     .await
 }
 
-// ─── Native AsyncNotify (replacing `tokio::sync::Notify`) ───────────────────
+// ─── Native AsyncNotify (permit-based multi-waker wakeup) ───────────────────
 
 #[derive(Default)]
 struct NotifyInner {

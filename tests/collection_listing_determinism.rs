@@ -18,7 +18,7 @@
 //!
 //! ## 与 `dict.keys()` 是**同一个**危害，而 `dict` 侧已修
 //!
-//! `method_dispatch.rs` 里 `dict.keys()` 的注释原文：
+//! `runtime/builtins/method.rs` 里 `dict.keys()` 的注释原文：
 //! 「用户按 `keys()[0]` 取「第一个键」、或 `for k in d.keys()` 顺序处理，
 //! 都会拿到随机结果 —— 且**不报错**」，并有 `tests/dict_determinism.rs` 守护。
 //!

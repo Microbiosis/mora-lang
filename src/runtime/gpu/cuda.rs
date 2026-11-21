@@ -1,6 +1,6 @@
-//! Wave 4 P2-2: Native NVIDIA CUDA Driver API (`nvcuda.dll` / `libcuda.so.1`) Hardware Backend.
+//! v0.110.0: Native NVIDIA CUDA Driver API (`nvcuda.dll` / `libcuda.so.1`) Hardware Backend.
 //!
-//! Architecture (`AGENTS.md §0`):
+//! Architecture:
 //! - Zero compile-time CUDA Toolkit / `nvcc` / Cargo dependency: dynamically opens the system
 //!   NVIDIA driver (`nvcuda.dll` on Windows, `libcuda.so.1` / `libcuda.so` on Linux) at runtime.
 //! - Uses NVIDIA's built-in driver PTX JIT (`cuModuleLoadData`) to compile Mora's native PTX ISA 7.0

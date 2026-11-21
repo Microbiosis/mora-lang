@@ -3,9 +3,11 @@
 -- v0.104.3 断言入口：本 fixture 的**末表达式**是守卫结果列表，
 -- 使 e2e 可用 `run_source` 直接断言精确值（无需子进程捕获 stdout）。
 --
--- 缺陷背景：守卫曾被发射进随即丢弃的子 EmitContext，其寄存器在外层 regs
+-- 缺陷背景（**历史**）：守卫曾被发射进随即丢弃的子 EmitContext，其寄存器在外层 regs
 -- 中从未被写过 → `h_match_expr` 读到 Nil → 守卫恒假、`when` 完全失效；
 -- 且 9 层管线在 witness_to_fcfg 里把守卫硬编码为 None，整个丢弃。
+-- （该 9 层 IR 已于 v0.110.0 删除；今天的 match/guard 由 `mir::control::lower`
+--  降低为 merge 块 + 模式绑定后的求值守卫。）
 -- 原 fixture 的取值恰好让**首个** arm 的守卫为真，故在缺陷下也"通过"
 -- —— 属侥幸。下方 ①②③ 把「必须落在哪个 arm」做成唯一正确解。
 task main()

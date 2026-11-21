@@ -1,10 +1,16 @@
-//! Closure / task MIR dispatch 路径测试 (v0.77 重命名自 tier0_closure_mir.rs)
+//! Closure / task 分派路径测试 (v0.77 重命名自 tier0_closure_mir.rs)
 //!
 //! v0.77 重构：删除 6 个 source-grep 静态合约测试
-//! （Value::Closure.mir_body 存在性、dispatch 走 execute、MirInst::Closure
+//! （Value::Closure.mir_body 存在性、dispatch 走 execute、`MirInst::Closure`
 //! 存在性等 — 任何重命名都会假阳性断裂）。保留 3 个 runtime 测试。
-//! 这些 runtime 测试验证 `MirInst::Closure` + `MirInst::TaskDef` →
-//! `execute` → `run_main_task` 真实端到端路径。
+//!
+//! ⚠ **历史说明**：上文的 `MirInst::Closure` / `MirInst::TaskDef` 与
+//! `Value::Closure.mir_body` 属**已退役**的 9 层 IR / 旧闭包表示（v0.110.0
+//! 删除）。现存形态：`Value::Closure` 持 `Arc<ControlProgram>` +
+//! `ModuleGlobals` + `UpvalueValue`（`src/value.rs`），task 定义经
+//! `WitnessKind::TaskDef` → `mir::control::lower` 生成 `ControlFunction`。
+//! 这些 runtime 测试验证「闭包 + task → `execute_program` → `run_main_task`」
+//! 真实端到端路径。
 
 use mora::parser_v3::ParserV3;
 use mora::runtime::CoreRuntime;
@@ -28,7 +34,8 @@ fn run_via_execute(source: &str) -> Result<(), String> {
 #[test]
 fn closure_literal_then_call_runs_via_mir() {
     // 注：closure 字面量语法按 parser 实际接受形式编写。
-    // 这里测试的是 MirInst::Closure + call_value 内 mir_body Some 路径。
+    // 这里测试的是**历史** `MirInst::Closure` + call_value 内 mir_body Some 路径
+    // （`MirInst` 已于 v0.110.0 随旧 MIR 一并删除）。
     let src = r#"
 task main()
   let xs = [1, 2, 3]

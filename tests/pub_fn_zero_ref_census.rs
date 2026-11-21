@@ -20,7 +20,7 @@
 //! | `typeck/` | 7 | `is_empty_union` / `enter_scope` / `exit_scope` / `push_scope` / `pop_scope` / `fresh_closure` / `is_builtin_type_name` |
 //! | `pregel/` + `trace_collector/` | 6 | `with_step_timeout` / `set_otel_endpoint` / `metrics_json` |
 //! | `mir/` + `flow.rs` + `orchestrate_dag/` | 8 | `run_with_signal_cached` / `label_index` / `is_pipe_method` |
-//! | `interpreter/` + `tea/` + `toolplane/` | 6 | `save_checkpoint` / `dispatch_many` / `shared_default_registry` |
+//! | **历史** `interpreter/` + `tea/` + `toolplane/` | 6 | `save_checkpoint` / `dispatch_many` / `shared_default_registry` |
 //!
 //! ## 抽查结论：全是**库 API 备用**，不是「写残的半成品」
 //!

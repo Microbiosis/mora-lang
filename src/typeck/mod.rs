@@ -1,38 +1,25 @@
-//! v11 静态类型检查
+//! v0.110.0: 统一静态类型系统与 AI-Native 编译期检查器（`src/typeck/`）。
 //!
-//! 设计原则：
-//! - **多错误收集**：一次跑完所有检查，统一报告（不首个错误终止）
-//! - **位置精确**：每条 TypeError 带行号（line, col），IDE 友好
-//! - **可选类型注解**：Mora 是渐进式静态类型语言（spec §3.1）——无注解时走 HM Hindley-Milner 推断；推断不出来视为 Any
-//! - **不破坏现有行为**：未标注类型注解的代码继续走默认推断路径（仅在 main.rs 入口可选启用严格 typeck）
-//!
-//! 检查范围：
-//! - let 初始化值 vs 类型 hint
-//! - task / closure 参数 vs 实参类型
-//! - task / closure 返回类型 vs return 表达式
-//! - binary 操作数类型（+ - * / % + 比较）
-//! - 索引操作类型（list→number, dict→string）
-//! - if 条件类型（任何值视为 truthy，不报）
-//! - method call 接收者类型 + 方法存在性
-//! - 变量引用 vs 作用域
-//!
-//! 不做：
-//! - 列表/字典元素类型推断（Mora 列表是异构容器）——注：v0.75.16 M1 已做
-//!   方法签名级元素类型保留，此处指字面量级不再扩展
-//! - 控制流敏感的类型缩窄
-
-// v0.55: typeck V2 模块 (mod check, mod pregel_check) 已删除。
-// 类型检查入口: `check_program_witnesses` (mod check_mir)。
+//! 架构原则（Wave 3 Stage 3A / 3B / 3C）：
+//! - **单一求解入口**：[`check_mir::check_program_witnesses`] 是 CLI、运行期与 LSP 的唯一静态类型检查入口。
+//! - **精确 `Span` 追踪与错误毒化恢复**：基于 `TypeVarId::{Meta, Rigid}`、`Type::Error` 毒化隔离与 fail-closed `Type::Unknown` 一次收集全部静态错误。
+//! - **5 项 AI-Native 静态检查**：
+//!   1. `DType`：硬件数值位宽严格匹配（`f64`/`f32`/`f16`/`bf16`/`fp8`/`i64`..`i4`/`u64`..`u8`/`bool`）
+//!   2. `Shape`：一等 `Tensor<DType, Shape, Device>` 符号维度合一、广播与多维切片边界校验
+//!   3. `Device`：静态追踪设备位置（`cpu`/`cuda:N`/`vulkan:N`/`metal:N`），禁止隐式跨设备混算
+//!   4. `Resource`：作用域资源配额与自动微分磁带期间的原位修改（`tensor_mutate`）别名检查
+//!   5. `Effect`：封闭可组合效果行（`EffectRow`）包含检查与自动微分纯度校验
+//! - **名义与服务类型契约**：泛型 `struct`（含默认值与编译期 `@tag` 元数据）、带载荷 `enum`、源码级 `trait`/`impl`/`dyn Trait`、具名/默认参数、同构 `list<T>`/`dict<K, V>`、不变 `channel<T>` 与协变 `task_handle<T>`/`result<T, E>`。
 
 pub mod check_mir;
 pub mod dispatch;
 pub mod hm;
-/// v0.75.18: 跨模块 import 符号表（typeck 阶段预扫描合并）
+/// 跨模块 import 符号表（typeck 阶段预扫描合并）
 pub mod imports;
 
 use std::collections::HashMap;
 
-// v1 AST types no longer imported — all v2 paths use ast_v2 / common
+// 共享类型（Span 等）统一来自 crate::common；本模块直接消费 MirWitness。
 use crate::common::Span;
 
 // ===================================================================
@@ -975,39 +962,6 @@ pub fn is_empty_union(ty: &Type) -> bool {
     matches!(ty, Type::Union(m) if m.is_empty())
 }
 
-/// v0.75.86 (Phase D + Phase E)：跨节点 Union merge 工具。
-///
-/// 把多个 `Type` 合并成 `Type::Union`，自动平展嵌套 Union + `Any` 短路。
-///
-/// **Phase E 签名变更**：参数从 `&[Type]` 改为 `&[(Span, Type)]`——
-/// 每个 arm 携带自身 span，让错误诊断能精确定位到出错 arm（之前
-/// `span: Span` 参数在 `join_types` 内部 unused 丢弃；现在 span 来源
-/// 于每个 arm 的实际位置）。
-///
-/// 行为：
-///   - 空切片 → `Type::Union(vec![])`（"any element type"占位）
-///   - 单个类型 → 该类型本身
-///   - 多类型 → `Type::Union(vec![t1, t2, ...])`（去重：单成员时退化为成员）
-///   - 嵌套 `Union(a, Union(b, c))` → `Union(a, b, c)`（平展）
-///   - 含 `Any` → `Type::Union(vec![])`（Any 是 top type，合并结果即"any"）
-///
-/// 设计参考：
-///   - HM `infer_if` 无 else 时 `Union(vec![then, Nil])`（唯一手工构造点）
-///   - Phase D 把这种「手工 Union 构造」抽象为 helper，给双向
-///     `pre_check_witness` 的 Match/If 分支 join 用。
-///   - Phase E 加 arm span 支持错误定位（之前 span 整体作为 outer 参数）。
-///
-/// 应用：
-///   - Match arm body join → `join_types(&arm_pairs, outer_span)`
-///   - 后续 If-else result join（独立 commit）→ `join_types(&[then_pair, else_pair], span)`
-///
-/// 参数语义：
-///   - `arms`：每个元素 `(arm_span, arm_body_inferred_type)`。
-///     arm_span 来自 `MirWitness::span`（Phase E 错误定位用）
-///   - `outer_span`：整个 Match 节点的 span（fallback——当无 arm span 时用）
-///
-/// v0.75.96: 抽离到 [`crate::typeck::hm::util::join_types`] 与
-/// [`crate::typeck::hm::util::check_union`]——双向定型内部 helper。
 /// 检查是否是已知的内置类型名（大小写不敏感）
 pub fn is_known_type(name: &str) -> bool {
     let lower = name.to_lowercase();
@@ -1208,7 +1162,7 @@ impl SymbolTable {
         }
     }
 
-    /// 沿作用域链查找；找不到返回 Any
+    /// 沿作用域链查找；找不到返回空 Union（`any` 占位）
     pub fn lookup(&self, name: &str) -> Type {
         for scope in self.scopes.iter().rev() {
             if let Some(t) = scope.get(name) {
@@ -1220,9 +1174,8 @@ impl SymbolTable {
 }
 
 // ===================================================================
-// v0.55: MirExpr-based type checking (V3 pipeline)
+// 类型检查入口
 // ===================================================================
 
-// v0.90.5: check_program_mir / check_program_mir_with_types 已删除
-// （兼容桥违反 AGENTS.md §6）。类型检查入口统一为
-// check_program_witnesses。
+// 唯一入口：check_mir::check_program_witnesses（CLI / 运行期 / LSP 共用），
+// 跨模块版本为 check_program_witnesses_with_modules。

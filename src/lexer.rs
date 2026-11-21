@@ -1,4 +1,16 @@
-//! v0.01: 词法分析器 — TokenType 枚举 + Token/Lexer（单字符 token 经 simple_token 收敛，v0.75.69）。
+//! v0.110.0: 词法分析器 — `TokenType` 枚举 + `Token` / `Lexer`。
+//!
+//! 产出带行列坐标的 token 流：关键字、字面量与运算符都在 `TokenType` 里。
+//! 运算符、标点等定长 token 由 `simple_token` 统一构造（多字符的 `->`、
+//! `=>` 也在其中）；字符串 / 字符 / 数值字面量由各自的 `*_from` 处理。
+//! `--` 行注释默认丢弃，只有 `Lexer::keep_comments(true)` 时才作为
+//! `TokenType::Comment` 发出（供 LSP 格式化器从 token 流重建整份文档）。
+//!
+//! 数值字面量在此定型：无后缀整数 → `TokenType::Int(i64)`（越 i64 报错，
+//! 不静默回绕）；带**非默认位宽**后缀的整数/浮点（`i4`..`u64` / `f16` 等）
+//! → `TokenType::TypedInt` / `TokenType::TypedFloat`（`i`/`u`/`f`/`i64`/
+//! `f64` 这些默认宽度后缀仍归 `TokenType::Int` / `TokenType::Float`）；
+//! 浮点字面量超出 f64 可表示范围时报错，而不是静默产出 `inf`。
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenType {
@@ -123,7 +135,7 @@ pub struct Lexer {
     /// （`lsp/providers/formatting.rs`）打开它，因为那条路径要从 token 流
     /// **重建整份文档**，lexer 不发的东西就等于不存在（见 D202）。
     ///
-    /// 保持默认关闭的收益：parser / typeck / interpreter **一行都不用改**，
+    /// 保持默认关闭的收益：parser / typeck / 运行时 VM **一行都不用改**，
     /// 也就不会有「parser 突然开始看见 `Comment` token」的风险。
     keep_comments: bool,
 }
@@ -132,18 +144,19 @@ pub struct Lexer {
 ///
 /// v0.104.6 D27：超范围字面量**静默变成 `inf`**。
 ///
-/// 本语言所有裸数字字面量都是 `Value::Float`（本函数的调用点，无 `i`/`f`/
-/// `n` 后缀时统一走 `TokenType::Float`），而 `f64::from_str` 对溢出是
-/// **饱和**的 —— 超出 f64 max（约 1.797e308）时返回 `inf` 而非 `Err`：
+/// 本函数的调用点只有两处 —— 无后缀浮点字面量与带位宽后缀的浮点字面量 ——
+/// 两者都已解析成 `f64`；而 `f64::from_str` 对溢出是**饱和**的 ——
+/// 超出 f64 max（约 1.797e308）时返回 `inf` 而非 `Err`：
 ///
 /// ```text
 /// print(1` + 309 个 0 + `)   # inf，exit 0，无任何提示
 /// print(` + 400 个 9 + `)    # inf，exit 0，无任何提示
 /// ```
 ///
-/// 这与本语言 v0.104.6 D21（BigInt 越 i64 后改走原生大数、**不再静默饱和**）
-/// 直接矛盾：用户能写 `100000000000000000000n` 拿到精确值，却写不出同一个
-/// 数的普通字面量形式 —— 少写一个 `n` 就从精确值变成 `inf`。
+/// ⇒ **字面量必须可表示**：同一个数不该「换个写法就变成 `inf`」。
+/// 需要超出 i64 / f64 表示范围的精确整数时，出路是独立标准库
+/// `std/math/bigint`（纯 Mora 实现），由用户显式 `import` 后在 Mora 代码里
+/// 运算，而不是靠字面量后缀。
 ///
 /// 判据与 Rust 自身一致（`let x = 1e400f64;` 在 Rust 里是编译错误
 /// "literal out of range for f64"）：**字面量必须可表示**。

@@ -1,33 +1,15 @@
-//! v0.75.96: HM 内部 utility 工具——check_union / join_types。
+//! v0.110.0: HM 内部 utility 工具——check_union / join_types。
 //!
-//! ## 背景
-//!
-//! 架构审查报告（v0.75.90）标记「🔴 阻断级风险 4」：
-//! `check_union` / `join_types` 是 Foundation 但被 `hm::unify.rs` 测试
-//! 反向引用——`unify.rs:492-499` 测试代码 `use crate::typeck::check_union;
-//! use crate::typeck::join_types;`，Foundation ↔ Kernel 跨层调用。
-//!
-//! ## 设计
-//!
-//! 这两个 fn 本质是 HM 双向定型（bidirectional）的内部 helper：
+//! `check_union` / `join_types` 是 HM 双向定型（bidirectional）的内部 helper：
 //!   - `check_union` —— 双向 check 模式核心，验证 actual subtype Union(members)
-//!   - `join_types` —— 双向 check 模式 Phase E，合并多 arm body 类型到 Union
+//!   - `join_types` —— 合并多 arm body 类型到 Union（平展嵌套 Union +
+//!     `Any` 短路；`Unknown` 直接短路）
 //!
-//! 抽离到 `crate::typeck::hm::util` 子模块——保持 HM 内部 API，
-//! Foundation (`typeck::mod.rs`) 不再持有这两个 fn。
+//! 两者只依赖 `crate::typeck::Type`（与 `Span`），不持有 HM 状态，因此留在
+//! HM 内部子模块而非 Foundation（`typeck/mod.rs`）—— 保持 `typeck` →
+//! `typeck::hm` 的单向依赖。
 //!
-//! ## 收益
-//!
-//! - `hm::unify.rs` 测试反向引用 Foundation 的问题消除（Kernel 内部）
-//! - HM 内部 helper 集中管理，未来 typeck 重构只动 util 子模块
-//! - 双向路径 `bidirectional.rs::use crate::typeck::join_types` 改路径
-//!   `use crate::typeck::hm::join_types`（语义清晰）
-//!
-//! ## 不变的
-//!
-//! - `check_union` / `join_types` 签名 / 行为完全保持
-//! - 错误归类为 [`MoraError::Typeck`]（`Result<(), MoraError>`）
-//! - 4 个 `check_union_*` 测试 + 1 个 `join_types_*` 测试语义保留
+//! 错误统一归类为 [`MoraError::Typeck`]（`Result<(), MoraError>`）。
 
 use crate::common::Span;
 use crate::error::MoraError;
@@ -139,7 +121,7 @@ mod tests {
     use super::*;
     use crate::common::Literal;
 
-    // ─── check_union 测试（v0.75.86 起在 unify.rs，v0.75.96 迁到 util.rs） ───
+    // ─── check_union 测试 ───
 
     #[test]
     fn check_union_empty_matches_anything() {

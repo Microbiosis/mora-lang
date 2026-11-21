@@ -1,4 +1,12 @@
-//! v0.25: LSP definition provider（跳转定义）。
+//! v0.110.0: LSP definition provider —— 从光标处标识符跳转到其定义处。
+//!
+//! 定位流程：入站 `position` 经 `parsed_doc_v3::pos_of` 收口（负值不回绕）→
+//! `position_to_offset`（UTF-16 → char）→ `ident_at_offset` 取词 → 在 `MirWitness` 树里
+//! 匹配同名 `let` / `fn` 定义。
+//!
+//! 坐标不变式：`Span::line` / `Span::column` 均为 **1-based**（LSP 要求 **0-based**）：
+//! `line` 出站前 `saturating_sub(1)`；`column` 指向整条语句而非标识符，需按标识符
+//! **完整词**双向就近查找定位到标识符本身。出站 `character` 必须是 **UTF-16 码元**。
 
 use std::collections::{BTreeMap, HashMap};
 

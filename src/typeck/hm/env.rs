@@ -1,4 +1,4 @@
-//! v0.53: Type Environment for HM Inference
+//! v0.110.0: Type Environment for HM Inference
 //!
 //! Manages variable-to-type mappings with let-generalization support
 

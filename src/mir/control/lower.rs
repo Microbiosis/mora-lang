@@ -1,4 +1,4 @@
-//! Direct `MirWitness[] -> ControlProgram` lowering (Wave 2 — Stage W2.2).
+//! v0.110.0: Direct `MirWitness[] -> ControlProgram` lowering.
 //!
 //! Compiles `ParserV3`'s syntax witness tree directly into explicit-CFG SSA
 //! [`ControlProgram`] with:
@@ -2584,7 +2584,7 @@ fn lower_call(
     }
 
     // `WitnessCallee::Method(obj, m)` uses `args[0]` as receiver if `args` carries receiver,
-    // or fallback variable `obj` if zero args (mirroring witness_to_fcfg/typeck).
+    // or fallback variable `obj` if zero args (mirroring the typeck side).
     if let WitnessCallee::Method(obj, method) = callee {
         let recv_reg = if args.is_empty() {
             stack.emit_read_var(prog, obj)

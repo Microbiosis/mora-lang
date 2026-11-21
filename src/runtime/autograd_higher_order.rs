@@ -1,9 +1,10 @@
-//! Wave 4 P1: Exact Arbitrary-Order Automatic Differentiation (`backward_tracked` & `forward_jvp_tracked`).
+//! v0.110.0: Exact Arbitrary-Order Automatic Differentiation (`backward_tracked` & `forward_jvp_tracked`).
 //!
-//! Architecture (`AGENTS.md §0`):
+//! Architecture:
 //! - Whenever an inner `grad` / `value_and_grad` / `jvp` tape finishes while one or more outer
 //!   tapes remain active on [`AutogradContext`], VJP and JVP rules are executed using tracked
-//!   [`Tensor`] primitives against the enclosing [`AutogradContext`] (`create_graph = true`).
+//!   [`Tensor`] primitives against the enclosing [`AutogradContext`], so the derivative itself
+//!   is recorded on the outer tape.
 //! - Because every backward/forward rule emits tracked operations onto all enclosing active tapes,
 //!   arbitrary-order derivatives (`grad(grad(f))`, `grad(grad(grad(f)))`), mixed forward-over-reverse
 //!   Hessian-vector products (`jvp(grad(f), x, v)`), reverse-over-forward HVPs
@@ -583,7 +584,7 @@ fn pow_db_tracked(
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// 1. Tracked Reverse-Mode Backward (`create_graph = true`)
+// 1. Tracked Reverse-Mode Backward (derivative recorded on the enclosing tapes)
 // ════════════════════════════════════════════════════════════════════════════
 
 pub(crate) fn backward_tracked(
@@ -976,7 +977,7 @@ pub(crate) fn backward_tracked(
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// 2. Tracked Forward-Mode JVP (`create_graph = true`, e.g. `grad(jvp(f))`)
+// 2. Tracked Forward-Mode JVP (derivative recorded on the enclosing tapes, e.g. `grad(jvp(f))`)
 // ════════════════════════════════════════════════════════════════════════════
 
 pub(crate) fn forward_jvp_tracked(

@@ -1,6 +1,6 @@
 //! v0.87: Lisp homoiconicity 三件套 — gensym / read / macroexpand 测试
 //!
-//! 测试策略：inline 源码风格（不依赖 fixture），每条测试独立构造 Interpreter
+//! 测试策略：inline 源码风格（不依赖 fixture），每条测试独立构造 `CoreRuntime`
 //! 和 Environment。通过 ParserV3::compile → execute + run_main_task 执行，
 //! 将结果存入模块级变量 __result，再从 env 中取出断言。
 //!

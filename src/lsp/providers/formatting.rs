@@ -1,4 +1,15 @@
-//! v0.25: LSP formatting provider（格式化）。
+//! v0.110.0: LSP formatting / rangeFormatting provider —— 基于 lexer token 流的行级重排。
+//!
+//! 本 provider **不消费 AST**（仓库内已无 AST）：`simple_format` 直接消费
+//! `crate::lexer::Lexer` 的 token 流（含注释），逐 token 重建整份文档
+//! （行尾去空白 + 2 空格缩进 + token 间补空格）。
+//!
+//! 两条承重不变式：
+//! - **保行数**：输出与输入的 `\n` 个数必须相等，否则区间切片会取错行；
+//! - **不吞注释**：lexer 必须 `keep_comments(true)`，否则格式化会删光文件里的注释。
+//!
+//! 区间请求（`rangeFormatting`）先格式化**整份**文档、再从中切出请求的行区间，
+//! 返回的 `newText` 恰好是该 range 的替换文本。
 
 use super::parsed_doc_v3;
 use crate::lsp::json::Value;
@@ -28,9 +39,10 @@ pub fn formatting(docs: &HashMap<String, DocumentState>, params: &Value, range: 
         None => return Value::Array(vec![]),
     };
 
-    // 基础格式化：每行按 token 简单重排。
-    // 完整实现需要 AST-aware formatter；这里给一个能工作的最小版本——
-    // 行首/行末去空白 + 一致缩进（2 空格，按 then / for body / task body / do-end 嵌套加 1 层）。
+    // 基础格式化：整份文档按 **lexer token 流** 重排（本仓已无 AST，
+    // 不存在「AST-aware formatter」这条路径）。
+    // 行级最小版本：行尾去空白 + 一致缩进（2 空格，按块开启处嵌套加 1 层，
+    // `end` 闭合层级）+ token 间补空格；不重新决策换行位置。
     //
     // v0.104.6 D202/D203：**整份文档**只格式化一次，区间请求再从结果里切。
     //

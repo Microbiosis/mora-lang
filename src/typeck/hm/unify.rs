@@ -1,4 +1,4 @@
-//! v0.53: Unification Algorithm for HM Type Inference
+//! v0.110.0: Unification Algorithm for HM Type Inference
 //!
 //! Implements the unification procedure to solve type constraints.
 //! Core of HM inference: finds most general unifier (MGU) for two types.

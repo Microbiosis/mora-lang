@@ -121,7 +121,7 @@ fn task_group_structured_concurrency_panic_and_abort_on_drop() {
             // Yield briefly so the spawned task starts polling and installs _guard
             mora::runtime::scheduler::sleep(Duration::from_millis(15)).await;
         }
-        // Poll up to 500ms for tokio runtime to drop the aborted future stack
+        // Poll up to 500ms for the TaskScheduler to drop the aborted future stack
         for _ in 0..50 {
             if aborted.load(Ordering::SeqCst) {
                 break;

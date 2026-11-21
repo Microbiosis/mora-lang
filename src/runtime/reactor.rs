@@ -596,7 +596,7 @@ impl AsyncIoReactor {
         }
     }
 
-    /// Synchronous bridge for executing non-blocking filesystem I/O onto [`Self::run_blocking_io`].
+    /// Synchronous bridge for executing blocking filesystem I/O onto [`Self::run_blocking_io`].
     pub fn run_fs<T, F>(&self, ctx: Option<&TaskContext>, op: F) -> MoraResult<T>
     where
         T: Send + 'static,

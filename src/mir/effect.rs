@@ -1,12 +1,13 @@
-//! v0.78: Effect row type — algebraic effect 的类型表示。
+//! v0.110.0: Effect row 类型 —— 代数效应（algebraic effect）的类型表示。
 //!
 //! 三个变体：
 //! - Empty：无副作用
 //! - Var(name)：row-polymorphic 变量（用于 `forall e.` 的多态）
 //! - Cons(head, tail)：具名 effect 头 + 尾
 //!
-//! 与 typeck/mod.rs::Type::TypeVar 同样的字符命名空间 —
-//! 未来 row unification 与现有 HM 引擎共用 Substitution。
+//! 与 `typeck::Type::TypeVar` 共用类型变量命名空间 —— row unification 已落地于
+//! `typeck::hm::row`（`unify_row` / `bind_row` / `rename_row` / `apply_row`），
+//! 与 HM 求解器共用同一套 `Substitution`。
 
 use std::fmt;
 
@@ -24,7 +25,6 @@ pub enum EffectRow {
 
 impl EffectRow {
     /// 累积一个具名 effect 到 row 中（push 到 Cons 链末尾）。
-    /// 用于 mir/mod.rs::MirFunction::effects 字段的 lowering 填充。
     ///
     /// 已存在同名 label 时返回 false，未追加。
     pub fn extend(&mut self, effect_name: &str) -> bool {
@@ -179,14 +179,14 @@ pub mod ambient {
 // 确定顺序 `merge` 折叠。`merge` 满足结合律（Vec 拼接），因此并发执行的结果
 // 与串行执行逐字节一致 —— 并发成为数据的自然属性，而非需要加锁防御的状态。
 
-/// 目标节点的待投递消息（原在 `checkpoint` 模块）。
+/// 目标节点的待投递消息。
 #[derive(Debug, Clone, PartialEq)]
 pub struct SendTask {
     pub target_node: String,
     pub input: crate::value::Value,
 }
 
-/// Aggregator 贡献记录（原在 `mir::orchestrate` 模块）。
+/// Aggregator 贡献记录。
 #[derive(Debug, Clone, PartialEq)]
 pub struct AggregatorContribution {
     pub name: String,

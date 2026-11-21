@@ -1,23 +1,17 @@
-//! v0.99: ambient random — PRNG 纯值 + ambient effect 操作分发。
+//! v0.110.0: ambient random — PRNG 纯值 + ambient effect 操作分发。
 //!
-//! v0.91 版本是进程级全局状态机：`static Mutex<Xoshiro256>` +
-//! `AtomicBool` 惰性初始化标志 + 时间种子 —— 副作用对类型系统完全不可见
-//! （typeck 视 `random.*` 为纯 `Any`），测试共享全局序列互相干扰，
-//! 并发靠一把进程级互斥锁防御。
-//!
-//! v0.99 数据流化（用数据流代替状态机）：
 //! - **状态是纯值**：`Xoshiro256` 由 [`crate::runtime::core::CoreRuntime`]
-//!   单属主持有（与 `gensym_counter` 同一 v0.95 模式），`&mut self` 线性
-//!   穿线 —— 无锁、无 static、无初始化标志。Clone 按值复制：Pregel worker
-//!   各自独立推进序列，并发从「共享一把锁」变成「值拷贝即隔离」。
+//!   单属主持有（与 `gensym_counter` 同一模式），`&mut self` 线性穿线 ——
+//!   无锁、无 static、无初始化标志。Clone 按值复制：各 worker 各自独立
+//!   推进序列，并发从「共享一把锁」变成「值拷贝即隔离」。
 //! - **副作用是 ambient effect**：`random.<method>(...)` 调用对应
 //!   [`crate::mir::effect::ambient`] 里的标签，运行时由根状态兜底应答，
 //!   用户 `handle random_seed { ... }` 可按动态作用域覆写；
 //!   类型层把调用记入效果行（每操作一个 ambient 签名，签名预置于
 //!   typeck 的 `effect_signatures`）。
 //!
-//! 算法保持 v0.91 语义不变：xoshiro256**（Vigna 2018）+ splitmix64 种子
-//! 派生。零外部依赖；密码学不可用但足够 AI/统计工作。
+//! 算法：xoshiro256**（Vigna 2018）+ splitmix64 种子派生。零外部依赖；
+//! 密码学不可用但足够 AI/统计工作。
 
 use crate::error::{MoraError, MoraResult};
 use crate::value::Value;

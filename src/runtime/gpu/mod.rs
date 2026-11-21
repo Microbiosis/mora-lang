@@ -1,12 +1,12 @@
-//! Wave 4 P2-2: Native Hardware GPU Backend Discovery & Dynamic Driver Loader
+//! v0.110.0: Native Hardware GPU Backend Discovery & Dynamic Driver Loader
 //! (`CUDA Driver API` + PTX JIT, `Vulkan C API` + SPIR-V Compute, `Metal Framework` + MSL).
 //!
-//! Architecture (`AGENTS.md §0`):
+//! Architecture:
 //! - Zero compile-time SDK or Cargo dependencies: dynamically opens OS-provided GPU drivers
 //!   (`nvcuda.dll` / `libcuda.so.1`, `vulkan-1.dll` / `libvulkan.so.1` / `libMoltenVK.dylib`,
 //!   `/System/Library/Frameworks/Metal.framework/Metal`) at runtime via `LoadLibraryA` / `dlopen`.
-//! - When real hardware GPUs are detected, `backend_for_device(&Device)` dispatches compute graphs
-//!   directly onto hardware VRAM & native GPU kernels.
+//! - When real hardware GPUs are detected, `crate::runtime::compute_dag::backend_for_device`
+//!   dispatches compute graphs directly onto hardware VRAM & native GPU kernels.
 //! - When no GPU driver is present (e.g. headless CPU CI runners) or `MORA_FORCE_CPU_EMULATION=1`
 //!   is set, cleanly falls back to `EmulatedDeviceBackend` without crashing.
 

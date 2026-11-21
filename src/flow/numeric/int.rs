@@ -1,4 +1,4 @@
-//! v0.104.6 D468：精确 i64 数值域（v0.110.0 起 `BigInt` 已下沉至独立标准库 `std/math/bigint`）。
+//! v0.110.0: 精确 `i64` 数值域（`numeric::int`）—— checked 算术，溢出一律报错。
 //!
 //! ## 为什么单独成域
 //!
@@ -79,7 +79,7 @@ pub fn pow(a: i64, b: i64) -> Result<i64, MoraError> {
 /// 精确整数除法：向零截断，除零报错，`i64::MIN / -1` 溢出报错。
 ///
 /// 向零截断是 Rust 的 i64 `/` 语义（`-7 / 2 == -3`），
-/// 与 BigInt 域的 `num_bigint` 行为一致（D19 修的就是这两者的分叉）。
+/// 与 `std/math/bigint.mora` 大整数域的向零截断行为一致。
 pub fn div(a: i64, b: i64) -> Result<i64, MoraError> {
     if b == 0 {
         return Err(MoraError::Other("division by zero".to_string()));

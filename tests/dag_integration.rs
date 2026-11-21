@@ -1,4 +1,5 @@
-//! W2.3: Control SSA VM integration tests (replacing legacy DAG interpreter tests).
+//! W2.3: Control SSA VM integration tests (replacing the legacy DAG-interpreter
+//! tests, whose execution stack was removed in v0.110.0).
 //!
 //! Verifies that `execute_program` and `run_main_task` execute real programs cleanly.
 

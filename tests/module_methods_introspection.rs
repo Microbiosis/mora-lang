@@ -24,7 +24,7 @@
 //! 的形式**内嵌**在两处：
 //!
 //! - `typeck::dispatch::module_method_signature`（当时的 900 行查表函数）
-//! - `interpreter::builtins::<mod>.rs::call_<mod>_method`
+//! - `interpreter::builtins::<mod>.rs::call_<mod>_method`（**历史** 路径；今为 `runtime::builtins::<mod>.rs`）
 //!
 //! 要让 `methods_of` 报出真名，得把 900 行查表**重构成表驱动**（再由查表同时
 //! 提供签名与枚举）。这是**重构**而非窄修复，动的是核心 typeck 路径，

@@ -1,4 +1,4 @@
-//! v0.92: Value 方法分派（list/dict/builtin/string）。
+//! v0.110.0: Value 方法分派（list/dict/builtin/string；数值方法转交 `numeric`）。
 
 use std::collections::HashMap;
 
@@ -7,7 +7,7 @@ use crate::error::{MoraError, MoraResult};
 use crate::value::list::List;
 use crate::value::{BuiltinKind, Value};
 
-/// Evaluate pure (non-callback, non-ambient) list methods without holding `&mut Interpreter`.
+/// Evaluate pure (non-callback, non-ambient) list methods without holding a mutable runtime reference.
 pub(crate) fn call_method_list_pure(
     list: List,
     method: &str,
@@ -187,7 +187,7 @@ fn call_method_list_inner(list: List, method: &str, args: &[Value]) -> MoraResul
             //
             // 全部 **exit 0、零提示**，返回一个用 null 补齐的伪矩阵 ——
             // 下游任何按长度/形状算的代码都会拿到垃圾而不自知。
-            // 「二维列表」按惯例即各行等长，spec §1060 `.transpose() -> list`
+            // 「二维列表」按惯例即各行等长，spec §1109 `.transpose() -> list`
             // 也未承诺补齐语义，故按不规则即报错处理。
             let ncols = rows.first().map(|r| r.len()).unwrap_or(0);
             if rows.iter().any(|r| r.len() != ncols) {
@@ -240,9 +240,10 @@ fn call_method_list_inner(list: List, method: &str, args: &[Value]) -> MoraResul
             // 做聚合（`sum` / 循环累加）的代码都会拿到**错误的数**。
             //
             // 为什么这不是「设计」：
-            // - `docs/learning-plan.md:166` 写的是「元素按 ravel 顺序复制，
-            //   **不足则循环重复**」—— 方向是「补」，从未说「多就丢」；
-            // - `docs/mora-spec.md:1068` 只说「重塑列表」；
+            // - `docs/learning-plan.md:53` 写的是「元素按 ravel 顺序复制，
+            //   不足则循环重复，但多出元素绝不静默丢弃（报错拦截）」——
+            //   方向是「补」，从未说「多就丢」，反而明文禁止静默丢弃；
+            // - `docs/mora-spec.md:1110` 只说「重塑列表」；
             // - `tests/list_methods.rs` 的 6 条 reshape 判据全是「恰好」
             //   或「填充」，**无一条覆盖截断**；
             // - numpy / Julia 的 `reshape` 在 size 不匹配时**报错**。

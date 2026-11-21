@@ -1,6 +1,6 @@
-//! Canonical explicit-CFG Control SSA IR (`ControlProgram` / `ControlFunction`).
+//! v0.110.0: Canonical explicit-CFG Control SSA IR (`ControlProgram` / `ControlFunction`).
 //!
-//! Design principles (Wave 2 — Stage W2.2):
+//! Design principles:
 //! - Explicit `BasicBlock`s + `BlockParam`s + structured `ControlTerminator`s:
 //!   no linear pc jump patching, no fragile Phi edge reconstruction, no fake
 //!   `Label` / `JumpExit` workarounds.

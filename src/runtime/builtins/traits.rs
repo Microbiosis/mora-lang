@@ -1,8 +1,9 @@
-//! Trait 分发机制
+//! v0.110.0: Trait 分发机制。
 //!
-//! 从 interpreter/mod.rs 提取的 trait 相关方法：
-//! - dispatch_trait_method: dyn dispatch，沿 trait 继承链找 impl 调用
-//! - construct_trait_instance: Trait::new("ForType") 构造 trait instance
+//! - `resolve_trait_method_call`: dyn dispatch，沿 trait 继承链找 impl 调用
+//! - `resolve_concrete_impl_method`: 具体类型上的 inherent / trait impl 方法查找
+//! - `construct_trait_instance_core`: `Trait::new("ForType")` 构造 trait instance
+//! - `collect_required_methods` / `collect_parent_traits`: trait 继承链辅助
 
 use std::collections::HashMap;
 

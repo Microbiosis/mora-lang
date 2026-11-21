@@ -60,7 +60,7 @@ pub enum E2eResult {
 /// 因此我们用 in-memory buffer + 替换 print 实现：
 /// print(x) 走 builtin dispatch → 流式输出由 Runtime 控制。
 ///
-/// 注：v0.55+ Interpreter 的 print 调用 stdout 全局（println! 风格）。
+/// 注：v0.55+ 内建 `print` 走 stdout 全局（println! 风格）。
 /// 测试用 std::process 的方式是脆弱的 — 我们用 env var 或 capture helper。
 /// 当前实现：直接跑原流程，让 stdout 走测试框架；E2E 测试断言
 /// `result.last_expr.to_string()`（module-level 最后表达式）。

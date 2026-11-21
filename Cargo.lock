@@ -4,4 +4,4 @@ version = 4
 
 [[package]]
 name = "mora"
-version = "0.110.0"
+version = "0.110.1"

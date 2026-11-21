@@ -1,9 +1,12 @@
-//! Stackful builtin, method, callable-value, and dynamic-lookup resolution (Wave 2 — Stage W2.3).
+//! v0.110.0: Stackful builtin, method, callable-value, and dynamic-lookup resolution.
 //!
 //! Pure builtins and value methods delegate directly to the canonical shared helpers in
 //! `crate::runtime::builtins::{impls, method, traits}`. Higher-order combinators, closures,
 //! continuations, ambient random effects, `eval`, and `macroexpand` yield [`CallAction`] descriptors
 //! executed iteratively by [`super::engine::VmEngine`] on its explicit heap call stack.
+//!
+//! Every stackful call is expressed as a [`CallAction`] descriptor rather than as a nested
+//! Rust call, so resolution itself never grows the C stack.
 
 use std::sync::Arc;
 
@@ -22,7 +25,7 @@ use crate::value::{BuiltinKind, MODULE_OBJECTS, StructDefRuntime, Value};
 
 use super::continuation::{CombinatorFrame, ScriptFrame, materialize_frame_named};
 
-/// Asynchronous or stackful call dispatch action returned by builtin/callee resolution.
+/// Deferred or stackful call dispatch action returned by builtin/callee resolution.
 pub enum CallAction {
     /// Immediate synchronous return value.
     Done(Value),
@@ -958,7 +961,7 @@ pub fn resolve_method_call_named(
     named_args: Vec<(String, Value)>,
     call_site: Span,
 ) -> MoraResult<CallAction> {
-    // Stage 3C: Tensor methods run with live autograd tape tracking first, then fall back to user impls.
+    // Tensor methods run with live autograd tape tracking first, then fall back to user impls.
     if let Value::Tensor(ref t) = receiver {
         if named_args.is_empty() {
             match crate::value::tensor::call_tensor_method_tracked(
@@ -985,7 +988,7 @@ pub fn resolve_method_call_named(
         }
     }
 
-    // Stage 3C: Nominal struct type & instance dispatch (field access, inherent/trait impls, schema/tags).
+    // Nominal struct type & instance dispatch (field access, inherent/trait impls, schema/tags).
     match &receiver {
         Value::StructType(def) => {
             let def = Arc::clone(def);
@@ -2629,7 +2632,7 @@ pub fn resolve_dyn_call_named(
             .map(CallAction::Done);
     }
 
-    // Stage 3C: Associated calls `Type::member(...)` for nominal structs, enums, and inherent impls.
+    // Associated calls `Type::member(...)` for nominal structs, enums, and inherent impls.
     if let Some((type_name, member)) = name.split_once("::") {
         if let Some(sdef) = core.struct_registry.get(type_name).cloned() {
             match member {

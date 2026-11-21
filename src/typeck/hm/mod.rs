@@ -1,15 +1,11 @@
-//! v0.55: Hindley-Milner Type Inference for MirWitness.
+//! v0.110.0: 基于 MirWitness 的 Hindley-Milner 类型推断引擎。
 //!
-//! This module is the MirWitness-native replacement of the ast_v2-based
-//! `typeck::check_program` pipeline. The earlier v0.53 prototype still
-//! referenced `NodeId` / `AstArena` and silently no-op'd any closure type
-//! check because `Type::Closure` is a unit variant. The current rewrite
-//! drives inference directly off `&MirWitness`, tracks closure signatures in
-//! a side table keyed by a fresh `Type::TypeVar`, and covers every
-//! `WitnessKind` variant.
+//! 推断直接消费 `&[MirWitness]`（parse 层产出的 witness 树），并覆盖
+//! `WitnessKind` 的每个变体。闭包与函数以柯里化的 `Type::Arrow` 表示；
+//! 闭包的参数规格与效果行按定义 span 登记在 `closure_param_specs` /
+//! `closure_rows`。
 //!
-//! Public entry point: `check_program_mir` (re-exported from
-//! `crate::typeck`).
+//! 入口：[`crate::typeck::check_mir::check_program_witnesses`]。
 
 use std::collections::{HashMap, HashSet};
 
@@ -2174,18 +2170,15 @@ impl HMInference {
                 let row = self.merge_rows(row, r3, expr.span);
                 Ok((Type::Nil, row))
             }
-            // v0.55: top-level declarations — no scalar result type.
+            // 顶层声明：本身不产生标量结果类型。
             //
-            // v0.103: AppDef 从本组移出（见下方独立分支）—— 它必须在 env 中
-            // 注册 app 名（运行时 h_app_def 会注册 Value::TeaApp，typeck 此前
-            // 不注册 → `app Counter ... end` 后的 `Counter` 被判 Unbound
-            // variable），并推断真实的 update/view 体。
-            // v0.104.6 D274：**`MacroDef` 已移出本组** —— 它此前与
-            // `TypeAlias`/`EnumDef`/`StructDef`/`Import` 并列返 `Nil`，
-            // 但那四者都是**纯类型声明**（无子表达式），而宏体是**活表达式**，
-            // 于是 `macro m() 1 + "str" end` 的类型错与未绑定变量**双双静默**
+            // `TypeAlias` / `Import` 是**纯类型声明**（无子表达式）⇒ 返 `Nil`。
+            // `MacroDef` 则**不**与它们并列：宏体是**活表达式**，若按纯声明处理，
+            // 宏体内的类型错与未绑定变量会**双双静默**
             // （实测：宏体内 `1 + "str"` → `1.0str` exit 0；`nosuchvar` → exit 0）。
-            // 现路由到 `infer_macro_def`（转调 `infer_fn_def`）。
+            // 故它路由到 `infer_macro_def`（转调 `infer_fn_def`）。
+            // `StructDef` / `EnumDef` / `TraitDef` / `ImplDef` 各自有独立的
+            // 推断入口（见下方分支），会把字段/变体/方法体的类型一并检查。
             WitnessKind::TypeAlias { .. } | WitnessKind::Import(_) => {
                 Ok((Type::Nil, crate::mir::effect::EffectRow::Empty))
             }

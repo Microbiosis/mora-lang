@@ -1,6 +1,10 @@
 //! v0.104.6 D82：`let x: dyn Trait = <普通值>` **整条路径走不通** ——
 //! emit 侧做了强制转换，typeck 却没算这一步。
 //!
+//! ⚠ **历史快照**：下文提到的 `MirInst::DynTrait` 属**已删除**的旧 MIR
+//! （`MirInst` 已于 v0.110.0 随 9 层 IR 一并删除）；今天前端直接产出 `MirWitness`，
+//! `dyn Trait` 强制转换由 `src/parser_v3/emit_definitions.rs` 与 `src/runtime/vm/` 承接。
+//!
 //! ## 现象（修前）
 //!
 //! ```mora

@@ -1,6 +1,6 @@
-//! ParserV3 语法辅助子系统（自 parse.rs 迁出，P1.4 拆分）。
+//! v0.110.0: `ParserV3` 语法辅助子系统（模式 / 类型注解解析）。
 //!
-//! 这些方法直接产出 `MirWitness`（witness-native），不再经 MirExpr 桥接：
+//! 这些方法直接产出 `MirWitness`（witness-native），零 AST 中间层：
 //! - `parse_pattern` / `try_parse_literal_pattern` — 模式匹配
 //! - `parse_type_annotation` / `parse_single_type_annotation` — 类型注解（含 union / 泛型）
 

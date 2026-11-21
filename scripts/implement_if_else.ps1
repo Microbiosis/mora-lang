@@ -1,5 +1,6 @@
 #!/bin/bash
 # Script to add if/else implementation to Parser V3 and MirExpr
+# ⚠ 历史脚本（v0.54 一次性实现用），已不可再运行：目标是 `src/mir/expr.rs` 与 `MirExpr` / `MirExprKind`，而旧 MIR 栈与 `src/interpreter/` 已于 v0.110.0 全部删除；当前解析器直接在 `src/parser_v3/emit.rs` 产出 `MirWitness`，`if/else` 由 `emit_if_w` 处理。保留本脚本仅供追溯当时的手工改法。
 
 echo "=== Implementing If/Else Expressions for v0.54 ==="
 

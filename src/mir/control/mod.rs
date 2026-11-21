@@ -1,4 +1,4 @@
-//! Canonical explicit-CFG Control SSA IR & optimization subsystem (Wave 2 — Stage W2.2).
+//! v0.110.0: Canonical explicit-CFG Control SSA IR and optimization subsystem.
 //!
 //! Pipeline:
 //! `MirWitness[] -> control::lower::lower_program -> ControlProgram -> control::opt::optimize_program`

@@ -1,5 +1,12 @@
 //! v0.104.6 D361 —— `index_value` 边界矩阵 + **索引赋值整条链路是死代码**（否定轮，无产品变更）
 //!
+//! ⚠ **历史快照**：下文引用的 `src/mir/handlers/`、`h_index` / `h_index_assign`、
+//! `mir/vm.rs` 与 `MirInst::IndexAssign` 均属**已退役**的 9 层 IR（随 v0.110.0
+//! 一并删除）。现存链路是 `WitnessKind::IndexAssign` → `ControlInst::IndexAssign`
+//! （`src/mir/control/ir.rs`）→ `runtime::vm::value_ops::index_assign_value`；
+//! 索引读取侧则是 `runtime::vm::value_ops::index_value` / `checked_index`。
+//! 结论（赋值链路源码层不可达）至今成立。
+//!
 //! D360 扫完 `src/mir/handlers/` 的 panic 面后，本轮钉 `values.rs` 的
 //! 索引面（`h_index` / `h_index_assign` → `mir/vm.rs` 的
 //! `index_value` / `index_assign_value`）。
@@ -19,9 +26,9 @@
 //!
 //! ## 索引**赋值**：**整条链路是死代码**
 //!
-//! `WitnessKind::IndexAssign` → `MirInst::IndexAssign` → `h_index_assign`
-//! → `index_assign_value` 在 `src/mir/` 与 `src/typeck/` 共 **23 个文件
-//! 54 处**都有定义与传递，**但 `src/parser_v3/` 零构造** ——
+//! `WitnessKind::IndexAssign` → `MirInst::IndexAssign`（**历史**指令名）→
+//! `h_index_assign` → `index_assign_value` 在 `src/mir/` 与 `src/typeck/` 共
+//! **23 个文件 54 处**都有定义与传递，**但 `src/parser_v3/` 零构造** ——
 //! **没有任何语法能产生它**。
 //!
 //! 实测四种候选写法全部不可达：

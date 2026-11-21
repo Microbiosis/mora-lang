@@ -1,7 +1,6 @@
-//! v0.92: Definition emit methods extracted from parser_v3/emit.rs (P1.3 split).
+//! v0.110.0: `ParserV3` 顶层与局部定义解析子模块（自 `parser_v3/emit.rs` 拆分）。
 //!
-//! emit.rs 是 2200+ 行巨型 impl ParserV3 block（P0 时期遗留）。
-//! 这里拆出定义类 emit 方法（let/task/return/type/enum/struct/app/closure_mir）。
+//! 承载 `let`、`task`、`return`、`type`、`enum`、`struct`（含 `@tag`）、`trait`、`impl` 与闭包定义的语法解析与 Witness 生成。
 //!
 //! 这些方法全部是 `impl ParserV3` 的固有方法——Rust 允许 impl 块在多个文件中
 //! 按模块拆分，只要都在 crate 内声明（见 `parser_v3/mod.rs`）。
@@ -11,8 +10,8 @@ use super::*;
 impl ParserV3 {
     /// v0.98: 显式 effect 签名声明 —— `effect Name(Hint, ...): Hint`。
     ///
-    /// 纯类型层契约：不产任何 MirInst（效果签名只被 typeck 消费 ——
-    /// perform 位点校验、handler `__arg0..N` 类型化、结果类型静态化）。
+    /// 纯类型层契约：只被 typeck 消费（perform 位点校验、handler `__arg0..N`
+    /// 类型化、结果类型静态化）。
     /// 返回标注用 `:` 风格（与 task 返回标注一致）；缺省 = Any
     /// （仅声明载荷契约，结果多态）。
     pub(super) fn emit_effect_sig_w(&mut self) -> Option<MirWitness> {
@@ -106,8 +105,6 @@ impl ParserV3 {
         let v_w = self.emit_expr_w()?;
         // v0.85: `let x: dyn Trait = v` — 自动产生 `WitnessKind::DynTrait`
         // coercion，把 plain value 包装为 Value::TraitObject（§3.5 spec 承诺）。
-        // v0.104.6 D474：原先是 (reg, witness) 二元组（reg 供
-        // `MirInst::DynTrait` 发射）；parser 只产 witness 后降为单值。
         let final_v_w = if let Some(crate::typeck::Type::TraitObject {
             trait_name,
             generics,
@@ -152,14 +149,13 @@ impl ParserV3 {
     /// 变量，紧接着 `acc = acc + i` 走「裸赋值」分支。后果分三档：
     ///   ① typeck 报 `Unbound variable 'assign'`（顶层、task 体内均如此）；
     ///   ② 仅当该语句位于**循环体**内时，循环体的类型检查此前是 v0.55 桩
-    ///      （见 `infer_expr` 的 Loop/While 分支）而被跳过，于是「看似可用」，
-    ///      实际靠运行期 DAG 按名字写环境掩盖；
+    ///      （见 `infer_expr` 的 Loop/While 分支）而被跳过，于是「看似可用」；
     ///   ③ 语义上多读一个不存在的变量，且 witness 树里多一个假的
     ///      `Variable("assign")` 节点（`child_witnesses` 遍历者都会看到）。
     ///
     /// 现在按 spec 形状解析：`assign` → 标识符 → `=` → 表达式，
-    /// 产出 `MirInst::Assign` + `WitnessKind::Assign`（与裸赋值同一 IR 契约，
-    /// 目标必须是已绑定名字，由 `infer_assign` 校验）。
+    /// 产出 `WitnessKind::Assign`（与裸赋值同一契约，目标必须是已绑定名字，
+    /// 由 `infer_assign` 校验）。
     pub(super) fn emit_assign_w(&mut self) -> Option<MirWitness> {
         let span = self.span_of_current();
         self.advance(); // 'assign'
@@ -344,8 +340,8 @@ impl ParserV3 {
         match token {
             TokenType::Return => {
                 // v0.104.6 D42：`return` 只在函数体里有意义。判据用
-                // `is_program_top`（程序顶层是唯一不属于任何函数体的寄存器
-                // 空间），与下方 `break`/`continue` 的 `loop_stack` 守卫同款。
+                // `is_program_top`（程序顶层是唯一不属于任何函数体的作用域），
+                // 与下方 `break`/`continue` 的 `parse_loop_depth` 守卫同款。
                 //
                 // 修前的实测（真实 CLI `mora run`，**全部 exit 0、零提示**）：
                 //
@@ -355,7 +351,7 @@ impl ParserV3 {
                 // print(999)   → 从不执行
                 // ```
                 //
-                // `if` / `for` / `with` 的体同样内联在程序顶层，故
+                // `if` / `for` 的体同样内联在程序顶层，故
                 // `if c == 1 then return 7 end` + `print(888)` 也会把 888 吞掉。
                 // 用户写「提前返回」却看到程序「成功结束」，与 D35
                 // （`let r = handle …` 让其后所有语句静默消失）同族。
@@ -376,13 +372,9 @@ impl ParserV3 {
                     return None;
                 }
                 self.advance();
-                // v0.102 修复：`return <expr>` 必须返回**表达式的求值寄存器**。
-                // 此前硬编码 `map(|_| 0)` —— 丢弃 emit_expr_w 的结果寄存器，
-                // 一律返回 reg 0。单表达式体（`task f(n) return n*n`）中函数
-                // 首参恰好落在 reg 0 而掩盖了缺陷；一旦表达式含多条指令
-                // （如 `return n + 100i`，n 在 reg 0、结果在 reg 2），就返回
-                // 了错误的值（实为第一个操作数）。与 `break`/`continue` 的
-                // 寄存器获取方式对齐：取真实结果寄存器。
+                // `return <expr>` 的值 = 该表达式的求值结果（witness 侧直接带上
+                // 该表达式，不硬编码任何常量 —— 硬编码会在多操作数表达式上
+                // 返回错误的值）。
                 let value = if self.check(&TokenType::Newline)
                     || self.check(&TokenType::RBrace)
                     || self.is_at_end()
@@ -404,11 +396,11 @@ impl ParserV3 {
                     String::new()
                 };
                 // v0.104.6 D474：判据从「IR 的 `loop_stack`」改成「解析期的
-                // 循环深度」（`EmitContext::parse_loop_depth`）。
+                // 循环深度」（`ParserScope::parse_loop_depth`）。
                 //
                 // 「循环外 break 是错误」是**解析语义** —— 判的是源码位置，
                 // 与 IR 的跳转标签无关。此前它借 `loop_stack`（IR 标签栈）当
-                // 「是否在循环内」的标记；parser 不再发射 MirInst 后那个栈在
+                // 「是否在循环内」的标记；parser 不再发射指令后那个栈在
                 // parser 侧永远为空，合法写法里的 `break` 一律被拒。
                 //
                 // 深度记在 `ParserScope` 里 ⇒ 嵌套的函数体（task / closure /

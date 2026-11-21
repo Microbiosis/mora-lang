@@ -1,8 +1,8 @@
 [package]
 name = "mora"
-version = "0.110.0"
+version = "0.110.1"
 edition = "2024"
-# v0.51: build.rs 注入 MORAGIT_VERSION 给编译期 env!() 用
+# build.rs 从 Cargo.toml 读取 CARGO_PKG_VERSION 并注入 MORAGIT_VERSION 环境变量
 build = "build.rs"
 authors = ["Mora contributors"]
 description = "An AI-native statically-typed language for native neural networks, compute graphs, and cloud-native services"
@@ -22,16 +22,16 @@ path = "src/main.rs"
 name = "mora-lsp"
 path = "src/bin/lsp.rs"
 
-# v0.110.0: 单二进制 `mora`（加 `mora-lsp`）；HTTP/MCP 等扩展包后续拆入独立标准库包。
+# v0.110.0: 核心二进制 `mora` 与 `mora-lsp`；纯 Mora 标准库（`std/math/bigint.mora`、`std/testing.mora`、`std/net/http.mora`、`std/mcp.mora`）内嵌于 `mora::resolve_std_module`。
 
 [dependencies]
-# v0.110.0+: 生产环境零外部第三方依赖（OS FFI、Futex 同步原语、多线程 Future 调度器、时间轮与非阻塞 TCP Reactor 均自研内建）。
+# v0.110.0: 生产环境零外部第三方依赖（OS FFI、Futex 同步原语、多线程 Future 调度器、最小堆定时器与非阻塞 TCP Reactor 均自研内建）。
 
 [dev-dependencies]
-# v0.110.0+: 测试环境同样零外部第三方依赖（属性测试由 std/testing.mora 与确定性 SplitMix64 生成器自研内建）。
+# v0.110.0: 测试环境同样零外部第三方依赖（属性测试由 std/testing.mora 与确定性 SplitMix64 生成器自研内建）。
 
 [features]
-# v0.110.0: 统一单引擎执行（CFG-SSA MIR + stackful VM + Tokio TaskScheduler / AsyncIoReactor），
+# v0.110.0: 统一单引擎执行（ControlProgram SSA IR + 堆帧状态机 VM + 零依赖自研 TaskScheduler / AsyncIoReactor），
 # 无可切换的遗留 JIT 或持久化环境 feature gate。
 
 # v0.104.6 D470：debug 构建的调试信息降档 —— 治「D 盘被编译产物吃满」。

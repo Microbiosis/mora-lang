@@ -97,7 +97,7 @@ pub struct StructField {
     pub tags: Vec<(String, String)>,
 }
 
-/// 编译期结构体完整元信息（供 `Struct::schema()` / `std/json` / `std/mcp` 消费）
+/// 编译期结构体完整元信息（供 `Struct::schema()` / `std/mcp` 消费）
 #[derive(Debug, Clone, PartialEq)]
 pub struct StructDefInfo {
     pub name: String,

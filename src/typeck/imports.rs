@@ -1,4 +1,4 @@
-//! v0.75.18: 跨模块 import 符号表。
+//! v0.110.0: 跨模块 import 符号表（typeck 阶段预扫描与合并）。
 //!
 //! typeck 阶段预扫描顶层 `import "path"` 语句，递归解析目标文件（visited
 //! 集合防环），提取其顶层符号类型并合并进 HM env — 引用 import 的符号不再
@@ -10,8 +10,8 @@
 //! 精度方案：模块自身的 `let` 绑定类型由该模块的 HM 推断产出（含
 //! let-generalization）；`task`/`struct`/`enum`/`type` 等显式声明按名称登记
 //! （这些名称不进 HM env，只有 let 绑定才进）。合并前做 sanitize：闭包身份
-//! TypeVar / 未解析 TypeVar 退化为 `Closure`/`Any`，避免跨模块 closure_sigs
-//! 侧表键冲突。
+//! TypeVar / 未解析 TypeVar 退化为 `Closure`/`Any`，避免闭包身份在跨模块
+//! 比较时无法匹配。
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -142,8 +142,7 @@ impl ImportedModuleSymbols {
 /// `pre` 是嵌套 import 已收集的符号，先合并进本模块 HM env —— 这样模块
 /// 自己的 `let` 引用其 import 的符号时也能正确推断（传递 import 支持）。
 ///
-/// v0.75.40: 消费 MirWitness（parse 层直接产出；exprs 版由 check_program_mir
-/// 桥接 from_exprs 后进入本函数，单一实现）。
+/// 消费 MirWitness（parse 层直接产出 witness，唯一实现）。
 fn extract_module_symbols(
     witnesses: &[MirWitness],
     nested: &ImportedModuleSymbols,

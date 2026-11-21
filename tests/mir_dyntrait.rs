@@ -1,8 +1,13 @@
-//! DynTrait MIR 路径测试 (v0.77 重命名自 tier0_dyntrait.rs)
+//! DynTrait 路径测试 (v0.77 重命名自 tier0_dyntrait.rs)
 //!
-//! v0.77 重构：删除 4 个 source-grep 静态合约测试（MirInst::DynTrait 存在性、
+//! v0.77 重构：删除 4 个 source-grep 静态合约测试（`MirInst::DynTrait` 存在性、
 //! lower_expr 处理 ExprKind::DynTrait、handlers 构造 TraitObject、lexer 支持
 //! as/dyn 关键字 — 任何重命名都会假阳性断裂）。保留 2 个 runtime 测试。
+//!
+//! ⚠ **历史说明**：上文的 `MirInst::DynTrait` 属**已退役**的 9 层 IR（v0.110.0
+//! 删除）。现存链路是 `WitnessKind::DynTrait`（`src/mir/witness.rs`）→
+//! `ControlInst::MakeDynTrait`（`src/mir/control/ir.rs`）→ 构造
+//! `Value::TraitObject`。
 //!
 //! α.12 验证 DynTrait cast 表达式从 parser → lowering → interp 完整链路，
 //! 构造 Value::TraitObject 包内嵌 expr。

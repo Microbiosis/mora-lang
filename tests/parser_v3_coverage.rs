@@ -1,6 +1,7 @@
 //! Parser V3 语法覆盖率测试（v0.110.0: witness 路径）
 //!
-//! 直接验证 Parser V3 对以下语法的解析能力（不经过 AST v2 / MirExpr）：
+//! 直接验证 Parser V3 对以下语法的解析能力（不经过 AST v2 / MirExpr ——
+//! 两者均已于 v0.110.0 删除，前端现在直接产出 `MirWitness`）：
 //! - `expr as dyn Trait<args>`  (DynTrait)
 //! - `obj.method(args)`         (MethodCall)
 //! - `expr[idx]`                (Index)

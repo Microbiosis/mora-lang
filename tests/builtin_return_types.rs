@@ -12,8 +12,8 @@
 //!
 //! ## 根因
 //!
-//! `Interpreter::new()`（`interpreter/mod.rs:495-511`）把 7 个内建一起 define
-//! 进 globals：
+//! `Interpreter::new()`（**历史** `src/interpreter/mod.rs:495-511`；v0.110.0 已解散，
+//! 当时把 7 个内建一起 define 进 globals（**历史**；今运行期按名解析：`runtime/builtins/registry.rs::RUNTIME_BUILTIN_NAMES` + `mir/control/ir.rs::BuiltinFnId`）
 //!
 //! ```text
 //! print  range  len  compose_prompt  tail  compress  crush_json
@@ -25,7 +25,7 @@
 //! 与 D67 是同一类后果，但成因不同：D67 是「类型没算出来」，这里是
 //! **「压根没查表」**。
 //!
-//! 四个的运行期返回类型逐个核对过（`builtin_impls.rs`）：
+//! 四个的运行期返回类型逐个核对过（**历史** `builtin_impls.rs`，今 `runtime/builtins/impls.rs`）：
 //! `compress` → `compress_top` 两条 `Ok` 都是 `Value::String`；
 //! `crush_json` → `Ok(Value::String(...))`；`tail` → `Ok(Value::String(tail_str))`；
 //! `compose_prompt` → `Ok(Value::String(buf))`。**全部是 String。**

@@ -88,7 +88,7 @@ fn e1_block_if_else_tail_on_else_path() {
     );
 }
 
-// ── 形态 3：裸 `if`（无 else，隐式 else 由 fcfg_lower 物化）─────────────
+// ── 形态 3：裸 `if`（无 else，隐式 else 由**历史** `fcfg_lower` 物化；该文件已于 v0.110.0 删除）─────────────
 
 /// 无 else 的 if 走 then：汇合点只能经 `Jump` 到达。
 #[test]

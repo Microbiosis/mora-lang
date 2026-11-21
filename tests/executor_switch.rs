@@ -1,9 +1,11 @@
-//! v0.90.3: 执行器切换验证 — compile_and_opt（生产编译入口）返回的
-//! MirFunction 必须可执行且语义正确。
+//! v0.90.3: 执行器切换验证 — 生产编译入口返回的程序必须可执行且语义正确。
 //!
-//! compile_and_opt 在 9 层差分绿时返回管线产出的 MirFunction
-//!（witness→FCFG→lower_fcfg→apply_rules），红时回落 emit.rs 直出。
-//! 本测试走完整生产路径（compile_and_opt → execute）断言执行结果。
+//! ⚠ **历史快照**：本文件头原描述的是「9 层差分绿时返回管线产出的
+//! `MirFunction`、红时回落 `emit.rs` 直出」的双路径 —— 该 9 层 IR 与差分
+//! 回落机制已于 **v0.110.0** 全部删除。今天**只有一条**编译路径：
+//! `ParserV3::compile → MirWitness[] → mir::control::lower_program → ControlProgram`
+//! → `optimize_program`。
+//! 本测试走完整生产路径（`compile_and_opt` → `execute_program`）断言执行结果。
 
 use mora::runtime::CoreRuntime;
 use mora::runtime::vm::{execute_program, run_main_task};

@@ -1,6 +1,12 @@
 //! v0.104.6 D278：quasiquote 的 `,,splice` 标记在 witness 层**丢失**
 //! ⇒ 9 层路径把它渲染成 `List([…])`（**已修**）
 //!
+//! ⚠ **历史快照**：下文的「9 层路径」指 v0.104.6 的 9 层 IR 管线
+//! （`mir/witness_to_fcfg.rs` / `mir/fcfg_lower.rs` / `mir/ehir_to_core.rs`），
+//! 已于 **v0.110.0** 全部删除。当前唯一管线为
+//! `ParserV3::compile → MirWitness[] → mir::control::lower_program → ControlProgram`
+//! → `typeck::check_mir::check_program_witnesses` → `runtime::vm::execute_program`。
+//!
 //! ## 原缺陷（D277/D278）
 //!
 //! `tests/fixtures/e2e/quasiquote.mora` 的 `` `,,items `` 在 9 层路径下输出

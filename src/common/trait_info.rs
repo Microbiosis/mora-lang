@@ -1,16 +1,7 @@
-//! v0.84 Phase 5: Trait 注册条目与方法签名。
+//! v0.110.0: Trait 注册条目与方法签名（位于 `common/` 基础层，供 `parser_v3`、`mir`、`typeck` 与 `runtime` 共享）。
 //!
-//! 原先在 `runtime/types.rs` 中定义，但 `mir/host.rs` 和 `mir/handlers.rs`
-//! 同时引用——造成 `mir/` → `runtime/` 的架构耦合。下沉到 `common/` 后，
-//! `mir/` 和 `runtime/` 各自依赖 `common/`，互不依赖。
-//!
-//! 依赖关系（修复前）:
-//!   mir/ → runtime/ (仅因 TraitInfo/TraitMethodSig)
-//!
-//! 依赖关系（修复后）:
-//!   mir/ → common/ (TraitInfo/TraitMethodSig)
-//!   runtime/ → common/ (TraitInfo/TraitMethodSig)
-//!   mir/ 与 runtime/ 互不依赖
+//! 分层关系：
+//!   `parser_v3` / `mir` / `typeck` / `runtime` → `common` (`TraitInfo` / `TraitMethodSig`)
 //!
 //! 类型：
 //! - `TraitInfo` — trait 注册条目（name + parents + methods）

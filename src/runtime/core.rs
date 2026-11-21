@@ -1,7 +1,12 @@
-//! v0.52 ADR-001: CoreRuntime — 语言执行必需的薄核心
+//! v0.110.0: CoreRuntime — 语言执行必需的薄核心。
 //!
-//! v0.110.0 瘦身：彻底剥离 `tool_registry` / `current_ai_config` / `config_stack`
-//! （Agent/AI 配置残留），并将原 `RegistryRuntime` 中存活的 `trait_registry` 并入 CoreRuntime。
+//! 只保留语言执行真正需要的状态：执行环境、trait / struct / enum 注册表、
+//! inherent 与 trait impl 方法表、gensym 计数器、ambient random 状态、
+//! 自动微分上下文，以及 `mora build` 产出的预编译 `ControlProgram` 模块缓存。
+//! 进程级共享服务（`TaskScheduler` / `AsyncIoReactor` / `DagPlanCache`）统一挂在
+//! [`EngineShared`] 上，由 `CoreRuntime` 以 `Arc` 持有并在 clone 间共享；
+//! 文件系统隔离策略由 [`crate::runtime::fs::FsContext`] 承担，
+//! 协作取消与超时由可选的 [`crate::runtime::scheduler::TaskContext`] 承担。
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -18,11 +23,11 @@ use crate::value::{EnumDefRuntime, Environment, MergeStrategy, StructDefRuntime,
 
 /// Shared immutable process-level services across tasks and spawned VM workers.
 pub struct EngineShared {
-    /// Wave 2 W2.4: Shared tokio multi-threaded task scheduler.
+    /// Shared zero-dependency native multi-threaded task scheduler.
     pub(crate) scheduler: Arc<TaskScheduler>,
-    /// Wave 2 W2.4: Shared tokio async I/O reactor.
+    /// Shared zero-dependency native non-blocking async I/O reactor.
     pub(crate) reactor: Arc<AsyncIoReactor>,
-    /// Wave 4 P1: Thread-safe structural compilation cache for [`crate::runtime::compute_dag::TensorComputeDag`].
+    /// Thread-safe structural compilation cache for [`crate::runtime::compute_dag::TensorComputeDag`].
     pub(crate) dag_cache: Arc<DagPlanCache>,
 }
 
@@ -67,9 +72,9 @@ type InherentMethodMap = HashMap<(String, String), (Value, bool)>;
 /// 语言执行必需的薄核心。
 #[derive(Clone)]
 pub struct CoreRuntime {
-    /// 当前执行环境（v0.75.76 起仅在 run 前由 `take_env` 取出，此后按值穿线）
+    /// 当前执行环境（clone 时按值复制，绑定互不穿透）
     pub(crate) environment: Environment,
-    /// v0.08: trait 系统注册表（原 RegistryRuntime 存活字段迁入）
+    /// trait 系统注册表（`trait_name` → `TraitInfo`）
     pub(crate) trait_registry: Arc<HashMap<String, TraitInfo>>,
     /// v0.67: 当前 transaction/worker 的合并策略。
     pub(crate) current_merge_strategies: Option<HashMap<String, MergeStrategy>>,
@@ -218,7 +223,7 @@ impl CoreRuntime {
         }
     }
 
-    /// 注册 trait（原 RegistryRuntime 存活行为迁入）。
+    /// 注册 trait。
     pub fn register_trait(&mut self, name: String, info: TraitInfo) {
         let mut map = (*self.trait_registry).clone();
         map.insert(name, info);

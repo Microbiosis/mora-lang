@@ -8,6 +8,10 @@
 //! print(7n / 0i)   →  thread 'mora-main' panicked at
 //!                     num-bigint-0.4.8/src/biguint/div.rs:
 //!                     attempt to divide by zero                 exit 101  ❌
+//!                     （**历史**：`BigInt` 曾由 num-bigint 后端承载；
+//!                      v0.110.0 起 BigInt 为纯 Mora 实现，
+//!                      `std/math/bigint.mora:423` 的除零返回
+//!                      `BigIntResult::Err("division by zero")`）
 //! print(7i / 0n)   →  同上 panic                                                 ❌
 //! ```
 //!
@@ -20,7 +24,7 @@
 //! `flow.rs::int_div` / `int_mod` 只对 `(Int, Int)` 与 `(BigInt, BigInt)`
 //! 两条 arm 做零检查；`Int ⊗ BigInt` / `BigInt ⊗ Int` 落进 `_` arm →
 //! `numeric_op`，在那里 Int 被提升成 BigInt 后直接 `a / b`，**绕过了零检查**
-//! —— 而 num-bigint 对零除数是 panic 而非返回错误。
+//! —— 而**历史** 的 num-bigint 后端对零除数是 panic 而非返回错误。
 //!
 //! ## 修法
 //!

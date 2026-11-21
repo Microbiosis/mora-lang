@@ -1,4 +1,4 @@
-//! v0.80: Effect row operations — row-polymorphic HM unification 的子模块。
+//! v0.110.0: Effect row operations — row-polymorphic HM unification 的子模块。
 //!
 //! 与 typeck/mod.rs::Type::Arrow 配合使用。
 //!
@@ -6,14 +6,15 @@
 //! - `unify_row(a, b, subst)`: 解 row equation；空 = Empty，
 //!   Var = row-polymorphic 变量（∀ρ），Cons = 具名 effect 头 + 尾。
 //! - `bind_row(name, val)`: 把 row var 绑到具体 row；occur check 避免循环。
-//! - `rename_row(row, fresh)`: 重命名 row var（与 Type::TypeVar 同样字符命名空间）。
+//! - `rename_row(row, fresh)`: 重命名 row var（row var 名字与
+//!   `Type::TypeVar(TypeVarId)` 彼此独立）。
 //! - `apply_row(row, subst)`: 把 substitution 应用到 row —— Var 替换为 bound row。
 
 use crate::mir::effect::EffectRow;
 use crate::typeck::hm::error::TypeError;
 
-/// v0.80: row var 命名器 —— 与 typeck::Type::TypeVar(char) 命名空间独立，
-/// row var 用 String（用户可见可读）。
+/// row var 命名器 —— 与 `typeck::Type::TypeVar(TypeVarId)` 命名空间独立，
+/// row var 用 String（`rho{N}`，用户可见可读）。
 #[derive(Default)]
 pub struct FreshVars {
     counter: u32,
@@ -138,10 +139,11 @@ pub fn bind_row(
     Ok(())
 }
 
-/// 重命名 row var（与 Type::TypeVar 同样字符命名空间）。
+/// 重命名 row var（fresh 名由 `FreshVars` 给出：`rho{N}` 字符串）。
 ///
-/// Mora 字符命名空间：单字符 `'a`..`'z`，fresh 由 FreshVars 提供。
-/// 这里我们用字符串（Var(String)）。
+/// row var 用字符串（`EffectRow::Var(String)`），与 `Type::TypeVar(TypeVarId)`
+/// 的名字空间彼此独立 —— 类型变量已是 `TypeVarId`（meta / rigid），不再
+/// 占用单字符命名空间。
 pub fn rename_row(row: &EffectRow, fresh: &mut FreshVars) -> EffectRow {
     use EffectRow::*;
     match row {

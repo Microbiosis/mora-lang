@@ -1,7 +1,7 @@
 //! v0.104.6 D356 —— 数字字面量的**位宽后缀被当成数值拼接**（已修）
 //!
-//! `src/lexer.rs` 是整条执行管线的最底层（`ParserV3 → MirExpr → lower
-//! → MirInst → dag_interp` 全靠它切 token），此前从未系统测过。
+//! `src/lexer.rs` 是整条执行管线的最底层（`ParserV3 → MirWitness → lower_program
+//! → ControlProgram → execute_program` 全靠它切 token），此前从未系统测过。
 //! 本轮从「数字字面量矩阵」入手，15 个用例翻出**一个真缺陷**。
 //!
 //! ## 缺陷：`1.5f32` 求值为 **1.532**

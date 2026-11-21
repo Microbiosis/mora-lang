@@ -5,13 +5,14 @@
 //!
 //! D231 已在 `compress::json` 立过同样的规矩（「`Value` → `f64` 的唯一提取点」
 //! /「新增数值提取**必须**走它，否则同样违约」），但那个收口住在 **`compress`
-//! 里，`interpreter` 够不着**。于是 `ai_helpers::extract_usage` 直接手写
+//! 里，`interpreter` 够不着**（**历史**：`compress` 与 `interpreter` 均已于
+//! v0.110.0 删除）。于是 `ai_helpers::extract_usage` 直接手写
 //! `if let Value::Float(n)`，**违反了 D231 自己立的约束**。
 //!
 //! ## 后果：token 预算机制整体失效且零症状
 //!
 //! `track_tokens` 是 token 预算检查的**唯一执行者**（per_call 上限、总量预算、
-//! 告警阈值、`ai.tokens().calls()` 全靠它），而 `ai_chat.rs` 两条 chat 响应
+//! 告警阈值、`ai.tokens().calls()` 全靠它），而 **历史** `ai_chat.rs` 两条 chat 响应
 //! 路径都经由 `extract_usage` 喂数：
 //!
 //! ```text

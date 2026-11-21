@@ -28,12 +28,15 @@
 //! 不能拿那条原则去推「小数也该报错」—— **原则的适用边界要看既有判据钉了什么**。
 //! D320 的修改已回退。
 //!
-//! ### 二、「`index_assign_value` 是死代码」= **MIR 层仍可达**
+//! ### 二、「`index_assign_value` 是死代码」= **IR 层仍有调用点**
 //!
 //! `xs[1] = 99` 与 `assign xs[1] = 99` 都是解析错误（`List` 自 v0.104.6 起
-//! 不可变），看起来该函数没用了。但 `handlers/values.rs:156` 的
-//! `MirInst::IndexAssign` 仍在调它 —— 手写 MIR / SSA 降级路径可达。
-//! `tests/list_semantics.rs:14-19` **早已精确记录**了这一点。
+//! 不可变），看起来该函数没用了。**历史**上 `handlers/values.rs:156` 的
+//! `MirInst::IndexAssign` 仍在调它（手写 MIR / SSA 降级路径可达）—— 该 MIR 栈
+//! 已随 v0.110.0 一并退役，现存调用点是 `ControlInst::IndexAssign`
+//! （`src/mir/control/ir.rs` → `runtime::vm::value_ops::index_assign_value`），
+//! 而 `src/parser_v3/` 零构造 ⇒ **源码层仍不可达**。
+//! `tests/list_semantics.rs` **早已精确记录**了这一点。
 //!
 //! ## 矩阵实际结论
 //!
@@ -211,8 +214,9 @@ fn d320_index_matrix_behaviour_is_pinned() {
     );
 }
 
-/// **已记录的 MIR 层限制**：下标赋值语法在 v0.104.6 移除，但 `index_assign_value`
-/// 仍被 `MirInst::IndexAssign`（手写 MIR / SSA 降级）调用，**不是死代码**。
+/// **已记录的 IR 层限制**：下标赋值语法在 v0.104.6 移除，但 `index_assign_value`
+/// 仍有 IR 层调用点（`ControlInst::IndexAssign` → `runtime::vm::value_ops`），
+/// **不是死代码**；只是 `src/parser_v3/` 零构造，源码层不可达。
 ///
 /// `tests/list_semantics.rs` 已记录这一点；本条把它与「源码层确实是解析错误」
 /// 一起钉住，防止将来有人照着解析错误把该函数删掉。

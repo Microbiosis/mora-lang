@@ -2,7 +2,7 @@
 //!
 //! ## 缺陷
 //!
-//! `interpreter/builtin_impls.rs` 里 `str` / `int` / `float` / `bool` / `atom`
+//! **历史** `interpreter/builtin_impls.rs`（今 `runtime/builtins/impls.rs`）里 `str` / `int` / `float` / `bool` / `atom`
 //! 五个入口此前都是同一行：
 //!
 //! ```rust

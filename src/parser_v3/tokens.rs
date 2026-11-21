@@ -1,4 +1,4 @@
-//! v0.92: ParserV3 的 token 流导航原语（自 parse.rs 迁出，P1.4 拆分）。
+//! v0.110.0: `ParserV3` 的 token 流导航原语（游标 / 匹配 / 消费）。
 //!
 //! 这些是纯粹的词法游标操作（advance/peek/consume/match_token 等），
 //! 不依赖任何语法语义。emit.rs / syntax.rs 共用。

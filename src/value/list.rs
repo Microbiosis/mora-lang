@@ -44,7 +44,7 @@ use std::sync::Arc as Rc;
 /// n=20000 建表 **20.33ms**。深值 `Vec` 在 n=4000 就要 120–200ms，二次增长
 /// 外推到 n=20000 是数秒 —— 而真实 Mora 程序
 /// `while i < n { let xs = xs.push(i) }` 还要**每轮 3 次**这种复制
-/// （`env.get` / 方法接收者 / `h_assign` 写回），实测 n=20000 需 **44 秒**。
+/// （`Environment::get` / 方法接收者 / `ControlInst::StoreLocal` 写回），实测 n=20000 需 **44 秒**。
 ///
 /// 即：本类型把累积建表那一段从「数十秒」压到「几十毫秒」。
 #[derive(Clone)]
@@ -252,7 +252,8 @@ impl List {
     /// **不可变**按下标写入，返回新列表（原列表不变）。
     ///
     /// 值语义下「原地改」只能表达成「产出新列表」。调用点要接住返回值。
-    /// （`vm.rs` 的 `list[i] = v` 两处已改写为 `list = list.set(i, v)`。）
+    /// （`runtime/vm/value_ops.rs` 的 `list[i] = v` 两处已改写为
+    /// `list = list.set(i, v)`。）
     pub fn set(&self, i: usize, value: Value) -> List {
         let mut out = self.clone();
         let ci = i / B;
@@ -265,7 +266,7 @@ impl List {
         out
     }
 
-    /// 稳定身份 —— 供 `DagExecMemo` 的 `InputFp::Heap` 做「同一列表实例」的判定。
+    /// 稳定身份 —— 用 `chunks` 缓冲区的地址标识一个列表实例。
     ///
     /// 分块实现没有单一连续缓冲区，但 `chunks` 这个 `Vec` 本身有稳定地址，
     /// 且每个列表实例各持一份 → 可作身份。**注意**：这依赖「不同实例不共享
@@ -328,7 +329,7 @@ impl<'a> Iterator for ListIter<'a> {
     }
 }
 
-/// 逆序迭代 —— `compress/json.rs` 的栈式 DFS 依赖 `items.iter().rev()`。
+/// 逆序迭代 —— 两端各持一个游标，`next()` 与 `next_back()` 互不吞元素。
 ///
 /// **两端必须各有各的游标**：早先我用单个 `idx` 同时充当前后端，于是
 /// `next()` 与 `next_back()` 会互相吞掉元素 —— 混用两端时结果错乱且不报错。

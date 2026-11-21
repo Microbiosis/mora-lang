@@ -1,4 +1,7 @@
-//! LSP Provider implementations (v0.55: all V3 Mir-native)
+//! v0.110.0: LSP 各 method 的 Provider 实现（统一消费 `MirWitness` 树）。
+//!
+//! 每个 Provider 都经 `parsed_doc_v3` 取文档的 `MirWitness` 树与符号位置，
+//! 类型信息来自 `typeck::check_mir` —— 不依赖 AST，也不存在第二条解析路径。
 
 mod completion;
 mod definition;

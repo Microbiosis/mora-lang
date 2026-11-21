@@ -1,8 +1,11 @@
-//! v0.92 P1.2: `Interpreter::call_builtin_*` — builtin 函数实现（自 dispatch.rs 迁出）。
+//! v0.110.0: `call_builtin_*` — 运行期自由函数（builtin）的具体实现。
 //!
-//! 按 concern 拆分：dispatch.rs 只保留路由（`call_function` 的 name→handler
-//! 分派 + `call_value` 的 Value→调用），本模块承载 30 个 `call_builtin_*`
-//! 具体实现 + 兜底查找。`testcase!` 宏定义在 `interpreter` 模块根。
+//! 按 concern 拆分：本模块只承载各 `call_builtin_*` 的实现，运行期路由
+//! （`BuiltinFnId` → 实现）由 `src/runtime/vm/builtins.rs` 承担。无法在此
+//! 直接求值的 builtin（`eval` / `apply` / `macroexpand` / `swap` / `into` /
+//! `tcp_connect` / `tcp_listen` / `jvp` / `trace_dag` / `kv_allocator` /
+//! `memory_pool`）在此返回 `None`，交回 VM 自行分派。
+//! `testcase!` 宏定义在本模块根（`builtins/mod.rs`）。
 
 use std::sync::Arc;
 

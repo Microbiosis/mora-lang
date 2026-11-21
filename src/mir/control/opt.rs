@@ -1,4 +1,4 @@
-//! Direct explicit-CFG optimization passes for [`ControlProgram`] (Wave 2 — Stage W2.2).
+//! v0.110.0: Direct explicit-CFG optimization passes for [`ControlProgram`].
 //!
 //! All passes operate directly on [`ControlFunction`] `BasicBlock`s and SSA
 //! block parameters, preserving CFG invariants and strict [`Purity`] semantics:
@@ -7,6 +7,12 @@
 //! - Constant folding uses [`crate::flow::eval_binary`] directly for exact
 //!   numeric-tower parity with the runtime VM (and preserves runtime errors on
 //!   invalid ops like `1i / 0i`).
+//!
+//! Pass set, by level:
+//! - `None`: no pass runs.
+//! - `Basic`: constant/copy propagation + constant folding, CFG simplification,
+//!   dead-code elimination and block compaction (up to 2 rounds).
+//! - `Aggressive`: `Basic` plus GVN/CSE and LICM (up to 4 rounds).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 

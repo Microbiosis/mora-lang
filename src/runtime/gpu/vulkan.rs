@@ -1,7 +1,7 @@
-//! Wave 4 P2-2: Native Vulkan 1.0 C API (`vulkan-1.dll` / `libvulkan.so.1` / `libMoltenVK.dylib`)
+//! v0.110.0: Native Vulkan 1.0 C API (`vulkan-1.dll` / `libvulkan.so.1` / `libMoltenVK.dylib`)
 //! Hardware Compute Backend with Pure-Rust SPIR-V 1.0 Shader Generation.
 //!
-//! Architecture (`AGENTS.md §0`):
+//! Architecture:
 //! - Zero compile-time Vulkan SDK / `shaderc` / Cargo dependencies: dynamically opens the OS
 //!   Vulkan loader at runtime and enumerates physical GPUs, VRAM heaps, and compute queues.
 //! - Emits a spec-compliant SPIR-V 1.0 `GLCompute` shader directly in pure Rust (`Vec<u32>`)

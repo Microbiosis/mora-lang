@@ -1,5 +1,12 @@
-//! Runtime built-in functions, value methods, domain modules (`math`/`stats`/`linalg`/`file`/`exec`),
-//! and trait dispatch support (consolidated from the retired `src/interpreter/` facade).
+//! v0.110.0: Runtime built-in functions, value methods, domain modules
+//! (`math`/`stats`/`linalg`/`file`/`exec`), and trait dispatch support.
+//!
+//! Pure built-ins and value methods are dispatched by `src/runtime/vm/builtins.rs`,
+//! which delegates to the canonical helpers in this module tree (`impls` / `method`
+//! / `traits`); builtins that need the VM stack (callbacks, `eval`, ambient
+//! effects, trait mediation) are left to the VM's own dispatch instead.
+//! `registry::RUNTIME_BUILTIN_NAMES` remains the single source of truth for the
+//! runtime free-function name list.
 
 /// Debug-only branch reachability assertion macro (`SQLite testcase()` style).
 macro_rules! testcase {

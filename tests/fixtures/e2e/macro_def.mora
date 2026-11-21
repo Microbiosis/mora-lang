@@ -1,6 +1,7 @@
 -- v0.83: macro 定义 + 展开 E2E 测试
--- 验证: parser emit_macro_def_w 保留宏体 -> Value::Macro { body }
---  -> MirHost::call_value -> run_mir(body, &mut child_env)
+-- 验证: parser 保留宏体 -> Value::Macro { body } -> 展开后进入
+--  唯一的编译/执行管线（ParserV3::compile -> mir::control::lower_program
+--  -> ControlProgram -> runtime::vm::execute_program）
 macro double(x)
   x + x
 end

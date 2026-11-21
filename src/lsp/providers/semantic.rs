@@ -1,4 +1,10 @@
-//! v0.25: LSP semantic tokens provider（语义高亮）。
+//! v0.110.0: LSP semanticTokens provider —— 基于 `MirWitness` 树发出语义高亮 token。
+//!
+//! token 种类与 `server.rs` 声明的 legend **同源**（`TOKEN_TYPES`），索引不得手写；
+//! 当前只发出 function / variable / string / float 四类，其余为占位。
+//!
+//! 坐标不变式：先收集**绝对**位置、按文档顺序排序，再做 5 元组 delta 编码；
+//! `deltaStart` / `length` 的单位是 **UTF-16 码元**。
 
 use std::collections::HashMap;
 

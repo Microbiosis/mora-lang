@@ -1,5 +1,13 @@
 //! v0.104.6 D35：代数效果（`handle` / `perform`）回归。
 //!
+//! ⚠ **历史快照**：本文件头叙述的是 v0.104.6 D35 那次事故，其根因链
+//! （`fcfg::Node::Handle` 缺 `dst` → `witness → FCFG → lower` 重建 MirFunction
+//! → DAG 执行器 `node_ready` 恒 false）发生在**已删除**的 9 层 IR 栈上 ——
+//! 该栈与 `src/interpreter/` 已于 **v0.110.0** 全部删除。当前唯一管线为
+//! `ParserV3::compile → MirWitness[] → mir::control::lower_program → ControlProgram`
+//! → `typeck::check_mir::check_program_witnesses` → `runtime::vm::execute_program`。
+//! 下方「两条编译路径」指历史语境；今天只剩**一条**路径。
+//!
 //! 起因是第三条审计线（效果子系统）撞上的最严重缺陷：
 //!
 //! ```text

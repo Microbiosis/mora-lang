@@ -1,4 +1,14 @@
-//! v0.25: LSP completion provider（补全建议）。
+//! v0.110.0: LSP completion provider —— 关键字 / 内建 / 模块 / 用户符号的合并补全。
+//!
+//! 数据来源（按插入顺序，后者不覆盖前者）：
+//! - 文档内的 `let` / `fn` 定义（经 `MirWitness` 提取，类型由
+//!   `typeck::check_mir::infer_program_types` 推断）—— `CompletionItemKind` 6（Variable）；
+//! - `runtime::builtins::RUNTIME_BUILTIN_NAMES` —— 10（Property）；
+//! - `value::MODULE_OBJECTS` —— 9（Module）；
+//! - `STAGE3B_TYPES_AND_CTORS`（Stage 3B 数值类型与 `Tensor` 构造子）—— 7（Class）；
+//! - `CANONICAL_KEYWORDS` —— 14（Keyword）。
+//!
+//! 所有条目按名称去重，先到先得。
 
 use std::collections::{BTreeSet, HashMap};
 

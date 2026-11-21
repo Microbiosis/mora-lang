@@ -2,7 +2,7 @@
 //!
 //! 所有经过运行时执行的文件操作（`file.*` 与 `ControlInst::Import`）必须先经由
 //! [`FsContext::resolve_path`] 验证并构造 [`CheckedPath`]，再交由
-//! [`crate::runtime::reactor::AsyncIoReactor`] 在非阻塞线程池上执行：
+//! [`crate::runtime::reactor::AsyncIoReactor`] 在调度器的阻塞线程池上执行：
 //! - 拒绝 NUL 字节与空路径，消除路径截断漏洞；
 //! - `virtual_cwd` 由每个 [`crate::runtime::CoreRuntime`] 独立持有，彻底替代会污染
 //!   全进程的 `std::env::set_current_dir`（解决并发竞态与 `chdir` 沙箱逃逸）；

@@ -2,6 +2,18 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [0.110.1] — 注释校准：全仓注释对齐 v0.110.0 现行架构
+
+对齐 v0.110.0 三项架构变更后的**全仓注释事实源**。**仅注释改动，可执行代码零变更**（146 文件，+907 / −941 行）。
+
+- **模块头统一**为 `//! v0.110.0: <当前职责一句话>` + 现行架构/不变量段落，删除「vX 把 A 从 B 迁到 C」流水账：覆盖 `src/{typeck,mir,parser_v3,runtime,lsp,flow,value,common}`、`build.rs`、`Cargo.toml`、`examples/`、`scripts/`。
+- **清零退役引用**：`tokio` / `parking_lot` / `num-bigint` / `proptest` 依赖叙事、`src/interpreter/` 门面、AST（`ast_v2` / `MirExpr`）、9 层 FCFG·EHIR·DAG·JIT、`Interpreter`、`MirInst`、`EmitContext`、`h_app_def` / `h_assign` / `h_index_assign` 等 handler、`Value::TeaApp`、`Value::Agent`、`http_server` / `compress` / `audit` 模块、已下线的 `mora-std-bigint` crate 与 Rust 侧 `BigInt`。
+- **修正事实性错误**（逐条 grep 核实后改正）：`WitnessKind` 实为 47 变体（原写 30）、`BuiltinKind` 13 变体（原写 26）、`MODULE_OBJECTS` 7 项（原写 23）、`len` 返回 `Type::Int`（原写 `Float`）、`DISPLAY_MAX_DEPTH`（原写 `MAX_DEPTH`）、`compute_dag` 为「4 种融合算子 / 3 遍 pass」（原写 4-pass）、`run_fs` 走阻塞线程池（原写非阻塞）、`Type::TypeVar` 现为 `TypeVarId`（原写 `char`）。
+- **保留并标注有价值的考古**：自研 `Mutex` 的 `<locked>` 环断开器机制、D302/D320/D361 等历史事故复盘仍保留，但失效路径引用改指现行链路（`ControlInst::IndexAssign` → `runtime::vm::value_ops` 等），并统一加「历史」标记。
+- **文档面同步**：`AGENTS.md`（Tokio 调度器、`proptest` dev-dep、已不存在的 `mora-std-bigint` crate）、`README.md`、`docs/mora-spec.md`（`tokio::process::Command` 等）、`docs/learning-plan.md`、`docs/architecture-diagram.md`、`docs/influences.md`。
+- **验证**：`cargo fmt --all -- --check` ✅；`cargo clippy --all-targets --all-features -- -D warnings` ✅ 零告警；`cargo test --all-targets` ✅ 1519 passed / 0 failed；`git diff -U0` 过滤确认可执行代码改动 **0 行**。
+- 说明：`[0.110.0]` 章节保留其发布时点的历史叙述（含当时的 `tokio` / `parking_lot` / `mora-std-bigint` 表述），不做追溯改写；`docs/_archive/**` 与根目录历史审计报告同理保留原样。
+
 ## [0.110.0] — 全波次（Wave 1–4 + P1/P2）架构重铸与 AI-Native 静态类型语言定版
 
 重新校准并完整兑现 Mora 核心定位：**AI-native 静态类型语言，面向大模型底层、计算图与算子、大模型推理/训练与资源动态调控，同时具备 Go 式云原生并发属性并对 HTTP 与 MCP 服务提供语言原语级友好支持**。

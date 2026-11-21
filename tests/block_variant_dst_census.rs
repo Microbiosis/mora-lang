@@ -1,5 +1,12 @@
 //! v0.104.6 D121：同族普查 —— D120 之后，`Node` 变体的 `result-reg` 覆盖是否还有漏的。
 //!
+//! ⚠ **历史快照**：本普查的对象是 `mora::mir::fcfg::Node` 这 56 个变体与
+//! `node_result_reg_of` 的对应关系 —— 9 层 IR 栈已于 **v0.110.0** 全部删除
+//! （`src/interpreter/` 同删）。当前唯一管线为
+//! `ParserV3::compile → MirWitness[] → mir::control::lower_program → ControlProgram`
+//! → `typeck::check_mir::check_program_witnesses` → `runtime::vm::execute_program`；
+//! 判据走的 `cli::compile_and_opt` 现在等于 `ParserV3::compile` + `optimize_program`。
+//!
 //! ## 为什么做这件事
 //!
 //! D120（`Node::Solve` 缺 `dst` → `let` 绑定拿哨兵 0 → 后续 Sequence 静默饿死）
@@ -18,8 +25,9 @@
 //!    **明确报错**（`Failed to parse`），作语句时**后续语句照常执行** ——
 //!    不存在 D120 那种「静默饿死」。
 //!
-//! ⚠ 判据一律走 **9 层管线**（`cli::compile_and_opt`）并**执行产物** ——
-//! 缺陷住在 `witness_to_fcfg`，直出路径永远看不到（D120 的教训）。
+//! ⚠ 判据一律走**生产编译入口**（`cli::compile_and_opt`，今天等于
+//! `ParserV3::compile` + `optimize_program`）并**执行产物** ——
+//! **历史**缺陷住在 `witness_to_fcfg`，直出路径永远看不到（D120 的教训）。
 
 use mora::cli::compile_and_opt;
 use mora::parser_v3::ParserV3;

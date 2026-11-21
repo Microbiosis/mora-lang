@@ -26,9 +26,8 @@
 //! 相等性判定也走 `HashMap` 的 `PartialEq`，与迭代序无关。本改动只影响
 //! **输出顺序**，不改变任何值、相等性或求值结果。
 //!
-//! 仓库内已有正确先例：`http_server.rs::value_to_json` 与
-//! `mcp_server.rs::mora_to_json` 一直先收进 `BTreeMap` 再输出 —— 本次
-//! 只是让核心的两处与它们对齐。
+//! 仓库内已有正确先例：`src/flow/json.rs::value_to_json` 一直先收进
+//! `BTreeMap` 再输出 —— 本次只是让核心的另一处与它对齐。
 
 use std::sync::Arc;
 

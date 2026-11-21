@@ -1,4 +1,4 @@
-//! v0.53: HM Inference Error Types
+//! v0.110.0: HM Inference Error Types
 
 use crate::common::Span;
 

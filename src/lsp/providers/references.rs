@@ -1,4 +1,11 @@
-//! v0.25: LSP references provider（引用查找）。
+//! v0.110.0: LSP references provider —— 列出光标处标识符的全部引用。
+//!
+//! 读点来自 `MirWitness` 树中的 `Variable` 节点；声明点（`let` / `fn` 绑定）按 LSP 的
+//! `context.includeDeclaration` / `context.onlyDeclaration` 决定是否并入。
+//!
+//! 坐标不变式：`Span::line` / `Span::column` 均为 **1-based**（LSP 要求 **0-based**）：
+//! `line` 出站前 `saturating_sub(1)`；`column` 需按标识符**完整词**双向就近查找定位到
+//! 标识符本身（找不到退回 `column - 1`）。出站 `character` 必须是 **UTF-16 码元**。
 
 use std::collections::{BTreeMap, HashMap};
 

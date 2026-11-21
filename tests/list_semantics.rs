@@ -14,9 +14,9 @@
 //!
 //! `xs[0] = 99` 与 `m[0][1] = 42` **都是解析错误**；`xs.set(0, 99)` 报
 //! 「no method: set」（`set` 只是 `list::List` 的 Rust 侧能力，未进 Mora 方法表）。
-//! 故 `vm::index_assign_value` 在源码层无调用方 —— 别名/嵌套赋值风险被限制在
-//! MIR 层（手写 MIR / SSA 降级）。这一点本身就值得钉住：若将来 parser 加上了
-//! 下标赋值语法，本文件应立刻扩到那两类用例。
+//! 故 `runtime::vm::value_ops::index_assign_value` 在源码层无调用方 —— 别名/嵌套
+//! 赋值风险被限制在 IR 层（`ControlInst::IndexAssign`）。这一点本身就值得钉住：
+//! 若将来 parser 加上了下标赋值语法，本文件应立刻扩到那两类用例。
 //!
 //! 其余 27 项均取自迁移后的**实测输出**，不是推断。
 

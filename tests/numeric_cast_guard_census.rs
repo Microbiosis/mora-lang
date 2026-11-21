@@ -2,14 +2,14 @@
 //!
 //! D339 修了 `tea.run(max_steps)` 的裸 `n as usize`，并提出一条纪律：
 //! **修同根因的缺陷后，问「同一语汇在别处还有几处」**。
-//! 本条把那条纪律**全称执行**：`src/` 下**全部 60 处**裸 `as <整型>` 转换，
+//! 本条把那条纪律**全称执行**（**历史** 口径：`src/` 下**全部 60 处**裸 `as <整型>` 转换；
 //! 逐一判定「是否吃用户实参、是否已有守卫」。
 //!
 //! ## 三层收窄（每一层都砍掉一批，且**都不靠猜**）
 //!
 //! ```text
 //! 210 处  全部 `as <整型>`（src/，排除测试文件与纯注释行）
-//!  60 处  限定在 src/interpreter/**（纯转换层）
+//!  60 处  限定在 src/interpreter/**（纯转换层）—— **历史** 路径，今为 `src/runtime/builtins/**`
 //!   2 处  再限定「右值含用户实参来源的名字」（n / size / args / budget / …）
 //!   1 处  唯一无就近守卫者 —— 且实测它是**内部值**（退避抖动 `exp`，来自 rand）
 //! ```
@@ -37,13 +37,14 @@
 //! ## 唯一无守卫的那处：实测是内部值
 //!
 //! ```text
-//! src/interpreter/mod.rs:102   (exp as i64 + offset).max(0) as u64
+//! src/interpreter/mod.rs:102   (exp as i64 + offset).max(0) as u64   ← **历史** 路径
 //! ```
 //!
 //! `exp` 来自退避计算的 `rand`（`mod.rs:97-102` 的 jitter 计算），
 //! **不来自任何 `Value`**，且前一行已有 `.max(0)` ⇒ 无负数、无回绕。
 //!
 //! ## `parse_budget_dispatch`（`numeric_helpers.rs:179`）为何**够不着**
+//!（**历史**：`numeric_helpers.rs` / `compose_prompt` 均已随 v0.110.0 移除）
 //!
 //! `Ok((num * mult as f64) as usize)` 确实**无负数守卫**（负数在 148-149
 //! 被前面两条 arm 拦了，但这是**类型相关**的：`String("-1KB")` 路径不走那两条）。
@@ -52,11 +53,12 @@
 //!
 //! - `compose_prompt` 的 typeck 签名把 `section` 声明为 `Type::String`（D68），
 //!   传 Dict 会被 typeck 拒（D68 之前的 `Signature` 注释已写明这条限制）；
-//! - `with budget = …` 那条路 D116 已让它**立即报错**（承诺但未实现）。
+//! - `with budget = …` 那条路 D116 已让它**立即报错**（承诺但未实现；**历史**：
+//!   `with` 配置块语法本身也已从解析器移除）。
 //!
 //! ⇒ 属**死路径**（与 D328 的 `compose` / `partial` 同族），只报告不修。
 
-/// **主断言（源码侧全称）**：`src/interpreter/**` 里的裸 `as <整型>` 转换，
+/// **主断言（源码侧全称）**：`src/runtime/builtins/**` 里的裸 `as <整型>` 转换，
 /// 凡是右值含**用户实参来源名字**的，必须在 7 行内出现守卫。
 ///
 /// 这是 D339 那条纪律的**机械化**：新加一个 `xs.take(some_arg)` 而忘了

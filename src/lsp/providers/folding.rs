@@ -1,4 +1,13 @@
-//! v0.25: LSP folding provider（折叠范围）。
+//! v0.110.0: LSP foldingRange provider —— 基于 `MirWitness` 树给出可折叠区间。
+//!
+//! 覆盖面：`if` / `match` / `fn` / 闭包 / 循环（`for` 在 witness 层是 `Loop`）/
+//! `while` / `macro` / `parallel` / `handle` 等**带 body** 的构造。
+//!
+//! 结束行取「体内最后一条语句所在的行」（`Sequence` 递归取子 witness 的最大行），
+//! 而不是 body 自身的 span —— 后者继承自外层构造，对结束行没有信息量。
+//!
+//! 坐标不变式：`Span::line` 是 **1-based**，LSP 的 `startLine` / `endLine` 是 **0-based**，
+//! 出站前统一 `saturating_sub(1)`。
 
 use std::collections::HashMap;
 
@@ -118,8 +127,10 @@ fn collect_folds(expr: &crate::mir::witness::MirWitness, out: &mut Vec<Value>) {
         // 不折叠等于编辑器里完全没法收起来。
         //
         // 本 arm 收的是**带 `MirWitness` body** 的那批（结束行可从 body 精确算出）。
-        // `StructDef` / `EnumDef` 的字段是纯字符串 /
-        // `TypeHint`，**不带 span**，结束行无从算起 —— 属 parser 层缺口，记档。
+        // `StructDef` / `EnumDef` 的字段与变体**自带 `Span`**
+        // （`WitnessStructField::span` / `WitnessEnumVariant::span`），结束行已可算出，
+        // 但本 provider 至今**未**为这两类块产出折叠区间 —— 属覆盖面缺口，
+        // 不再是 parser 层拿不到位置的限制。
         WitnessKind::MacroDef { body, .. } | WitnessKind::Parallel { body, .. } => {
             let end_line = body_end_line(body);
             if end_line > expr.span.line {

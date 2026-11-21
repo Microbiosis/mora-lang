@@ -8,7 +8,7 @@
 //!
 //! 「我还没查过」不该留成尾巴。此处逐个读运行期实现补齐判据。
 //!
-//! | 内建 | 运行期（`builtin_impls.rs`） | 声明 |
+//! | 内建 | 运行期（**历史** `builtin_impls.rs`，今 `runtime/builtins/impls.rs`） | 声明 |
 //! |---|---|---|
 //! | `batch_chat(list)` | 逐项 `do_ai_chat`，后者 `Ok(Value::String(…))` | `List[String]` |
 //! | `into(list, fn)` | 逐项调 fn，命中 List 时 **extend（展平）** | `List[α]`（α fresh） |

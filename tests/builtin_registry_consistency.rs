@@ -7,7 +7,8 @@
 //! 1. typeck 权威签名表 `typeck::dispatch::builtin_signatures()`
 //! 2. typeck 本地兜底 `typeck::hm::builtin::builtin_callee_ty` 的 match
 //!    （含 `"car" | "cdr" | "uncurry"` 这类多模式 arm）
-//! 3. 运行期分发 `interpreter::dispatch` 的 `match`
+//! 3. 运行期分发 `runtime::vm::builtins` 的 `match`（内建名清单见
+//!    `runtime::builtins::registry::RUNTIME_BUILTIN_NAMES`）
 //!
 //! D4 / D5 / D9 / D12 / D16 一族缺陷皆源于此。本文件把「不许漂移」从
 //! **约定**变成 **CI 强制的不变量**。

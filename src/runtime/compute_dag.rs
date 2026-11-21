@@ -1,10 +1,10 @@
-//! Wave 4 P1: Native `TensorComputeDag`, Deep Operator Fusion, Hardware-SIMD CPU Backend,
+//! v0.110.0: Native `TensorComputeDag`, Deep Operator Fusion, Hardware-SIMD CPU Backend,
 //! Compile-Time Buffer Lifetime Reuse (`DagMemoryPlan`), and Structural Graph Cache (`DagPlanCache`).
 //!
-//! Architecture (`AGENTS.md §0`):
+//! Architecture:
 //! - Explicit inspectable compute-graph IR (`DagNode` / `DagOp`) captured from arbitrary Mora
 //!   functions (including higher-order `grad(f)` backward passes!) via `trace_dag(f, inputs...)`.
-//! - Four-pass operator-fusion pipeline (`TensorComputeDag::fuse`):
+//! - Four-way operator fusion (`TensorComputeDag::fuse`):
 //!   1. `FusedFlashAttention`: fuses `Softmax((Q @ K^T) * scale [+ mask]) @ V` (absorbing trailing
 //!      `Transpose` on `K`) into a tiled FlashAttention-2 online-softmax kernel (`Br=32, Bc=32`,
 //!      zero `O(Sq * Sk)` attention score matrix allocation).
@@ -17,6 +17,8 @@
 //!   tensors to a minimal pool of reusable physical scratch buffers (`DagWorkspace`).
 //! - Thread-safe structural compilation cache (`DagPlanCache`) hosted on [`crate::runtime::EngineShared`]
 //!   caches fused plans, memory plans, constant staging buffers, and reusable workspaces.
+//! - Kernels run on a [`DeviceBackend`]: the host CPU SIMD backend, a live hardware GPU backend
+//!   (`CUDA` / `Vulkan` / `Metal`) when a driver is present, or the host-emulated backend otherwise.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;

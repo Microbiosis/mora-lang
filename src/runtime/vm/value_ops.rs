@@ -1,5 +1,8 @@
-//! Pure value helpers for indexing, compiled pattern matching, trait boxing,
-//! quasiquote interpolation, and `eval` assertions (Wave 2 — Stage W2.3).
+//! v0.110.0: Pure value helpers for indexing, compiled pattern matching, trait boxing,
+//! quasiquote interpolation, and `eval` assertions.
+//!
+//! These helpers never push VM frames and never touch the runtime environment: the only
+//! optional side effect is recording onto the autograd tape the caller passes in.
 
 use crate::error::{MoraError, MoraResult};
 use crate::flow::{dynamic_type_name, type_name, values_equal};

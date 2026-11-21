@@ -6,7 +6,7 @@
 //! ## 为什么这四张矩阵值得单独钉
 //!
 //! `src/lexer.rs` 是整条执行管线的最底层
-//! （`ParserV3 → MirExpr → lower → MirInst → dag_interp` 全靠它切 token），
+//! （`ParserV3 → MirWitness → lower_program → ControlProgram → execute_program` 全靠它切 token），
 //! 且 D354 刚动过 keyword 相关逻辑，lexer 侧是它的**对偶面**。
 //!
 //! 每张矩阵都按「**正例 + 边界 + 负例**」三段写，理由各不同：

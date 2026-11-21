@@ -1,4 +1,10 @@
-//! v0.25: LSP document symbol provider（符号大纲）。
+//! v0.110.0: LSP documentSymbol provider —— 列出文档内的 `let` / `fn` 符号。
+//!
+//! 符号来自 `MirWitness` 树中提取的定义，`kind` 固定为 13（`SymbolKind::Variable`）。
+//!
+//! 坐标不变式：`Span::line` / `Span::column` 均为 **1-based**（LSP 要求 **0-based**）：
+//! `line` 出站前 `saturating_sub(1)`；`column` 需按标识符**完整词**双向就近查找定位到
+//! 标识符本身（找不到退回 `column - 1`）。出站 `character` 必须是 **UTF-16 码元**。
 
 use std::collections::{BTreeMap, HashMap};
 

@@ -1,4 +1,4 @@
-//! Wave 4 P2-1: Deterministic Binary Bytecode Codec (`MORABC02`) for [`ControlProgram`] SSA IR.
+//! v0.110.0: Deterministic Binary Bytecode Codec (`MORABC02`) for [`ControlProgram`] SSA IR.
 //!
 //! Serializes and deserializes verified, optimized [`ControlProgram`] graphs and multi-module
 //! [`CompiledPackage`] artifacts with:

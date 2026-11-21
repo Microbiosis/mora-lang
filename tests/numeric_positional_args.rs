@@ -28,9 +28,11 @@
 //!
 //! ## 同族里早就有人做对了
 //!
-//! `ai.retry` 的 `backoff_ms` **Int/Float 都认**（`src/interpreter/builtins/ai.rs`）。
-//! 即「同族里有人做了 → 破例的是疏漏」—— 已把那条正确做法收成
-//! `builtins::optional_num_arg` 一处。
+//! **历史** `ai.retry` 的 `backoff_ms` **Int/Float 都认**（**历史**
+//! `src/interpreter/builtins/ai.rs`）—— 即「同族里有人做了 → 破例的是疏漏」。
+//! 那条正确做法曾收成 `builtins::optional_num_arg` 一处；
+//! **v0.110.0 起 `ai` 模块与该辅助函数均已移除**，数值实参改由
+//! `runtime/builtins/mod.rs::required_num_arg` 统一收口。
 //!
 //! ## 记档（**未改**）：负数不在本轮收紧
 //!

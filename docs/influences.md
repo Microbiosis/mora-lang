@@ -173,7 +173,7 @@ end)
 | 云原生原则 | Mora v0.110.0 实现 |
 | :--- | :--- |
 | 轻量协程与通道 | `spawn`（`task_handle<T>`）、`channel(cap)`（`channel<T>` 不变类型）、`select`（`case`/`timeout`/`default`）、`context()` |
-| 非阻塞网络 I/O | `tcp_listen` / `tcp_connect` / `tcp_listener` / `tcp_stream`（基于 Tokio `AsyncIoReactor`） |
+| 非阻塞网络 I/O | `tcp_listen` / `tcp_connect` / `tcp_listener` / `tcp_stream`（基于**自研** `AsyncIoReactor`） |
 | 纯 Mora HTTP/SSE 标准库 | `std/net/http.mora`（声明式 `Router`、`:param`/`*`、中间件、`chunked`、`keep-alive`、`max_body_bytes` 413 守卫、SSE 流） |
 | 纯 Mora MCP 标准库 | `std/mcp.mora`（JSON-RPC 2.0、Tools/Resources/Prompts、`Struct::schema()` 自动派生、HTTP+SSE 与 Stdio NDJSON） |
 | 零源码单二进制交付 | `mora build <file.mora> -o <app>`（预编译 `MORABC02` 二进制 `ControlProgram` 字节码，零源码嵌入） |
@@ -288,7 +288,7 @@ print(d.summary())
 | Mora 核心子系统 | 借鉴来源 | 核心机制 | 实现模块（`src/` & `std/`） |
 | :--- | :--- | :--- | :--- |
 | 单遍 Control SSA IR 与优化器 | MLIR / Cranelift SSA | 显式基本块 `BasicBlock`、`ControlInst`、`ControlTerminator`、CopyProp/GVN-CSE/LICM/DCE 与 `MORABC02` 二进制编解码 | `src/mir/control/{ir,lower,verify,opt,codec}.rs` |
-| 堆帧状态机 VM 与定界续延 | OCaml 5 / Chez Scheme | 显式 `Vec<CallFrame>`、`O(1)` 尾调用帧复用、`CapturedFrames` 多发定界续延切片重放 | `src/runtime/vm/engine.rs`、`src/runtime/effect.rs` |
+| 堆帧状态机 VM 与定界续延 | OCaml 5 / Chez Scheme | 显式 `Vec<CallFrame>`、`O(1)` 尾调用帧复用、`CapturedFrames` 多发定界续延切片重放 | `src/runtime/vm/engine.rs`、`src/runtime/vm/continuation.rs` |
 | 5 项 AI-Native 静态检查 | Dex / Jaxtyping / Koka | 单一 `Span` 追踪 HM 求解器：静态校验 `DType`、`Shape`（符号维度）、`Device`、`Resource`（原位别名）、`Effect` | `src/typeck/hm/{mod,infer,stage3c}.rs` |
 | `TensorComputeDag` 与融合后端 | XLA / PyTorch 2 Inductor / FlashAttention-2 | 4 遍融合（`FusedFlashAttention`/`FusedRmsNormLinear`/`FusedLinearAct`/`FusedElementwise`）、`DagMemoryPlan`、动态 CUDA PTX / Vulkan SPIR-V / Metal MSL / CPU AVX2+NEON 后端 | `src/runtime/{compute_dag,simd_kernels}.rs`、`src/runtime/gpu/{mod,cuda,vulkan,metal}.rs` |
 | `KVPageAllocator` 与 `MemoryPool` | vLLM PagedAttention / CUDA Caching Allocator | 64B 对齐分页 KV 物理池、CoW `fork_seq`、硬字节配额、优先级抢占驱逐、上升沿回差水位线回调与 2 次幂 Slab 复用池 | `src/runtime/{kv_cache,memory_pool}.rs` |

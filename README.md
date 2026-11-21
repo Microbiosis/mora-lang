@@ -196,7 +196,7 @@ See [editors/](editors/) for the six supported editors:
 ```
 .mora ──► lexer ──► parser_v3::compile ──► MirWitness[] + ControlProgram SSA IR
         ──► typeck (unified Span-tracked HM solver) ──► mir::control optimize (--opt=0/1/2)
-        ──► runtime::vm (stackful VM) + runtime::scheduler / runtime::reactor (Tokio)
+        ──► runtime::vm (stackful VM) + runtime::scheduler / runtime::reactor (zero-dependency native)
                 ├──► traits / algebraic effects / closures / delimited continuations
                 ├──► spawn / channel<T> / select / context / sleep / AsyncTcpListener
                 ├──► json.* / file.* (FsPolicy + CheckedPath) / exec.* / math.* / stats.* / linalg.* / random.*
@@ -221,8 +221,8 @@ Key modules under `src/`:
 
 ### Architecture evolution (Wave 1–4)
 
-- **Wave 1 (Completed, v0.110.0)** — Decoupled application-layer DSL constructs from the compiler core; extracted `BigInt` into `std/math/bigint` (`mora-std-bigint`) and focused the core runtime on language primitives and 7 foundational modules.
-- **Wave 2 (Completed, v0.110.0)** — Unified execution around the single-pass Control SSA IR & heap-framed stackful VM (`O(1)` tail-call optimization, multi-shot delimited continuations), Tokio `TaskScheduler` & `AsyncIoReactor`, Go-style `spawn`/`channel<T>`/`select`/`context`/`sleep`, first-class async TCP (`tcp_listen`/`tcp_connect`/`tcp_listener`/`tcp_stream`), `FsPolicy`/`CheckedPath` sandboxed I/O, `HostObject` extensibility, and HM-unified `mora-lsp`.
+- **Wave 1 (Completed, v0.110.0)** — Decoupled application-layer DSL constructs from the compiler core; extracted `BigInt` into `std/math/bigint` (a pure-Mora standard library module) and focused the core runtime on language primitives and 7 foundational modules.
+- **Wave 2 (Completed, v0.110.0)** — Unified execution around the single-pass Control SSA IR & heap-framed stackful VM (`O(1)` tail-call optimization, multi-shot delimited continuations), zero-dependency native `TaskScheduler` & `AsyncIoReactor`, Go-style `spawn`/`channel<T>`/`select`/`context`/`sleep`, first-class async TCP (`tcp_listen`/`tcp_connect`/`tcp_listener`/`tcp_stream`), `FsPolicy`/`CheckedPath` sandboxed I/O, `HostObject` extensibility, and HM-unified `mora-lsp`.
 - **Wave 3 — Stage 3A / 3B / 3C (Completed, v0.110.0)** — Stage 3A delivered strict `Int`/`Float` lexical precision, low-bitwidth suffixes (`f16`/`bf16`/`fp8`/`i4`..`i64`), `**`/`@`/`!`, and the single Span-tracked HM constraint solver. Stage 3B added first-class `Tensor<DType, Shape, Device>` with 64-byte aligned packed storage and 5 static checks (DType, Shape, Device, Resource, Effect). Stage 3C delivered nominal `struct`/`enum`/`@tag` reflection, source-level `trait`/`impl`/`dyn`, default & named keyword arguments, zero-copy multi-dim `TensorSlice`, and reverse-mode `grad`/`value_and_grad`/`no_grad`.
 - **Wave 4 — Track 4-1 / 4-2 / 4-3 + P1/P2 (Completed, v0.110.0)** — Native `TensorComputeDag` (`trace_dag`) with 4-pass fusion (`FusedFlashAttention` tiled online-softmax FlashAttention-2, `FusedRmsNormLinear`, `FusedLinearAct`, `FusedElementwise`), zero-dependency dynamic hardware GPU `DeviceBackend`s (NVIDIA CUDA Driver API + PTX ISA 7.0 `f64` kernels & `CudaVramArena`, Vulkan 1.0 + pure-Rust SPIR-V 1.0 compute shaders, macOS Metal MSL) plus `AVX2+FMA`/`NEON` multi-threaded `CpuDeviceBackend`, compile-time `DagMemoryPlan` physical scratch-buffer reuse & `DagPlanCache`, arbitrary-order AD (`grad(grad(f))`, `jvp(grad(f), x, v)` exact HVP, `trace_dag(grad(f))`), PagedAttention-style `KVPageAllocator` (`kv_allocator` with byte quotas, priority preemption & watermark callbacks) & 64B slab `MemoryPool` (`memory_pool`), zero-source `MORABC02` precompiled bytecode `mora build` single-binary & `.morac` execution, and pure-Mora `std/net/http` (Router/Chunked/Keep-Alive/413/SSE) & `std/mcp` (Tools/Resources/Prompts/`Struct::schema()`/Stdio) standard libraries.
 

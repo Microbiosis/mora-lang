@@ -41,7 +41,7 @@ Mora 是一门 **AI-native 静态类型语言**，核心定位是服务于**大�
 | **AI-native 底层友好** | 精确数值塔（`Int`/`Float` 与低位宽后缀 `f16`/`bf16`/`fp8`/`i4`..`i64`）、矩阵乘 `@`、幂运算 `**`、代数效果（`perform`/`handle`/多发 `resume`）与持久化块列表 |
 | **静态类型** | 编译期单一 Span 追踪 Hindley-Milner 约束求解 + 刚性泛型 + 值限制 + 效果行包含检查，注解可选（局部类型推断） |
 | **渐进复杂度** | 简单脚本直接运行，复杂系统可扩展到闭包、泛型、trait/`dyn`、Control SSA IR 优化与堆帧状态机 VM |
-| **云原生并发与事务** | 语言级 Go 式并发（`spawn` / 不变 `channel<T>` / 公平 `select` / 分层取消 `context` / `sleep`）、`parallel` / `worker` / `transaction` / `atom` 与 Tokio 多线程调度器 / Reactor |
+| **云原生并发与事务** | 语言级 Go 式并发（`spawn` / 不变 `channel<T>` / 公平 `select` / 分层取消 `context` / `sleep`）、`parallel` / `worker` / `transaction` / `atom` 与**自研**多线程调度器 / Reactor |
 | **可组合与同像性** | `eval`/`quote`/`read`/`quasiquote` + `macro` 支持编译期与运行期元编程 |
 
 ### 1.2 设计哲学
@@ -142,7 +142,7 @@ assign x = 20    -- 显式修改
 | | `external` | 宿主扩展对象 (`Value::External(Arc<dyn HostObject>)`) |
 | **同像性** (v0.86) | `code` | `quote(expr)` / `read("...")` |
 
-> `BigInt` 任意精度整数已于 v0.110.0 从语言核心迁至 `std/math/bigint`（`mora-std-bigint` 包）。
+> `BigInt` 任意精度整数已于 v0.110.0 从语言核心迁至 `std/math/bigint`（**纯 Mora** 标准库模块 `std/math/bigint.mora`，非 Rust crate）。
 
 ### 3.2 类型推断
 
@@ -229,7 +229,7 @@ print(p.greet())
 
 ### 3.6 数值塔（v0.110.0 核心收敛）
 
-Mora 核心运行时内置两个数值类型，构成一个**带可表示性检查**的数值塔（原任意精度 `BigInt` 已于 v0.110.0 迁出核心运行时至独立 crate `mora-std-bigint` / 规划路径 `std/math/bigint`）：
+Mora 核心运行时内置两个数值类型，构成一个**带可表示性检查**的数值塔（原任意精度 `BigInt` 已于 v0.110.0 迁出核心运行时至独立纯 Mora 标准库模块 `std/math/bigint.mora`）：
 
 ```text
        Int              i64（`42i`）
@@ -362,7 +362,7 @@ source → Lexer::scan_tokens → ParserV3::compile (parse_witnesses)
 
 **执行与调度内核**：
 - **堆帧状态机 VM**（`src/runtime/vm/`）：基于显式 `Vec<CallFrame>` 的单一执行引擎，支持 `O(1)` 尾调用帧复用与一等定界续延多发重放（`Value::Continuation`）
-- **Tokio 多线程调度器与 Reactor**（`src/runtime/{core,scheduler,reactor,fs}.rs`）：`CoreRuntime` 持有进程级共享 `EngineShared { scheduler: TaskScheduler, reactor: AsyncIoReactor }`，驱动 Go 式 `spawn`、`MoraChannel`、`select`、`TaskContext` 协作式取消、`AsyncTcpListener` 以及 `FsPolicy` / `CheckedPath` 文件系统沙箱隔离
+- **自研多线程调度器与 Reactor**（`src/runtime/{core,scheduler,reactor,fs}.rs`，**历史**：原为 Tokio 实现）：`CoreRuntime` 持有进程级共享 `EngineShared { scheduler: TaskScheduler, reactor: AsyncIoReactor }`，驱动 Go 式 `spawn`、`MoraChannel`、`select`、`TaskContext` 协作式取消、`AsyncTcpListener` 以及 `FsPolicy` / `CheckedPath` 文件系统沙箱隔离
 
 **编译优化控制**：
 - CLI `--opt=0|1|2` 或环境变量 `MORA_OPT=0|1|2`（`0` = 关闭、`1` = Basic、`>=2` = Aggressive）
@@ -887,7 +887,7 @@ export let CONFIG = {debug: true}
 - 相对路径：`import "./utils.mora"`
 - 绝对路径：`import "/home/user/libs/utils.mora"`
 - 内嵌纯 Mora 标准库：`import "std/net/http"`（HTTP/1.1 Router / Chunked / Keep-Alive / 413 / SSE）与 `import "std/mcp"`（MCP JSON-RPC 2.0 / Tools / Resources / Prompts / `Struct::schema()` / Stdio NDJSON）
-- 独立 Rust 标准库包：`std/math/bigint`（`mora-std-bigint` crate）
+- 独立纯 Mora 标准库模块：`std/math/bigint`（`std/math/bigint.mora`）
 
 ### 10.4 内置模块
 
@@ -1509,7 +1509,7 @@ Mora 运行时内置显式文件系统边界隔离（`src/runtime/fs.rs`）：
 ### 17.2 边界校验与外部进程安全
 
 - `file.*` 内建在路径参数上执行显式 NUL 字节与 `FsPolicy` 边界校验
-- `exec.parallel` 基于 `tokio::process::Command` + `Semaphore` 异步受控执行，严格校验并发上限 `max_concurrent` 与超时参数 `timeout_ms` 为非负数
+- `exec.parallel` 基于 `std::process::Command` + 自研 `AsyncSemaphore` 异步受控执行，严格校验并发上限 `max_concurrent` 与超时参数 `timeout_ms` 为非负数（**历史**：v0.110.0 之前基于 `tokio::process::Command`）
 - JSON 与 LSP 传输层强制执行 `MAX_JSON_DEPTH = 256` 迭代解析上限与 `MAX_CONTENT_LENGTH = 16 MiB` 报文头上限
 - `MORABC02` 字节码加载器强制校验 64 位 FNV-1a 校验和、变长整数边界与 `verify_program` SSA 结构合法性
 - 数值核心对精确 `Int` (`i64`) 与低位宽标量（`i8`..`u64`）运算溢出显式返回错误
@@ -1624,8 +1624,8 @@ v1.0.0  -- 首个长期稳定版本
 ### 20.2 当前版本
 
 **v0.110.0** — 全波次（Wave 1–Wave 4 + P1/P2）架构重铸定版：
-- **Wave 1**：移除越位应用层 DSL 与重依赖，`BigInt` 独立至 `std/math/bigint`（`mora-std-bigint`），核心收敛为 12 个顶层模块与 3 个生产依赖（`libc`/`parking_lot`/`tokio`）。
-- **Wave 2**：统一至单遍 `ControlProgram` SSA IR + 堆帧状态机 VM（`O(1)` TCO + 多发定界续延 `Value::Continuation`）、Tokio `TaskScheduler`/`AsyncIoReactor`、Go 式 `spawn`/`channel<T>`/`select`/`context`/`sleep`、非阻塞异步 TCP（`tcp_listen`/`tcp_connect`）与 `FsPolicy`/`CheckedPath` 文件系统隔离。
+- **Wave 1**：移除越位应用层 DSL 与重依赖，`BigInt` 独立至 `std/math/bigint`（**纯 Mora** 标准库模块 `std/math/bigint.mora`），核心收敛为 12 个顶层模块（**v0.110.0 起零第三方生产依赖** —— 原 `libc`/`parking_lot`/`tokio` 已全部清零）。
+- **Wave 2**：统一至单遍 `ControlProgram` SSA IR + 堆帧状态机 VM（`O(1)` TCO + 多发定界续延 `Value::Continuation`）、**自研** `TaskScheduler`/`AsyncIoReactor`（**历史**：原为 Tokio 实现）、Go 式 `spawn`/`channel<T>`/`select`/`context`/`sleep`、非阻塞异步 TCP（`tcp_listen`/`tcp_connect`）与 `FsPolicy`/`CheckedPath` 文件系统隔离。
 - **Wave 3（Stage 3A / 3B / 3C）**：确立严格 `Int`/`Float` 字面量精度与硬件低位宽后缀（`f16`/`bf16`/`fp8`/`i4`..`i64`）、`**`/`@`/`!`、单一 `Span` 追踪 HM 约束求解器、一等 64B 对齐 `Tensor<DType, Shape, Device>` 与 5 项静态检查（DType/Shape/Device/Resource/Effect）、名义泛型 `struct`/`enum`/`@tag`、源码级 `trait`/`impl`/`dyn Trait`、具名/默认参数、多维零拷贝切片与反向自动微分 `grad`/`value_and_grad`/`no_grad`。
 - **Wave 4（Track 4-1 / 4-2 / 4-3 + P1/P2）**：落地 `TensorComputeDag`（`trace_dag` 4 遍算子融合 `FusedFlashAttention`/`FusedRmsNormLinear`/`FusedLinearAct`/`FusedElementwise`、`DagMemoryPlan` 静态草稿复用、`DagPlanCache`）、前向 `jvp` 与多磁带任意阶微分 `grad^n` & HVP、零依赖动态加载 **CUDA PTX / Vulkan SPIR-V / Metal MSL / CPU AVX2+NEON** 硬件计算后端、PagedAttention `KVPageAllocator`（`kv_allocator`）与 64B Slab `MemoryPool`（`memory_pool`）、纯 Mora `std/net/http`（Router/Chunked/Keep-Alive/413/SSE）与 `std/mcp`（Tools/Resources/Prompts/`Struct::schema()`/Stdio）标准库，以及零源码 `MORABC02` 预编译字节码单二进制 `mora build` 与 `.morac`。
 

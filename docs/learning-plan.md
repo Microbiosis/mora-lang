@@ -9,7 +9,7 @@
 | 阶段 / 波次 | 核心主题 | 关键交付 | 状态 | 核心实现模块 |
 | :--- | :--- | :--- | :---: | :--- |
 | **早期 P1–P5** | 多范式语言内核 | 模式匹配与守卫、管道 `\|>` 与窗口/重塑、闭包与组合子、`parallel`/`worker`/`transaction`/`atom`、Lisp 同像性（`macro`/`quote`/`quasiquote`/`eval`） | ✅ 完成 | `src/parser_v3/`、`src/runtime/builtins/` |
-| **Wave 1** | 架构解耦与编译器瘦身 | 移除 20+ 越位 Agent/办公/TEA/Rel 模块与重依赖；核心收敛为 12 个顶层模块与 3 个生产依赖（`libc`/`parking_lot`/`tokio`）；`BigInt` 独立至 `std/math/bigint` | ✅ 完成 | `src/lib.rs`、`std/math/bigint/` |
+| **Wave 1** | 架构解耦与编译器瘦身 | 移除 20+ 越位 Agent/办公/TEA/Rel 模块与重依赖；核心收敛为 12 个顶层模块（**v0.110.0 起零第三方生产依赖**，原 `libc`/`parking_lot`/`tokio` 已全部清零）；`BigInt` 独立至 `std/math/bigint` | ✅ 完成 | `src/lib.rs`、`std/math/bigint/` |
 | **Wave 2** | 单一 Control SSA IR、堆帧 VM 与云原生并发 | 单遍 `MirWitness[] → ControlProgram` SSA IR + 优化器；堆帧 VM（`O(1)` 尾调用 + 多发定界续延 `Value::Continuation`）；Go 式 `spawn`/`channel<T>`/`select`/`context`/`sleep`、异步 `tcp_listen`/`tcp_connect` 与 `FsPolicy`/`CheckedPath` | ✅ 完成 | `src/mir/control/`、`src/runtime/{vm,scheduler,reactor,fs}.rs` |
 | **Wave 3 — Stage 3A** | 精确数值与统一 HM 求解器 | 严格分离 `Int` (`i64`) / `Float` (`f64`) 字面量、硬件低位宽后缀（`f16`/`bf16`/`fp8`/`i4`..`i64`）、`**`/`@`/`!`；单一 `Span` 追踪 HM 约束求解器（`check_program_witnesses`） | ✅ 完成 | `src/lexer.rs`、`src/typeck/hm/` |
 | **Wave 3 — Stage 3B** | 一等 `Tensor` 与 5 项 AI-Native 静态检查 | 64 字节对齐紧凑 `AlignedByteBuffer`（含 `i4` 半字节打包）、零拷贝视图；编译期 `DType` / `Shape` / `Device` / `Resource` / `Effect` 5 项静态检查 | ✅ 完成 | `src/common/dtype.rs`、`src/value/tensor.rs`、`src/typeck/hm/infer.rs` |

@@ -61,8 +61,8 @@
 >
 > ### 0.6 上下文实例（v0.78+ ~ v0.110.0 起强制）
 >
-> - **Wave 1（架构解耦与编译器瘦身）**：核心只保留语言原语与 7 个基础内建模块（`json`/`file`/`exec`/`math`/`stats`/`linalg`/`random`），上层应用耦合构造彻底迁出，`BigInt` 独立至 `std/math/bigint`（`mora-std-bigint`）。
-> - **Wave 2（单一 Control SSA 管线、堆帧 VM 与 Go 式云原生并发）**：不做双轨兼容桥，直接收口至 `MirWitness[] → ControlProgram` 单遍 SSA IR、堆帧状态机 VM（`O(1)` 尾调用 + 多发定界续延 `Value::Continuation`）、Tokio `TaskScheduler` / `AsyncIoReactor`、Go 式 `spawn` / 不变 `channel<T>` / 公平 `select` / `context` / `sleep`、非阻塞异步 TCP（`tcp_listen` / `tcp_connect`）与 `FsPolicy` / `CheckedPath` 沙箱隔离。
+> - **Wave 1（架构解耦与编译器瘦身）**：核心只保留语言原语与 7 个基础内建模块（`json`/`file`/`exec`/`math`/`stats`/`linalg`/`random`），上层应用耦合构造彻底迁出，`BigInt` 独立至纯 Mora 标准库 `std/math/bigint.mora`（v0.110.0 起 Rust 侧不再有 BigInt 类型）。
+> - **Wave 2（单一 Control SSA 管线、堆帧 VM 与 Go 式云原生并发）**：不做双轨兼容桥，直接收口至 `MirWitness[] → ControlProgram` 单遍 SSA IR、堆帧状态机 VM（`O(1)` 尾调用 + 多发定界续延 `Value::Continuation`）、自研零依赖 `TaskScheduler` / `AsyncIoReactor`、Go 式 `spawn` / 不变 `channel<T>` / 公平 `select` / `context` / `sleep`、非阻塞异步 TCP（`tcp_listen` / `tcp_connect`）与 `FsPolicy` / `CheckedPath` 沙箱隔离。
 > - **Wave 3（精确数值、统一 HM 求解器、一等 Tensor、5 项静态检查与模型语法）**：Stage 3A 严格分离 `Int`/`Float` 字面量与低位宽后缀（`f16`/`bf16`/`fp8`/`i4`..`i64`）、`**`/`@`/`!` 及单一 `Span` 追踪 HM 约束求解器（`check_program_witnesses`）；Stage 3B 构建一等 64B 对齐 `Tensor<DType, Shape, Device>` 与 5 项静态检查（DType/Shape/Device/Resource/Effect）；Stage 3C 落地名义 `struct`/`enum`/`@tag`、源码级 `trait`/`impl`/`dyn Trait`、具名与默认参数、零拷贝多维切片及反向模式 `grad`/`value_and_grad`/`no_grad`。
 > - **Wave 4（AI 原生计算图、硬件 GPU 后端、动态显存调控与云原生标准库闭环）**：原生 `TensorComputeDag`（`trace_dag` 4 遍算子融合 `FusedFlashAttention`/`FusedRmsNormLinear`/`FusedLinearAct`/`FusedElementwise`、`DagMemoryPlan`、`DagPlanCache`）、前向 `jvp` 与多磁带任意阶微分 `grad^n` & HVP、零依赖动态加载 CUDA PTX / Vulkan SPIR-V / Metal MSL / CPU AVX2+NEON 硬件后端、`KVPageAllocator` 与 64B Slab `MemoryPool` 动态资源调控、零源码 `MORABC02` 预编译字节码 `mora build` 单二进制与 `.morac` 直跑，以及纯 Mora `std/net/http`（含 Router/Chunked/Keep-Alive/413/SSE）与 `std/mcp` 标准库。
 >
@@ -85,7 +85,7 @@
 
 以下场景**必须**先调用 MCP 搜索：
 
-- 任何第三方库的 API、配置、版本兼容性（如 `tokio`、`parking_lot`、`libc`、`proptest` 等）
+- 任何第三方库的 API、配置、版本兼容性（如未来引入的 `serde` / `tokio` 等）
 - 任何外部协议/规范的最新动态（如 MCP 协议、HTTP 标准、语言标准库）
 - 当前日期附近的发布说明、breaking change、CVE
 - 官方推荐的 best practice、迁移指南
@@ -233,9 +233,9 @@
 
 ## Project layout
 
-- `src/` — core compiler, unified HM type checker, Control SSA IR (`MORABC02` codec), stackful VM, `TensorComputeDag` & CUDA/Vulkan/Metal/SIMD backends, `KVPageAllocator` & `MemoryPool`, Tokio scheduler/reactor, and binaries (`mora`, `mora-lsp`)
-- `std/` — modular standard libraries (`std/math/bigint` / `mora-std-bigint` Rust crate, pure-Mora `std/net/http.mora` with Router/Chunked/Keep-Alive/SSE, and `std/mcp.mora` with Tools/Resources/Prompts/`Struct::schema()`/Stdio)
-- `tests/` — integration tests + property-based tests (proptest)
+- `src/` — core compiler, unified HM type checker, Control SSA IR (`MORABC02` codec), stackful VM, `TensorComputeDag` & CUDA/Vulkan/Metal/SIMD backends, `KVPageAllocator` & `MemoryPool`, zero-dependency native scheduler/reactor, and binaries (`mora`, `mora-lsp`)
+- `std/` — pure-Mora standard libraries (`std/math/bigint.mora`, `std/testing.mora`, `std/net/http.mora` with Router/Chunked/Keep-Alive/SSE, and `std/mcp.mora` with Tools/Resources/Prompts/`Struct::schema()`/Stdio), embedded in the binary via `mora::resolve_std_module`
+- `tests/` — integration tests + property-based tests (self-hosted `std/testing.mora` generator)
 - `examples/` — runnable Mora demo scripts (CI also runs these against the release binary)
 - `docs/` — language spec, influences, learning plan, architecture diagram
 - `scripts/` — repo utility scripts (PowerShell helpers)
@@ -262,9 +262,9 @@
 ## Testing instructions
 
 - Unit + integration tests: `cargo test --all-targets` (CI matrix: Ubuntu / Windows / macOS, stable only)
-- Workspace std crates: `cargo test -p mora-std-bigint`
 - Library tests only: `cargo test --lib`
-- Property-based tests: `proptest = "1.7"` dev-dep (see `tests/proptest_*.rs`)
+- Pure-Mora std library: exercised through the embedded modules (`cargo test --test std_math_bigint_and_testing`)
+- Property-based tests: self-hosted generator in `std/testing.mora` driven by the deterministic SplitMix64 PRNG (see `tests/proptest_*.rs`)
 - LSP smoke: `cargo run --release --example lsp_smoke -- ./target/release/mora-lsp`
 - Add tests for every new behavior — see existing `tests/*.rs` files for the pattern
 - All tests must pass before opening a PR

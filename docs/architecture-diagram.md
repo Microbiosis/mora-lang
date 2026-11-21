@@ -65,7 +65,7 @@ flowchart TD
     end
 
     subgraph STD_WS["Workspace 标准库包与纯 Mora 标准库"]
-        BIGINT["std/math/bigint (mora-std-bigint)\n独立 BigInt 标准库 crate"]
+        BIGINT["std/math/bigint (纯 Mora)\n独立 BigInt 标准库模块"]
         HTTP_MCP["std/net/http.mora & std/mcp.mora\n纯 Mora HTTP/1.1 (Router/Chunked/Keep-Alive/SSE) 与 MCP JSON-RPC 2.0 标准库"]
     end
 

@@ -57,6 +57,7 @@ fn dispatch() -> i32 {
                     "  mora build <file.mora>     Compile a script into an AOT MORABC02 standalone binary [--emit-bc] [-o <out>]"
                 );
                 println!("  mora install <url>         Install a package from a URL");
+                println!("  mora install --clean       Remove stale/broken packages from vendor/");
                 println!();
                 println!("  mora --version             Show version");
                 println!("  mora --help                Show this help");
@@ -102,7 +103,15 @@ fn dispatch() -> i32 {
         "install" => {
             if args.len() < 3 {
                 eprintln!("Usage: mora install <url>");
+                eprintln!(
+                    "       mora install --clean   Remove stale/broken packages from vendor/"
+                );
                 process::exit(1);
+            }
+            // `--clean`：只清扫 vendor/ 的历史残留（旧版 install 留下的 HTTP 错误页），
+            // 不安装任何东西。
+            if args[2] == "--clean" {
+                return mora::cli::install::clean_vendor();
             }
             // 安装失败必须以非 0 退出码结束（HTTP 4xx/5xx、传输失败、
             // 目标不可写……），否则脚本/CI 会把「装了个错误页」当成成功。

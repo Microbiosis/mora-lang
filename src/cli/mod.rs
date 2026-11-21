@@ -4,6 +4,7 @@
 pub mod bundle;
 pub mod install;
 pub mod repl;
+pub mod vendor;
 
 use std::fs;
 use std::path::Path;

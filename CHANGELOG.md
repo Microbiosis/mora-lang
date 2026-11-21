@@ -14,6 +14,18 @@ All notable changes to Mora will be documented in this file.
   - `mora.lock` 仅在安装成功后写入。
 - **判据**：新增 `tests/install_http_status.rs`（本地 HTTP 服务 + 真实 `mora install`）—— 404 / 502 ⇒ 退出码非 0、不打印 `Installed`、`vendor/` 下不留任何文件、不产生 `mora.lock`；200 ⇒ 退出码 0、包内容逐字落盘、`mora.lock` 登记 URL。单元测试覆盖包名解析 / 2xx 判定 / curl 与 wget 状态码解析。
 
+### `vendor/` 历史残留自动清扫（补 v0.110.1 之前的遗留物）
+
+- **背景**：v0.110.1 之前的 `mora install` 不校验 HTTP 状态 ⇒ 404/502 的**错误页响应体**被写进 `vendor/<pkg>.mora` 并登记进 `mora.lock`。这些文件在磁盘上与「正常安装的包」**无从区分**，直到有人真的 import 它。
+- **清扫判据**（两条同时满足才删）：① **不是合法的 Mora 程序**（`ParserV3::compile` 失败 —— 装出来的包必须能编译）；② **是本工具装出来的**（登记在 `mora.lock`）**或**内容带 HTTP 错误页特征（文件**本身**以 `<!DOCTYPE html` / `<html` / `502 Bad Gateway` 等开头）。
+  - 第 ① 条保证**项目自带的样例包不会被误删**（如本仓 `vendor/hello.mora` —— 能编译即保留）；
+  - 第 ② 条保证**用户手写但写坏的包不会被越权删除**（既不在登记表、也不像错误页 ⇒ 一律保留）；
+  - 判定用 `compile`（解析 + 降低）而**不是**类型检查：包 `import` 兄弟模块时类型检查会因模块缺失报错，但那是**环境问题**、不是文件损坏。
+- **新增 `src/cli/vendor.rs`**：`mora.lock` 的读写（`LockFile`）+ 清扫（`sweep_vendor`）+ 残留判定；全部 `pub(crate)`，不扩公开 API 面。
+- **触发方式**：① **每次 `mora install` 前自动清扫**（工具自己造成的垃圾，由工具自己收拾）；② 新增 `mora install --clean` 显式只清扫不安装。
+- **连带清理**：被删包在 `mora.lock` 里的死条目一并清除；清扫报告逐条点名被删的包与被清的条目。
+- **判据**：新增 `tests/vendor_prune.rs` —— 错误页残留被删、正常包保留、用户写坏的文件保留、`mora.lock` 死条目被清、install 前自动清扫生效、干净目录上的 `--clean` 是 no-op（不凭空造出登记表）。
+
 ### 会话级产物出库
 
 - `build_output.txt` / `clippy_output.txt` / `fmt_output.txt`（构建门禁输出缓存）、`mora_logo_preview.png`（AI 图片生成产物）、`scripts/audit_stats.py`（会话级审计脚本）、`.v2c/plugin_root`（本机 ZCode 插件缓存路径）、`tests/.mimosa/hook-*/`（Mimosa 扫描缓存）—— 全部**取消 git 跟踪**（文件保留在本机），`.gitignore` 补 `.v2c/`。`git ls-files -ci --exclude-standard` 现为空。

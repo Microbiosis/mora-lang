@@ -25,18 +25,31 @@
 //! - wget：HTTP 错误时退出码非 0，状态码从 stderr 的 `ERROR 404: Not Found.` 解析。
 
 use std::fs;
+use std::path::Path;
 use std::process::Command;
 
+use super::vendor::{LockFile, sweep_vendor};
+
+/// `vendor/` 目录名（包仓库根）。
+const VENDOR_DIR: &str = "vendor";
+
+/// 安装登记表文件名。
+const LOCK_FILE: &str = "mora.lock";
+
 /// 安装一个包。返回进程退出码（成功 0，失败非 0）。
+///
+/// 安装前先**自动清扫** `vendor/`：清掉旧版 install 留下的 HTTP 错误页残留
+/// （见 [`super::vendor`] 的判据）—— 工具自己造成的垃圾，由工具自己收拾。
 pub fn install_package(url: &str) -> i32 {
-    let vendor_dir = "vendor";
-    if let Err(e) = fs::create_dir_all(vendor_dir) {
+    if let Err(e) = fs::create_dir_all(VENDOR_DIR) {
         eprintln!("Failed to create vendor directory: {e}");
         return 1;
     }
 
+    sweep_and_report();
+
     let pkg_name = package_name_from_url(url);
-    let dest = format!("{vendor_dir}/{pkg_name}.mora");
+    let dest = format!("{VENDOR_DIR}/{pkg_name}.mora");
     let staging = format!("{dest}.part");
 
     println!("Installing {pkg_name} from {url}...");
@@ -52,7 +65,7 @@ pub fn install_package(url: &str) -> i32 {
         Ok(_) => match fs::rename(&staging, &dest) {
             Ok(()) => {
                 println!("Installed {pkg_name} -> {dest}");
-                update_lock(pkg_name, url);
+                record_in_lock(pkg_name, url);
                 0
             }
             Err(e) => {
@@ -67,6 +80,61 @@ pub fn install_package(url: &str) -> i32 {
             eprintln!("Failed to install {pkg_name}: {msg}");
             1
         }
+    }
+}
+
+/// 只做清扫、不安装（`mora install --clean`）。返回进程退出码。
+pub fn clean_vendor() -> i32 {
+    let _ = fs::create_dir_all(VENDOR_DIR);
+    let sweep = sweep_and_report();
+    if sweep.is_empty() {
+        println!("Nothing to clean in {VENDOR_DIR}/.");
+    }
+    0
+}
+
+/// 清扫 `vendor/` 并打印报告。返回清扫结果。
+fn sweep_and_report() -> super::vendor::VendorSweep {
+    let lock_path = Path::new(LOCK_FILE);
+    let mut lock = LockFile::load(lock_path);
+    let sweep = sweep_vendor(Path::new(VENDOR_DIR), &mut lock);
+
+    if !sweep.removed.is_empty() {
+        println!(
+            "Cleaned {} stale package(s) from {VENDOR_DIR}/:",
+            sweep.removed.len()
+        );
+        for name in &sweep.removed {
+            println!("  - {VENDOR_DIR}/{name}.mora (not a valid Mora package)");
+        }
+    }
+    if !sweep.lock_removed.is_empty() {
+        println!(
+            "Removed {} entry/entries from {LOCK_FILE}:",
+            sweep.lock_removed.len()
+        );
+        for name in &sweep.lock_removed {
+            println!("  - {name}");
+        }
+    }
+    if !sweep.lock_removed.is_empty()
+        && let Err(e) = lock.save(lock_path)
+    {
+        eprintln!("Warning: failed to update {LOCK_FILE}: {e}");
+    }
+    sweep
+}
+
+/// 把已安装的包登记进 `mora.lock`。
+fn record_in_lock(pkg_name: &str, url: &str) {
+    let lock_path = Path::new(LOCK_FILE);
+    let mut lock = LockFile::load(lock_path);
+    if lock.contains(pkg_name) {
+        return;
+    }
+    lock.insert(pkg_name, url);
+    if let Err(e) = lock.save(lock_path) {
+        eprintln!("Warning: failed to update {LOCK_FILE}: {e}");
     }
 }
 
@@ -182,22 +250,6 @@ fn describe_failure(tool: &str, stderr: &str, exit_code: Option<i32>) -> String 
 /// 失败路径：删除暂存文件（错误页不得留在磁盘上）。
 fn discard_staging(staging: &str) {
     let _ = fs::remove_file(staging);
-}
-
-/// 登记到 `mora.lock`（仅在安装成功后调用）。
-fn update_lock(pkg_name: &str, url: &str) {
-    let lock_path = "mora.lock";
-    let mut content = String::new();
-    if std::path::Path::new(lock_path).exists() {
-        content = fs::read_to_string(lock_path).unwrap_or_default();
-    }
-    let entry = format!("{pkg_name} = \"{url}\"\n");
-    if !content.contains(pkg_name) {
-        content.push_str(&entry);
-        if let Err(e) = fs::write(lock_path, content) {
-            eprintln!("Warning: failed to update {lock_path}: {e}");
-        }
-    }
 }
 
 /// 工具是否在 PATH 上（Windows 用 `where`，Unix 用 `which`）。

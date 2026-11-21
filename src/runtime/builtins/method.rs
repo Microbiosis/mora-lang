@@ -280,8 +280,26 @@ fn call_method_list_inner(list: List, method: &str, args: &[Value]) -> MoraResul
         "sum" | "mean" | "median" | "stddev" | "var" | "min" | "max" => {
             super::stats::call_stats_method(method, &[Value::List(list.clone())])
         }
-        // v0.91: List.sort() — 升序排序（仅数值列表，非数值原样返回）
+        // v0.91 / v0.110.1: List.sort() — 升序排序（支持全数值列表与全字符串列表）
         "sort" => {
+            if list.is_empty() {
+                return Ok(Value::List(Vec::new().into()));
+            }
+            if list.iter().all(|v| matches!(v, Value::String(_))) {
+                let mut strings: Vec<&str> = list
+                    .iter()
+                    .filter_map(|v| match v {
+                        Value::String(s) => Some(s.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                strings.sort_unstable();
+                let sorted: Vec<Value> = strings
+                    .into_iter()
+                    .map(|s| Value::String(s.to_string()))
+                    .collect();
+                return Ok(Value::List(sorted.into()));
+            }
             // 提取 f64 副本用于排序
             let mut indexed: Vec<(usize, f64)> = list
                 .iter()
@@ -294,7 +312,7 @@ fn call_method_list_inner(list: List, method: &str, args: &[Value]) -> MoraResul
                 .collect();
             if indexed.len() != list.len() {
                 return Err(MoraError::Runtime(
-                    "List.sort: contains non-numeric elements".to_string(),
+                    "List.sort: elements must be all numeric or all strings".to_string(),
                 ));
             }
             // v0.104.6 D242：用 `total_cmp`（IEEE 754 全序）而非
@@ -509,6 +527,8 @@ pub(crate) fn eval_pure_method(
         | Value::Context(_)
         | Value::TcpListener(_)
         | Value::TcpStream(_)
+        | Value::TlsListener(_)
+        | Value::TlsStream(_)
         | Value::ComputeDag(_)
         | Value::KVAllocator(_)
         | Value::MemoryPool(_)

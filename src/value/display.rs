@@ -144,6 +144,23 @@ impl std::fmt::Display for Value {
                     s.is_closed()
                 )
             }
+            Value::TlsListener(l) => {
+                write!(
+                    f,
+                    "<tls_listener addr={} closed={}>",
+                    l.local_addr(),
+                    l.is_closed()
+                )
+            }
+            Value::TlsStream(s) => {
+                write!(
+                    f,
+                    "<tls_stream peer={} proto={} closed={}>",
+                    s.peer_addr(),
+                    s.tls_version(),
+                    s.is_closed()
+                )
+            }
             Value::ComputeDag(dag) => {
                 write!(
                     f,

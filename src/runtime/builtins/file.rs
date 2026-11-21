@@ -101,6 +101,118 @@ pub fn call_file_method(core: &mut CoreRuntime, method: &str, args: &[Value]) ->
             })?;
             Ok(Value::Nil)
         }
+        "read_binary" => {
+            let raw = expect_str(0, "path")?;
+            let checked = core.fs_context().resolve_path(&raw, &op)?;
+            let bytes = core.reactor().run_fs(core.task_context.as_ref(), move || {
+                std::fs::read(checked.as_path()).map_err(|e| {
+                    MoraError::Io(format!("file.read_binary: cannot read '{}': {}", raw, e))
+                })
+            })?;
+            Ok(Value::Tensor(crate::value::tensor::Tensor::from_u8_vec(
+                &bytes,
+            )?))
+        }
+        "read_binary_range" => {
+            let raw = expect_str(0, "path")?;
+            let expect_nonneg_u64 = |idx: usize, name: &str| -> MoraResult<u64> {
+                match args.get(idx) {
+                    Some(Value::Int(n)) if *n >= 0 => Ok(*n as u64),
+                    Some(Value::Int(n)) => Err(MoraError::Runtime(format!(
+                        "file.read_binary_range: {} must be non-negative, got {}",
+                        name, n
+                    ))),
+                    Some(_) => Err(MoraError::Runtime(format!(
+                        "file.read_binary_range: {} must be an int",
+                        name
+                    ))),
+                    None => Err(MoraError::Runtime(format!(
+                        "file.read_binary_range: missing argument {}",
+                        name
+                    ))),
+                }
+            };
+            let offset = expect_nonneg_u64(1, "offset")?;
+            let length = expect_nonneg_u64(2, "len")? as usize;
+            let checked = core.fs_context().resolve_path(&raw, &op)?;
+            let bytes = core.reactor().run_fs(core.task_context.as_ref(), move || {
+                use std::io::{Read, Seek, SeekFrom};
+                let mut f = std::fs::File::open(checked.as_path()).map_err(|e| {
+                    MoraError::Io(format!(
+                        "file.read_binary_range: cannot open '{}': {}",
+                        raw, e
+                    ))
+                })?;
+                let file_len = f
+                    .metadata()
+                    .map_err(|e| {
+                        MoraError::Io(format!(
+                            "file.read_binary_range: cannot stat '{}': {}",
+                            raw, e
+                        ))
+                    })?
+                    .len();
+                let end = offset.checked_add(length as u64).ok_or_else(|| {
+                    MoraError::Io("file.read_binary_range: offset + len overflow".to_string())
+                })?;
+                if end > file_len {
+                    return Err(MoraError::Io(format!(
+                        "file.read_binary_range: requested range [{}..{}) exceeds file size {} for '{}'",
+                        offset, end, file_len, raw
+                    )));
+                }
+                f.seek(SeekFrom::Start(offset)).map_err(|e| {
+                    MoraError::Io(format!(
+                        "file.read_binary_range: seek failed on '{}': {}",
+                        raw, e
+                    ))
+                })?;
+                let mut buf = vec![0u8; length];
+                f.read_exact(&mut buf).map_err(|e| {
+                    MoraError::Io(format!(
+                        "file.read_binary_range: read failed on '{}': {}",
+                        raw, e
+                    ))
+                })?;
+                Ok(buf)
+            })?;
+            Ok(Value::Tensor(crate::value::tensor::Tensor::from_u8_vec(
+                &bytes,
+            )?))
+        }
+        "write_binary" => {
+            let raw = expect_str(0, "path")?;
+            let Some(Value::Tensor(buf_tensor)) = args.get(1) else {
+                return Err(MoraError::Runtime(
+                    "file.write_binary(path, bytes): second argument must be a u8 Tensor"
+                        .to_string(),
+                ));
+            };
+            if buf_tensor.dtype != crate::common::DType::U8 {
+                return Err(MoraError::Runtime(format!(
+                    "file.write_binary: tensor must have dtype 'u8', got '{}'",
+                    buf_tensor.dtype.short_name()
+                )));
+            }
+            let bytes = buf_tensor.to_raw_byte_vec()?;
+            let checked = core.fs_context().resolve_path(&raw, &op)?;
+            core.reactor().run_fs(core.task_context.as_ref(), move || {
+                let target = checked.as_path();
+                if let Some(parent) = target.parent()
+                    && !parent.as_os_str().is_empty()
+                    && !parent.exists()
+                {
+                    return Err(MoraError::Runtime(format!(
+                        "file.write_binary: parent directory does not exist: {}",
+                        parent.display()
+                    )));
+                }
+                std::fs::write(target, &bytes).map_err(|e| {
+                    MoraError::Io(format!("file.write_binary: cannot write '{}': {}", raw, e))
+                })
+            })?;
+            Ok(Value::Nil)
+        }
         "exists" => {
             let raw = expect_str(0, "path")?;
             let checked = core.fs_context().resolve_path(&raw, &op)?;

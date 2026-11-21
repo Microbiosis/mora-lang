@@ -119,6 +119,12 @@ fn call_for(name: &str) -> Option<&'static str> {
         "tcp_connect" => {
             "fn() let l = tcp_listen(\"127.0.0.1:0\")\nlet s = tcp_connect(l.local_addr())\nl.close()\nreturn s end()"
         }
+        "tls_listen" => {
+            "fn() let c: dict<string, any> = {}\nassign c = c.set(\"cert_pem\", file.read_text(\"test_data/tls/test_server.pem\")).set(\"key_pem\", file.read_text(\"test_data/tls/test_server_pkcs8.key\"))\nlet l = tls_listen(\"127.0.0.1:0\", c)\nl.close()\nreturn l end()"
+        }
+        "tls_connect" => {
+            "fn() let sc: dict<string, any> = {}\nassign sc = sc.set(\"cert_pem\", file.read_text(\"test_data/tls/test_server.pem\")).set(\"key_pem\", file.read_text(\"test_data/tls/test_server_pkcs8.key\"))\nlet l = tls_listen(\"127.0.0.1:0\", sc)\nlet addr = l.local_addr()\nlet srv = spawn fn() let a = l.accept()\na.close()\nreturn nil end\nlet cc: dict<string, any> = {}\nassign cc = cc.set(\"ca_pem\", file.read_text(\"test_data/tls/test_ca.pem\"))\nlet s = tls_connect(addr, \"localhost\", cc)\ns.close()\nsrv.join()\nl.close()\nreturn s end()"
+        }
         "tensor" => "tensor([1.0, 2.0])",
         "grad" => "grad(fn(x) x end)",
         "value_and_grad" => "value_and_grad(fn(x) x end)",

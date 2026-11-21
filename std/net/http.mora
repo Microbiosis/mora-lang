@@ -244,12 +244,12 @@ task match_route_pattern(pattern: string, path: string): RouteMatch
   return RouteMatch(matched=true, params=params)
 end
 
-task run_middleware_chain(mws: list<any>, idx: int, req: HttpRequest, stream: tcp_stream, target: any): any
+task run_middleware_chain(mws: list<any>, idx: int, req: HttpRequest, stream: tcp_stream | tls_stream, target: any): any
   if idx >= mws.len() then
     return target(req, stream)
   end
   let mw = mws.get(idx)
-  let next_fn = fn(r: HttpRequest, s: tcp_stream) run_middleware_chain(mws, idx + 1, r, s, target) end
+  let next_fn = fn(r: HttpRequest, s: tcp_stream | tls_stream) run_middleware_chain(mws, idx + 1, r, s, target) end
   return mw(req, stream, next_fn)
 end
 
@@ -289,10 +289,10 @@ export impl Router
     return Router(routes=self.routes, middlewares=self.middlewares.push(mw))
   end
 
-  task handle(self, req: HttpRequest, stream: tcp_stream): any
+  task handle(self, req: HttpRequest, stream: tcp_stream | tls_stream): any
     let routes = self.routes
     let mws = self.middlewares
-    let dispatch = fn(r: HttpRequest, s: tcp_stream)
+    let dispatch = fn(r: HttpRequest, s: tcp_stream | tls_stream)
       let allowed: list<string> = []
       let req_method = r.method.upper()
       for entry in routes
@@ -316,8 +316,8 @@ export impl Router
     return run_middleware_chain(mws, 0, req, stream, dispatch)
   end
 
-  task serve_listener(self, listener: tcp_listener, max_requests: int = 0, ctx: any = nil, max_body_bytes: int = 1048576, max_keepalive_requests: int = 100): int
-    let h = fn(req: HttpRequest, stream: tcp_stream) self.handle(req, stream) end
+  task serve_listener(self, listener: tcp_listener | tls_listener, max_requests: int = 0, ctx: any = nil, max_body_bytes: int = 1048576, max_keepalive_requests: int = 100): int
+    let h = fn(req: HttpRequest, stream: tcp_stream | tls_stream) self.handle(req, stream) end
     return serve_listener(listener, h, max_requests, ctx, max_body_bytes, max_keepalive_requests)
   end
 
@@ -327,9 +327,20 @@ export impl Router
     listener.close()
     return count
   end
+
+  task serve_tls(self, addr: string, cert_pem: string, key_pem: string, max_requests: int = 0, ctx: any = nil, max_body_bytes: int = 1048576, max_keepalive_requests: int = 100): int
+    let cfg: dict<string, any> = {}
+    assign cfg = cfg.set("cert_pem", cert_pem)
+    assign cfg = cfg.set("key_pem", key_pem)
+    assign cfg = cfg.set("alpn", ["http/1.1"])
+    let listener = tls_listen(addr, cfg)
+    let count = self.serve_listener(listener, max_requests, ctx, max_body_bytes, max_keepalive_requests)
+    listener.close()
+    return count
+  end
 end
 
-task parse_headers_from_stream(stream: tcp_stream, ctx: any): dict<string, string>
+task parse_headers_from_stream(stream: tcp_stream | tls_stream, ctx: any): dict<string, string>
   let hdrs: dict<string, string> = {}
   while true
     let raw_line = stream.read_line(8192, ctx)
@@ -347,7 +358,7 @@ task parse_headers_from_stream(stream: tcp_stream, ctx: any): dict<string, strin
   return hdrs
 end
 
-task read_exact_body(stream: tcp_stream, content_len: int, ctx: any): string
+task read_exact_body(stream: tcp_stream | tls_stream, content_len: int, ctx: any): string
   if content_len <= 0 then
     return ""
   end
@@ -363,7 +374,7 @@ task read_exact_body(stream: tcp_stream, content_len: int, ctx: any): string
   return body
 end
 
-task read_chunked_body(stream: tcp_stream, max_body_bytes: int, ctx: any): ChunkedResult
+task read_chunked_body(stream: tcp_stream | tls_stream, max_body_bytes: int, ctx: any): ChunkedResult
   let body = ""
   while true
     let size_line = stream.read_line(4096, ctx)
@@ -395,7 +406,7 @@ task read_chunked_body(stream: tcp_stream, max_body_bytes: int, ctx: any): Chunk
   return ChunkedResult(body=body, too_large=false, error="")
 end
 
-export task read_request(stream: tcp_stream, ctx: any = nil, max_body_bytes: int = 1048576): HttpRequest
+export task read_request(stream: tcp_stream | tls_stream, ctx: any = nil, max_body_bytes: int = 1048576): HttpRequest
   let empty_p: dict<string, string> = {}
   let start_line = stream.read_line(8192, ctx).trim()
   if start_line == "" then
@@ -454,7 +465,7 @@ task should_keep_alive(req: HttpRequest, allow_keep_alive: bool): bool
   return true
 end
 
-export task write_response(stream: tcp_stream, resp: HttpResponse, ctx: any = nil, keep_alive: bool = false): nil
+export task write_response(stream: tcp_stream | tls_stream, resp: HttpResponse, ctx: any = nil, keep_alive: bool = false): nil
   let reason = status_reason(resp.status)
   let out = "HTTP/1.1 " + str(resp.status) + " " + reason + "\r\n"
   let has_cl = false
@@ -499,13 +510,13 @@ export task write_response(stream: tcp_stream, resp: HttpResponse, ctx: any = ni
   return nil
 end
 
-export task sse_start(stream: tcp_stream, ctx: any = nil): nil
+export task sse_start(stream: tcp_stream | tls_stream, ctx: any = nil): nil
   let hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n"
   stream.write(hdr, ctx)
   return nil
 end
 
-export task sse_send(stream: tcp_stream, event_name: string, data: string, id: string = "", ctx: any = nil): nil
+export task sse_send(stream: tcp_stream | tls_stream, event_name: string, data: string, id: string = "", ctx: any = nil): nil
   let frame = ""
   if id != "" then
     assign frame = frame + "id: " + id + "\n"
@@ -521,7 +532,7 @@ export task sse_send(stream: tcp_stream, event_name: string, data: string, id: s
   return nil
 end
 
-export task sse_read_event(stream: tcp_stream, ctx: any = nil): SseEvent
+export task sse_read_event(stream: tcp_stream | tls_stream, ctx: any = nil): SseEvent
   let ev_name = "message"
   let ev_id = ""
   let ev_data = ""
@@ -563,7 +574,7 @@ export task sse_read_event(stream: tcp_stream, ctx: any = nil): SseEvent
   return SseEvent(event=ev_name, data=ev_data, id=ev_id)
 end
 
-export task serve_listener(listener: tcp_listener, handler: any, max_requests: int = 0, ctx: any = nil, max_body_bytes: int = 1048576, max_keepalive_requests: int = 100): int
+export task serve_listener(listener: tcp_listener | tls_listener, handler: any, max_requests: int = 0, ctx: any = nil, max_body_bytes: int = 1048576, max_keepalive_requests: int = 100): int
   let accepted = 0
   let workers: list<task_handle<any>> = []
   while max_requests <= 0 or accepted < max_requests
@@ -622,7 +633,18 @@ export task serve(addr: string, handler: any, max_requests: int = 0, ctx: any = 
   return count
 end
 
-export task read_http_response(stream: tcp_stream, ctx: any = nil, max_body_bytes: int = 0): HttpClientResponse
+export task serve_tls(addr: string, cert_pem: string, key_pem: string, handler: any, max_requests: int = 0, ctx: any = nil, max_body_bytes: int = 1048576, max_keepalive_requests: int = 100): int
+  let cfg: dict<string, any> = {}
+  assign cfg = cfg.set("cert_pem", cert_pem)
+  assign cfg = cfg.set("key_pem", key_pem)
+  assign cfg = cfg.set("alpn", ["http/1.1"])
+  let listener = tls_listen(addr, cfg)
+  let count = serve_listener(listener, handler, max_requests, ctx, max_body_bytes, max_keepalive_requests)
+  listener.close()
+  return count
+end
+
+export task read_http_response(stream: tcp_stream | tls_stream, ctx: any = nil, max_body_bytes: int = 0): HttpClientResponse
   let status_line = stream.read_line(8192, ctx).trim()
   let parts = status_line.split(" ")
   let code = if parts.len() >= 2 then int(parts.get(1)) else 200 end
@@ -655,7 +677,7 @@ export task read_http_response(stream: tcp_stream, ctx: any = nil, max_body_byte
   return HttpClientResponse(status=code, status_text=reason, headers=hdrs, body=body)
 end
 
-export task send_request_on(stream: tcp_stream, method: string, host: string, path: string, body: string = "", content_type: string = "application/json", keep_alive: bool = true, ctx: any = nil): HttpClientResponse
+export task send_request_on(stream: tcp_stream | tls_stream, method: string, host: string, path: string, body: string = "", content_type: string = "application/json", keep_alive: bool = true, ctx: any = nil): HttpClientResponse
   let conn_val = if keep_alive then "keep-alive" else "close" end
   let req = method.upper() + " " + path + " HTTP/1.1\r\nHost: " + host + "\r\nConnection: " + conn_val + "\r\n"
   if body != "" then
@@ -666,7 +688,7 @@ export task send_request_on(stream: tcp_stream, method: string, host: string, pa
   return read_http_response(stream, ctx, 0)
 end
 
-export task send_chunked_request_on(stream: tcp_stream, method: string, host: string, path: string, chunks: list<string>, content_type: string = "text/plain", keep_alive: bool = false, ctx: any = nil): HttpClientResponse
+export task send_chunked_request_on(stream: tcp_stream | tls_stream, method: string, host: string, path: string, chunks: list<string>, content_type: string = "text/plain", keep_alive: bool = false, ctx: any = nil): HttpClientResponse
   let conn_val = if keep_alive then "keep-alive" else "close" end
   let req = method.upper() + " " + path + " HTTP/1.1\r\nHost: " + host + "\r\nConnection: " + conn_val + "\r\nContent-Type: " + content_type + "\r\nTransfer-Encoding: chunked\r\n\r\n" + encode_chunked_body(chunks)
   stream.write(req, ctx)
@@ -698,6 +720,40 @@ end
 export task open_sse(addr: string, path: string = "/sse", timeout_ms: int = 5000): tcp_stream
   let stream = tcp_connect(addr, timeout_ms)
   let req = "GET " + path + " HTTP/1.1\r\nHost: " + addr + "\r\nAccept: text/event-stream\r\nConnection: keep-alive\r\n\r\n"
+  stream.write(req)
+  let _status = stream.read_line(8192)
+  let _hdrs = parse_headers_from_stream(stream, nil)
+  return stream
+end
+
+export task https_request(method: string, addr: string, path: string, server_name: string = "", body: string = "", content_type: string = "application/json", tls_config: dict<string, any> = {}, timeout_ms: int = 5000): HttpClientResponse
+  let stream = tls_connect(addr, server_name, tls_config, timeout_ms)
+  let host_hdr = if server_name != "" then server_name else addr end
+  let resp = send_request_on(stream, method, host_hdr, path, body, content_type, false, nil)
+  stream.close()
+  return resp
+end
+
+export task https_get(addr: string, path: string = "/", server_name: string = "", tls_config: dict<string, any> = {}, timeout_ms: int = 5000): HttpClientResponse
+  return https_request("GET", addr, path, server_name, "", "text/plain", tls_config, timeout_ms)
+end
+
+export task https_post(addr: string, path: string, body: string, server_name: string = "", content_type: string = "application/json", tls_config: dict<string, any> = {}, timeout_ms: int = 5000): HttpClientResponse
+  return https_request("POST", addr, path, server_name, body, content_type, tls_config, timeout_ms)
+end
+
+export task https_post_chunked(addr: string, path: string, chunks: list<string>, server_name: string = "", content_type: string = "text/plain", tls_config: dict<string, any> = {}, timeout_ms: int = 5000): HttpClientResponse
+  let stream = tls_connect(addr, server_name, tls_config, timeout_ms)
+  let host_hdr = if server_name != "" then server_name else addr end
+  let resp = send_chunked_request_on(stream, "POST", host_hdr, path, chunks, content_type, false, nil)
+  stream.close()
+  return resp
+end
+
+export task open_https_sse(addr: string, path: string = "/sse", server_name: string = "", tls_config: dict<string, any> = {}, timeout_ms: int = 5000): tls_stream
+  let stream = tls_connect(addr, server_name, tls_config, timeout_ms)
+  let host_hdr = if server_name != "" then server_name else addr end
+  let req = "GET " + path + " HTTP/1.1\r\nHost: " + host_hdr + "\r\nAccept: text/event-stream\r\nConnection: keep-alive\r\n\r\n"
   stream.write(req)
   let _status = stream.read_line(8192)
   let _hdrs = parse_headers_from_stream(stream, nil)

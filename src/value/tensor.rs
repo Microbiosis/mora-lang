@@ -139,6 +139,46 @@ impl AlignedByteBuffer {
         buf
     }
 
+    /// Construct a compact 64-byte aligned buffer directly from raw little-endian hardware bytes.
+    pub(crate) fn from_raw_bytes(raw: &[u8], len: usize, dtype: DType) -> MoraResult<Self> {
+        let expected = dtype.storage_bytes(len);
+        if raw.len() != expected {
+            return Err(MoraError::Runtime(format!(
+                "Tensor::from_bytes: byte length mismatch for dtype '{}' with {} elements: expected {} bytes, got {}",
+                dtype.short_name(),
+                len,
+                expected,
+                raw.len()
+            )));
+        }
+        let mut buf = Self::zeroed(len, dtype);
+        let mut offset = 0usize;
+        for blk in &mut buf.blocks {
+            if offset >= raw.len() {
+                break;
+            }
+            let take = (raw.len() - offset).min(64);
+            blk.0[..take].copy_from_slice(&raw[offset..offset + take]);
+            offset += take;
+        }
+        Ok(buf)
+    }
+
+    /// Copy the exact `byte_len` little-endian hardware-packed bytes out of this buffer.
+    pub(crate) fn copy_bytes_out(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.byte_len);
+        let mut remaining = self.byte_len;
+        for blk in &self.blocks {
+            if remaining == 0 {
+                break;
+            }
+            let take = remaining.min(64);
+            out.extend_from_slice(&blk.0[..take]);
+            remaining -= take;
+        }
+        out
+    }
+
     #[inline]
     pub fn len(&self) -> usize {
         self.len
@@ -770,6 +810,183 @@ impl Tensor {
             data.push(core.random_state.next_f64());
         }
         Self::from_raw(data, shape, dtype, device, requires_grad)
+    }
+
+    /// Construct a 1D `Tensor<u8, [N], cpu>` directly from raw bytes with zero per-byte boxing.
+    pub(crate) fn from_u8_vec(bytes: &[u8]) -> MoraResult<Arc<Self>> {
+        let len = bytes.len();
+        let buf = AlignedByteBuffer::from_raw_bytes(bytes, len, DType::U8)?;
+        Self::from_aligned_buffer(buf, vec![len], Device::Cpu, false)
+    }
+
+    /// Materialize the exact little-endian hardware-packed bytes of this tensor (handling slices/views).
+    pub(crate) fn to_raw_byte_vec(self: &Arc<Self>) -> MoraResult<Vec<u8>> {
+        let numel = self.numel();
+        let guard = self.storage.data.read();
+        if self.is_contiguous() {
+            if self.offset == 0 && numel == guard.len() {
+                return Ok(guard.copy_bytes_out());
+            }
+            if self.dtype != DType::I4 {
+                let elem_bytes = self.dtype.storage_bytes(1);
+                let byte_start = self.offset * elem_bytes;
+                let byte_len = numel * elem_bytes;
+                let mut out = Vec::with_capacity(byte_len);
+                let mut pos = byte_start;
+                let end = byte_start + byte_len;
+                while pos < end {
+                    let blk_idx = pos / 64;
+                    let blk_off = pos % 64;
+                    let take = (64 - blk_off).min(end - pos);
+                    out.extend_from_slice(&guard.blocks[blk_idx].0[blk_off..blk_off + take]);
+                    pos += take;
+                }
+                return Ok(out);
+            }
+        }
+        drop(guard);
+        let contig = self.contiguous()?;
+        let guard = contig.storage.data.read();
+        Ok(guard.copy_bytes_out())
+    }
+
+    /// Return this tensor's raw little-endian hardware bytes as a 1D `Tensor<u8, [nbytes], cpu>`.
+    pub(crate) fn to_bytes(self: &Arc<Self>) -> MoraResult<Arc<Self>> {
+        let raw = self.to_raw_byte_vec()?;
+        Self::from_u8_vec(&raw)
+    }
+
+    /// Reconstruct a `Tensor<dtype, shape, device>` losslessly from a `Tensor<u8>` byte buffer.
+    pub(crate) fn from_bytes(
+        buf: &Arc<Self>,
+        shape: Vec<usize>,
+        dtype: DType,
+        device: Device,
+        requires_grad: bool,
+    ) -> MoraResult<Arc<Self>> {
+        if buf.dtype != DType::U8 {
+            return Err(MoraError::Runtime(format!(
+                "Tensor::from_bytes: buffer must have dtype 'u8', got '{}'",
+                buf.dtype.short_name()
+            )));
+        }
+        let numel = checked_numel(&shape)?;
+        let raw = buf.to_raw_byte_vec()?;
+        let aligned = AlignedByteBuffer::from_raw_bytes(&raw, numel, dtype)?;
+        Self::from_aligned_buffer(aligned, shape, device, requires_grad)
+    }
+
+    /// Encode a UTF-8 string into a 1D `Tensor<u8, [N], cpu>` byte tensor.
+    pub(crate) fn from_utf8(text: &str) -> MoraResult<Arc<Self>> {
+        Self::from_u8_vec(text.as_bytes())
+    }
+
+    /// Decode a `Tensor<u8>` byte tensor into a validated UTF-8 string.
+    pub(crate) fn to_utf8(self: &Arc<Self>) -> MoraResult<String> {
+        if self.dtype != DType::U8 {
+            return Err(MoraError::Runtime(format!(
+                "Tensor.to_utf8: expected dtype 'u8', got '{}'",
+                self.dtype.short_name()
+            )));
+        }
+        let raw = self.to_raw_byte_vec()?;
+        String::from_utf8(raw)
+            .map_err(|e| MoraError::Runtime(format!("Tensor.to_utf8: invalid UTF-8 bytes: {e}")))
+    }
+
+    /// Concatenate a non-empty sequence of tensors along `axis` (supports negative axes).
+    pub(crate) fn cat(tensors: &[Arc<Self>], axis: isize) -> MoraResult<Arc<Self>> {
+        if tensors.is_empty() {
+            return Err(MoraError::Runtime(
+                "Tensor::cat: expects a non-empty list of tensors".to_string(),
+            ));
+        }
+        let first = &tensors[0];
+        let rank = first.shape.len();
+        if rank == 0 {
+            return Err(MoraError::Runtime(
+                "Tensor::cat: cannot concatenate 0D scalar tensors".to_string(),
+            ));
+        }
+        let resolved = if axis < 0 {
+            axis + (rank as isize)
+        } else {
+            axis
+        };
+        if resolved < 0 || (resolved as usize) >= rank {
+            return Err(MoraError::Runtime(format!(
+                "Tensor::cat: axis {axis} out of bounds for {rank}D tensor"
+            )));
+        }
+        let ax = resolved as usize;
+        let dtype = first.dtype;
+        let device = first.device.clone();
+
+        let mut out_shape = first.shape.clone();
+        let mut concat_dim_total = first.shape[ax];
+        for (idx, t) in tensors.iter().enumerate().skip(1) {
+            if t.dtype != dtype {
+                return Err(MoraError::Runtime(format!(
+                    "Tensor::cat: dtype mismatch at index {idx}: expected '{}', got '{}'",
+                    dtype.short_name(),
+                    t.dtype.short_name()
+                )));
+            }
+            if t.device != device {
+                return Err(MoraError::Runtime(format!(
+                    "Tensor::cat: device mismatch at index {idx}: expected '{device}', got '{}'",
+                    t.device
+                )));
+            }
+            if t.shape.len() != rank {
+                return Err(MoraError::Runtime(format!(
+                    "Tensor::cat: rank mismatch at index {idx}: expected {rank}D, got {}D",
+                    t.shape.len()
+                )));
+            }
+            for d in 0..rank {
+                if d != ax && t.shape[d] != first.shape[d] {
+                    return Err(MoraError::Runtime(format!(
+                        "Tensor::cat: shape mismatch at index {idx} dim {d}: expected {}, got {}",
+                        first.shape[d], t.shape[d]
+                    )));
+                }
+            }
+            concat_dim_total = concat_dim_total.checked_add(t.shape[ax]).ok_or_else(|| {
+                MoraError::Runtime("Tensor::cat: concatenated dimension overflow".to_string())
+            })?;
+        }
+        out_shape[ax] = concat_dim_total;
+        let total_numel = checked_numel(&out_shape)?;
+
+        // Fast direct-byte memcpy path for axis == 0 on byte-addressable dtypes (critical for binary I/O).
+        if ax == 0 && dtype != DType::I4 {
+            let total_bytes = dtype.storage_bytes(total_numel);
+            let mut raw = Vec::with_capacity(total_bytes);
+            for t in tensors {
+                raw.extend_from_slice(&t.to_raw_byte_vec()?);
+            }
+            let buf = AlignedByteBuffer::from_raw_bytes(&raw, total_numel, dtype)?;
+            return Self::from_aligned_buffer(buf, out_shape, device, false);
+        }
+
+        // General ND axis concatenation preserving exact hardware values.
+        let outer: usize = out_shape[..ax].iter().copied().product::<usize>().max(1);
+        let inner: usize = out_shape[ax + 1..]
+            .iter()
+            .copied()
+            .product::<usize>()
+            .max(1);
+        let mut vals = Vec::with_capacity(total_numel);
+        let flats: Vec<Vec<Value>> = tensors.iter().map(|t| t.to_flat_values()).collect();
+        for o in 0..outer {
+            for (ti, t) in tensors.iter().enumerate() {
+                let chunk = t.shape[ax] * inner;
+                let base = o * chunk;
+                vals.extend_from_slice(&flats[ti][base..base + chunk]);
+            }
+        }
+        Self::from_values(&vals, out_shape, dtype, device, false)
     }
 
     /// Construct a `Tensor` from a nested [`Value::List`] (or clone/cast an existing `Value::Tensor`),
@@ -1842,6 +2059,9 @@ pub fn call_tensor_associated_named(
         "eye" => &["n", "m", "dtype", "device", "requires_grad"],
         "arange" => &["start", "end", "step", "dtype", "device", "requires_grad"],
         "from_list" => &["data", "dtype", "device", "requires_grad"],
+        "from_bytes" => &["bytes", "shape", "dtype", "device", "requires_grad"],
+        "from_utf8" => &["text"],
+        "cat" => &["tensors", "axis"],
         "devices" => &[],
         "device_info" => &["device"],
         _ => {
@@ -2160,6 +2380,85 @@ pub fn call_tensor_associated(
             )?))
         }
         "from_list" => call_builtin_tensor(args),
+        "from_bytes" => {
+            if args.len() < 3 {
+                return Err(MoraError::Runtime(
+                    "Tensor::from_bytes(bytes, shape, dtype, device?, requires_grad?) requires at least 3 arguments".to_string(),
+                ));
+            }
+            let Value::Tensor(buf) = &args[0] else {
+                return Err(MoraError::Runtime(format!(
+                    "Tensor::from_bytes: first argument must be a u8 Tensor, got {}",
+                    crate::flow::type_name(&args[0])
+                )));
+            };
+            let shape = parse_shape_arg(&args[1], "Tensor::from_bytes")?;
+            let dtype =
+                parse_optional_dtype(args.get(2), "Tensor::from_bytes")?.ok_or_else(|| {
+                    MoraError::Runtime("Tensor::from_bytes requires a dtype string".to_string())
+                })?;
+            let device = parse_optional_device(args.get(3), "Tensor::from_bytes")?;
+            let requires_grad = parse_optional_bool(args.get(4), "Tensor::from_bytes")?;
+            Ok(Value::Tensor(Tensor::from_bytes(
+                buf,
+                shape,
+                dtype,
+                device,
+                requires_grad,
+            )?))
+        }
+        "from_utf8" => {
+            if args.len() != 1 {
+                return Err(MoraError::Runtime(format!(
+                    "Tensor::from_utf8(text) expects 1 argument, got {}",
+                    args.len()
+                )));
+            }
+            let Value::String(text) = &args[0] else {
+                return Err(MoraError::Runtime(format!(
+                    "Tensor::from_utf8: expected string, got {}",
+                    crate::flow::type_name(&args[0])
+                )));
+            };
+            Ok(Value::Tensor(Tensor::from_utf8(text)?))
+        }
+        "cat" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(MoraError::Runtime(format!(
+                    "Tensor::cat(tensors, axis?) expects 1..=2 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let Value::List(list) = &args[0] else {
+                return Err(MoraError::Runtime(format!(
+                    "Tensor::cat: first argument must be a list of tensors, got {}",
+                    crate::flow::type_name(&args[0])
+                )));
+            };
+            let mut tensors = Vec::with_capacity(list.len());
+            for (idx, item) in list.iter().enumerate() {
+                let Value::Tensor(t) = item else {
+                    return Err(MoraError::Runtime(format!(
+                        "Tensor::cat: element {idx} must be a Tensor, got {}",
+                        crate::flow::type_name(item)
+                    )));
+                };
+                tensors.push(Arc::clone(t));
+            }
+            let axis = match args.get(1) {
+                None | Some(Value::Nil) => 0isize,
+                Some(v) => {
+                    let raw = parse_num_arg(v, "Tensor::cat")?;
+                    if !raw.is_finite() || raw.fract() != 0.0 {
+                        return Err(MoraError::Runtime(format!(
+                            "Tensor::cat: axis must be an integer, got {raw}"
+                        )));
+                    }
+                    raw as isize
+                }
+            };
+            Ok(Value::Tensor(Tensor::cat(&tensors, axis)?))
+        }
         _ => Err(MoraError::Runtime(format!(
             "Tensor has no associated function 'Tensor::{assoc}'"
         ))),
@@ -2194,6 +2493,24 @@ pub fn call_tensor_method_tracked(
         "dtype" => Ok(Value::String(t.dtype.short_name().to_string())),
         "device" => Ok(Value::String(t.device.to_string())),
         "is_contiguous" => Ok(Value::Bool(t.is_contiguous())),
+        "to_bytes" => {
+            if !args.is_empty() {
+                return Err(MoraError::Runtime(format!(
+                    "Tensor.to_bytes() expects 0 arguments, got {}",
+                    args.len()
+                )));
+            }
+            Ok(Value::Tensor(t.to_bytes()?))
+        }
+        "to_utf8" => {
+            if !args.is_empty() {
+                return Err(MoraError::Runtime(format!(
+                    "Tensor.to_utf8() expects 0 arguments, got {}",
+                    args.len()
+                )));
+            }
+            Ok(Value::String(t.to_utf8()?))
+        }
         "contiguous" => {
             let out = t.contiguous()?;
             if let Some(ag) = autograd.as_deref_mut()

@@ -1,0 +1,787 @@
+-- Mora Pure Standard Library: `std/nn/gguf`
+-- Complete GGUF v2/v3 binary model checkpoint encoder/decoder implemented in pure Mora
+-- over 64-byte aligned `Tensor<u8>` buffers and `file.read_binary_range` / `file.write_binary`.
+--
+-- Supports:
+-- - Magic `"GGUF"`, version 2 & 3, configurable alignment (`general.alignment`, default 32B)
+-- - All 13 official `gguf_type` KV metadata types (`UINT8=0`..`FLOAT64=12`, including `ARRAY`)
+-- - Hardware unquantized `ggml_type`s (`F32=0`, `F16=1`, `I8=24`, `I16=25`, `I32=26`, `I64=27`, `F64=28`, `BF16=30`)
+-- - GGML block-quantized LLM formats `Q8_0` (`ggml_type=8`) & `Q4_0` (`ggml_type=2`) with dequantization to `f32`
+-- - Automatic GGML reversed-dimension ↔ Mora row-major shape conversion
+-- - Lazy header-only `inspect(path)` and single-tensor range `load_tensor(path, name, device?)`
+
+export let GGUF_DEFAULT_ALIGNMENT: int = 32
+
+-- Official GGUF metadata value type tags (`gguf_type`)
+export let GGUF_TYPE_UINT8: int = 0
+export let GGUF_TYPE_INT8: int = 1
+export let GGUF_TYPE_UINT16: int = 2
+export let GGUF_TYPE_INT16: int = 3
+export let GGUF_TYPE_UINT32: int = 4
+export let GGUF_TYPE_INT32: int = 5
+export let GGUF_TYPE_FLOAT32: int = 6
+export let GGUF_TYPE_BOOL: int = 7
+export let GGUF_TYPE_STRING: int = 8
+export let GGUF_TYPE_ARRAY: int = 9
+export let GGUF_TYPE_UINT64: int = 10
+export let GGUF_TYPE_INT64: int = 11
+export let GGUF_TYPE_FLOAT64: int = 12
+
+-- Official GGML tensor type IDs (`ggml_type`)
+export let GGML_TYPE_F32: int = 0
+export let GGML_TYPE_F16: int = 1
+export let GGML_TYPE_Q4_0: int = 2
+export let GGML_TYPE_Q8_0: int = 8
+export let GGML_TYPE_I8: int = 24
+export let GGML_TYPE_I16: int = 25
+export let GGML_TYPE_I32: int = 26
+export let GGML_TYPE_I64: int = 27
+export let GGML_TYPE_F64: int = 28
+export let GGML_TYPE_BF16: int = 30
+
+export enum GgufResult<T>
+  Ok(T)
+  Err(string)
+end
+
+export struct GgufMetaValue
+  value_type: int = 8
+  value: any = ""
+  elem_type: int = -1
+end
+
+export struct GgufTensorInfo
+  name: string = ""
+  dims: list<int>
+  ggml_type: int = 0
+  type_name: string = "F32"
+  offset: int = 0
+  nbytes: int = 0
+end
+
+export struct GgufHeader
+  version: int = 3
+  tensor_count: int = 0
+  kv_count: int = 0
+  alignment: int = 32
+  data_offset: int = 0
+  metadata: dict<string, any>
+  metadata_types: dict<string, int>
+  tensors: dict<string, GgufTensorInfo>
+end
+
+export struct GgufFile
+  header: GgufHeader
+  metadata: dict<string, any>
+  tensors: dict<string, any>
+end
+
+struct ReadResult
+  ok: bool
+  val: any
+  next_pos: int
+  error: string
+end
+
+-- Typed metadata constructors for full 13-type GGUF v3 metadata control
+export task meta_u8(v: int): GgufMetaValue
+  return GgufMetaValue(value_type=GGUF_TYPE_UINT8, value=v, elem_type=-1)
+end
+export task meta_i8(v: int): GgufMetaValue
+  return GgufMetaValue(value_type=GGUF_TYPE_INT8, value=v, elem_type=-1)
+end
+export task meta_u16(v: int): GgufMetaValue
+  return GgufMetaValue(value_type=GGUF_TYPE_UINT16, value=v, elem_type=-1)
+end
+export task meta_i16(v: int): GgufMetaValue
+  return GgufMetaValue(value_type=GGUF_TYPE_INT16, value=v, elem_type=-1)
+end
+export task meta_u32(v: int): GgufMetaValue
+  return GgufMetaValue(value_type=GGUF_TYPE_UINT32, value=v, elem_type=-1)
+end
+export task meta_i32(v: int): GgufMetaValue
+  return GgufMetaValue(value_type=GGUF_TYPE_INT32, value=v, elem_type=-1)
+end
+export task meta_u64(v: int): GgufMetaValue
+  return GgufMetaValue(value_type=GGUF_TYPE_UINT64, value=v, elem_type=-1)
+end
+export task meta_i64(v: int): GgufMetaValue
+  return GgufMetaValue(value_type=GGUF_TYPE_INT64, value=v, elem_type=-1)
+end
+export task meta_f32(v: float): GgufMetaValue
+  return GgufMetaValue(value_type=GGUF_TYPE_FLOAT32, value=v, elem_type=-1)
+end
+export task meta_f64(v: float): GgufMetaValue
+  return GgufMetaValue(value_type=GGUF_TYPE_FLOAT64, value=v, elem_type=-1)
+end
+export task meta_bool(v: bool): GgufMetaValue
+  return GgufMetaValue(value_type=GGUF_TYPE_BOOL, value=v, elem_type=-1)
+end
+export task meta_string(v: string): GgufMetaValue
+  return GgufMetaValue(value_type=GGUF_TYPE_STRING, value=v, elem_type=-1)
+end
+export task meta_array(elem_type: int, items: list<any>): GgufMetaValue
+  return GgufMetaValue(value_type=GGUF_TYPE_ARRAY, value=items, elem_type=elem_type)
+end
+
+export task ggml_type_name(tid: int): string
+  if tid == GGML_TYPE_F32 then return "F32" end
+  if tid == GGML_TYPE_F16 then return "F16" end
+  if tid == GGML_TYPE_Q4_0 then return "Q4_0" end
+  if tid == GGML_TYPE_Q8_0 then return "Q8_0" end
+  if tid == GGML_TYPE_I8 then return "I8" end
+  if tid == GGML_TYPE_I16 then return "I16" end
+  if tid == GGML_TYPE_I32 then return "I32" end
+  if tid == GGML_TYPE_I64 then return "I64" end
+  if tid == GGML_TYPE_F64 then return "F64" end
+  if tid == GGML_TYPE_BF16 then return "BF16" end
+  return "UNKNOWN(" + str(tid) + ")"
+end
+
+export task mora_to_ggml_type(dt: string): int
+  if dt == "f32" then return GGML_TYPE_F32 end
+  if dt == "f16" then return GGML_TYPE_F16 end
+  if dt == "bf16" then return GGML_TYPE_BF16 end
+  if dt == "f64" then return GGML_TYPE_F64 end
+  if dt == "i8" then return GGML_TYPE_I8 end
+  if dt == "i16" then return GGML_TYPE_I16 end
+  if dt == "i32" then return GGML_TYPE_I32 end
+  if dt == "i64" then return GGML_TYPE_I64 end
+  return -1
+end
+
+export task ggml_to_mora_dtype(tid: int): string
+  if tid == GGML_TYPE_F32 then return "f32" end
+  if tid == GGML_TYPE_F16 then return "f16" end
+  if tid == GGML_TYPE_BF16 then return "bf16" end
+  if tid == GGML_TYPE_F64 then return "f64" end
+  if tid == GGML_TYPE_I8 then return "i8" end
+  if tid == GGML_TYPE_I16 then return "i16" end
+  if tid == GGML_TYPE_I32 then return "i32" end
+  if tid == GGML_TYPE_I64 then return "i64" end
+  return ""
+end
+
+task ggml_tensor_nbytes(tid: int, numel: int): int
+  if tid == GGML_TYPE_F32 or tid == GGML_TYPE_I32 then return numel * 4 end
+  if tid == GGML_TYPE_F16 or tid == GGML_TYPE_BF16 or tid == GGML_TYPE_I16 then return numel * 2 end
+  if tid == GGML_TYPE_F64 or tid == GGML_TYPE_I64 then return numel * 8 end
+  if tid == GGML_TYPE_I8 then return numel end
+  if tid == GGML_TYPE_Q8_0 then
+    if numel % 32 != 0 then return -1 end
+    return (numel / 32) * 34
+  end
+  if tid == GGML_TYPE_Q4_0 then
+    if numel % 32 != 0 then return -1 end
+    return (numel / 32) * 18
+  end
+  return -1
+end
+
+task align_up(offset: int, alignment: int): int
+  let rem = offset % alignment
+  if rem == 0 then return offset end
+  return offset + (alignment - rem)
+end
+
+task reverse_int_list(xs: list<int>): list<int>
+  let out: list<int> = []
+  let i = xs.len() - 1
+  while i >= 0
+    assign out = out.push(xs.get(i))
+    assign i = i - 1
+  end
+  return out
+end
+
+-- Little-endian primitive encoders over compact Tensor<u8>
+task enc_u8(v: int): any
+  return Tensor::full([1], v, dtype="u8").to_bytes()
+end
+task enc_i8(v: int): any
+  return Tensor::full([1], v, dtype="i8").to_bytes()
+end
+task enc_u16(v: int): any
+  return Tensor::full([1], v, dtype="u16").to_bytes()
+end
+task enc_i16(v: int): any
+  return Tensor::full([1], v, dtype="i16").to_bytes()
+end
+task enc_u32(v: int): any
+  return Tensor::full([1], v, dtype="u32").to_bytes()
+end
+task enc_i32(v: int): any
+  return Tensor::full([1], v, dtype="i32").to_bytes()
+end
+task enc_u64(v: int): any
+  return Tensor::full([1], v, dtype="i64").to_bytes()
+end
+task enc_i64(v: int): any
+  return Tensor::full([1], v, dtype="i64").to_bytes()
+end
+task enc_f32(v: float): any
+  return Tensor::full([1], v, dtype="f32").to_bytes()
+end
+task enc_f64(v: float): any
+  return Tensor::full([1], v, dtype="f64").to_bytes()
+end
+
+task enc_gguf_string(s: string): any
+  let bytes = Tensor::from_utf8(s)
+  let prefix = enc_u64(bytes.numel())
+  if bytes.numel() == 0 then
+    return prefix
+  end
+  return Tensor::cat([prefix, bytes], 0)
+end
+
+-- Little-endian primitive decoders with bounds checking
+task read_scalar_int(buf: any, pos: int, width: int, dt: string): ReadResult
+  let total = buf.numel()
+  if pos + width > total then
+    return ReadResult(ok=false, val=0, next_pos=pos, error="gguf: unexpected EOF reading " + dt)
+  end
+  let t = Tensor::from_bytes(buf[pos..pos + width], [1], dt)
+  return ReadResult(ok=true, val=int(t.item()), next_pos=pos + width, error="")
+end
+
+task read_scalar_float(buf: any, pos: int, width: int, dt: string): ReadResult
+  let total = buf.numel()
+  if pos + width > total then
+    return ReadResult(ok=false, val=0.0, next_pos=pos, error="gguf: unexpected EOF reading " + dt)
+  end
+  let t = Tensor::from_bytes(buf[pos..pos + width], [1], dt)
+  return ReadResult(ok=true, val=float(t.item()), next_pos=pos + width, error="")
+end
+
+task read_gguf_string(buf: any, pos: int): ReadResult
+  let len_r = read_scalar_int(buf, pos, 8, "i64")
+  if !len_r.ok then return len_r end
+  let n = int(len_r.val)
+  let s_start = len_r.next_pos
+  if n < 0 or s_start + n > buf.numel() then
+    return ReadResult(ok=false, val="", next_pos=pos, error="gguf: string length out of bounds")
+  end
+  if n == 0 then
+    return ReadResult(ok=true, val="", next_pos=s_start, error="")
+  end
+  let txt = buf[s_start..s_start + n].to_utf8()
+  return ReadResult(ok=true, val=txt, next_pos=s_start + n, error="")
+end
+
+task read_meta_value(buf: any, pos: int, vtype: int): ReadResult
+  if vtype == GGUF_TYPE_UINT8 then return read_scalar_int(buf, pos, 1, "u8") end
+  if vtype == GGUF_TYPE_INT8 then return read_scalar_int(buf, pos, 1, "i8") end
+  if vtype == GGUF_TYPE_UINT16 then return read_scalar_int(buf, pos, 2, "u16") end
+  if vtype == GGUF_TYPE_INT16 then return read_scalar_int(buf, pos, 2, "i16") end
+  if vtype == GGUF_TYPE_UINT32 then return read_scalar_int(buf, pos, 4, "u32") end
+  if vtype == GGUF_TYPE_INT32 then return read_scalar_int(buf, pos, 4, "i32") end
+  if vtype == GGUF_TYPE_FLOAT32 then return read_scalar_float(buf, pos, 4, "f32") end
+  if vtype == GGUF_TYPE_BOOL then
+    let br = read_scalar_int(buf, pos, 1, "u8")
+    if !br.ok then return br end
+    return ReadResult(ok=true, val=int(br.val) != 0, next_pos=br.next_pos, error="")
+  end
+  if vtype == GGUF_TYPE_STRING then return read_gguf_string(buf, pos) end
+  if vtype == GGUF_TYPE_UINT64 then return read_scalar_int(buf, pos, 8, "i64") end
+  if vtype == GGUF_TYPE_INT64 then return read_scalar_int(buf, pos, 8, "i64") end
+  if vtype == GGUF_TYPE_FLOAT64 then return read_scalar_float(buf, pos, 8, "f64") end
+  if vtype == GGUF_TYPE_ARRAY then
+    let et_r = read_scalar_int(buf, pos, 4, "u32")
+    if !et_r.ok then return et_r end
+    let cnt_r = read_scalar_int(buf, et_r.next_pos, 8, "i64")
+    if !cnt_r.ok then return cnt_r end
+    let et = int(et_r.val)
+    let cnt = int(cnt_r.val)
+    if cnt < 0 then
+      return ReadResult(ok=false, val=[], next_pos=pos, error="gguf: negative array length")
+    end
+    let items: list<any> = []
+    let cur = cnt_r.next_pos
+    let i = 0
+    while i < cnt
+      let ir = read_meta_value(buf, cur, et)
+      if !ir.ok then return ir end
+      assign items = items.push(ir.val)
+      assign cur = ir.next_pos
+      assign i = i + 1
+    end
+    return ReadResult(ok=true, val=items, next_pos=cur, error="")
+  end
+  return ReadResult(ok=false, val=nil, next_pos=pos, error="gguf: unknown metadata type tag " + str(vtype))
+end
+
+task gg_is_ok(r: any): bool
+  return match r with
+    GgufResult::Ok(_) -> true
+    GgufResult::Err(_) -> false
+  end
+end
+
+task gg_err(r: any): string
+  return match r with
+    GgufResult::Ok(_) -> ""
+    GgufResult::Err(msg) -> msg
+  end
+end
+
+task gg_val(r: any): any
+  return match r with
+    GgufResult::Ok(v) -> v
+    GgufResult::Err(_) -> nil
+  end
+end
+
+task encode_meta_payload(vtype: int, val: any, elem_type: int): GgufResult<any>
+  if vtype == GGUF_TYPE_UINT8 then return GgufResult::Ok(enc_u8(int(val))) end
+  if vtype == GGUF_TYPE_INT8 then return GgufResult::Ok(enc_i8(int(val))) end
+  if vtype == GGUF_TYPE_UINT16 then return GgufResult::Ok(enc_u16(int(val))) end
+  if vtype == GGUF_TYPE_INT16 then return GgufResult::Ok(enc_i16(int(val))) end
+  if vtype == GGUF_TYPE_UINT32 then return GgufResult::Ok(enc_u32(int(val))) end
+  if vtype == GGUF_TYPE_INT32 then return GgufResult::Ok(enc_i32(int(val))) end
+  if vtype == GGUF_TYPE_UINT64 then return GgufResult::Ok(enc_u64(int(val))) end
+  if vtype == GGUF_TYPE_INT64 then return GgufResult::Ok(enc_i64(int(val))) end
+  if vtype == GGUF_TYPE_FLOAT32 then return GgufResult::Ok(enc_f32(float(val))) end
+  if vtype == GGUF_TYPE_FLOAT64 then return GgufResult::Ok(enc_f64(float(val))) end
+  if vtype == GGUF_TYPE_BOOL then
+    let b = if bool(val) then 1 else 0 end
+    return GgufResult::Ok(enc_u8(b))
+  end
+  if vtype == GGUF_TYPE_STRING then return GgufResult::Ok(enc_gguf_string(str(val))) end
+  if vtype == GGUF_TYPE_ARRAY then
+    let parts: list<any> = [enc_u32(elem_type), enc_u64(len(val))]
+    for elem in val
+      let er = encode_meta_payload(elem_type, elem, -1)
+      if !gg_is_ok(er) then
+        return GgufResult::Err(gg_err(er))
+      end
+      assign parts = parts.push(gg_val(er))
+    end
+    return GgufResult::Ok(Tensor::cat(parts, 0))
+  end
+  return GgufResult::Err("gguf: unsupported metadata value type " + str(vtype))
+end
+
+task normalize_meta_entry(raw: any): GgufResult<GgufMetaValue>
+  if is_instance(raw, "GgufMetaValue") then
+    return GgufResult::Ok(raw)
+  end
+  let ty = type_of(raw)
+  if ty == "string" then return GgufResult::Ok(meta_string(str(raw))) end
+  if ty == "int" then return GgufResult::Ok(meta_i64(int(raw))) end
+  if ty == "float" then return GgufResult::Ok(meta_f64(float(raw))) end
+  if ty == "bool" then return GgufResult::Ok(meta_bool(bool(raw))) end
+  if ty == "list" then
+    if len(raw) == 0 then
+      return GgufResult::Ok(meta_array(GGUF_TYPE_STRING, []))
+    end
+    let first_ty = type_of(raw.get(0))
+    let et = GGUF_TYPE_STRING
+    if first_ty == "int" then assign et = GGUF_TYPE_INT64 end
+    if first_ty == "float" then assign et = GGUF_TYPE_FLOAT64 end
+    if first_ty == "bool" then assign et = GGUF_TYPE_BOOL end
+    return GgufResult::Ok(meta_array(et, raw))
+  end
+  return GgufResult::Err("gguf: unsupported metadata value of Mora type '" + ty + "'")
+end
+
+-- Dequantize GGML `Q8_0` blocks (each 34 bytes = [f16 scale (2B), 32 x i8 quants (32B)]) into Tensor<f32>.
+export task dequantize_q8_0(raw: any, shape: list<int>, device: string = "cpu"): GgufResult<any>
+  let numel = 1
+  for d in shape
+    assign numel = numel * d
+  end
+  if numel % 32 != 0 then
+    return GgufResult::Err("gguf: Q8_0 tensor numel must be a multiple of 32")
+  end
+  let nblocks = numel / 32
+  if raw.numel() != nblocks * 34 then
+    return GgufResult::Err("gguf: Q8_0 byte size mismatch")
+  end
+  let out_vals: list<float> = []
+  let b = 0
+  while b < nblocks
+    let base = b * 34
+    let scale = float(Tensor::from_bytes(raw[base..base + 2], [1], "f16").item())
+    let qs = Tensor::from_bytes(raw[base + 2..base + 34], [32], "i8")
+    let i = 0
+    while i < 32
+      let q = float(int(qs[i]))
+      assign out_vals = out_vals.push(q * scale)
+      assign i = i + 1
+    end
+    assign b = b + 1
+  end
+  let flat = Tensor::from_list(out_vals, dtype="f32", device=device)
+  return GgufResult::Ok(flat.reshape(shape))
+end
+
+-- Dequantize GGML `Q4_0` blocks (each 18 bytes = [f16 scale (2B), 16B packed low/high nibbles]) into Tensor<f32>.
+-- GGML Q4_0 layout: first 16 values = (byte & 0x0F) - 8; next 16 values = (byte >> 4) - 8.
+export task dequantize_q4_0(raw: any, shape: list<int>, device: string = "cpu"): GgufResult<any>
+  let numel = 1
+  for d in shape
+    assign numel = numel * d
+  end
+  if numel % 32 != 0 then
+    return GgufResult::Err("gguf: Q4_0 tensor numel must be a multiple of 32")
+  end
+  let nblocks = numel / 32
+  if raw.numel() != nblocks * 18 then
+    return GgufResult::Err("gguf: Q4_0 byte size mismatch")
+  end
+  let out_vals: list<float> = []
+  let b = 0
+  while b < nblocks
+    let base = b * 18
+    let scale = float(Tensor::from_bytes(raw[base..base + 2], [1], "f16").item())
+    let lo_vals: list<float> = []
+    let hi_vals: list<float> = []
+    let j = 0
+    while j < 16
+      let byte_v = int(raw[base + 2 + j])
+      let lo = (byte_v % 16) - 8
+      let hi = (byte_v / 16) - 8
+      assign lo_vals = lo_vals.push(float(lo) * scale)
+      assign hi_vals = hi_vals.push(float(hi) * scale)
+      assign j = j + 1
+    end
+    for v in lo_vals
+      assign out_vals = out_vals.push(v)
+    end
+    for v in hi_vals
+      assign out_vals = out_vals.push(v)
+    end
+    assign b = b + 1
+  end
+  let flat = Tensor::from_list(out_vals, dtype="f32", device=device)
+  return GgufResult::Ok(flat.reshape(shape))
+end
+
+-- Quantize a float tensor (numel % 32 == 0) into raw GGML `Q8_0` block bytes (`Tensor<u8>`).
+export task quantize_q8_0(t: any): GgufResult<any>
+  let numel = t.numel()
+  if numel % 32 != 0 then
+    return GgufResult::Err("gguf: quantize_q8_0 requires numel divisible by 32")
+  end
+  let flat = t.to_dtype("f32").reshape([numel])
+  let nblocks = numel / 32
+  let parts: list<any> = []
+  let b = 0
+  while b < nblocks
+    let base = b * 32
+    let blk = flat[base..base + 32]
+    let amax = float(blk.abs().max())
+    let scale = if amax == 0.0 then 0.0 else amax / 127.0 end
+    let inv_scale = if scale == 0.0 then 0.0 else 1.0 / scale end
+    let scale_bytes = Tensor::full([1], scale, dtype="f16").to_bytes()
+    let q_list: list<int> = []
+    let i = 0
+    while i < 32
+      let v = float(blk[i]) * inv_scale
+      let rounded = if v >= 0.0 then int(v + 0.5) else int(v - 0.5) end
+      let clamped = rounded
+      if clamped > 127 then assign clamped = 127 end
+      if clamped < -127 then assign clamped = -127 end
+      assign q_list = q_list.push(clamped)
+      assign i = i + 1
+    end
+    let q_bytes = Tensor::from_list(q_list, dtype="i8").to_bytes()
+    assign parts = parts.push(scale_bytes)
+    assign parts = parts.push(q_bytes)
+    assign b = b + 1
+  end
+  return GgufResult::Ok(Tensor::cat(parts, 0))
+end
+
+task decode_tensor_payload(raw: any, name: string, dims: list<int>, ggml_type: int, device: string): GgufResult<any>
+  if ggml_type == GGML_TYPE_Q8_0 then
+    return dequantize_q8_0(raw, dims, device)
+  end
+  if ggml_type == GGML_TYPE_Q4_0 then
+    return dequantize_q4_0(raw, dims, device)
+  end
+  let mora_dt = ggml_to_mora_dtype(ggml_type)
+  if mora_dt == "" then
+    return GgufResult::Err("gguf: unsupported ggml_type " + str(ggml_type) + " for tensor '" + name + "'")
+  end
+  return GgufResult::Ok(Tensor::from_bytes(raw, dims, mora_dt, device))
+end
+
+-- Parse GGUF v2/v3 header from a Tensor<u8> buffer (header prefix or complete file).
+export task inspect_bytes(buf: any): GgufResult<GgufHeader>
+  if type_of(buf) != "tensor" or buf.dtype() != "u8" then
+    return GgufResult::Err("gguf: expected Tensor<u8> buffer")
+  end
+  if buf.numel() < 24 then
+    return GgufResult::Err("gguf: buffer shorter than 24-byte GGUF header")
+  end
+  -- Verify ASCII magic "GGUF" (0x47, 0x47, 0x55, 0x46)
+  if int(buf[0]) != 71 or int(buf[1]) != 71 or int(buf[2]) != 85 or int(buf[3]) != 70 then
+    return GgufResult::Err("gguf: invalid magic header (expected 'GGUF')")
+  end
+  let ver_r = read_scalar_int(buf, 4, 4, "u32")
+  if !ver_r.ok then return GgufResult::Err(ver_r.error) end
+  let version = int(ver_r.val)
+  if version != 2 and version != 3 then
+    return GgufResult::Err("gguf: unsupported GGUF version " + str(version) + " (expected 2 or 3)")
+  end
+  let tc_r = read_scalar_int(buf, 8, 8, "i64")
+  if !tc_r.ok then return GgufResult::Err(tc_r.error) end
+  let kvc_r = read_scalar_int(buf, 16, 8, "i64")
+  if !kvc_r.ok then return GgufResult::Err(kvc_r.error) end
+  let tensor_count = int(tc_r.val)
+  let kv_count = int(kvc_r.val)
+  if tensor_count < 0 or kv_count < 0 then
+    return GgufResult::Err("gguf: negative tensor_count or metadata_kv_count")
+  end
+
+  let pos = 24
+  let meta: dict<string, any> = {}
+  let meta_types: dict<string, int> = {}
+  let alignment = GGUF_DEFAULT_ALIGNMENT
+
+  let ki = 0
+  while ki < kv_count
+    let kr = read_gguf_string(buf, pos)
+    if !kr.ok then return GgufResult::Err(kr.error) end
+    let key = str(kr.val)
+    let tr = read_scalar_int(buf, kr.next_pos, 4, "u32")
+    if !tr.ok then return GgufResult::Err(tr.error) end
+    let vtype = int(tr.val)
+    let vr = read_meta_value(buf, tr.next_pos, vtype)
+    if !vr.ok then return GgufResult::Err(vr.error) end
+    assign meta = meta.set(key, vr.val)
+    assign meta_types = meta_types.set(key, vtype)
+    if key == "general.alignment" then
+      let custom_a = int(vr.val)
+      if custom_a <= 0 or (custom_a % 8) != 0 then
+        return GgufResult::Err("gguf: invalid general.alignment " + str(custom_a))
+      end
+      assign alignment = custom_a
+    end
+    assign pos = vr.next_pos
+    assign ki = ki + 1
+  end
+
+  let tensors: dict<string, GgufTensorInfo> = {}
+  let ti = 0
+  while ti < tensor_count
+    let nr = read_gguf_string(buf, pos)
+    if !nr.ok then return GgufResult::Err(nr.error) end
+    let name = str(nr.val)
+    let nd_r = read_scalar_int(buf, nr.next_pos, 4, "u32")
+    if !nd_r.ok then return GgufResult::Err(nd_r.error) end
+    let ndims = int(nd_r.val)
+    let cur = nd_r.next_pos
+    let ggml_dims: list<int> = []
+    let numel = 1
+    let di = 0
+    while di < ndims
+      let dr = read_scalar_int(buf, cur, 8, "i64")
+      if !dr.ok then return GgufResult::Err(dr.error) end
+      let d = int(dr.val)
+      if d < 0 then
+        return GgufResult::Err("gguf: negative dimension in tensor '" + name + "'")
+      end
+      assign ggml_dims = ggml_dims.push(d)
+      assign numel = numel * d
+      assign cur = dr.next_pos
+      assign di = di + 1
+    end
+    let ty_r = read_scalar_int(buf, cur, 4, "u32")
+    if !ty_r.ok then return GgufResult::Err(ty_r.error) end
+    let tid = int(ty_r.val)
+    let off_r = read_scalar_int(buf, ty_r.next_pos, 8, "i64")
+    if !off_r.ok then return GgufResult::Err(off_r.error) end
+    let rel_off = int(off_r.val)
+    let nbytes = ggml_tensor_nbytes(tid, numel)
+    if nbytes < 0 then
+      return GgufResult::Err("gguf: unsupported or misaligned ggml_type " + str(tid) + " for tensor '" + name + "'")
+    end
+    -- Reverse GGML inner-first dims into Mora row-major shape
+    let mora_shape = reverse_int_list(ggml_dims)
+    let info = GgufTensorInfo(name=name, dims=mora_shape, ggml_type=tid, type_name=ggml_type_name(tid), offset=rel_off, nbytes=nbytes)
+    assign tensors = tensors.set(name, info)
+    assign pos = off_r.next_pos
+    assign ti = ti + 1
+  end
+
+  let data_offset = align_up(pos, alignment)
+  return GgufResult::Ok(GgufHeader(version=version, tensor_count=tensor_count, kv_count=kv_count, alignment=alignment, data_offset=data_offset, metadata=meta, metadata_types=meta_types, tensors=tensors))
+end
+
+-- Encode tensors + metadata into a compliant GGUF v3 binary Tensor<u8> buffer.
+-- Note: to store quantized Q8_0 tensors, pass raw bytes via `quantize_q8_0(t)` or standard hardware Tensors.
+export task encode(tensors: dict<string, any>, metadata: dict<string, any> = {}, alignment: int = 32): GgufResult<any>
+  if alignment <= 0 or (alignment % 8) != 0 then
+    return GgufResult::Err("gguf: alignment must be a positive multiple of 8")
+  end
+
+  let eff_meta = metadata
+  if alignment != GGUF_DEFAULT_ALIGNMENT and eff_meta.get("general.alignment") == nil then
+    assign eff_meta = eff_meta.set("general.alignment", meta_u32(alignment))
+  end
+
+  let meta_keys = eff_meta.keys().sort()
+  let tensor_names = tensors.keys().sort()
+
+  let parts: list<any> = []
+  assign parts = parts.push(Tensor::from_utf8("GGUF"))
+  assign parts = parts.push(enc_u32(3))
+  assign parts = parts.push(enc_u64(tensor_names.len()))
+  assign parts = parts.push(enc_u64(meta_keys.len()))
+
+  -- Write KV metadata section
+  for raw_k in meta_keys
+    let k = str(raw_k)
+    let mv_res = normalize_meta_entry(eff_meta.get(k))
+    if !gg_is_ok(mv_res) then
+      return GgufResult::Err(gg_err(mv_res))
+    end
+    let mv: GgufMetaValue = gg_val(mv_res)
+    assign parts = parts.push(enc_gguf_string(k))
+    assign parts = parts.push(enc_u32(mv.value_type))
+    let pr = encode_meta_payload(mv.value_type, mv.value, mv.elem_type)
+    if !gg_is_ok(pr) then
+      return GgufResult::Err(gg_err(pr))
+    end
+    assign parts = parts.push(gg_val(pr))
+  end
+
+  -- Prepare tensor payloads and write tensor info directory
+  let payload_chunks: list<any> = []
+  let rel_offset = 0
+  for raw_name in tensor_names
+    let name = str(raw_name)
+    let t = tensors.get(name)
+    if type_of(t) != "tensor" then
+      return GgufResult::Err("gguf: tensor entry '" + name + "' must be a Tensor")
+    end
+    let tid = mora_to_ggml_type(t.dtype())
+    if tid < 0 then
+      return GgufResult::Err("gguf: dtype '" + t.dtype() + "' is not directly supported in GGUF")
+    end
+    let raw_bytes = t.to_bytes()
+    let nbytes = raw_bytes.numel()
+    let aligned_off = align_up(rel_offset, alignment)
+    let gap = aligned_off - rel_offset
+    if gap > 0 then
+      assign payload_chunks = payload_chunks.push(Tensor::zeros([gap], dtype="u8"))
+    end
+    if nbytes > 0 then
+      assign payload_chunks = payload_chunks.push(raw_bytes)
+    end
+
+    let ggml_dims = reverse_int_list(t.shape())
+    assign parts = parts.push(enc_gguf_string(name))
+    assign parts = parts.push(enc_u32(ggml_dims.len()))
+    for d in ggml_dims
+      assign parts = parts.push(enc_u64(d))
+    end
+    assign parts = parts.push(enc_u32(tid))
+    assign parts = parts.push(enc_u64(aligned_off))
+    assign rel_offset = aligned_off + nbytes
+  end
+
+  let header_buf = Tensor::cat(parts, 0)
+  let data_start = align_up(header_buf.numel(), alignment)
+  let hdr_pad = data_start - header_buf.numel()
+  let final_parts: list<any> = [header_buf]
+  if hdr_pad > 0 then
+    assign final_parts = final_parts.push(Tensor::zeros([hdr_pad], dtype="u8"))
+  end
+  for chunk in payload_chunks
+    assign final_parts = final_parts.push(chunk)
+  end
+  return GgufResult::Ok(Tensor::cat(final_parts, 0))
+end
+
+-- Decode an in-memory GGUF Tensor<u8> buffer into tensors on `device` (default `"cpu"`).
+export task decode(buf: any, device: string = "cpu"): GgufResult<GgufFile>
+  let hdr_res = inspect_bytes(buf)
+  if !gg_is_ok(hdr_res) then
+    return GgufResult::Err(gg_err(hdr_res))
+  end
+  let hdr: GgufHeader = gg_val(hdr_res)
+  let out_tensors: dict<string, any> = {}
+  let total = buf.numel()
+  for raw_name in hdr.tensors.keys()
+    let name = str(raw_name)
+    let info = hdr.tensors.get(name)
+    let abs_start = hdr.data_offset + info.offset
+    let abs_end = abs_start + info.nbytes
+    if abs_end > total then
+      return GgufResult::Err("gguf: tensor '" + name + "' data range exceeds buffer length")
+    end
+    let slice = if info.nbytes == 0 then Tensor::zeros([0], dtype="u8") else buf[abs_start..abs_end] end
+    let dec = decode_tensor_payload(slice, info.name, info.dims, info.ggml_type, device)
+    if !gg_is_ok(dec) then
+      return GgufResult::Err(gg_err(dec))
+    end
+    assign out_tensors = out_tensors.set(name, gg_val(dec))
+  end
+  return GgufResult::Ok(GgufFile(header=hdr, metadata=hdr.metadata, tensors=out_tensors))
+end
+
+-- Save tensors + metadata as a GGUF v3 checkpoint file on disk.
+export task save(path: string, tensors: dict<string, any>, metadata: dict<string, any> = {}, alignment: int = 32): GgufResult<int>
+  let enc = encode(tensors, metadata, alignment)
+  if !gg_is_ok(enc) then
+    return GgufResult::Err(gg_err(enc))
+  end
+  let buf = gg_val(enc)
+  file.write_binary(path, buf)
+  return GgufResult::Ok(buf.numel())
+end
+
+-- Lazily inspect a `.gguf` file header from disk using exponentially growing prefix range reads
+-- (reads ONLY the metadata/tensor-directory prefix, never the bulk tensor weight blob!).
+export task inspect(path: string): GgufResult<GgufHeader>
+  if !file.exists(path) then
+    return GgufResult::Err("gguf: file not found: " + path)
+  end
+  let total = int(file.size(path))
+  if total < 24 then
+    return GgufResult::Err("gguf: file shorter than 24 bytes")
+  end
+  let win = 65536
+  while true
+    let take = if win > total then total else win end
+    let chunk = file.read_binary_range(path, 0, take)
+    let res = inspect_bytes(chunk)
+    if gg_is_ok(res) then
+      return res
+    end
+    let msg = gg_err(res)
+    if take >= total or (!msg.contains("EOF") and !msg.contains("out of bounds")) then
+      return GgufResult::Err(msg)
+    end
+    assign win = win * 4
+  end
+  return GgufResult::Err("gguf: failed to inspect header")
+end
+
+-- Lazily load a SINGLE named tensor from a `.gguf` file on disk via exact range I/O.
+export task load_tensor(path: string, name: string, device: string = "cpu"): GgufResult<any>
+  let hdr_res = inspect(path)
+  if !gg_is_ok(hdr_res) then
+    return GgufResult::Err(gg_err(hdr_res))
+  end
+  let hdr: GgufHeader = gg_val(hdr_res)
+  let info = hdr.tensors.get(name)
+  if info == nil then
+    return GgufResult::Err("gguf: tensor '" + name + "' not found in '" + path + "'")
+  end
+  let raw = if info.nbytes == 0 then Tensor::zeros([0], dtype="u8") else file.read_binary_range(path, hdr.data_offset + info.offset, info.nbytes) end
+  return decode_tensor_payload(raw, info.name, info.dims, info.ggml_type, device)
+end
+
+-- Load an entire `.gguf` checkpoint from disk onto `device` (default `"cpu"`).
+export task load(path: string, device: string = "cpu"): GgufResult<GgufFile>
+  if !file.exists(path) then
+    return GgufResult::Err("gguf: file not found: " + path)
+  end
+  let buf = file.read_binary(path)
+  return decode(buf, device)
+end

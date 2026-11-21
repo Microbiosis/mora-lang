@@ -41,6 +41,8 @@ pub const RUNTIME_BUILTIN_NAMES: &[&str] = &[
     "tcp_connect",
     "tcp_listen",
     "tensor",
+    "tls_connect",
+    "tls_listen",
     "trace_dag",
     "type_of",
     "uncurry",

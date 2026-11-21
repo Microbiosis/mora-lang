@@ -743,6 +743,8 @@ pub fn type_name(value: &Value) -> &'static str {
         Value::Context(_) => "context",
         Value::TcpListener(_) => "tcp_listener",
         Value::TcpStream(_) => "tcp_stream",
+        Value::TlsListener(_) => "tls_listener",
+        Value::TlsStream(_) => "tls_stream",
         Value::ComputeDag(_) => "compute_dag",
         Value::KVAllocator(_) => "kv_allocator",
         Value::MemoryPool(_) => "memory_pool",

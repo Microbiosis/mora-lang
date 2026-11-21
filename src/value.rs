@@ -286,6 +286,10 @@ pub enum Value {
     TcpListener(Arc<crate::runtime::reactor::MoraTcpListener>),
     /// Wave 2: Non-blocking async TCP stream (`tcp_connect(addr)` / `listener.accept()`).
     TcpStream(Arc<crate::runtime::reactor::MoraTcpStream>),
+    /// v0.110.1: Native async TLS 1.2/1.3 listener (`tls_listen(addr, config)`).
+    TlsListener(Arc<crate::runtime::tls::MoraTlsListener>),
+    /// v0.110.1: Native async TLS 1.2/1.3 stream (`tls_connect(...)` / `tls_listener.accept()`).
+    TlsStream(Arc<crate::runtime::tls::MoraTlsStream>),
     /// Wave 3 — Stage 3B: First-class strided N-dimensional tensor (`tensor(...)` / `Tensor::*`).
     Tensor(Arc<tensor::Tensor>),
     /// Wave 4: Native fused tensor compute graph (`trace_dag(...)`).
@@ -358,6 +362,8 @@ impl PartialEq for Value {
             (Value::Context(a), Value::Context(b)) => a.same_handle(b),
             (Value::TcpListener(a), Value::TcpListener(b)) => Arc::ptr_eq(a, b),
             (Value::TcpStream(a), Value::TcpStream(b)) => Arc::ptr_eq(a, b),
+            (Value::TlsListener(a), Value::TlsListener(b)) => Arc::ptr_eq(a, b),
+            (Value::TlsStream(a), Value::TlsStream(b)) => Arc::ptr_eq(a, b),
             (Value::ComputeDag(a), Value::ComputeDag(b)) => Arc::ptr_eq(a, b) || a == b,
             (Value::KVAllocator(a), Value::KVAllocator(b)) => Arc::ptr_eq(a, b),
             (Value::MemoryPool(a), Value::MemoryPool(b)) => Arc::ptr_eq(a, b),
@@ -547,6 +553,22 @@ impl Value {
             Value::TaskHandle(_) => &["join", "abort", "is_done", "context"],
             Value::Context(_) => &["child", "with_timeout", "cancel", "is_cancelled", "spawn"],
             Value::TcpListener(_) => &["accept", "local_addr", "close", "is_closed"],
+            Value::TlsListener(_) => &["accept", "local_addr", "close", "is_closed"],
+            Value::TlsStream(_) => &[
+                "read",
+                "read_bytes",
+                "read_line",
+                "write",
+                "write_bytes",
+                "shutdown",
+                "close",
+                "is_closed",
+                "local_addr",
+                "peer_addr",
+                "tls_version",
+                "cipher_suite",
+                "alpn_protocol",
+            ],
             Value::TcpStream(_) => &[
                 "read",
                 "read_bytes",

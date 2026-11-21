@@ -99,6 +99,14 @@ const STAGE3B_TYPES_AND_CTORS: &[(&str, &str)] = &[
         "Non-blocking async TCP stream type (tcp_connect / accept)",
     ),
     (
+        "tls_listener",
+        "Native async TLS 1.2/1.3 listener type (tls_listen)",
+    ),
+    (
+        "tls_stream",
+        "Native async TLS 1.2/1.3 stream type (tls_connect / accept)",
+    ),
+    (
         "compute_dag",
         "Fused TensorComputeDag compute graph type (trace_dag)",
     ),
@@ -141,6 +149,18 @@ const STAGE3B_TYPES_AND_CTORS: &[(&str, &str)] = &[
     (
         "Tensor::from_list",
         "Tensor::from_list(data, dtype?, device?, requires_grad?)",
+    ),
+    (
+        "Tensor::from_bytes",
+        "Tensor::from_bytes(bytes, shape, dtype, device?, requires_grad?) -> Tensor from raw little-endian u8 bytes",
+    ),
+    (
+        "Tensor::from_utf8",
+        "Tensor::from_utf8(text) -> Tensor<u8, [N], cpu> UTF-8 byte buffer",
+    ),
+    (
+        "Tensor::cat",
+        "Tensor::cat(tensors, axis?) -> concatenate tensors along axis",
     ),
     (
         "Tensor::devices",

@@ -425,6 +425,8 @@ fn encode_builtin_fn_id(id: BuiltinFnId) -> u8 {
         BuiltinFnId::TypeOf => 38,
         BuiltinFnId::Uncurry => 39,
         BuiltinFnId::ValueAndGrad => 40,
+        BuiltinFnId::TlsConnect => 41,
+        BuiltinFnId::TlsListen => 42,
     }
 }
 
@@ -471,6 +473,8 @@ fn decode_builtin_fn_id(tag: u8) -> MoraResult<BuiltinFnId> {
         38 => BuiltinFnId::TypeOf,
         39 => BuiltinFnId::Uncurry,
         40 => BuiltinFnId::ValueAndGrad,
+        41 => BuiltinFnId::TlsConnect,
+        42 => BuiltinFnId::TlsListen,
         other => return Err(corrupt(format!("invalid BuiltinFnId tag {other}"))),
     })
 }

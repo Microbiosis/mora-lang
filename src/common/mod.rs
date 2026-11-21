@@ -3,6 +3,7 @@
 //! 被 parser_v3、mir、typeck 和 runtime 共同引用的基础类型。
 
 pub mod dtype;
+pub(crate) mod dynlib;
 pub mod lock;
 pub mod sync;
 pub mod sys;

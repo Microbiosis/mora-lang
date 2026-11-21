@@ -623,6 +623,8 @@ pub fn value_to_json(value: &Value) -> String {
                 Value::Context(_) => out.push_str("\"<context>\""),
                 Value::TcpListener(_) => out.push_str("\"<tcp_listener>\""),
                 Value::TcpStream(_) => out.push_str("\"<tcp_stream>\""),
+                Value::TlsListener(_) => out.push_str("\"<tls_listener>\""),
+                Value::TlsStream(_) => out.push_str("\"<tls_stream>\""),
                 Value::ComputeDag(_) => out.push_str("\"<compute_dag>\""),
                 Value::KVAllocator(_) => out.push_str("\"<kv_allocator>\""),
                 Value::MemoryPool(_) => out.push_str("\"<memory_pool>\""),

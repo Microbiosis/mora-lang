@@ -27,5 +27,7 @@ pub mod reactor;
 pub mod scheduler;
 // Wave 4 P1: Hardware-SIMD & multi-threaded cache-blocked CPU kernels
 pub(crate) mod simd_kernels;
+// v0.110.1: Zero-dependency native async TLS 1.2/1.3 transport (Windows Schannel / Unix OpenSSL)
+pub mod tls;
 // Wave 2 W2.3: Heap-framed stackful VM & delimited continuations
 pub mod vm;

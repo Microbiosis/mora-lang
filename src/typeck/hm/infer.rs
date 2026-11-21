@@ -1265,6 +1265,8 @@ impl HMInference {
                 && let WitnessCallee::Name(bname) | WitnessCallee::Var(bname) = callee
                 && (bname == "tcp_listen"
                     || bname == "tcp_connect"
+                    || bname == "tls_listen"
+                    || bname == "tls_connect"
                     || bname == "kv_allocator"
                     || bname == "memory_pool")
             {
@@ -1273,6 +1275,16 @@ impl HMInference {
                 } else if bname == "tcp_connect" {
                     vec![
                         "addr".to_string(),
+                        "timeout_ms".to_string(),
+                        "ctx".to_string(),
+                    ]
+                } else if bname == "tls_listen" {
+                    vec!["addr".to_string(), "config".to_string()]
+                } else if bname == "tls_connect" {
+                    vec![
+                        "addr".to_string(),
+                        "server_name".to_string(),
+                        "config".to_string(),
                         "timeout_ms".to_string(),
                         "ctx".to_string(),
                     ]
@@ -1662,6 +1674,7 @@ impl HMInference {
         let resolved_sig = module_sig
             .clone()
             .or_else(|| crate::typeck::dispatch::method_signature(&resolved_recv, method));
+        let resolved_return_ty = resolved_sig.as_ref().map(|s| s.return_type.clone());
         let module_return_ty = module_sig.map(|s| s.return_type);
 
         if !has_resolved_sig
@@ -1676,6 +1689,27 @@ impl HMInference {
             )
         {
             return res;
+        }
+
+        if !has_resolved_sig && mod_name.is_none() {
+            let is_closed_transport = |t: &Type| {
+                matches!(
+                    t,
+                    Type::TcpListener | Type::TcpStream | Type::TlsListener | Type::TlsStream
+                )
+            };
+            let reject_unknown = is_closed_transport(&resolved_recv)
+                || matches!(
+                    &resolved_recv,
+                    Type::Union(members) if !members.is_empty() && members.iter().all(is_closed_transport)
+                );
+            if reject_unknown {
+                return Err(vec![TypeError::UnificationFailure {
+                    expected: format!("valid method on '{}'", resolved_recv.name()),
+                    got: format!("unknown method '.{method}()'"),
+                    span: Some(span),
+                }]);
+            }
         }
 
         if let Some(sig) = resolved_sig {
@@ -1771,6 +1805,7 @@ impl HMInference {
         }
 
         let return_ty = module_return_ty
+            .or(resolved_return_ty)
             .unwrap_or_else(|| crate::typeck::dispatch::method_return_type(&resolved_recv, method));
         let return_ty = if matches!(return_ty, Type::Unknown) {
             self.fresh_type_var()
@@ -3498,6 +3533,9 @@ impl HMInference {
             ctor,
             "tensor"
                 | "from_list"
+                | "from_bytes"
+                | "from_utf8"
+                | "cat"
                 | "zeros"
                 | "ones"
                 | "randn"
@@ -3747,6 +3785,134 @@ impl HMInference {
                     acc_row,
                 ))
             }
+            "from_bytes" => {
+                let Some(buf_w) = slots.first().copied().flatten() else {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: 3,
+                        actual: 0,
+                        span,
+                    }]);
+                };
+                let Some(shape_w) = slots.get(1).copied().flatten() else {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: 3,
+                        actual: 1,
+                        span,
+                    }]);
+                };
+                let Some(dt_w) = slots.get(2).copied().flatten() else {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: 3,
+                        actual: 2,
+                        span,
+                    }]);
+                };
+                let buf_ty = slot_types[0]
+                    .as_ref()
+                    .map(|t| self.subst.apply(t))
+                    .unwrap_or(Type::Any);
+                self.constraints.push(SpannedConstraint::new(
+                    Constraint::Subtype {
+                        sub: Box::new(buf_ty),
+                        sup: Box::new(Type::Tensor {
+                            dtype: Box::new(Type::Scalar(crate::common::DType::U8)),
+                            shape: ShapeType::Unranked(None),
+                            device: crate::typeck::DeviceType::Any,
+                        }),
+                    },
+                    buf_w.span,
+                ));
+                let shape = match Self::extract_static_shape_list(shape_w) {
+                    Some(dims) => ShapeType::Ranked(dims),
+                    None => ShapeType::Unranked(None),
+                };
+                let dtype = Self::parse_static_dtype_witness(Some(dt_w))?.unwrap_or(Type::Any);
+                let device = Self::parse_static_device_witness(slots.get(3).copied().flatten())?;
+                Ok((
+                    Type::Tensor {
+                        dtype: Box::new(dtype),
+                        shape,
+                        device,
+                    },
+                    acc_row,
+                ))
+            }
+            "from_utf8" => {
+                let Some(text_w) = slots.first().copied().flatten() else {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: 1,
+                        actual: 0,
+                        span,
+                    }]);
+                };
+                let text_ty = slot_types[0]
+                    .as_ref()
+                    .map(|t| self.subst.apply(t))
+                    .unwrap_or(Type::Any);
+                self.constraints.push(SpannedConstraint::new(
+                    Constraint::Subtype {
+                        sub: Box::new(text_ty),
+                        sup: Box::new(Type::String),
+                    },
+                    text_w.span,
+                ));
+                let id = self.fresh_counter;
+                self.fresh_counter += 1;
+                Ok((
+                    Type::Tensor {
+                        dtype: Box::new(Type::Scalar(crate::common::DType::U8)),
+                        shape: ShapeType::Ranked(vec![DimExpr::Var(id)]),
+                        device: crate::typeck::DeviceType::Concrete(crate::common::Device::Cpu),
+                    },
+                    acc_row,
+                ))
+            }
+            "cat" => {
+                let Some(list_w) = slots.first().copied().flatten() else {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: 1,
+                        actual: 0,
+                        span,
+                    }]);
+                };
+                let list_ty = slot_types[0]
+                    .as_ref()
+                    .map(|t| self.subst.apply(t))
+                    .unwrap_or(Type::Any);
+                let elem_ty = match list_ty {
+                    Type::List(inner) => self.subst.apply(&inner),
+                    Type::Any | Type::Error | Type::TypeVar(_) => Type::any_tensor(),
+                    other => {
+                        return Err(vec![TypeError::UnificationFailure {
+                            expected: "list<Tensor> for Tensor::cat".to_string(),
+                            got: other.name(),
+                            span: Some(list_w.span),
+                        }]);
+                    }
+                };
+                if let Some(ax_w) = slots.get(1).copied().flatten() {
+                    let ax_ty = slot_types[1]
+                        .as_ref()
+                        .map(|t| self.subst.apply(t))
+                        .unwrap_or(Type::Any);
+                    self.constraints.push(SpannedConstraint::new(
+                        Constraint::Subtype {
+                            sub: Box::new(ax_ty),
+                            sup: Box::new(Type::Union(vec![Type::Int, Type::Nil])),
+                        },
+                        ax_w.span,
+                    ));
+                }
+                let ret = match elem_ty {
+                    Type::Tensor { dtype, device, .. } => Type::Tensor {
+                        dtype,
+                        shape: ShapeType::Unranked(None),
+                        device,
+                    },
+                    _ => Type::any_tensor(),
+                };
+                Ok((ret, acc_row))
+            }
             _ => unreachable!(),
         }
     }
@@ -3993,6 +4159,108 @@ impl HMInference {
                     acc_row,
                 ))
             }
+            "from_bytes" => {
+                if args.len() < 3 || args.len() > 5 {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: 3,
+                        actual: args.len(),
+                        span,
+                    }]);
+                }
+                let buf_ty = self.subst.apply(&arg_types[0]);
+                self.constraints.push(SpannedConstraint::new(
+                    Constraint::Subtype {
+                        sub: Box::new(buf_ty),
+                        sup: Box::new(Type::Tensor {
+                            dtype: Box::new(Type::Scalar(crate::common::DType::U8)),
+                            shape: ShapeType::Unranked(None),
+                            device: crate::typeck::DeviceType::Any,
+                        }),
+                    },
+                    args[0].span,
+                ));
+                let shape = match Self::extract_static_shape_list(&args[1]) {
+                    Some(dims) => ShapeType::Ranked(dims),
+                    None => ShapeType::Unranked(None),
+                };
+                let dtype = Self::parse_static_dtype_witness(args.get(2))?.unwrap_or(Type::Any);
+                let device = Self::parse_static_device_witness(args.get(3))?;
+                Ok((
+                    Type::Tensor {
+                        dtype: Box::new(dtype),
+                        shape,
+                        device,
+                    },
+                    acc_row,
+                ))
+            }
+            "from_utf8" => {
+                if args.len() != 1 {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: 1,
+                        actual: args.len(),
+                        span,
+                    }]);
+                }
+                let text_ty = self.subst.apply(&arg_types[0]);
+                self.constraints.push(SpannedConstraint::new(
+                    Constraint::Subtype {
+                        sub: Box::new(text_ty),
+                        sup: Box::new(Type::String),
+                    },
+                    args[0].span,
+                ));
+                let id = self.fresh_counter;
+                self.fresh_counter += 1;
+                Ok((
+                    Type::Tensor {
+                        dtype: Box::new(Type::Scalar(crate::common::DType::U8)),
+                        shape: ShapeType::Ranked(vec![DimExpr::Var(id)]),
+                        device: crate::typeck::DeviceType::Concrete(crate::common::Device::Cpu),
+                    },
+                    acc_row,
+                ))
+            }
+            "cat" => {
+                if args.is_empty() || args.len() > 2 {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: 1,
+                        actual: args.len(),
+                        span,
+                    }]);
+                }
+                let list_ty = self.subst.apply(&arg_types[0]);
+                let elem_ty = match list_ty {
+                    Type::List(inner) => self.subst.apply(&inner),
+                    Type::Any | Type::Error | Type::TypeVar(_) => Type::any_tensor(),
+                    other => {
+                        return Err(vec![TypeError::UnificationFailure {
+                            expected: "list<Tensor> for Tensor::cat".to_string(),
+                            got: other.name(),
+                            span: Some(args[0].span),
+                        }]);
+                    }
+                };
+                if let Some(ax_ty) = arg_types.get(1) {
+                    let ax_resolved = self.subst.apply(ax_ty);
+                    self.constraints.push(SpannedConstraint::new(
+                        Constraint::Subtype {
+                            sub: Box::new(ax_resolved),
+                            sup: Box::new(Type::Union(vec![Type::Int, Type::Nil])),
+                        },
+                        args[1].span,
+                    ));
+                }
+                let ret = match elem_ty {
+                    Type::Tensor { dtype, device, .. } => Type::Tensor {
+                        dtype,
+                        shape: ShapeType::Unranked(None),
+                        device,
+                    },
+                    _ => Type::any_tensor(),
+                };
+                Ok((ret, acc_row))
+            }
             _ => Err(vec![TypeError::UnboundVariable {
                 name: format!("Tensor::{ctor}"),
                 span,
@@ -4199,6 +4467,44 @@ impl HMInference {
                     }]);
                 }
                 Ok((Type::List(Box::new(Type::Any)), acc_row))
+            }
+            "to_bytes" => {
+                if !args.is_empty() {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: 0,
+                        actual: args.len(),
+                        span,
+                    }]);
+                }
+                let id = self.fresh_counter;
+                self.fresh_counter += 1;
+                Ok((
+                    Type::Tensor {
+                        dtype: Box::new(Type::Scalar(crate::common::DType::U8)),
+                        shape: ShapeType::Ranked(vec![DimExpr::Var(id)]),
+                        device: DeviceType::Concrete(crate::common::Device::Cpu),
+                    },
+                    acc_row,
+                ))
+            }
+            "to_utf8" => {
+                if !args.is_empty() {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: 0,
+                        actual: args.len(),
+                        span,
+                    }]);
+                }
+                if let Some(dt) = cur_dtype.as_dtype()
+                    && dt != crate::common::DType::U8
+                {
+                    return Err(vec![TypeError::UnificationFailure {
+                        expected: "Tensor<u8> for .to_utf8()".to_string(),
+                        got: format!("Tensor<{}>", dt.short_name()),
+                        span: Some(span),
+                    }]);
+                }
+                Ok((Type::String, acc_row))
             }
             "reshape" => {
                 if args.is_empty() {
@@ -4530,6 +4836,104 @@ impl HMInference {
         span: Span,
     ) -> Option<Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>>> {
         let resolved: Vec<Type> = arg_types.iter().map(|t| self.subst.apply(t)).collect();
+        if module == "file" {
+            match method {
+                "read_binary" => {
+                    if args.len() != 1 {
+                        return Some(Err(vec![TypeError::ArityMismatch {
+                            expected: 1,
+                            actual: args.len(),
+                            span,
+                        }]));
+                    }
+                    self.constraints.push(SpannedConstraint::new(
+                        Constraint::Subtype {
+                            sub: Box::new(resolved[0].clone()),
+                            sup: Box::new(Type::String),
+                        },
+                        args[0].span,
+                    ));
+                    let id = self.fresh_counter;
+                    self.fresh_counter += 1;
+                    return Some(Ok((
+                        Type::Tensor {
+                            dtype: Box::new(Type::Scalar(crate::common::DType::U8)),
+                            shape: crate::typeck::ShapeType::Ranked(vec![
+                                crate::typeck::DimExpr::Var(id),
+                            ]),
+                            device: crate::typeck::DeviceType::Concrete(crate::common::Device::Cpu),
+                        },
+                        acc_row.clone(),
+                    )));
+                }
+                "read_binary_range" => {
+                    if args.len() != 3 {
+                        return Some(Err(vec![TypeError::ArityMismatch {
+                            expected: 3,
+                            actual: args.len(),
+                            span,
+                        }]));
+                    }
+                    self.constraints.push(SpannedConstraint::new(
+                        Constraint::Subtype {
+                            sub: Box::new(resolved[0].clone()),
+                            sup: Box::new(Type::String),
+                        },
+                        args[0].span,
+                    ));
+                    for idx in [1usize, 2usize] {
+                        self.constraints.push(SpannedConstraint::new(
+                            Constraint::Subtype {
+                                sub: Box::new(resolved[idx].clone()),
+                                sup: Box::new(Type::Int),
+                            },
+                            args[idx].span,
+                        ));
+                    }
+                    let id = self.fresh_counter;
+                    self.fresh_counter += 1;
+                    return Some(Ok((
+                        Type::Tensor {
+                            dtype: Box::new(Type::Scalar(crate::common::DType::U8)),
+                            shape: crate::typeck::ShapeType::Ranked(vec![
+                                crate::typeck::DimExpr::Var(id),
+                            ]),
+                            device: crate::typeck::DeviceType::Concrete(crate::common::Device::Cpu),
+                        },
+                        acc_row.clone(),
+                    )));
+                }
+                "write_binary" => {
+                    if args.len() != 2 {
+                        return Some(Err(vec![TypeError::ArityMismatch {
+                            expected: 2,
+                            actual: args.len(),
+                            span,
+                        }]));
+                    }
+                    self.constraints.push(SpannedConstraint::new(
+                        Constraint::Subtype {
+                            sub: Box::new(resolved[0].clone()),
+                            sup: Box::new(Type::String),
+                        },
+                        args[0].span,
+                    ));
+                    self.constraints.push(SpannedConstraint::new(
+                        Constraint::Subtype {
+                            sub: Box::new(resolved[1].clone()),
+                            sup: Box::new(Type::Tensor {
+                                dtype: Box::new(Type::Scalar(crate::common::DType::U8)),
+                                shape: crate::typeck::ShapeType::Unranked(None),
+                                device: crate::typeck::DeviceType::Any,
+                            }),
+                        },
+                        args[1].span,
+                    ));
+                    return Some(Ok((Type::Nil, acc_row.clone())));
+                }
+                _ => {}
+            }
+        }
         let has_tensor = resolved.iter().any(|t| matches!(t, Type::Tensor { .. }));
         let has_scalar = resolved.iter().any(|t| matches!(t, Type::Scalar(_)));
         if !has_tensor && !has_scalar {

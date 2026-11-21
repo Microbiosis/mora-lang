@@ -1,0 +1,424 @@
+-- Mora Pure Standard Library: `std/nn/safetensors`
+-- Full Hugging Face Safetensors binary weight serialization/deserialization specification
+-- implemented in pure Mora over compact 64-byte aligned `Tensor<u8>` byte buffers and
+-- `CheckedPath`-confined range I/O (`file.read_binary_range` / `file.write_binary`).
+
+export let MAX_HEADER_SIZE: int = 100000000
+
+export enum SafetensorsResult<T>
+  Ok(T)
+  Err(string)
+end
+
+export struct TensorInfo
+  name: string = ""
+  dtype: string = "F32"
+  mora_dtype: string = "f32"
+  shape: list<int>
+  data_start: int = 0
+  data_end: int = 0
+  nbytes: int = 0
+end
+
+export struct SafetensorsHeader
+  header_len: int = 0
+  data_offset: int = 8
+  metadata: dict<string, string>
+  tensors: dict<string, TensorInfo>
+end
+
+export struct SafetensorsFile
+  metadata: dict<string, string>
+  headers: dict<string, TensorInfo>
+  tensors: dict<string, any>
+end
+
+export task mora_to_safetensors_dtype(dt: string): string
+  if dt == "f64" then return "F64" end
+  if dt == "f32" then return "F32" end
+  if dt == "f16" then return "F16" end
+  if dt == "bf16" then return "BF16" end
+  if dt == "fp8_e4m3" or dt == "fp8" then return "F8_E4M3" end
+  if dt == "fp8_e5m2" then return "F8_E5M2" end
+  if dt == "i64" then return "I64" end
+  if dt == "i32" then return "I32" end
+  if dt == "i16" then return "I16" end
+  if dt == "i8" then return "I8" end
+  if dt == "u64" then return "U64" end
+  if dt == "u32" then return "U32" end
+  if dt == "u16" then return "U16" end
+  if dt == "u8" then return "U8" end
+  if dt == "bool" then return "BOOL" end
+  return ""
+end
+
+export task safetensors_to_mora_dtype(st: string): string
+  if st == "F64" then return "f64" end
+  if st == "F32" then return "f32" end
+  if st == "F16" then return "f16" end
+  if st == "BF16" then return "bf16" end
+  if st == "F8_E4M3" then return "fp8_e4m3" end
+  if st == "F8_E5M2" then return "fp8_e5m2" end
+  if st == "I64" then return "i64" end
+  if st == "I32" then return "i32" end
+  if st == "I16" then return "i16" end
+  if st == "I8" then return "i8" end
+  if st == "U64" then return "u64" end
+  if st == "U32" then return "u32" end
+  if st == "U16" then return "u16" end
+  if st == "U8" then return "u8" end
+  if st == "BOOL" then return "bool" end
+  return ""
+end
+
+task dtype_elem_bytes(mora_dt: string): int
+  if mora_dt == "f64" or mora_dt == "i64" or mora_dt == "u64" then return 8 end
+  if mora_dt == "f32" or mora_dt == "i32" or mora_dt == "u32" then return 4 end
+  if mora_dt == "f16" or mora_dt == "bf16" or mora_dt == "i16" or mora_dt == "u16" then return 2 end
+  if mora_dt == "fp8_e4m3" or mora_dt == "fp8_e5m2" or mora_dt == "i8" or mora_dt == "u8" or mora_dt == "bool" then return 1 end
+  return -1
+end
+
+task encode_u64_le(n: int): any
+  return Tensor::full([1], n, dtype="i64").to_bytes()
+end
+
+task decode_u64_le(buf: any, offset: int): int
+  let sl = buf[offset..offset + 8]
+  let t = Tensor::from_bytes(sl, [1], "i64")
+  return int(t.item())
+end
+
+task spaces_str(n: int): string
+  let out = ""
+  let i = 0
+  while i < n
+    assign out = out + " "
+    assign i = i + 1
+  end
+  return out
+end
+
+task sort_ranges_by_start(entries: list<TensorInfo>): list<TensorInfo>
+  let arr = entries
+  let n = arr.len()
+  let i = 1
+  while i < n
+    let cur = arr.get(i)
+    let j = i - 1
+    let inserted = false
+    let next_arr: list<TensorInfo> = []
+    let k = 0
+    while k < i
+      let ek = arr.get(k)
+      if !inserted and cur.data_start < ek.data_start then
+        assign next_arr = next_arr.push(cur)
+        assign inserted = true
+      end
+      assign next_arr = next_arr.push(ek)
+      assign k = k + 1
+    end
+    if !inserted then
+      assign next_arr = next_arr.push(cur)
+    end
+    let tail_k = i + 1
+    while tail_k < n
+      assign next_arr = next_arr.push(arr.get(tail_k))
+      assign tail_k = tail_k + 1
+    end
+    assign arr = next_arr
+    assign i = i + 1
+  end
+  return arr
+end
+
+task parse_and_validate_header(header_bytes: any, header_len: int, trailing_data_len: int): SafetensorsResult<SafetensorsHeader>
+  if header_len < 2 then
+    return SafetensorsResult::Err("safetensors: invalid header length (< 2 bytes)")
+  end
+  if header_len > MAX_HEADER_SIZE then
+    return SafetensorsResult::Err("safetensors: HeaderTooLarge (exceeds 100MB limit)")
+  end
+  let first_byte = int(header_bytes[0])
+  if first_byte != 123 then
+    return SafetensorsResult::Err("safetensors: JSON header must start with '{' (0x7B)")
+  end
+
+  let hdr_text = header_bytes.to_utf8()
+  let parsed = json.parse(hdr_text)
+  if type_of(parsed) != "dict" then
+    return SafetensorsResult::Err("safetensors: header JSON root must be an object")
+  end
+
+  let meta: dict<string, string> = {}
+  let infos: dict<string, TensorInfo> = {}
+  let info_list: list<TensorInfo> = []
+
+  for raw_key in parsed.keys()
+    let k = str(raw_key)
+    let entry = parsed.get(k)
+    if k == "__metadata__" then
+      if type_of(entry) != "dict" then
+        return SafetensorsResult::Err("safetensors: __metadata__ must be an object")
+      end
+      for mk in entry.keys()
+        let mkey = str(mk)
+        let mval = entry.get(mkey)
+        if type_of(mval) != "string" then
+          return SafetensorsResult::Err("safetensors: __metadata__ values must be strings")
+        end
+        assign meta = meta.set(mkey, str(mval))
+      end
+      let _branch_done = 0
+    else
+      if type_of(entry) != "dict" then
+        return SafetensorsResult::Err("safetensors: tensor entry '" + k + "' must be an object")
+      end
+      let st_dt_val = entry.get("dtype")
+      let shape_val = entry.get("shape")
+      let offsets_val = entry.get("data_offsets")
+      if type_of(st_dt_val) != "string" then
+        return SafetensorsResult::Err("safetensors: tensor '" + k + "' missing string 'dtype'")
+      end
+      let st_dt = str(st_dt_val)
+      let mora_dt = safetensors_to_mora_dtype(st_dt)
+      if mora_dt == "" then
+        return SafetensorsResult::Err("safetensors: unsupported dtype '" + st_dt + "' for tensor '" + k + "'")
+      end
+      if type_of(shape_val) != "list" then
+        return SafetensorsResult::Err("safetensors: tensor '" + k + "' missing list 'shape'")
+      end
+      let shape: list<int> = []
+      let numel = 1
+      for dim_v in shape_val
+        if type_of(dim_v) != "int" then
+          return SafetensorsResult::Err("safetensors: tensor '" + k + "' has non-integer dimension")
+        end
+        let d = int(dim_v)
+        if d < 0 then
+          return SafetensorsResult::Err("safetensors: tensor '" + k + "' has negative dimension")
+        end
+        assign shape = shape.push(d)
+        assign numel = numel * d
+      end
+      if type_of(offsets_val) != "list" or len(offsets_val) != 2 then
+        return SafetensorsResult::Err("safetensors: tensor '" + k + "' must have data_offsets [begin, end]")
+      end
+      let ob = offsets_val.get(0)
+      let oe = offsets_val.get(1)
+      if type_of(ob) != "int" or type_of(oe) != "int" then
+        return SafetensorsResult::Err("safetensors: tensor '" + k + "' data_offsets must be integers")
+      end
+      let begin = int(ob)
+      let end_pos = int(oe)
+      if begin < 0 or end_pos < begin then
+        return SafetensorsResult::Err("safetensors: tensor '" + k + "' has invalid data_offsets range")
+      end
+      let eb = dtype_elem_bytes(mora_dt)
+      let expected_bytes = numel * eb
+      let actual_bytes = end_pos - begin
+      if actual_bytes != expected_bytes then
+        return SafetensorsResult::Err("safetensors: tensor '" + k + "' byte length mismatch: expected " + str(expected_bytes) + ", got " + str(actual_bytes))
+      end
+      let tinfo = TensorInfo(name=k, dtype=st_dt, mora_dtype=mora_dt, shape=shape, data_start=begin, data_end=end_pos, nbytes=actual_bytes)
+      assign infos = infos.set(k, tinfo)
+      assign info_list = info_list.push(tinfo)
+      let _branch_done = 0
+    end
+  end
+
+  -- Strict security verification: non-overlapping, contiguous, zero-hole byte coverage
+  let sorted = sort_ranges_by_start(info_list)
+  let cursor = 0
+  for ti in sorted
+    if ti.data_start < cursor then
+      return SafetensorsResult::Err("safetensors: overlapping data_offsets at tensor '" + ti.name + "'")
+    end
+    if ti.data_start > cursor then
+      return SafetensorsResult::Err("safetensors: unmapped gap/hole before tensor '" + ti.name + "'")
+    end
+    assign cursor = ti.data_end
+  end
+  if trailing_data_len >= 0 and cursor != trailing_data_len then
+    return SafetensorsResult::Err("safetensors: data buffer size mismatch: header covers " + str(cursor) + " bytes, file has " + str(trailing_data_len) + " bytes")
+  end
+
+  return SafetensorsResult::Ok(SafetensorsHeader(header_len=header_len, data_offset=8 + header_len, metadata=meta, tensors=infos))
+end
+
+-- Serialize a dict<string, Tensor> (+ optional string metadata) into a compliant Safetensors Tensor<u8> buffer.
+export task encode(tensors: dict<string, any>, metadata: dict<string, string> = {}): SafetensorsResult<any>
+  let names = tensors.keys().sort()
+  let hdr_obj: dict<string, any> = {}
+  if metadata.len() > 0 then
+    assign hdr_obj = hdr_obj.set("__metadata__", metadata)
+  end
+
+  let payload_parts: list<any> = []
+  let offset = 0
+  for raw_name in names
+    let name = str(raw_name)
+    if name == "__metadata__" then
+      return SafetensorsResult::Err("safetensors: tensor cannot be named '__metadata__'")
+    end
+    let t = tensors.get(name)
+    if type_of(t) != "tensor" then
+      return SafetensorsResult::Err("safetensors: entry '" + name + "' is not a Tensor")
+    end
+    let mora_dt = t.dtype()
+    let st_dt = mora_to_safetensors_dtype(mora_dt)
+    if st_dt == "" then
+      return SafetensorsResult::Err("safetensors: dtype '" + mora_dt + "' is not representable in safetensors")
+    end
+    let raw_bytes = t.to_bytes()
+    let nbytes = raw_bytes.numel()
+    let entry: dict<string, any> = {}
+    assign entry = entry.set("dtype", st_dt)
+    assign entry = entry.set("shape", t.shape())
+    assign entry = entry.set("data_offsets", [offset, offset + nbytes])
+    assign hdr_obj = hdr_obj.set(name, entry)
+    if nbytes > 0 then
+      assign payload_parts = payload_parts.push(raw_bytes)
+    end
+    assign offset = offset + nbytes
+  end
+
+  let hdr_json = json.stringify(hdr_obj)
+  let hdr_raw = Tensor::from_utf8(hdr_json)
+  let raw_len = hdr_raw.numel()
+  -- Pad JSON header with ASCII spaces (0x20) so 8 + header_len is 8-byte aligned
+  let rem = raw_len % 8
+  let pad = if rem == 0 then 0 else 8 - rem end
+  let padded_hdr = if pad > 0 then Tensor::from_utf8(hdr_json + spaces_str(pad)) else hdr_raw end
+  let final_hdr_len = padded_hdr.numel()
+  if final_hdr_len > MAX_HEADER_SIZE then
+    return SafetensorsResult::Err("safetensors: HeaderTooLarge (exceeds 100MB limit)")
+  end
+
+  let prefix = encode_u64_le(final_hdr_len)
+  let all_parts: list<any> = []
+  assign all_parts = all_parts.push(prefix)
+  assign all_parts = all_parts.push(padded_hdr)
+  for part in payload_parts
+    assign all_parts = all_parts.push(part)
+  end
+  return SafetensorsResult::Ok(Tensor::cat(all_parts, 0))
+end
+
+-- Inspect ONLY the header metadata from an in-memory Tensor<u8> buffer (no tensor deserialization).
+export task inspect_bytes(buf: any): SafetensorsResult<SafetensorsHeader>
+  if type_of(buf) != "tensor" or buf.dtype() != "u8" then
+    return SafetensorsResult::Err("safetensors: expected Tensor<u8> buffer")
+  end
+  let total = buf.numel()
+  if total < 8 then
+    return SafetensorsResult::Err("safetensors: buffer shorter than 8-byte header length prefix")
+  end
+  let header_len = decode_u64_le(buf, 0)
+  if header_len < 0 or header_len > MAX_HEADER_SIZE then
+    return SafetensorsResult::Err("safetensors: HeaderTooLarge (exceeds 100MB limit)")
+  end
+  if 8 + header_len > total then
+    return SafetensorsResult::Err("safetensors: truncated header (buffer smaller than 8 + header_len)")
+  end
+  let hdr_bytes = buf[8..8 + header_len]
+  let trailing = total - (8 + header_len)
+  return parse_and_validate_header(hdr_bytes, header_len, trailing)
+end
+
+task st_is_ok(r: any): bool
+  return match r with
+    SafetensorsResult::Ok(_) -> true
+    SafetensorsResult::Err(_) -> false
+  end
+end
+
+task st_err(r: any): string
+  return match r with
+    SafetensorsResult::Ok(_) -> ""
+    SafetensorsResult::Err(msg) -> msg
+  end
+end
+
+task st_val(r: any): any
+  return match r with
+    SafetensorsResult::Ok(v) -> v
+    SafetensorsResult::Err(_) -> nil
+  end
+end
+
+-- Decode an in-memory Tensor<u8> Safetensors buffer into tensors on `device` (default `"cpu"`).
+export task decode(buf: any, device: string = "cpu"): SafetensorsResult<SafetensorsFile>
+  let hdr_res = inspect_bytes(buf)
+  if !st_is_ok(hdr_res) then
+    return SafetensorsResult::Err(st_err(hdr_res))
+  end
+  let hdr: SafetensorsHeader = st_val(hdr_res)
+  let out_tensors: dict<string, any> = {}
+  for raw_name in hdr.tensors.keys()
+    let name = str(raw_name)
+    let info = hdr.tensors.get(name)
+    let slice = if info.nbytes == 0 then Tensor::zeros([0], dtype="u8") else buf[hdr.data_offset + info.data_start..hdr.data_offset + info.data_end] end
+    let t = Tensor::from_bytes(slice, info.shape, info.mora_dtype, device)
+    assign out_tensors = out_tensors.set(name, t)
+  end
+  return SafetensorsResult::Ok(SafetensorsFile(metadata=hdr.metadata, headers=hdr.tensors, tensors=out_tensors))
+end
+
+-- Save tensors directly to disk using CheckedPath-confined binary I/O; returns total bytes written.
+export task save(path: string, tensors: dict<string, any>, metadata: dict<string, string> = {}): SafetensorsResult<int>
+  let enc = encode(tensors, metadata)
+  if !st_is_ok(enc) then
+    return SafetensorsResult::Err(st_err(enc))
+  end
+  let buf = st_val(enc)
+  file.write_binary(path, buf)
+  return SafetensorsResult::Ok(buf.numel())
+end
+
+-- Lazily inspect a `.safetensors` file header from disk (reads ONLY 8 + header_len bytes).
+export task inspect(path: string): SafetensorsResult<SafetensorsHeader>
+  if !file.exists(path) then
+    return SafetensorsResult::Err("safetensors: file not found: " + path)
+  end
+  let total = int(file.size(path))
+  if total < 8 then
+    return SafetensorsResult::Err("safetensors: file shorter than 8 bytes")
+  end
+  let prefix = file.read_binary_range(path, 0, 8)
+  let header_len = decode_u64_le(prefix, 0)
+  if header_len < 0 or header_len > MAX_HEADER_SIZE then
+    return SafetensorsResult::Err("safetensors: HeaderTooLarge (exceeds 100MB limit)")
+  end
+  if 8 + header_len > total then
+    return SafetensorsResult::Err("safetensors: truncated header in file '" + path + "'")
+  end
+  let hdr_bytes = file.read_binary_range(path, 8, header_len)
+  let trailing = total - (8 + header_len)
+  return parse_and_validate_header(hdr_bytes, header_len, trailing)
+end
+
+-- Lazily load a SINGLE named tensor from disk (reads ONLY header + that tensor's byte slice!).
+export task load_tensor(path: string, name: string, device: string = "cpu"): SafetensorsResult<any>
+  let hdr_res = inspect(path)
+  if !st_is_ok(hdr_res) then
+    return SafetensorsResult::Err(st_err(hdr_res))
+  end
+  let hdr: SafetensorsHeader = st_val(hdr_res)
+  let info = hdr.tensors.get(name)
+  if info == nil then
+    return SafetensorsResult::Err("safetensors: tensor '" + name + "' not found in '" + path + "'")
+  end
+  let raw = if info.nbytes == 0 then Tensor::zeros([0], dtype="u8") else file.read_binary_range(path, hdr.data_offset + info.data_start, info.nbytes) end
+  let t = Tensor::from_bytes(raw, info.shape, info.mora_dtype, device)
+  return SafetensorsResult::Ok(t)
+end
+
+-- Load an entire `.safetensors` checkpoint from disk onto `device` (default `"cpu"`).
+export task load(path: string, device: string = "cpu"): SafetensorsResult<SafetensorsFile>
+  if !file.exists(path) then
+    return SafetensorsResult::Err("safetensors: file not found: " + path)
+  end
+  let buf = file.read_binary(path)
+  return decode(buf, device)
+end

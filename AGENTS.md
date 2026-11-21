@@ -233,8 +233,8 @@
 
 ## Project layout
 
-- `src/` — core compiler, unified HM type checker, Control SSA IR (`MORABC02` codec), stackful VM, `TensorComputeDag` & CUDA/Vulkan/Metal/SIMD backends, `KVPageAllocator` & `MemoryPool`, zero-dependency native scheduler/reactor, and binaries (`mora`, `mora-lsp`)
-- `std/` — pure-Mora standard libraries (`std/math/bigint.mora`, `std/testing.mora`, `std/net/http.mora` with Router/Chunked/Keep-Alive/SSE, and `std/mcp.mora` with Tools/Resources/Prompts/`Struct::schema()`/Stdio), embedded in the binary via `mora::resolve_std_module`
+- `src/` — core compiler, unified HM type checker, Control SSA IR (`MORABC02` codec), stackful VM, `TensorComputeDag` & CUDA/Vulkan/Metal/SIMD backends, `KVPageAllocator` & `MemoryPool`, zero-dependency native scheduler/reactor/TLS (`runtime/tls`), and binaries (`mora`, `mora-lsp`)
+- `std/` — pure-Mora standard libraries (`std/math/bigint.mora`, `std/testing.mora`, `std/nn/safetensors.mora`, `std/nn/gguf.mora`, `std/net/tls.mora`, `std/net/http.mora` with HTTPS/Router/Chunked/Keep-Alive/SSE, and `std/mcp.mora` with Tools/Resources/Prompts/`Struct::schema()`/HTTPS/Stdio), embedded in the binary via `mora::resolve_std_module`
 - `tests/` — integration tests + property-based tests (self-hosted `std/testing.mora` generator)
 - `examples/` — runnable Mora demo scripts (CI also runs these against the release binary)
 - `docs/` — language spec, influences, learning plan, architecture diagram

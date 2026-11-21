@@ -234,6 +234,48 @@ pub fn builtin_signatures() -> Vec<(String, Signature)> {
             ),
         ),
         (
+            "tls_listen".to_string(),
+            Signature::new(
+                vec![
+                    ("addr".to_string(), Type::String),
+                    (
+                        "config".to_string(),
+                        Type::Dict(Box::new(Type::String), Box::new(Type::Any)),
+                    ),
+                ],
+                Type::TlsListener,
+            ),
+        ),
+        (
+            "tls_connect".to_string(),
+            Signature::with_min_arity(
+                vec![
+                    ("addr".to_string(), Type::String),
+                    (
+                        "server_name".to_string(),
+                        Type::Union(vec![Type::String, Type::Nil]),
+                    ),
+                    (
+                        "config".to_string(),
+                        Type::Union(vec![
+                            Type::Dict(Box::new(Type::String), Box::new(Type::Any)),
+                            Type::Nil,
+                        ]),
+                    ),
+                    (
+                        "timeout_ms".to_string(),
+                        Type::Union(vec![Type::Int, Type::Float, Type::Nil]),
+                    ),
+                    (
+                        "ctx".to_string(),
+                        Type::Union(vec![Type::Context, Type::Nil]),
+                    ),
+                ],
+                1,
+                Type::TlsStream,
+            ),
+        ),
+        (
             "tensor".to_string(),
             Signature::with_min_arity(
                 vec![
@@ -367,6 +409,8 @@ enum Ret {
     Bool,
     String,
     Nil,
+    /// `Tensor<u8, [_], cpu>` —— 紧凑 64B 对齐字节缓冲区（`file.read_binary` 等）。
+    ByteTensor,
     /// `Type::List` —— 元素类型唯一，故是 1 元数组而非切片。
     List(&'static [Ret; 1]),
     /// `Type::Dict` —— `[键, 值]`。
@@ -384,6 +428,13 @@ impl Ret {
             Ret::Bool => Type::Bool,
             Ret::String => Type::String,
             Ret::Nil => Type::Nil,
+            Ret::ByteTensor => Type::Tensor {
+                dtype: Box::new(Type::Scalar(crate::common::DType::U8)),
+                shape: crate::typeck::ShapeType::Ranked(vec![crate::typeck::DimExpr::Symbolic(
+                    "_".to_string(),
+                )]),
+                device: crate::typeck::DeviceType::Concrete(crate::common::Device::Cpu),
+            },
             Ret::List([elem]) => Type::List(Box::new(elem.materialize())),
             Ret::Dict([k, v]) => Type::Dict(Box::new(k.materialize()), Box::new(v.materialize())),
             Ret::Union(xs) => Type::Union(xs.iter().map(|r| r.materialize()).collect()),
@@ -508,10 +559,20 @@ const FILE_METHODS: &[MethodGroup] = &[
     ),
     // Nil —— 写操作一族（2 元）
     MethodGroup::new(
-        &["write_text", "append_text", "write_bytes", "rename", "copy"],
+        &[
+            "write_text",
+            "append_text",
+            "write_bytes",
+            "write_binary",
+            "rename",
+            "copy",
+        ],
         2,
         Ret::Nil,
     ),
+    // ByteTensor —— 零装箱二进制字节流读写（供 std/nn/safetensors、std/nn/gguf 等复用）
+    MethodGroup::new(&["read_binary"], 1, Ret::ByteTensor),
+    MethodGroup::new(&["read_binary_range"], 3, Ret::ByteTensor),
 ];
 
 // ── exec ── `exec_parallel` 的成功路径返回 `Ok(Value::List[Dict])` ────────
@@ -659,6 +720,43 @@ pub fn method_arity(receiver: &Type, method: &str) -> Option<usize> {
 pub fn method_signature(receiver: &Type, method: &str) -> Option<Signature> {
     if let Type::BuiltinModule(module) = receiver {
         return module_method_signature(module, method);
+    }
+    if let Type::Union(members) = receiver
+        && !members.is_empty()
+    {
+        let mut member_sigs: Vec<Signature> = Vec::with_capacity(members.len());
+        for m in members {
+            let sig = method_signature(m, method)?;
+            member_sigs.push(sig);
+        }
+        let first = member_sigs[0].clone();
+        if member_sigs.iter().all(|s| {
+            s.params.len() == first.params.len()
+                && s.min_arity == first.min_arity
+                && s.variadic == first.variadic
+        }) {
+            let mut merged_params = first.params.clone();
+            if let Some(p0) = merged_params.first_mut() {
+                p0.1 = receiver.clone();
+            }
+            let mut ret_types: Vec<Type> = Vec::new();
+            for s in &member_sigs {
+                if !ret_types.contains(&s.return_type) {
+                    ret_types.push(s.return_type.clone());
+                }
+            }
+            let merged_ret = if ret_types.len() == 1 {
+                ret_types.remove(0)
+            } else {
+                Type::Union(ret_types)
+            };
+            let mut sig = match first.min_arity {
+                Some(min_a) => Signature::with_min_arity(merged_params, min_a, merged_ret),
+                None => Signature::new(merged_params, merged_ret),
+            };
+            sig.variadic = first.variadic;
+            return Some(sig);
+        }
     }
     if let Some(sig) = method_signature_builtin(receiver, method) {
         return Some(sig);
@@ -1060,6 +1158,99 @@ fn method_signature_builtin(receiver: &Type, method: &str) -> Option<Signature> 
             vec![("self".to_string(), Type::TcpStream)],
             Type::String,
         )),
+        // ── v0.110.1: Native Async TLS 1.2/1.3 Listener / Stream methods ──
+        (Type::TlsListener, "accept") => Some(Signature::with_min_arity(
+            vec![
+                ("self".to_string(), Type::TlsListener),
+                (
+                    "ctx".to_string(),
+                    Type::Union(vec![Type::Context, Type::Nil]),
+                ),
+            ],
+            1,
+            Type::TlsStream,
+        )),
+        (Type::TlsListener, "local_addr") => Some(Signature::new(
+            vec![("self".to_string(), Type::TlsListener)],
+            Type::String,
+        )),
+        (Type::TlsListener, "close") => Some(Signature::new(
+            vec![("self".to_string(), Type::TlsListener)],
+            Type::Nil,
+        )),
+        (Type::TlsListener, "is_closed") => Some(Signature::new(
+            vec![("self".to_string(), Type::TlsListener)],
+            Type::Bool,
+        )),
+        (Type::TlsStream, "read" | "read_line") => Some(Signature::with_min_arity(
+            vec![
+                ("self".to_string(), Type::TlsStream),
+                (
+                    "max_bytes".to_string(),
+                    Type::Union(vec![Type::Int, Type::Nil]),
+                ),
+                (
+                    "ctx".to_string(),
+                    Type::Union(vec![Type::Context, Type::Nil]),
+                ),
+            ],
+            1,
+            Type::String,
+        )),
+        (Type::TlsStream, "read_bytes") => Some(Signature::with_min_arity(
+            vec![
+                ("self".to_string(), Type::TlsStream),
+                (
+                    "max_bytes".to_string(),
+                    Type::Union(vec![Type::Int, Type::Nil]),
+                ),
+                (
+                    "ctx".to_string(),
+                    Type::Union(vec![Type::Context, Type::Nil]),
+                ),
+            ],
+            1,
+            Type::List(Box::new(Type::Int)),
+        )),
+        (Type::TlsStream, "write") => Some(Signature::with_min_arity(
+            vec![
+                ("self".to_string(), Type::TlsStream),
+                ("data".to_string(), Type::String),
+                (
+                    "ctx".to_string(),
+                    Type::Union(vec![Type::Context, Type::Nil]),
+                ),
+            ],
+            2,
+            Type::Int,
+        )),
+        (Type::TlsStream, "write_bytes") => Some(Signature::with_min_arity(
+            vec![
+                ("self".to_string(), Type::TlsStream),
+                ("bytes".to_string(), Type::List(Box::new(Type::Int))),
+                (
+                    "ctx".to_string(),
+                    Type::Union(vec![Type::Context, Type::Nil]),
+                ),
+            ],
+            2,
+            Type::Int,
+        )),
+        (Type::TlsStream, "shutdown" | "close") => Some(Signature::new(
+            vec![("self".to_string(), Type::TlsStream)],
+            Type::Nil,
+        )),
+        (Type::TlsStream, "is_closed") => Some(Signature::new(
+            vec![("self".to_string(), Type::TlsStream)],
+            Type::Bool,
+        )),
+        (
+            Type::TlsStream,
+            "local_addr" | "peer_addr" | "tls_version" | "cipher_suite" | "alpn_protocol",
+        ) => Some(Signature::new(
+            vec![("self".to_string(), Type::TlsStream)],
+            Type::String,
+        )),
         // ── Wave 4: TensorComputeDag & KVPageAllocator methods ──
         (Type::ComputeDag, "fuse" | "compile") => Some(Signature::new(
             vec![("self".to_string(), Type::ComputeDag)],
@@ -1346,6 +1537,14 @@ fn method_signature_builtin(receiver: &Type, method: &str) -> Option<Signature> 
         (Type::Tensor { .. }, "to_list") => Some(Signature::new(
             vec![("self".to_string(), receiver.clone())],
             Type::List(Box::new(Type::Any)),
+        )),
+        (Type::Tensor { .. }, "to_bytes") => Some(Signature::new(
+            vec![("self".to_string(), receiver.clone())],
+            Ret::ByteTensor.materialize(),
+        )),
+        (Type::Tensor { .. }, "to_utf8") => Some(Signature::new(
+            vec![("self".to_string(), receiver.clone())],
+            Type::String,
         )),
         (Type::Tensor { .. }, "reshape") => Some(Signature::variadic(
             vec![

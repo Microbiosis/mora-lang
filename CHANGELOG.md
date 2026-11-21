@@ -2,6 +2,35 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [0.110.1] — P3 ML 权重标准库（Safetensors / GGUF v3）与零依赖原生异步 TLS 1.2/1.3 & HTTPS
+
+在不引入任何外部 Cargo 依赖（保持 `Cargo.toml` / `Cargo.lock` **0 生产依赖 / 0 测试依赖**）的前提下，补齐 AI 模型权重序列化与云原生加密传输两条完整标准库纵深链路。
+
+### ML 权重标准库与紧凑二进制张量原语（`tests/p3_std_nn_weights.rs`）
+
+- **紧凑二进制 `Tensor` 与沙箱范围 I/O 原语**：
+  - `Tensor` 新增 `t.to_bytes()`、`t.to_utf8()`、`Tensor::from_bytes(buf, shape, dtype, device?)`、`Tensor::from_utf8(s)` 与 `Tensor::cat(tensors, axis?)`（直读/直写 64 字节对齐 `AlignedByteBuffer` 小端硬件字节，零中间列表装箱）
+  - `file` 内建模块新增 `file.read_binary(path)`、`file.read_binary_range(path, offset, len)`、`file.write_binary(path, buf)`（经 `CheckedPath` 与 `AsyncIoReactor::run_fs` 沙箱化异步执行并支持 `TaskContext` 协作取消）
+  - 统一 HM 求解器新增 `Ret::ByteTensor` 与 `Tensor<u8, [?], cpu>` 静态校验，LSP 同步暴露 `Tensor::{from_bytes,from_utf8,cat}` 补全；`List.sort()` 补齐全字符串列表字典序排序，与 HM 签名对齐
+- **纯 Mora `std/nn/safetensors`（[std/nn/safetensors.mora](std/nn/safetensors.mora)）**：
+  - 完整实现 Hugging Face Safetensors 规范：8B LE 头长度前缀、100MB `HeaderTooLarge` DoS 防护、8B 对齐空格填充、全部 15 种官方 dtype（含 `F8_E4M3`/`F8_E5M2`/`BF16`/`F16`/`BOOL`）、`__metadata__`、以及严格的无重叠连续零空洞 `data_offsets` 安全校验
+  - 支持懒加载头检视 `inspect(path)`、按名范围加载单张量至目标设备 `load_tensor(path, name, device?)`、全量 `load` / `save` / `encode` / `decode`
+- **纯 Mora `std/nn/gguf`（[std/nn/gguf.mora](std/nn/gguf.mora)）**：
+  - 完整实现 GGUF v2/v3 规范：`"GGUF"` 魔数与版本校验、全部 13 种 `gguf_type` 元数据（含递归 `ARRAY`）、自定义 `general.alignment`（默认 32B）、GGML 反转维度与 Mora 行主序自动互转
+  - 支持 8 种未量化硬件张量类型（`F32`/`F16`/`BF16`/`F64`/`I8`/`I16`/`I32`/`I64`）、GGML 块量化格式 `Q8_0` & `Q4_0` 反量化及纯 Mora `quantize_q8_0`，以及指数增长前缀范围读 `inspect(path)` 与单张量懒加载 `load_tensor(path, name, device?)`
+
+### 零依赖原生异步 TLS 1.2/1.3、联合流静态类型与 HTTPS / MCP-over-HTTPS（`tests/p3_tls_and_https.rs`）
+
+- **跨平台动态加载共享底座与无锁 sans-IO 原生 TLS 引擎**：
+  - 将 `DynLib` 从 `src/runtime/gpu/mod.rs` 抽提至共享 `src/common/dynlib.rs` 复用
+  - 新增纯 Rust RFC 7468 PEM / Base64 / ASN.1 PKCS#1 & SEC1 → PKCS#8 解码器（`src/runtime/tls/pem.rs`）
+  - 新增零依赖原生 OS TLS 1.2/1.3 引擎（`src/runtime/tls/{mod,schannel,openssl}.rs`）：Windows 动态加载 `secur32.dll` + `crypt32.dll` + `ncrypt.dll`（CNG 具名临时容器 `Drop` 自动 `NCryptDeleteKey` 回收 + 真实 `CertGetCertificateChain` / `CERT_CHAIN_POLICY_SSL` / `hExclusiveRoot` 专属 CA 校验 + ALPN）；Linux/macOS 动态加载 `libssl` + `libcrypto` Memory-BIO（纯内存 PEM 装载、SNI、`X509_VERIFY_PARAM_set1_host`/`ip_asc`、`SSL_VERIFY_PEER` 与 ALPN 协商）
+  - 在 `MoraTcpListener` / `MoraTcpStream` 之上构建 `MoraTlsListener` / `MoraTlsStream`，全程不跨 `.await` 持锁，原生支持 `TaskContext` 协作取消与 `.close()` 立即唤醒
+- **一等 TLS 类型、联合接收器方法派发与标准库升级**：
+  - 语言内核新增 `Type::{TlsListener, TlsStream}`、`Value::{TlsListener, TlsStream}`、`BuiltinFnId::{TlsConnect, TlsListen}`（`MORABC02` 字节码标签 41/42 向后兼容）、`tls_listen` / `tls_connect` 及 `.accept`/`.read`/`.read_line`/`.read_bytes`/`.write`/`.write_bytes`/`.shutdown`/`.close`/`.tls_version`/`.cipher_suite`/`.alpn_protocol`，同步接入 LSP 补全与注册表/签名对拍守卫
+  - `typeck::dispatch::method_signature` 与 HM 求解器新增非空 `Type::Union` 接收器公共方法合并推导及封闭传输句柄未知方法静态拦截，使 `tcp_stream | tls_stream` 与 `tcp_listener | tls_listener` 具备完备静态类型安全
+  - 新增纯 Mora [std/net/tls.mora](std/net/tls.mora) 并扩展 [std/net/http.mora](std/net/http.mora)（`Router.serve_tls`、`serve_tls`、`https_request`/`https_get`/`https_post`/`https_post_chunked`/`open_https_sse`，Router/Chunked/Keep-Alive/413/SSE 全量复用至 HTTPS）与 [std/mcp.mora](std/mcp.mora)（`serve_https`、`call_https`）
+
 ## [0.110.0] — 全波次（Wave 1–4 + P1/P2）架构重铸与 AI-Native 静态类型语言定版
 
 重新校准并完整兑现 Mora 核心定位：**AI-native 静态类型语言，面向大模型底层、计算图与算子、大模型推理/训练与资源动态调控，同时具备 Go 式云原生并发属性并对 HTTP 与 MCP 服务提供语言原语级友好支持**。

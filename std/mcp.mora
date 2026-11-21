@@ -465,7 +465,7 @@ export impl McpServer
     return processed
   end
 
-  task dispatch_http(self, req: HttpRequest, stream: tcp_stream): any
+  task dispatch_http(self, req: HttpRequest, stream: tcp_stream | tls_stream): any
     if req.path == "/health" and req.method == "GET" then
       return json_response(200, {"status": "ok", "server": self.name, "version": self.version})
     end
@@ -485,13 +485,24 @@ export impl McpServer
     return json_response(404, {"error": "not found", "path": req.path})
   end
 
-  task serve_listener(self, listener: tcp_listener, max_requests: int = 0, ctx: any = nil, max_body_bytes: int = 1048576): int
-    let handler = fn(req: HttpRequest, stream: tcp_stream) self.dispatch_http(req, stream) end
+  task serve_listener(self, listener: tcp_listener | tls_listener, max_requests: int = 0, ctx: any = nil, max_body_bytes: int = 1048576): int
+    let handler = fn(req: HttpRequest, stream: tcp_stream | tls_stream) self.dispatch_http(req, stream) end
     return serve_listener(listener, handler, max_requests, ctx, max_body_bytes)
   end
 
   task serve_http(self, addr: string, max_requests: int = 0, ctx: any = nil, max_body_bytes: int = 1048576): int
     let listener = tcp_listen(addr)
+    let n = self.serve_listener(listener, max_requests, ctx, max_body_bytes)
+    listener.close()
+    return n
+  end
+
+  task serve_https(self, addr: string, cert_pem: string, key_pem: string, max_requests: int = 0, ctx: any = nil, max_body_bytes: int = 1048576): int
+    let cfg: dict<string, any> = {}
+    assign cfg = cfg.set("cert_pem", cert_pem)
+    assign cfg = cfg.set("key_pem", key_pem)
+    assign cfg = cfg.set("alpn", ["http/1.1"])
+    let listener = tls_listen(addr, cfg)
     let n = self.serve_listener(listener, max_requests, ctx, max_body_bytes)
     listener.close()
     return n
@@ -503,5 +514,13 @@ export task call_http(addr: string, method: string, params: dict<string, any>, i
   assign req_obj = req_obj.set("jsonrpc", "2.0").set("id", id).set("method", method).set("params", params)
   let payload = json.stringify(req_obj)
   let resp = post(addr, "/mcp", payload, "application/json", 5000)
+  return json.parse(resp.body)
+end
+
+export task call_https(addr: string, method: string, params: dict<string, any>, server_name: string = "", tls_config: dict<string, any> = {}, id: int = 1): dict<string, any>
+  let req_obj: dict<string, any> = {}
+  assign req_obj = req_obj.set("jsonrpc", "2.0").set("id", id).set("method", method).set("params", params)
+  let payload = json.stringify(req_obj)
+  let resp = https_post(addr, "/mcp", payload, server_name, "application/json", tls_config, 5000)
   return json.parse(resp.body)
 end

@@ -206,6 +206,118 @@ pub fn resolve_builtin_call_named(
                     args.push(c);
                 }
             }
+            BuiltinFnId::TlsListen => {
+                let mut addr_slot = args.first().cloned();
+                let mut cfg_slot = args.get(1).cloned();
+                for (k, v) in named_args {
+                    match k.as_str() {
+                        "addr" => {
+                            if addr_slot.is_some() {
+                                return Err(MoraError::Runtime(
+                                    "tls_listen(): duplicate argument 'addr'".to_string(),
+                                ));
+                            }
+                            addr_slot = Some(v);
+                        }
+                        "config" => {
+                            if cfg_slot.is_some() {
+                                return Err(MoraError::Runtime(
+                                    "tls_listen(): duplicate argument 'config'".to_string(),
+                                ));
+                            }
+                            cfg_slot = Some(v);
+                        }
+                        other => {
+                            return Err(MoraError::Runtime(format!(
+                                "tls_listen(): unexpected keyword argument '{other}'"
+                            )));
+                        }
+                    }
+                }
+                args.clear();
+                if let Some(a) = addr_slot {
+                    args.push(a);
+                }
+                if let Some(c) = cfg_slot {
+                    args.push(c);
+                }
+            }
+            BuiltinFnId::TlsConnect => {
+                let mut addr_slot = args.first().cloned();
+                let mut sni_slot = args.get(1).cloned();
+                let mut cfg_slot = args.get(2).cloned();
+                let mut timeout_slot = args.get(3).cloned();
+                let mut ctx_slot = args.get(4).cloned();
+                for (k, v) in named_args {
+                    match k.as_str() {
+                        "addr" => {
+                            if addr_slot.is_some() {
+                                return Err(MoraError::Runtime(
+                                    "tls_connect(): duplicate argument 'addr'".to_string(),
+                                ));
+                            }
+                            addr_slot = Some(v);
+                        }
+                        "server_name" | "sni" => {
+                            if sni_slot.is_some() {
+                                return Err(MoraError::Runtime(
+                                    "tls_connect(): duplicate argument 'server_name'".to_string(),
+                                ));
+                            }
+                            sni_slot = Some(v);
+                        }
+                        "config" => {
+                            if cfg_slot.is_some() {
+                                return Err(MoraError::Runtime(
+                                    "tls_connect(): duplicate argument 'config'".to_string(),
+                                ));
+                            }
+                            cfg_slot = Some(v);
+                        }
+                        "timeout_ms" | "timeout" => {
+                            if timeout_slot.is_some() {
+                                return Err(MoraError::Runtime(
+                                    "tls_connect(): duplicate argument 'timeout_ms'".to_string(),
+                                ));
+                            }
+                            timeout_slot = Some(v);
+                        }
+                        "ctx" | "context" => {
+                            if ctx_slot.is_some() {
+                                return Err(MoraError::Runtime(
+                                    "tls_connect(): duplicate argument 'ctx'".to_string(),
+                                ));
+                            }
+                            ctx_slot = Some(v);
+                        }
+                        other => {
+                            return Err(MoraError::Runtime(format!(
+                                "tls_connect(): unexpected keyword argument '{other}'"
+                            )));
+                        }
+                    }
+                }
+                args.clear();
+                if let Some(a) = addr_slot {
+                    args.push(a);
+                }
+                if sni_slot.is_some()
+                    || cfg_slot.is_some()
+                    || timeout_slot.is_some()
+                    || ctx_slot.is_some()
+                {
+                    args.push(sni_slot.unwrap_or(Value::Nil));
+                }
+                if cfg_slot.is_some() || timeout_slot.is_some() || ctx_slot.is_some() {
+                    args.push(cfg_slot.unwrap_or(Value::Nil));
+                }
+                if timeout_slot.is_some() || ctx_slot.is_some() {
+                    args.push(timeout_slot.unwrap_or(Value::Nil));
+                }
+                if let Some(c) = ctx_slot {
+                    args.push(c);
+                }
+            }
             BuiltinFnId::KvAllocator => {
                 let names = [
                     "total_pages",
@@ -476,6 +588,165 @@ pub fn resolve_builtin_call_named(
                 crate::runtime::reactor::MoraTcpStream::connect(addr, timeout, eff_ctx),
             )?;
             Ok(CallAction::Done(Value::TcpStream(stream)))
+        }
+        BuiltinFnId::TlsListen => {
+            if args.len() != 2 {
+                return Err(MoraError::Runtime(format!(
+                    "tls_listen(addr, config) expects 2 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let Value::String(addr) = &args[0] else {
+                return Err(MoraError::Runtime(format!(
+                    "tls_listen(addr, config): expected string address, got {}",
+                    crate::flow::type_name(&args[0])
+                )));
+            };
+            let Value::Dict(cfg_map) = &args[1] else {
+                return Err(MoraError::Runtime(format!(
+                    "tls_listen(addr, config): expected config dict, got {}",
+                    crate::flow::type_name(&args[1])
+                )));
+            };
+            let cert_pem = match cfg_map.get("cert_pem") {
+                Some(Value::String(s)) => s.clone(),
+                _ => {
+                    return Err(MoraError::Runtime(
+                        "tls_listen(addr, config): config dict requires string 'cert_pem'"
+                            .to_string(),
+                    ));
+                }
+            };
+            let key_pem = match cfg_map.get("key_pem") {
+                Some(Value::String(s)) => s.clone(),
+                _ => {
+                    return Err(MoraError::Runtime(
+                        "tls_listen(addr, config): config dict requires string 'key_pem'"
+                            .to_string(),
+                    ));
+                }
+            };
+            let alpn_protocols = parse_tls_alpn_opt(cfg_map.get("alpn"), "tls_listen")?;
+            if let Some(c) = core.task_context.as_ref() {
+                c.status()?;
+            }
+            let cfg = crate::runtime::tls::TlsServerConfig {
+                cert_pem,
+                key_pem,
+                alpn_protocols,
+            };
+            let listener = core
+                .reactor()
+                .scheduler()
+                .block_on(crate::runtime::tls::MoraTlsListener::bind(addr, &cfg))?;
+            Ok(CallAction::Done(Value::TlsListener(listener)))
+        }
+        BuiltinFnId::TlsConnect => {
+            if args.is_empty() || args.len() > 5 {
+                return Err(MoraError::Runtime(format!(
+                    "tls_connect(addr, server_name?, config?, timeout_ms?, ctx?) expects 1..=5 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let Value::String(addr) = &args[0] else {
+                return Err(MoraError::Runtime(format!(
+                    "tls_connect(addr, ...): expected string address, got {}",
+                    crate::flow::type_name(&args[0])
+                )));
+            };
+            let mut server_name = match args.get(1) {
+                None | Some(Value::Nil) => String::new(),
+                Some(Value::String(s)) => s.clone(),
+                Some(other) => {
+                    return Err(MoraError::Runtime(format!(
+                        "tls_connect(..., server_name): expected string or nil, got {}",
+                        crate::flow::type_name(other)
+                    )));
+                }
+            };
+            let mut ca_pem: Option<String> = None;
+            let mut alpn_protocols: Vec<String> = Vec::new();
+            let mut insecure_skip_verify = false;
+            match args.get(2) {
+                None | Some(Value::Nil) => {}
+                Some(Value::Dict(cfg_map)) => {
+                    if let Some(v) = cfg_map.get("ca_pem") {
+                        match v {
+                            Value::Nil => {}
+                            Value::String(s) if !s.is_empty() => ca_pem = Some(s.clone()),
+                            Value::String(_) => {}
+                            other => {
+                                return Err(MoraError::Runtime(format!(
+                                    "tls_connect: config.ca_pem expected string or nil, got {}",
+                                    crate::flow::type_name(other)
+                                )));
+                            }
+                        }
+                    }
+                    if let Some(v) = cfg_map.get("server_name")
+                        && server_name.is_empty()
+                    {
+                        if let Value::String(s) = v {
+                            server_name = s.clone();
+                        } else if !matches!(v, Value::Nil) {
+                            return Err(MoraError::Runtime(format!(
+                                "tls_connect: config.server_name expected string, got {}",
+                                crate::flow::type_name(v)
+                            )));
+                        }
+                    }
+                    alpn_protocols = parse_tls_alpn_opt(cfg_map.get("alpn"), "tls_connect")?;
+                    if let Some(v) = cfg_map.get("insecure_skip_verify") {
+                        match v {
+                            Value::Bool(b) => insecure_skip_verify = *b,
+                            Value::Nil => {}
+                            other => {
+                                return Err(MoraError::Runtime(format!(
+                                    "tls_connect: config.insecure_skip_verify expected bool, got {}",
+                                    crate::flow::type_name(other)
+                                )));
+                            }
+                        }
+                    }
+                }
+                Some(other) => {
+                    return Err(MoraError::Runtime(format!(
+                        "tls_connect(..., config): expected dict or nil, got {}",
+                        crate::flow::type_name(other)
+                    )));
+                }
+            }
+            if server_name.is_empty() {
+                server_name = extract_host_from_addr(addr);
+            }
+            let timeout = match args.get(3) {
+                None | Some(Value::Nil) => None,
+                Some(v) => Some(crate::runtime::builtins::duration_from_ms(
+                    v,
+                    "tls_connect",
+                )?),
+            };
+            let explicit_ctx = match args.get(4) {
+                None | Some(Value::Nil) => None,
+                Some(Value::Context(c)) => Some(c.clone()),
+                Some(other) => {
+                    return Err(MoraError::Runtime(format!(
+                        "tls_connect(..., ctx): expected context, got {}",
+                        crate::flow::type_name(other)
+                    )));
+                }
+            };
+            let eff_ctx = explicit_ctx.as_ref().or(core.task_context.as_ref());
+            let cfg = crate::runtime::tls::TlsClientConfig {
+                server_name,
+                ca_pem,
+                alpn_protocols,
+                insecure_skip_verify,
+            };
+            let stream = core.reactor().scheduler().block_on(
+                crate::runtime::tls::MoraTlsStream::connect(addr, &cfg, timeout, eff_ctx),
+            )?;
+            Ok(CallAction::Done(Value::TlsStream(stream)))
         }
         BuiltinFnId::Jvp => {
             if args.len() != 3 {
@@ -1189,6 +1460,8 @@ pub fn resolve_method_call_named(
         Value::Context(ctx) => resolve_context_method(&ctx, method, args, core),
         Value::TcpListener(l) => resolve_tcp_listener_method(&l, method, args, core),
         Value::TcpStream(s) => resolve_tcp_stream_method(&s, method, args, core),
+        Value::TlsListener(l) => resolve_tls_listener_method(&l, method, args, core),
+        Value::TlsStream(s) => resolve_tls_stream_method(&s, method, args, core),
         Value::ComputeDag(dag) => resolve_compute_dag_method(&dag, method, args, core),
         Value::KVAllocator(kv) => resolve_kv_allocator_method(&kv, method, args),
         Value::MemoryPool(pool) => resolve_memory_pool_method(&pool, method, args),
@@ -1700,6 +1973,312 @@ fn resolve_tcp_stream_method(
         }
         _ => Err(MoraError::Runtime(format!(
             "TcpStream has no method: {method}"
+        ))),
+    }
+}
+
+fn parse_tls_alpn_opt(val: Option<&Value>, fn_name: &str) -> MoraResult<Vec<String>> {
+    match val {
+        None | Some(Value::Nil) => Ok(Vec::new()),
+        Some(Value::List(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items.iter() {
+                let Value::String(s) = item else {
+                    return Err(MoraError::Runtime(format!(
+                        "{fn_name}: config.alpn elements must be strings, got {}",
+                        crate::flow::type_name(item)
+                    )));
+                };
+                out.push(s.clone());
+            }
+            Ok(out)
+        }
+        Some(other) => Err(MoraError::Runtime(format!(
+            "{fn_name}: config.alpn expected list<string> or nil, got {}",
+            crate::flow::type_name(other)
+        ))),
+    }
+}
+
+fn extract_host_from_addr(addr: &str) -> String {
+    let trimmed = addr.trim();
+    if let Some(rest) = trimmed.strip_prefix('[')
+        && let Some(end) = rest.find(']')
+    {
+        return rest[..end].to_string();
+    }
+    if let Some((host, _port)) = trimmed.rsplit_once(':') {
+        host.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn resolve_tls_listener_method(
+    listener: &Arc<crate::runtime::tls::MoraTlsListener>,
+    method: &str,
+    args: Vec<Value>,
+    core: &CoreRuntime,
+) -> MoraResult<CallAction> {
+    match method {
+        "accept" => {
+            if args.len() > 1 {
+                return Err(MoraError::Runtime(format!(
+                    "tls_listener.accept(ctx?) expects 0..=1 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let explicit_ctx = parse_optional_tcp_ctx(args.first(), "tls_listener.accept")?;
+            let eff_ctx = explicit_ctx.as_ref().or(core.task_context.as_ref());
+            let stream = core
+                .reactor()
+                .scheduler()
+                .block_on(listener.accept(eff_ctx))?;
+            Ok(CallAction::Done(Value::TlsStream(stream)))
+        }
+        "local_addr" => {
+            if !args.is_empty() {
+                return Err(MoraError::Runtime(format!(
+                    "tls_listener.local_addr() expects 0 arguments, got {}",
+                    args.len()
+                )));
+            }
+            Ok(CallAction::Done(Value::String(
+                listener.local_addr().to_string(),
+            )))
+        }
+        "close" => {
+            if !args.is_empty() {
+                return Err(MoraError::Runtime(format!(
+                    "tls_listener.close() expects 0 arguments, got {}",
+                    args.len()
+                )));
+            }
+            listener.close();
+            Ok(CallAction::Done(Value::Nil))
+        }
+        "is_closed" => {
+            if !args.is_empty() {
+                return Err(MoraError::Runtime(format!(
+                    "tls_listener.is_closed() expects 0 arguments, got {}",
+                    args.len()
+                )));
+            }
+            Ok(CallAction::Done(Value::Bool(listener.is_closed())))
+        }
+        _ => Err(MoraError::Runtime(format!(
+            "TlsListener has no method: {method}"
+        ))),
+    }
+}
+
+fn resolve_tls_stream_method(
+    stream: &Arc<crate::runtime::tls::MoraTlsStream>,
+    method: &str,
+    args: Vec<Value>,
+    core: &CoreRuntime,
+) -> MoraResult<CallAction> {
+    match method {
+        "read" => {
+            if args.len() > 2 {
+                return Err(MoraError::Runtime(format!(
+                    "tls_stream.read(max_bytes?, ctx?) expects 0..=2 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let max_bytes = parse_tcp_max_bytes(args.first(), 65536, "tls_stream.read")?;
+            let explicit_ctx = parse_optional_tcp_ctx(args.get(1), "tls_stream.read")?;
+            let eff_ctx = explicit_ctx.as_ref().or(core.task_context.as_ref());
+            let bytes = core
+                .reactor()
+                .scheduler()
+                .block_on(stream.read_bytes(max_bytes, eff_ctx))?;
+            let text = String::from_utf8(bytes).map_err(|e| {
+                MoraError::Io(format!("tls_stream.read: invalid UTF-8 payload: {e}"))
+            })?;
+            Ok(CallAction::Done(Value::String(text)))
+        }
+        "read_bytes" => {
+            if args.len() > 2 {
+                return Err(MoraError::Runtime(format!(
+                    "tls_stream.read_bytes(max_bytes?, ctx?) expects 0..=2 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let max_bytes = parse_tcp_max_bytes(args.first(), 65536, "tls_stream.read_bytes")?;
+            let explicit_ctx = parse_optional_tcp_ctx(args.get(1), "tls_stream.read_bytes")?;
+            let eff_ctx = explicit_ctx.as_ref().or(core.task_context.as_ref());
+            let bytes = core
+                .reactor()
+                .scheduler()
+                .block_on(stream.read_bytes(max_bytes, eff_ctx))?;
+            let vals: Vec<Value> = bytes.into_iter().map(|b| Value::Int(b as i64)).collect();
+            Ok(CallAction::Done(Value::List(vals.into())))
+        }
+        "read_line" => {
+            if args.len() > 2 {
+                return Err(MoraError::Runtime(format!(
+                    "tls_stream.read_line(max_bytes?, ctx?) expects 0..=2 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let max_bytes = parse_tcp_max_bytes(args.first(), 65536, "tls_stream.read_line")?;
+            let explicit_ctx = parse_optional_tcp_ctx(args.get(1), "tls_stream.read_line")?;
+            let eff_ctx = explicit_ctx.as_ref().or(core.task_context.as_ref());
+            let bytes = core
+                .reactor()
+                .scheduler()
+                .block_on(stream.read_line_bytes(max_bytes, eff_ctx))?;
+            let text = String::from_utf8(bytes).map_err(|e| {
+                MoraError::Io(format!("tls_stream.read_line: invalid UTF-8 line: {e}"))
+            })?;
+            Ok(CallAction::Done(Value::String(text)))
+        }
+        "write" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(MoraError::Runtime(format!(
+                    "tls_stream.write(data, ctx?) expects 1..=2 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let Value::String(data) = &args[0] else {
+                return Err(MoraError::Runtime(format!(
+                    "tls_stream.write(data, ctx?): expected string, got {}",
+                    crate::flow::type_name(&args[0])
+                )));
+            };
+            let explicit_ctx = parse_optional_tcp_ctx(args.get(1), "tls_stream.write")?;
+            let eff_ctx = explicit_ctx.as_ref().or(core.task_context.as_ref());
+            let n = core
+                .reactor()
+                .scheduler()
+                .block_on(stream.write_bytes(data.as_bytes(), eff_ctx))?;
+            Ok(CallAction::Done(Value::Int(n as i64)))
+        }
+        "write_bytes" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(MoraError::Runtime(format!(
+                    "tls_stream.write_bytes(bytes, ctx?) expects 1..=2 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let Value::List(items) = &args[0] else {
+                return Err(MoraError::Runtime(format!(
+                    "tls_stream.write_bytes(bytes, ctx?): expected list<int>, got {}",
+                    crate::flow::type_name(&args[0])
+                )));
+            };
+            let mut raw = Vec::with_capacity(items.len());
+            for item in items.iter() {
+                match item {
+                    Value::Int(n) if (0..=255).contains(n) => raw.push(*n as u8),
+                    Value::Int(n) => {
+                        return Err(MoraError::Runtime(format!(
+                            "tls_stream.write_bytes: byte value {n} out of range 0..=255"
+                        )));
+                    }
+                    other => {
+                        return Err(MoraError::Runtime(format!(
+                            "tls_stream.write_bytes: expected int byte 0..=255, got {}",
+                            crate::flow::type_name(other)
+                        )));
+                    }
+                }
+            }
+            let explicit_ctx = parse_optional_tcp_ctx(args.get(1), "tls_stream.write_bytes")?;
+            let eff_ctx = explicit_ctx.as_ref().or(core.task_context.as_ref());
+            let n = core
+                .reactor()
+                .scheduler()
+                .block_on(stream.write_bytes(&raw, eff_ctx))?;
+            Ok(CallAction::Done(Value::Int(n as i64)))
+        }
+        "shutdown" => {
+            if !args.is_empty() {
+                return Err(MoraError::Runtime(format!(
+                    "tls_stream.shutdown() expects 0 arguments, got {}",
+                    args.len()
+                )));
+            }
+            core.reactor().scheduler().block_on(stream.shutdown())?;
+            Ok(CallAction::Done(Value::Nil))
+        }
+        "close" => {
+            if !args.is_empty() {
+                return Err(MoraError::Runtime(format!(
+                    "tls_stream.close() expects 0 arguments, got {}",
+                    args.len()
+                )));
+            }
+            core.reactor().scheduler().block_on(stream.close());
+            Ok(CallAction::Done(Value::Nil))
+        }
+        "is_closed" => {
+            if !args.is_empty() {
+                return Err(MoraError::Runtime(format!(
+                    "tls_stream.is_closed() expects 0 arguments, got {}",
+                    args.len()
+                )));
+            }
+            Ok(CallAction::Done(Value::Bool(stream.is_closed())))
+        }
+        "local_addr" => {
+            if !args.is_empty() {
+                return Err(MoraError::Runtime(format!(
+                    "tls_stream.local_addr() expects 0 arguments, got {}",
+                    args.len()
+                )));
+            }
+            Ok(CallAction::Done(Value::String(
+                stream.local_addr().to_string(),
+            )))
+        }
+        "peer_addr" => {
+            if !args.is_empty() {
+                return Err(MoraError::Runtime(format!(
+                    "tls_stream.peer_addr() expects 0 arguments, got {}",
+                    args.len()
+                )));
+            }
+            Ok(CallAction::Done(Value::String(
+                stream.peer_addr().to_string(),
+            )))
+        }
+        "tls_version" => {
+            if !args.is_empty() {
+                return Err(MoraError::Runtime(format!(
+                    "tls_stream.tls_version() expects 0 arguments, got {}",
+                    args.len()
+                )));
+            }
+            Ok(CallAction::Done(Value::String(
+                stream.tls_version().to_string(),
+            )))
+        }
+        "cipher_suite" => {
+            if !args.is_empty() {
+                return Err(MoraError::Runtime(format!(
+                    "tls_stream.cipher_suite() expects 0 arguments, got {}",
+                    args.len()
+                )));
+            }
+            Ok(CallAction::Done(Value::String(
+                stream.cipher_suite().to_string(),
+            )))
+        }
+        "alpn_protocol" => {
+            if !args.is_empty() {
+                return Err(MoraError::Runtime(format!(
+                    "tls_stream.alpn_protocol() expects 0 arguments, got {}",
+                    args.len()
+                )));
+            }
+            Ok(CallAction::Done(Value::String(
+                stream.alpn_protocol().unwrap_or("").to_string(),
+            )))
+        }
+        _ => Err(MoraError::Runtime(format!(
+            "TlsStream has no method: {method}"
         ))),
     }
 }

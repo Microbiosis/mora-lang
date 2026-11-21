@@ -82,6 +82,8 @@ pub(crate) fn eval_pure_builtin(
         | BuiltinFnId::Macroexpand
         | BuiltinFnId::TcpConnect
         | BuiltinFnId::TcpListen
+        | BuiltinFnId::TlsConnect
+        | BuiltinFnId::TlsListen
         | BuiltinFnId::Jvp
         | BuiltinFnId::TraceDag
         | BuiltinFnId::KvAllocator

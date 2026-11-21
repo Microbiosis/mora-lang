@@ -241,6 +241,10 @@ pub enum Type {
     TcpListener,
     /// Wave 2: Non-blocking async TCP stream (`tcp_stream`).
     TcpStream,
+    /// v0.110.1: Native async TLS 1.2/1.3 listener (`tls_listener`).
+    TlsListener,
+    /// v0.110.1: Native async TLS 1.2/1.3 stream (`tls_stream`).
+    TlsStream,
     /// Wave 4: Native fused tensor compute graph (`compute_dag`).
     ComputeDag,
     /// Wave 4: Paged KV-cache dynamic resource allocator (`kv_allocator`).
@@ -423,6 +427,8 @@ impl Type {
             Type::Context => "context".to_string(),
             Type::TcpListener => "tcp_listener".to_string(),
             Type::TcpStream => "tcp_stream".to_string(),
+            Type::TlsListener => "tls_listener".to_string(),
+            Type::TlsStream => "tls_stream".to_string(),
             Type::ComputeDag => "compute_dag".to_string(),
             Type::KVAllocator => "kv_allocator".to_string(),
             Type::MemoryPool => "memory_pool".to_string(),
@@ -466,6 +472,8 @@ impl Type {
             "context" => Type::Context,
             "tcp_listener" | "tcplistener" => Type::TcpListener,
             "tcp_stream" | "tcpstream" => Type::TcpStream,
+            "tls_listener" | "tlslistener" => Type::TlsListener,
+            "tls_stream" | "tlsstream" => Type::TlsStream,
             "compute_dag" | "computedag" => Type::ComputeDag,
             "kv_allocator" | "kvallocator" => Type::KVAllocator,
             "memory_pool" | "memorypool" => Type::MemoryPool,

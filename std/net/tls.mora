@@ -1,0 +1,91 @@
+-- Pure-Mora Async TLS 1.2/1.3 Standard Library (`std/net/tls`)
+-- Built directly on Mora's zero-dependency native OS TLS primitives (`tls_listen`, `tls_connect`,
+-- `tls_listener`, `tls_stream`) backed by Windows Schannel / Unix OpenSSL-LibreSSL.
+
+export struct TlsServerConfig
+  cert_pem: string = ""
+  key_pem: string = ""
+  alpn: list<string>
+end
+
+export struct TlsClientConfig
+  server_name: string = ""
+  ca_pem: string = ""
+  alpn: list<string>
+  insecure_skip_verify: bool = false
+end
+
+export struct TlsConnInfo
+  tls_version: string = ""
+  cipher_suite: string = ""
+  alpn_protocol: string = ""
+  local_addr: string = ""
+  peer_addr: string = ""
+end
+
+export task server_config(cert_pem: string, key_pem: string, alpn: list<string> = ["http/1.1"]): TlsServerConfig
+  return TlsServerConfig(cert_pem=cert_pem, key_pem=key_pem, alpn=alpn)
+end
+
+export task server_config_files(cert_path: string, key_path: string, alpn: list<string> = ["http/1.1"]): TlsServerConfig
+  let cert_pem = file.read_text(cert_path)
+  let key_pem = file.read_text(key_path)
+  return TlsServerConfig(cert_pem=cert_pem, key_pem=key_pem, alpn=alpn)
+end
+
+export task client_config(server_name: string = "", ca_pem: string = "", alpn: list<string> = ["http/1.1"], insecure_skip_verify: bool = false): TlsClientConfig
+  return TlsClientConfig(server_name=server_name, ca_pem=ca_pem, alpn=alpn, insecure_skip_verify=insecure_skip_verify)
+end
+
+export task client_config_ca_file(server_name: string, ca_path: string, alpn: list<string> = ["http/1.1"]): TlsClientConfig
+  let ca_pem = file.read_text(ca_path)
+  return TlsClientConfig(server_name=server_name, ca_pem=ca_pem, alpn=alpn, insecure_skip_verify=false)
+end
+
+export task server_config_to_dict(cfg: TlsServerConfig): dict<string, any>
+  let d: dict<string, any> = {}
+  assign d = d.set("cert_pem", cfg.cert_pem)
+  assign d = d.set("key_pem", cfg.key_pem)
+  assign d = d.set("alpn", cfg.alpn)
+  return d
+end
+
+export task client_config_to_dict(cfg: TlsClientConfig): dict<string, any>
+  let d: dict<string, any> = {}
+  if cfg.server_name != "" then
+    assign d = d.set("server_name", cfg.server_name)
+  end
+  if cfg.ca_pem != "" then
+    assign d = d.set("ca_pem", cfg.ca_pem)
+  end
+  if cfg.alpn.len() > 0 then
+    assign d = d.set("alpn", cfg.alpn)
+  end
+  assign d = d.set("insecure_skip_verify", cfg.insecure_skip_verify)
+  return d
+end
+
+export task listen_config(addr: string, cfg: TlsServerConfig): tls_listener
+  return tls_listen(addr, server_config_to_dict(cfg))
+end
+
+export task listen(addr: string, cert_pem: string, key_pem: string, alpn: list<string> = ["http/1.1"]): tls_listener
+  return listen_config(addr, server_config(cert_pem, key_pem, alpn))
+end
+
+export task listen_files(addr: string, cert_path: string, key_path: string, alpn: list<string> = ["http/1.1"]): tls_listener
+  return listen_config(addr, server_config_files(cert_path, key_path, alpn))
+end
+
+export task connect_config(addr: string, cfg: TlsClientConfig, timeout_ms: int = 5000, ctx: any = nil): tls_stream
+  return tls_connect(addr, cfg.server_name, client_config_to_dict(cfg), timeout_ms, ctx)
+end
+
+export task connect(addr: string, server_name: string = "", ca_pem: string = "", alpn: list<string> = ["http/1.1"], insecure_skip_verify: bool = false, timeout_ms: int = 5000, ctx: any = nil): tls_stream
+  let cfg = client_config(server_name, ca_pem, alpn, insecure_skip_verify)
+  return connect_config(addr, cfg, timeout_ms, ctx)
+end
+
+export task conn_info(stream: tls_stream): TlsConnInfo
+  return TlsConnInfo(tls_version=stream.tls_version(), cipher_suite=stream.cipher_suite(), alpn_protocol=stream.alpn_protocol(), local_addr=stream.local_addr(), peer_addr=stream.peer_addr())
+end

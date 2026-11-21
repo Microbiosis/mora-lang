@@ -475,6 +475,8 @@ impl ParserV3 {
                     "context" => Type::Context,
                     "tcp_listener" | "tcplistener" => Type::TcpListener,
                     "tcp_stream" | "tcpstream" => Type::TcpStream,
+                    "tls_listener" | "tlslistener" => Type::TlsListener,
+                    "tls_stream" | "tlsstream" => Type::TlsStream,
                     "compute_dag" | "computedag" => Type::ComputeDag,
                     "kv_allocator" | "kvallocator" => Type::KVAllocator,
                     "memory_pool" | "memorypool" => Type::MemoryPool,

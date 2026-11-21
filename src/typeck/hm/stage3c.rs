@@ -148,6 +148,8 @@ pub(super) fn canonical_target_name_of(ty: &Type) -> Option<String> {
         Type::Context => Some("context".to_string()),
         Type::TcpListener => Some("tcp_listener".to_string()),
         Type::TcpStream => Some("tcp_stream".to_string()),
+        Type::TlsListener => Some("tls_listener".to_string()),
+        Type::TlsStream => Some("tls_stream".to_string()),
         Type::ComputeDag => Some("compute_dag".to_string()),
         Type::KVAllocator => Some("kv_allocator".to_string()),
         Type::MemoryPool => Some("memory_pool".to_string()),
@@ -2488,6 +2490,9 @@ impl HMInference {
             "full" => &["shape", "value", "dtype", "device", "requires_grad"],
             "eye" => &["n", "m", "dtype", "device", "requires_grad"],
             "arange" => &["start", "stop", "step", "dtype", "device", "requires_grad"],
+            "from_bytes" => &["bytes", "shape", "dtype", "device", "requires_grad"],
+            "from_utf8" => &["text"],
+            "cat" => &["tensors", "axis"],
             _ => &[],
         };
         if named_args.is_empty() {

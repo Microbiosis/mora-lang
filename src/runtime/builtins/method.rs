@@ -533,6 +533,8 @@ pub(crate) fn eval_pure_method(
         | Value::KVAllocator(_)
         | Value::MemoryPool(_)
         | Value::GpuKernel(_)
+        | Value::ProcessGroup(_)
+        | Value::TraceProfiler(_)
         | Value::Builtin(BuiltinKind::Random | BuiltinKind::File | BuiltinKind::Exec) => None,
         Value::List(list) => call_method_list_pure(list.clone(), method, args),
         Value::Dict(map) => call_method_dict_pure(map, method, args),

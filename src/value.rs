@@ -307,6 +307,10 @@ pub enum Value {
     MemoryPool(Arc<crate::runtime::memory_pool::MemoryPool>),
     /// P4-1B: First-class compiled source-level GPU compute kernel (`kernel name(...) ... end`).
     GpuKernel(Arc<crate::runtime::gpu::kernel_compiler::CompiledGpuKernel>),
+    /// P4-4: Distributed tensor collective communicator (`process_group(...)` / `tcp_process_group(...)`).
+    ProcessGroup(Arc<crate::runtime::distributed::ProcessGroup>),
+    /// P4-4: Compute & service nanosecond trace profiler (`profiler()` / `std/trace`).
+    TraceProfiler(Arc<crate::runtime::profiler::TraceProfilerHandle>),
     /// Wave 3 — Stage 3C: First-class nominal struct type constructor & metadata object.
     StructType(Arc<StructDefRuntime>),
     /// Wave 3 — Stage 3C: First-class nominal struct instance preserving field order, const args & `@tag` schema.
@@ -379,6 +383,8 @@ impl PartialEq for Value {
             (Value::KVAllocator(a), Value::KVAllocator(b)) => Arc::ptr_eq(a, b),
             (Value::MemoryPool(a), Value::MemoryPool(b)) => Arc::ptr_eq(a, b),
             (Value::GpuKernel(a), Value::GpuKernel(b)) => Arc::ptr_eq(a, b) || a.hash == b.hash,
+            (Value::ProcessGroup(a), Value::ProcessGroup(b)) => Arc::ptr_eq(a, b),
+            (Value::TraceProfiler(a), Value::TraceProfiler(b)) => Arc::ptr_eq(a, b),
             (Value::Tensor(a), Value::Tensor(b)) => Arc::ptr_eq(a, b) || a == b,
             (Value::StructType(a), Value::StructType(b)) => Arc::ptr_eq(a, b) || a.name == b.name,
             (
@@ -597,6 +603,7 @@ impl Value {
             ],
             Value::ComputeDag(_) => &[
                 "run",
+                "run_profiled",
                 "fuse",
                 "compile",
                 "node_count",
@@ -657,6 +664,29 @@ impl Value {
                 "emit_msl",
                 "name",
                 "params",
+            ],
+            Value::ProcessGroup(_) => &[
+                "rank",
+                "world_size",
+                "backend",
+                "ranks",
+                "all_reduce",
+                "all_gather",
+                "broadcast",
+                "reduce_scatter",
+                "barrier",
+                "stats",
+            ],
+            Value::TraceProfiler(_) => &[
+                "start",
+                "stop",
+                "clear",
+                "is_active",
+                "now_ns",
+                "record",
+                "events",
+                "summary",
+                "to_chrome_json",
             ],
             Value::Tensor(_) => &[
                 "shape",

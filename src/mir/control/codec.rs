@@ -429,6 +429,9 @@ fn encode_builtin_fn_id(id: BuiltinFnId) -> u8 {
         BuiltinFnId::TlsListen => 42,
         BuiltinFnId::Assert => 43,
         BuiltinFnId::AssertEq => 44,
+        BuiltinFnId::ProcessGroup => 45,
+        BuiltinFnId::TcpProcessGroup => 46,
+        BuiltinFnId::Profiler => 47,
     }
 }
 
@@ -479,6 +482,9 @@ fn decode_builtin_fn_id(tag: u8) -> MoraResult<BuiltinFnId> {
         42 => BuiltinFnId::TlsListen,
         43 => BuiltinFnId::Assert,
         44 => BuiltinFnId::AssertEq,
+        45 => BuiltinFnId::ProcessGroup,
+        46 => BuiltinFnId::TcpProcessGroup,
+        47 => BuiltinFnId::Profiler,
         other => return Err(corrupt(format!("invalid BuiltinFnId tag {other}"))),
     })
 }

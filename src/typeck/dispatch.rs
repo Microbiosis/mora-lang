@@ -409,6 +409,28 @@ pub fn builtin_signatures() -> Vec<(String, Signature)> {
                 Type::MemoryPool,
             ),
         ),
+        (
+            "process_group".to_string(),
+            Signature::new(
+                vec![("world_size".to_string(), Type::Int)],
+                Type::ProcessGroup,
+            ),
+        ),
+        (
+            "tcp_process_group".to_string(),
+            Signature::new(
+                vec![
+                    ("rank".to_string(), Type::Int),
+                    ("world_size".to_string(), Type::Int),
+                    ("addrs".to_string(), Type::List(Box::new(Type::String))),
+                ],
+                Type::ProcessGroup,
+            ),
+        ),
+        (
+            "profiler".to_string(),
+            Signature::new(vec![], Type::TraceProfiler),
+        ),
         // v0.91: 数学 builtin — math/stats/linalg/random
         // 这些是 domain prefix 模块，typeck 注册为 marker signature（任意参数→Any）
         // 实际方法分派由 dispatch.rs::call_method_builtin 处理
@@ -1311,6 +1333,13 @@ fn method_signature_builtin(receiver: &Type, method: &str) -> Option<Signature> 
             vec![("self".to_string(), Type::ComputeDag)],
             Type::Dict(Box::new(Type::String), Box::new(Type::Any)),
         )),
+        (Type::ComputeDag, "run_profiled") => Some(Signature::variadic(
+            vec![
+                ("self".to_string(), Type::ComputeDag),
+                ("input".to_string(), Type::Any),
+            ],
+            Type::Dict(Box::new(Type::String), Box::new(Type::Any)),
+        )),
         (Type::ComputeDag, "backend_info") => Some(Signature::new(
             vec![("self".to_string(), Type::ComputeDag)],
             Type::Dict(Box::new(Type::String), Box::new(Type::String)),
@@ -1507,6 +1536,97 @@ fn method_signature_builtin(receiver: &Type, method: &str) -> Option<Signature> 
         (Type::MemoryPool, "stats") => Some(Signature::new(
             vec![("self".to_string(), Type::MemoryPool)],
             Type::Dict(Box::new(Type::String), Box::new(Type::Int)),
+        )),
+        // ── P4-4: Distributed ProcessGroup collective methods ──
+        (Type::ProcessGroup, "rank" | "world_size") => Some(Signature::new(
+            vec![("self".to_string(), Type::ProcessGroup)],
+            Type::Int,
+        )),
+        (Type::ProcessGroup, "backend") => Some(Signature::new(
+            vec![("self".to_string(), Type::ProcessGroup)],
+            Type::String,
+        )),
+        (Type::ProcessGroup, "ranks") => Some(Signature::new(
+            vec![("self".to_string(), Type::ProcessGroup)],
+            Type::List(Box::new(Type::ProcessGroup)),
+        )),
+        (Type::ProcessGroup, "all_reduce" | "reduce_scatter") => Some(Signature::with_min_arity(
+            vec![
+                ("self".to_string(), Type::ProcessGroup),
+                ("tensor".to_string(), Type::any_tensor()),
+                ("op".to_string(), Type::Union(vec![Type::String, Type::Nil])),
+            ],
+            2,
+            Type::any_tensor(),
+        )),
+        (Type::ProcessGroup, "all_gather") => Some(Signature::new(
+            vec![
+                ("self".to_string(), Type::ProcessGroup),
+                ("tensor".to_string(), Type::any_tensor()),
+            ],
+            Type::any_tensor(),
+        )),
+        (Type::ProcessGroup, "broadcast") => Some(Signature::new(
+            vec![
+                ("self".to_string(), Type::ProcessGroup),
+                ("tensor".to_string(), Type::any_tensor()),
+                ("root".to_string(), Type::Int),
+            ],
+            Type::any_tensor(),
+        )),
+        (Type::ProcessGroup, "barrier") => Some(Signature::new(
+            vec![("self".to_string(), Type::ProcessGroup)],
+            Type::Nil,
+        )),
+        (Type::ProcessGroup, "stats") => Some(Signature::new(
+            vec![("self".to_string(), Type::ProcessGroup)],
+            Type::Dict(Box::new(Type::String), Box::new(Type::Int)),
+        )),
+        // ── P4-4: TraceProfiler nanosecond span recorder methods ──
+        (Type::TraceProfiler, "start" | "stop" | "clear") => Some(Signature::new(
+            vec![("self".to_string(), Type::TraceProfiler)],
+            Type::Nil,
+        )),
+        (Type::TraceProfiler, "is_active") => Some(Signature::new(
+            vec![("self".to_string(), Type::TraceProfiler)],
+            Type::Bool,
+        )),
+        (Type::TraceProfiler, "now_ns") => Some(Signature::new(
+            vec![("self".to_string(), Type::TraceProfiler)],
+            Type::Int,
+        )),
+        (Type::TraceProfiler, "record") => Some(Signature::with_min_arity(
+            vec![
+                ("self".to_string(), Type::TraceProfiler),
+                ("cat".to_string(), Type::String),
+                ("name".to_string(), Type::String),
+                ("start_ns".to_string(), Type::Int),
+                ("dur_ns".to_string(), Type::Int),
+                (
+                    "args".to_string(),
+                    Type::Union(vec![
+                        Type::Dict(Box::new(Type::String), Box::new(Type::Any)),
+                        Type::Nil,
+                    ]),
+                ),
+            ],
+            5,
+            Type::Nil,
+        )),
+        (Type::TraceProfiler, "events") => Some(Signature::new(
+            vec![("self".to_string(), Type::TraceProfiler)],
+            Type::List(Box::new(Type::Dict(
+                Box::new(Type::String),
+                Box::new(Type::Any),
+            ))),
+        )),
+        (Type::TraceProfiler, "summary") => Some(Signature::new(
+            vec![("self".to_string(), Type::TraceProfiler)],
+            Type::Dict(Box::new(Type::String), Box::new(Type::Any)),
+        )),
+        (Type::TraceProfiler, "to_chrome_json") => Some(Signature::new(
+            vec![("self".to_string(), Type::TraceProfiler)],
+            Type::String,
         )),
         (Type::Tensor { .. }, "shape") => Some(Signature::new(
             vec![("self".to_string(), receiver.clone())],

@@ -545,6 +545,8 @@ impl ParserV3 {
                     "compute_dag" | "computedag" => Type::ComputeDag,
                     "kv_allocator" | "kvallocator" => Type::KVAllocator,
                     "memory_pool" | "memorypool" => Type::MemoryPool,
+                    "process_group" | "processgroup" => Type::ProcessGroup,
+                    "trace_profiler" | "traceprofiler" => Type::TraceProfiler,
                     "gpu_kernel" | "gpukernel" => Type::GpuKernel(None),
                     "channel" => Type::Channel(Box::new(Type::Any)),
                     "task_handle" | "taskhandle" => Type::TaskHandle(Box::new(Type::Any)),

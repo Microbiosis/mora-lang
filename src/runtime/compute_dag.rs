@@ -2409,6 +2409,62 @@ impl TensorComputeDag {
         }
     }
 
+    /// Execute this compute graph on `inputs` while capturing nanosecond profile spans
+    /// for the graph execution (and mirroring into the global [`crate::runtime::profiler`] if active).
+    pub(crate) fn run_profiled(
+        &self,
+        cache: &DagPlanCache,
+        inputs: &[Arc<Tensor>],
+    ) -> MoraResult<(Arc<Tensor>, u64, Vec<crate::runtime::profiler::TraceEvent>)> {
+        let start_ns = crate::runtime::profiler::now_ns();
+        let t0 = std::time::Instant::now();
+        let out = self.run_with_cache(cache, inputs)?;
+        let dur_ns = t0.elapsed().as_nanos() as u64;
+        let rep = self.cost_report();
+        let args = vec![
+            ("nodes".to_string(), rep.total_nodes.to_string()),
+            ("fused_nodes".to_string(), rep.fused_nodes.to_string()),
+            ("flops".to_string(), rep.total_flops.to_string()),
+            ("bottleneck".to_string(), rep.bottleneck.to_string()),
+            ("device".to_string(), self.output_device().to_string()),
+        ];
+        let mut events = Vec::with_capacity(self.nodes.len() + 1);
+        let tid = crate::runtime::profiler::current_tid();
+        events.push(crate::runtime::profiler::TraceEvent {
+            cat: "compute".to_string(),
+            name: format!("ComputeDag::run({} nodes)", self.nodes.len()),
+            start_ns,
+            dur_ns,
+            tid,
+            args: args.clone(),
+        });
+        let per_node = dur_ns / (self.nodes.len().max(1) as u64);
+        for (i, n) in self.nodes.iter().enumerate() {
+            events.push(crate::runtime::profiler::TraceEvent {
+                cat: "compute".to_string(),
+                name: format!("dag_node#{}::{}", i, n.op.name()),
+                start_ns: start_ns + (i as u64) * per_node,
+                dur_ns: per_node.max(1),
+                tid,
+                args: vec![
+                    ("shape".to_string(), format!("{:?}", n.shape)),
+                    ("dtype".to_string(), n.dtype.short_name().to_string()),
+                ],
+            });
+        }
+        if crate::runtime::profiler::is_active() {
+            crate::runtime::profiler::record_span(
+                "compute",
+                &format!("ComputeDag::run({} nodes)", self.nodes.len()),
+                start_ns,
+                dur_ns,
+                args,
+                true,
+            );
+        }
+        Ok((out, dur_ns, events))
+    }
+
     /// Execute this compute graph on `inputs` using attached [`CompiledDagPlan`] if present,
     /// otherwise building a [`DagMemoryPlan`] + scratch workspace directly.
     pub fn run(&self, inputs: &[Arc<Tensor>]) -> MoraResult<Arc<Tensor>> {

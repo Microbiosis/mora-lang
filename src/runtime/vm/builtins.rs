@@ -1160,6 +1160,93 @@ pub fn resolve_builtin_call_named(
             let pool = crate::runtime::memory_pool::MemoryPool::new(max_bytes, device)?;
             Ok(CallAction::Done(Value::MemoryPool(pool)))
         }
+        BuiltinFnId::ProcessGroup => {
+            if args.len() != 1 {
+                return Err(MoraError::Runtime(format!(
+                    "process_group(world_size) expects 1 argument, got {}",
+                    args.len()
+                )));
+            }
+            let world_size = match &args[0] {
+                Value::Int(n) if *n > 0 => *n as usize,
+                other => {
+                    return Err(MoraError::Runtime(format!(
+                        "process_group: 'world_size' must be a positive integer, got {other}"
+                    )));
+                }
+            };
+            let pg = crate::runtime::distributed::ProcessGroup::new_inproc(world_size)?;
+            Ok(CallAction::Done(Value::ProcessGroup(pg)))
+        }
+        BuiltinFnId::TcpProcessGroup => {
+            if args.len() != 3 {
+                return Err(MoraError::Runtime(format!(
+                    "tcp_process_group(rank, world_size, addrs) expects 3 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let rank = match &args[0] {
+                Value::Int(n) if *n >= 0 => *n as usize,
+                other => {
+                    return Err(MoraError::Runtime(format!(
+                        "tcp_process_group: 'rank' must be a non-negative integer, got {other}"
+                    )));
+                }
+            };
+            let world_size = match &args[1] {
+                Value::Int(n) if *n > 0 => *n as usize,
+                other => {
+                    return Err(MoraError::Runtime(format!(
+                        "tcp_process_group: 'world_size' must be a positive integer, got {other}"
+                    )));
+                }
+            };
+            let addrs = match &args[2] {
+                Value::List(items) => {
+                    let mut out = Vec::with_capacity(items.len());
+                    for item in items.iter() {
+                        match item {
+                            Value::String(s) => out.push(s.clone()),
+                            other => {
+                                return Err(MoraError::Runtime(format!(
+                                    "tcp_process_group: peer address must be string, got {}",
+                                    crate::flow::type_name(other)
+                                )));
+                            }
+                        }
+                    }
+                    out
+                }
+                other => {
+                    return Err(MoraError::Runtime(format!(
+                        "tcp_process_group: 'addrs' must be list<string>, got {}",
+                        crate::flow::type_name(other)
+                    )));
+                }
+            };
+            let eff_ctx = core.task_context.clone();
+            Ok(CallAction::AwaitFuture(Box::pin(async move {
+                let pg = crate::runtime::distributed::ProcessGroup::connect_tcp_ring(
+                    rank,
+                    world_size,
+                    addrs,
+                    eff_ctx.as_ref(),
+                )
+                .await?;
+                Ok(Value::ProcessGroup(pg))
+            })))
+        }
+        BuiltinFnId::Profiler => {
+            if !args.is_empty() {
+                return Err(MoraError::Runtime(format!(
+                    "profiler() expects 0 arguments, got {}",
+                    args.len()
+                )));
+            }
+            Ok(CallAction::Done(Value::TraceProfiler(
+                crate::runtime::profiler::global_handle(),
+            )))
+        }
         _ => unreachable!("all BuiltinFnId handled cleanly"),
     }
 }
@@ -1626,6 +1713,8 @@ pub fn resolve_method_call_named(
         Value::KVAllocator(kv) => resolve_kv_allocator_method(&kv, method, args),
         Value::MemoryPool(pool) => resolve_memory_pool_method(&pool, method, args),
         Value::GpuKernel(kernel) => resolve_gpu_kernel_method(&kernel, method, args),
+        Value::ProcessGroup(pg) => resolve_process_group_method(&pg, method, args, core),
+        Value::TraceProfiler(prof) => resolve_trace_profiler_method(&prof, method, args),
         Value::List(list) => match method {
             "map" => {
                 let mapper = args
@@ -2525,6 +2614,58 @@ fn resolve_compute_dag_method(
             let out = dag.run_with_cache(core.shared().dag_cache(), &tensors)?;
             Ok(CallAction::Done(Value::Tensor(out)))
         }
+        "run_profiled" => {
+            let raw_inputs: Vec<Value> = if args.len() == 1
+                && let Value::List(xs) = &args[0]
+            {
+                xs.iter().cloned().collect()
+            } else {
+                args
+            };
+            let mut tensors = Vec::with_capacity(raw_inputs.len());
+            for (i, v) in raw_inputs.into_iter().enumerate() {
+                match v {
+                    Value::Tensor(t) => tensors.push(t),
+                    Value::Float(f) => tensors.push(crate::value::tensor::Tensor::from_raw(
+                        vec![f],
+                        Vec::new(),
+                        crate::common::DType::F64,
+                        crate::common::Device::Cpu,
+                        false,
+                    )?),
+                    Value::Scalar(s) => tensors.push(crate::value::tensor::Tensor::from_raw(
+                        vec![s.as_f64()],
+                        Vec::new(),
+                        s.dtype(),
+                        crate::common::Device::Cpu,
+                        false,
+                    )?),
+                    other => {
+                        return Err(MoraError::Runtime(format!(
+                            "ComputeDag.run_profiled: argument #{i} must be Tensor or numeric scalar, got {}",
+                            crate::flow::dynamic_type_name(&other)
+                        )));
+                    }
+                }
+            }
+            let (out, dur_ns, events) = dag.run_profiled(core.shared().dag_cache(), &tensors)?;
+            let mut m = std::collections::HashMap::new();
+            m.insert("output".to_string(), Value::Tensor(out));
+            m.insert("duration_ns".to_string(), Value::Int(dur_ns as i64));
+            m.insert(
+                "duration_us".to_string(),
+                Value::Float(dur_ns as f64 / 1000.0),
+            );
+            m.insert(
+                "events".to_string(),
+                crate::runtime::profiler::events_to_mora_value(&events),
+            );
+            m.insert(
+                "chrome_json".to_string(),
+                Value::String(crate::runtime::profiler::format_chrome_trace_json(&events)),
+            );
+            Ok(CallAction::Done(Value::Dict(m)))
+        }
         "node_count" => {
             if !args.is_empty() {
                 return Err(MoraError::Runtime(
@@ -3258,6 +3399,343 @@ fn resolve_memory_pool_method(
         "stats" => Ok(CallAction::Done(Value::Dict(pool.stats_dict()))),
         _ => Err(MoraError::Runtime(format!(
             "MemoryPool has no method: {method}"
+        ))),
+    }
+}
+
+fn resolve_process_group_method(
+    pg: &Arc<crate::runtime::distributed::ProcessGroup>,
+    method: &str,
+    args: Vec<Value>,
+    core: &CoreRuntime,
+) -> MoraResult<CallAction> {
+    match method {
+        "rank" => {
+            if !args.is_empty() {
+                return Err(MoraError::Runtime(
+                    "process_group.rank() expects 0 arguments".to_string(),
+                ));
+            }
+            Ok(CallAction::Done(Value::Int(pg.rank() as i64)))
+        }
+        "world_size" => {
+            if !args.is_empty() {
+                return Err(MoraError::Runtime(
+                    "process_group.world_size() expects 0 arguments".to_string(),
+                ));
+            }
+            Ok(CallAction::Done(Value::Int(pg.world_size() as i64)))
+        }
+        "backend" => {
+            if !args.is_empty() {
+                return Err(MoraError::Runtime(
+                    "process_group.backend() expects 0 arguments".to_string(),
+                ));
+            }
+            Ok(CallAction::Done(Value::String(
+                pg.backend_name().to_string(),
+            )))
+        }
+        "ranks" => {
+            if !args.is_empty() {
+                return Err(MoraError::Runtime(
+                    "process_group.ranks() expects 0 arguments".to_string(),
+                ));
+            }
+            let handles: Vec<Value> = pg
+                .inproc_ranks()?
+                .into_iter()
+                .map(Value::ProcessGroup)
+                .collect();
+            Ok(CallAction::Done(Value::List(handles.into())))
+        }
+        "stats" => {
+            if !args.is_empty() {
+                return Err(MoraError::Runtime(
+                    "process_group.stats() expects 0 arguments".to_string(),
+                ));
+            }
+            let map: std::collections::HashMap<String, Value> = pg
+                .stats_map()
+                .into_iter()
+                .map(|(k, v)| (k, Value::Int(v)))
+                .collect();
+            Ok(CallAction::Done(Value::Dict(map)))
+        }
+        "all_reduce" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(MoraError::Runtime(format!(
+                    "process_group.all_reduce(tensor, op?) expects 1..=2 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let Value::Tensor(t) = args[0].clone() else {
+                return Err(MoraError::Runtime(format!(
+                    "process_group.all_reduce: first argument must be Tensor, got {}",
+                    crate::flow::type_name(&args[0])
+                )));
+            };
+            let op_name = match args.get(1) {
+                None | Some(Value::Nil) => "sum",
+                Some(Value::String(s)) => s.as_str(),
+                Some(other) => {
+                    return Err(MoraError::Runtime(format!(
+                        "process_group.all_reduce: 'op' must be string, got {}",
+                        crate::flow::type_name(other)
+                    )));
+                }
+            };
+            let op = crate::runtime::distributed::ReduceOp::parse(op_name)?;
+            let pg = Arc::clone(pg);
+            let eff_ctx = core.task_context.clone();
+            Ok(CallAction::AwaitFuture(Box::pin(async move {
+                let out = pg.all_reduce(t, op, eff_ctx.as_ref()).await?;
+                Ok(Value::Tensor(out))
+            })))
+        }
+        "reduce_scatter" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(MoraError::Runtime(format!(
+                    "process_group.reduce_scatter(tensor, op?) expects 1..=2 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let Value::Tensor(t) = args[0].clone() else {
+                return Err(MoraError::Runtime(format!(
+                    "process_group.reduce_scatter: first argument must be Tensor, got {}",
+                    crate::flow::type_name(&args[0])
+                )));
+            };
+            let op_name = match args.get(1) {
+                None | Some(Value::Nil) => "sum",
+                Some(Value::String(s)) => s.as_str(),
+                Some(other) => {
+                    return Err(MoraError::Runtime(format!(
+                        "process_group.reduce_scatter: 'op' must be string, got {}",
+                        crate::flow::type_name(other)
+                    )));
+                }
+            };
+            let op = crate::runtime::distributed::ReduceOp::parse(op_name)?;
+            let pg = Arc::clone(pg);
+            let eff_ctx = core.task_context.clone();
+            Ok(CallAction::AwaitFuture(Box::pin(async move {
+                let out = pg.reduce_scatter(t, op, eff_ctx.as_ref()).await?;
+                Ok(Value::Tensor(out))
+            })))
+        }
+        "all_gather" => {
+            if args.len() != 1 {
+                return Err(MoraError::Runtime(format!(
+                    "process_group.all_gather(tensor) expects 1 argument, got {}",
+                    args.len()
+                )));
+            }
+            let Value::Tensor(t) = args[0].clone() else {
+                return Err(MoraError::Runtime(format!(
+                    "process_group.all_gather: argument must be Tensor, got {}",
+                    crate::flow::type_name(&args[0])
+                )));
+            };
+            let pg = Arc::clone(pg);
+            let eff_ctx = core.task_context.clone();
+            Ok(CallAction::AwaitFuture(Box::pin(async move {
+                let out = pg.all_gather(t, eff_ctx.as_ref()).await?;
+                Ok(Value::Tensor(out))
+            })))
+        }
+        "broadcast" => {
+            if args.len() != 2 {
+                return Err(MoraError::Runtime(format!(
+                    "process_group.broadcast(tensor, root) expects 2 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let Value::Tensor(t) = args[0].clone() else {
+                return Err(MoraError::Runtime(format!(
+                    "process_group.broadcast: first argument must be Tensor, got {}",
+                    crate::flow::type_name(&args[0])
+                )));
+            };
+            let root = match &args[1] {
+                Value::Int(n) if *n >= 0 => *n as usize,
+                other => {
+                    return Err(MoraError::Runtime(format!(
+                        "process_group.broadcast: 'root' must be a non-negative integer, got {other}"
+                    )));
+                }
+            };
+            let pg = Arc::clone(pg);
+            let eff_ctx = core.task_context.clone();
+            Ok(CallAction::AwaitFuture(Box::pin(async move {
+                let out = pg.broadcast(t, root, eff_ctx.as_ref()).await?;
+                Ok(Value::Tensor(out))
+            })))
+        }
+        "barrier" => {
+            if !args.is_empty() {
+                return Err(MoraError::Runtime(
+                    "process_group.barrier() expects 0 arguments".to_string(),
+                ));
+            }
+            let pg = Arc::clone(pg);
+            let eff_ctx = core.task_context.clone();
+            Ok(CallAction::AwaitFuture(Box::pin(async move {
+                pg.barrier(eff_ctx.as_ref()).await?;
+                Ok(Value::Nil)
+            })))
+        }
+        _ => Err(MoraError::Runtime(format!(
+            "ProcessGroup has no method: {method}"
+        ))),
+    }
+}
+
+fn resolve_trace_profiler_method(
+    prof: &Arc<crate::runtime::profiler::TraceProfilerHandle>,
+    method: &str,
+    args: Vec<Value>,
+) -> MoraResult<CallAction> {
+    match method {
+        "start" => {
+            if !args.is_empty() {
+                return Err(MoraError::Runtime(
+                    "trace_profiler.start() expects 0 arguments".to_string(),
+                ));
+            }
+            prof.start();
+            Ok(CallAction::Done(Value::Nil))
+        }
+        "stop" => {
+            if !args.is_empty() {
+                return Err(MoraError::Runtime(
+                    "trace_profiler.stop() expects 0 arguments".to_string(),
+                ));
+            }
+            prof.stop();
+            Ok(CallAction::Done(Value::Nil))
+        }
+        "clear" => {
+            if !args.is_empty() {
+                return Err(MoraError::Runtime(
+                    "trace_profiler.clear() expects 0 arguments".to_string(),
+                ));
+            }
+            prof.clear();
+            Ok(CallAction::Done(Value::Nil))
+        }
+        "is_active" => {
+            if !args.is_empty() {
+                return Err(MoraError::Runtime(
+                    "trace_profiler.is_active() expects 0 arguments".to_string(),
+                ));
+            }
+            Ok(CallAction::Done(Value::Bool(prof.is_active())))
+        }
+        "now_ns" => {
+            if !args.is_empty() {
+                return Err(MoraError::Runtime(
+                    "trace_profiler.now_ns() expects 0 arguments".to_string(),
+                ));
+            }
+            Ok(CallAction::Done(Value::Int(prof.now_ns() as i64)))
+        }
+        "record" => {
+            if args.len() < 4 || args.len() > 5 {
+                return Err(MoraError::Runtime(format!(
+                    "trace_profiler.record(cat, name, start_ns, dur_ns, args?) expects 4..=5 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let Value::String(cat) = args[0].clone() else {
+                return Err(MoraError::Runtime(format!(
+                    "trace_profiler.record: 'cat' must be string, got {}",
+                    crate::flow::type_name(&args[0])
+                )));
+            };
+            let Value::String(name) = args[1].clone() else {
+                return Err(MoraError::Runtime(format!(
+                    "trace_profiler.record: 'name' must be string, got {}",
+                    crate::flow::type_name(&args[1])
+                )));
+            };
+            let start_ns = match &args[2] {
+                Value::Int(n) if *n >= 0 => *n as u64,
+                other => {
+                    return Err(MoraError::Runtime(format!(
+                        "trace_profiler.record: 'start_ns' must be non-negative int, got {other}"
+                    )));
+                }
+            };
+            let dur_ns = match &args[3] {
+                Value::Int(n) if *n >= 0 => *n as u64,
+                other => {
+                    return Err(MoraError::Runtime(format!(
+                        "trace_profiler.record: 'dur_ns' must be non-negative int, got {other}"
+                    )));
+                }
+            };
+            let mut extra = Vec::new();
+            if let Some(arg_dict) = args.get(4) {
+                match arg_dict {
+                    Value::Dict(map) => {
+                        let mut pairs: Vec<(String, String)> = map
+                            .iter()
+                            .map(|(k, v)| match v {
+                                Value::String(s) => (k.clone(), s.clone()),
+                                other => (k.clone(), other.to_string()),
+                            })
+                            .collect();
+                        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+                        extra = pairs;
+                    }
+                    Value::Nil => {}
+                    other => {
+                        return Err(MoraError::Runtime(format!(
+                            "trace_profiler.record: 'args' must be dict, got {}",
+                            crate::flow::type_name(other)
+                        )));
+                    }
+                }
+            }
+            prof.record(cat, name, start_ns, dur_ns, extra);
+            Ok(CallAction::Done(Value::Nil))
+        }
+        "events" => {
+            if !args.is_empty() {
+                return Err(MoraError::Runtime(
+                    "trace_profiler.events() expects 0 arguments".to_string(),
+                ));
+            }
+            let evs = prof.snapshot();
+            Ok(CallAction::Done(
+                crate::runtime::profiler::events_to_mora_value(&evs),
+            ))
+        }
+        "summary" => {
+            if !args.is_empty() {
+                return Err(MoraError::Runtime(
+                    "trace_profiler.summary() expects 0 arguments".to_string(),
+                ));
+            }
+            let evs = prof.snapshot();
+            Ok(CallAction::Done(
+                crate::runtime::profiler::summary_to_mora_value(&evs),
+            ))
+        }
+        "to_chrome_json" => {
+            if !args.is_empty() {
+                return Err(MoraError::Runtime(
+                    "trace_profiler.to_chrome_json() expects 0 arguments".to_string(),
+                ));
+            }
+            let evs = prof.snapshot();
+            Ok(CallAction::Done(Value::String(
+                crate::runtime::profiler::format_chrome_trace_json(&evs),
+            )))
+        }
+        _ => Err(MoraError::Runtime(format!(
+            "TraceProfiler has no method: {method}"
         ))),
     }
 }

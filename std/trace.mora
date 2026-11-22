@@ -1,0 +1,99 @@
+-- Pure-Mora standard library: Compute & Service Trace Profiler (`std/trace`)
+--
+-- Unified nanosecond tracing interface covering `ComputeDag.run_profiled()`,
+-- GPU `kernel` launches, KV-cache allocations, distributed `ProcessGroup`
+-- collectives, and live HTTP/MCP service handlers with Chrome Trace Event JSON export.
+
+export task trace_start(): nil
+  let p = profiler()
+  p.start()
+  return nil
+end
+
+export task trace_stop(): nil
+  let p = profiler()
+  p.stop()
+  return nil
+end
+
+export task trace_clear(): nil
+  let p = profiler()
+  p.clear()
+  return nil
+end
+
+export task trace_is_active(): bool
+  let p = profiler()
+  return p.is_active()
+end
+
+export task trace_now_ns(): int
+  let p = profiler()
+  return p.now_ns()
+end
+
+export task trace_record(cat: string, name: string, start_ns: int, dur_ns: int): nil
+  let p = profiler()
+  p.record(cat, name, start_ns, dur_ns)
+  return nil
+end
+
+export task trace_service_span(method: string, path: string, status: int, start_ns: int, dur_ns: int): nil
+  let p = profiler()
+  let args: dict<string, any> = {}
+  assign args = args.set("method", method)
+  assign args = args.set("path", path)
+  assign args = args.set("status", str(status))
+  p.record("service", method + " " + path, start_ns, dur_ns, args)
+  return nil
+end
+
+export task trace_span(cat: string, name: string, f: any): any
+  let p = profiler()
+  let t0 = p.now_ns()
+  let res = f()
+  let t1 = p.now_ns()
+  let dur = t1 - t0
+  if dur < 0 then
+    assign dur = 0
+  end
+  if p.is_active() then
+    p.record(cat, name, t0, dur)
+  end
+  return res
+end
+
+export task trace_http_middleware(): any
+  return fn(req: any, stream: any, next_fn: any)
+    let p = profiler()
+    let t0 = p.now_ns()
+    let resp = next_fn(req, stream)
+    let t1 = p.now_ns()
+    let dur = t1 - t0
+    if dur < 0 then
+      assign dur = 0
+    end
+    if p.is_active() then
+      let args: dict<string, any> = {}
+      assign args = args.set("method", req.method)
+      assign args = args.set("path", req.path)
+      p.record("service", req.method + " " + req.path, t0, dur, args)
+    end
+    return resp
+  end
+end
+
+export task trace_events(): list<dict<string, any>>
+  let p = profiler()
+  return p.events()
+end
+
+export task trace_summary(): dict<string, any>
+  let p = profiler()
+  return p.summary()
+end
+
+export task trace_chrome_json(): string
+  let p = profiler()
+  return p.to_chrome_json()
+end

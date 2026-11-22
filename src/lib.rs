@@ -46,6 +46,7 @@ pub fn resolve_std_module(spec: &str) -> Option<&'static str> {
             Some(include_str!("../std/nn/safetensors.mora"))
         }
         "std/nn/gguf" | "std/nn/gguf.mora" => Some(include_str!("../std/nn/gguf.mora")),
+        "std/trace" | "std/trace.mora" => Some(include_str!("../std/trace.mora")),
         _ => None,
     }
 }

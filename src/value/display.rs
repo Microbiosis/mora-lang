@@ -198,6 +198,23 @@ impl std::fmt::Display for Value {
                     .collect();
                 write!(f, "<gpu_kernel {}({})>", k.name(), pstr.join(", "))
             }
+            Value::ProcessGroup(pg) => {
+                write!(
+                    f,
+                    "<process_group rank={}/{} backend={}>",
+                    pg.rank(),
+                    pg.world_size(),
+                    pg.backend_name()
+                )
+            }
+            Value::TraceProfiler(p) => {
+                write!(
+                    f,
+                    "<trace_profiler active={} events={}>",
+                    p.is_active(),
+                    p.event_count()
+                )
+            }
             Value::Tensor(t) => write!(f, "{t}"),
             Value::StructType(def) => write!(f, "<struct {}>", def.name),
             Value::StructInstance {

@@ -251,6 +251,10 @@ pub enum Type {
     KVAllocator,
     /// Wave 4 P1: General 64-byte aligned size-classed tensor memory pool (`memory_pool`).
     MemoryPool,
+    /// P4-4: Distributed tensor collective communicator (`process_group` / `tcp_process_group`).
+    ProcessGroup,
+    /// P4-4: Nanosecond compute & service trace profiler (`profiler()` / `std/trace`).
+    TraceProfiler,
     /// Stage 3B: Distinct low-bitwidth / hardware-precision scalar type (`f32`, `f16`, `bf16`, `fp8`, `i32`, `i16`, `i8`, `i4`, `u64`, `u32`, `u16`, `u8`).
     /// Canonical 64-bit `i64` is `Type::Int` and `f64` is `Type::Float`.
     Scalar(crate::common::DType),
@@ -436,6 +440,8 @@ impl Type {
             Type::ComputeDag => "compute_dag".to_string(),
             Type::KVAllocator => "kv_allocator".to_string(),
             Type::MemoryPool => "memory_pool".to_string(),
+            Type::ProcessGroup => "process_group".to_string(),
+            Type::TraceProfiler => "trace_profiler".to_string(),
             Type::ConstInt(n) => n.to_string(),
             Type::GpuKernel(params) => match params {
                 Some(ps) => {
@@ -489,6 +495,8 @@ impl Type {
             "compute_dag" | "computedag" => Type::ComputeDag,
             "kv_allocator" | "kvallocator" => Type::KVAllocator,
             "memory_pool" | "memorypool" => Type::MemoryPool,
+            "process_group" | "processgroup" => Type::ProcessGroup,
+            "trace_profiler" | "traceprofiler" => Type::TraceProfiler,
             "gpu_kernel" | "gpukernel" | "kernel" => Type::GpuKernel(None),
             "tensor" | "Tensor" => Type::any_tensor(),
             "task" => Type::Task,

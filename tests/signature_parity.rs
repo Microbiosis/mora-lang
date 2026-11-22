@@ -134,6 +134,9 @@ fn call_for(name: &str) -> Option<&'static str> {
         "trace_dag" => "trace_dag(fn(x) x * 2.0 end, tensor([1.0]))",
         "kv_allocator" => "kv_allocator(4, 4, 2, 4)",
         "memory_pool" => "memory_pool(1024)",
+        "process_group" => "process_group(2)",
+        "tcp_process_group" => "tcp_process_group(0, 1, [\"127.0.0.1:0\"])",
+        "profiler" => "profiler()",
         // domain prefix 模块 / 宏展开，无独立固定返回值语义
         "math" | "stats" | "linalg" | "macroexpand" => return None,
         _ => return None,

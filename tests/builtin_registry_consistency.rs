@@ -97,6 +97,9 @@ fn probe_source(name: &str) -> Option<&'static str> {
         "trace_dag" => "let v: string = trace_dag(fn(x) x * 2.0 end, tensor([1.0]))\n",
         "kv_allocator" => "let v: string = kv_allocator(4, 4, 2, 4)\n",
         "memory_pool" => "let v: string = memory_pool(1024)\n",
+        "process_group" => "let v: string = process_group(2)\n",
+        "tcp_process_group" => "let v: string = tcp_process_group(0, 1, [\"127.0.0.1:0\"])\n",
+        "profiler" => "let v: string = profiler()\n",
         // 返回类型随回调/元素变化 ⇒ 无法用固定探针判「被拒」，见 LOOSE。
         "car" | "cdr" | "cons" | "uncurry" | "apply" | "into" | "swap" | "compose" | "partial"
         | "merge_with" | "tail" | "macroexpand" | "curry" => "let v = NAME_PLACEHOLDER\n",
@@ -137,6 +140,9 @@ const CONCRETE_RETURN: &[&str] = &[
     "trace_dag",
     "kv_allocator",
     "memory_pool",
+    "process_group",
+    "tcp_process_group",
+    "profiler",
 ];
 
 /// 把探针里的占位符换成真实调用。

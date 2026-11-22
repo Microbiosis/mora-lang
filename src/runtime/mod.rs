@@ -13,6 +13,8 @@ pub mod builtins;
 pub mod compute_dag;
 pub mod core;
 pub use core::{CoreRuntime, EngineShared};
+// P4-4: Distributed tensor collectives (`ProcessGroup`) over M:N fibers & AsyncIoReactor TCP ring
+pub(crate) mod distributed;
 // v0.110.0: 文件系统隔离策略、独立 virtual_cwd 与 CheckedPath 凭证
 pub mod fs;
 // Wave 4 P2-2: Native hardware GPU drivers (CUDA PTX / Vulkan SPIR-V / Metal MSL)
@@ -22,6 +24,8 @@ pub mod kv_cache;
 pub mod memory_pool;
 // P4-3: Zero-dependency strict W^X (`RW -> RX`) x86-64 SSE2/AVX2 native kernel emitter
 pub(crate) mod native_jit;
+// P4-4: Nanosecond compute & service TraceProfiler (Chrome Trace Event JSON export)
+pub(crate) mod profiler;
 // v0.99: ambient random —— PRNG 纯值 + ambient effect 操作分发
 pub mod random;
 // Wave 2 W2.4: Zero-dependency native async I/O reactor and structured task scheduler

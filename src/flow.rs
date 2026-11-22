@@ -752,6 +752,8 @@ pub fn type_name(value: &Value) -> &'static str {
         Value::KVAllocator(_) => "kv_allocator",
         Value::MemoryPool(_) => "memory_pool",
         Value::GpuKernel(_) => "gpu_kernel",
+        Value::ProcessGroup(_) => "process_group",
+        Value::TraceProfiler(_) => "trace_profiler",
         Value::Tensor(_) => "tensor",
         Value::StructType(_) => "struct_type",
         Value::StructInstance { .. } => "struct",

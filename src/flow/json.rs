@@ -633,6 +633,8 @@ pub fn value_to_json(value: &Value) -> String {
                     out.push_str(k.name());
                     out.push_str(">\"");
                 }
+                Value::ProcessGroup(_) => out.push_str("\"<process_group>\""),
+                Value::TraceProfiler(_) => out.push_str("\"<trace_profiler>\""),
                 Value::External(obj) => match obj.to_json() {
                     Some(v) if atom_depth < MAX_JSON_DEPTH => {
                         stack.push(SerStep::Val(Cow::Owned(v), atom_depth + 1));

@@ -822,6 +822,8 @@ impl HMInference {
             "compute_dag" | "computedag" => Type::ComputeDag,
             "kv_allocator" | "kvallocator" => Type::KVAllocator,
             "memory_pool" | "memorypool" => Type::MemoryPool,
+            "process_group" | "processgroup" => Type::ProcessGroup,
+            "trace_profiler" | "traceprofiler" => Type::TraceProfiler,
             "gpu_kernel" | "gpukernel" => Type::GpuKernel(None),
             "list" => Type::List(Box::new(gen_tys.into_iter().next().unwrap_or(Type::Any))),
             "dict" => {

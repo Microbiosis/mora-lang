@@ -471,6 +471,14 @@ impl KVPageAllocator {
         seq_id: u64,
         count: usize,
     ) -> MoraResult<(Vec<usize>, Vec<TriggeredWatermark>)> {
+        let _trace = crate::runtime::profiler::TraceScope::enter(
+            "kv_cache",
+            "kv_append_tokens",
+            vec![
+                ("seq_id".to_string(), seq_id.to_string()),
+                ("tokens".to_string(), count.to_string()),
+            ],
+        );
         let mut inner = self.inner.lock();
         let tick = Self::next_tick(&mut inner);
         let cur_tokens = inner

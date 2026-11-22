@@ -119,6 +119,14 @@ const STAGE3B_TYPES_AND_CTORS: &[(&str, &str)] = &[
         "64-byte aligned size-classed tensor memory pool type (memory_pool)",
     ),
     (
+        "process_group",
+        "Distributed tensor collective group type (process_group / tcp_process_group)",
+    ),
+    (
+        "trace_profiler",
+        "Nanosecond compute & service trace profiler handle type (profiler / std/trace)",
+    ),
+    (
         "Tensor::zeros",
         "Tensor::zeros(shape, dtype?, device?, requires_grad?)",
     ),

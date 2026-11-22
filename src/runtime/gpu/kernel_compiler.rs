@@ -2913,6 +2913,15 @@ pub(crate) fn launch_compiled_kernel(
     }
 
     let exec_device = target_device.unwrap_or(Device::Cpu);
+    let _trace = crate::runtime::profiler::TraceScope::enter(
+        "gpu",
+        format!("kernel::{}", kernel.name()),
+        vec![
+            ("device".to_string(), exec_device.to_string()),
+            ("grid".to_string(), format!("{grid:?}")),
+            ("block".to_string(), format!("{block:?}")),
+        ],
+    );
 
     // 2. Hardware GPU fast path (zero H2D / D2H on persistent VRAM tensors!).
     if !matches!(exec_device, Device::Cpu)

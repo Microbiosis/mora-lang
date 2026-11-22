@@ -174,7 +174,7 @@ fn d196_block_body_is_indented_and_outside_statement_is_not() {
         f
     );
     assert_eq!(
-        indent_of(&f, "print (0"),
+        indent_of(&f, "print(0"),
         0,
         "块**外**的语句必须顶格（修前被缩进 2 —— 层级加错了地方）:\n{}",
         f
@@ -187,7 +187,7 @@ fn d196_identifier_keyword_blocks_are_indented_too() {
     let src = "let i = 0\nwhile i < 3\n  print(i)\n  i = i + 1\nend\nprint(9)\n";
     let f = format_source("b2", src);
     assert_eq!(
-        indent_of(&f, "print (i"),
+        indent_of(&f, "print(i"),
         2,
         "`while` 的块体应缩进 2（`while` 走 Identifier，不按文本认就会顶格）:\n{}",
         f
@@ -198,7 +198,7 @@ fn d196_identifier_keyword_blocks_are_indented_too() {
         "唯一的 `end` 应顶格:\n{}",
         f
     );
-    assert_eq!(indent_of(&f, "print (9"), 0, "块外语句必须顶格:\n{}", f);
+    assert_eq!(indent_of(&f, "print(9"), 0, "块外语句必须顶格:\n{}", f);
 }
 
 /// 嵌套块逐层缩进（每层 +2）。
@@ -208,7 +208,7 @@ fn d196_nested_blocks_indent_per_level() {
         "for i in [1,2]\n  for j in [3,4]\n    print(i * j)\n  end\n  print(i)\nend\nprint(0)\n";
     let f = format_source("c1", src);
     assert_eq!(
-        indent_of(&f, "print (i * j"),
+        indent_of(&f, "print(i * j"),
         4,
         "第二层块体应缩进 4:\n{}",
         f
@@ -225,7 +225,7 @@ fn d196_nested_blocks_indent_per_level() {
         "第一层 `end` 缩进 2:\n{}",
         f
     );
-    assert_eq!(indent_of(&f, "print (0"), 0, "块外顶格:\n{}", f);
+    assert_eq!(indent_of(&f, "print(0"), 0, "块外顶格:\n{}", f);
 }
 
 /// **正对照**：格式化**不改变语义** —— 格式化后的文本运行结果与原文逐字一致。

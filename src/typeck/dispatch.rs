@@ -100,6 +100,30 @@ pub fn builtin_signatures() -> Vec<(String, Signature)> {
                 Type::Nil,
             ),
         ),
+        // v0.110.1: First-class runtime assertions for `mora test` and scripts.
+        (
+            "assert".to_string(),
+            Signature::with_min_arity(
+                vec![
+                    ("cond".to_string(), Type::Bool),
+                    ("msg".to_string(), Type::String),
+                ],
+                1,
+                Type::Nil,
+            ),
+        ),
+        (
+            "assert_eq".to_string(),
+            Signature::with_min_arity(
+                vec![
+                    ("left".to_string(), Type::Any),
+                    ("right".to_string(), Type::Any),
+                    ("msg".to_string(), Type::String),
+                ],
+                2,
+                Type::Nil,
+            ),
+        ),
         // v0.13: print(x...) accepts any printable value and returns nil.
         (
             "print".to_string(),

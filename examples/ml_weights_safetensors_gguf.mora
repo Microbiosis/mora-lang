@@ -1,0 +1,72 @@
+-- Pure-Mora ML Weight Formats (`std/nn/safetensors` & `std/nn/gguf`) — Mora v0.110.1
+--
+-- Demonstrates zero-dependency in-memory binary checkpoint encoding, header inspection,
+-- bit-exact multi-DType (`f32`/`f16`/`bf16`) round-trips, and GGUF Q8_0 quantization.
+--
+-- Run:   mora examples/ml_weights_safetensors_gguf.mora
+-- Check: mora --check examples/ml_weights_safetensors_gguf.mora
+
+import "std/nn/safetensors"
+import "std/nn/gguf"
+
+print("=== 1. Safetensors Multi-DType In-Memory Round-Trip ===")
+let w_f32 = tensor([[0.5, -1.5, 2.0], [3.0, 4.5, -0.25]], dtype = "f32")
+let w_f16 = tensor([1.0, -0.5, 2.5, 0.0], dtype = "f16")
+let w_bf16 = tensor([1.5, -3.0, 0.25, 8.0], dtype = "bf16")
+
+let st_tensors: dict<string, any> = {}
+assign st_tensors = st_tensors.set("attn.q_proj", w_f32).set("attn.k_proj", w_f16).set("mlp.gate", w_bf16)
+let st_meta: dict<string, string> = {"framework": "mora", "version": "0.110.1"}
+
+let st_buf = match safetensors_encode(st_tensors, st_meta) with
+    SafetensorsResult::Ok(b) -> b
+    SafetensorsResult::Err(_) -> Tensor::zeros([0], dtype = "u8")
+  end
+  assert(st_buf.numel() > 0, "safetensors encode failed")
+
+  let st_hdr_ok = match safetensors_inspect_bytes(st_buf) with
+      SafetensorsResult::Ok(h) -> h.tensors.len() == 3 and h.metadata.get("framework") == "mora"
+      SafetensorsResult::Err(_) -> false
+    end
+    assert(st_hdr_ok, "safetensors inspect_bytes failed")
+
+    let st_dec_ok = match safetensors_decode(st_buf, "cpu") with
+        SafetensorsResult::Ok(f) -> f.tensors.get("attn.q_proj").to_bytes() == w_f32.to_bytes() and f.tensors.get("attn.k_proj").to_bytes() == w_f16.to_bytes() and f.tensors.get("mlp.gate").to_bytes() == w_bf16.to_bytes()
+        SafetensorsResult::Err(_) -> false
+      end
+      assert(st_dec_ok, "safetensors bit-exact decode failed")
+      print("Safetensors bytes:", st_buf.numel(), "verified: f32/f16/bf16 bit-exact PASS")
+
+      print("=== 2. GGUF v3 Metadata, Tensor Round-Trip & Q8_0 Quantization ===")
+      let gw = Tensor::arange(-16.0, 16.0, 1.0, dtype = "f32") * 0.125f32
+      let q_raw = match quantize_q8_0(gw) with
+          GgufResult::Ok(b) -> b
+          GgufResult::Err(_) -> Tensor::zeros([0], dtype = "u8")
+        end
+        assert_eq(q_raw.numel(), 34, "expected 34-byte Q8_0 block for 32 weights")
+
+        let deq = match dequantize_q8_0(q_raw, [32], "cpu") with
+            GgufResult::Ok(t) -> t
+            GgufResult::Err(_) -> Tensor::zeros([32], dtype = "f32")
+          end
+          let max_q_err = (gw - deq).abs().max()
+          assert(max_q_err < 0.05000000074505806f32, "Q8_0 dequant error too high")
+          print("Q8_0 compression: 128B f32 ->", q_raw.numel(), "bytes, max error:", max_q_err)
+
+          let g_tensors: dict<string, any> = {}
+          assign g_tensors = g_tensors.set("blk.0.ffn_norm.weight", gw)
+          let g_meta: dict<string, any> = {}
+          assign g_meta = g_meta.set("general.architecture", meta_string("llama")).set("llama.block_count", meta_u32(2))
+
+          let g_buf = match gguf_encode(g_tensors, g_meta, 32) with
+              GgufResult::Ok(b) -> b
+              GgufResult::Err(_) -> Tensor::zeros([0], dtype = "u8")
+            end
+            assert(g_buf.numel() > 0, "gguf encode failed")
+
+            let g_ok = match gguf_decode(g_buf, "cpu") with
+                GgufResult::Ok(f) -> f.tensors.get("blk.0.ffn_norm.weight").to_bytes() == gw.to_bytes() and f.metadata.get("general.architecture") == "llama"
+                GgufResult::Err(_) -> false
+              end
+              assert(g_ok, "gguf decode failed")
+              print("GGUF v3 bytes:", g_buf.numel(), "verified: metadata + f32 tensor PASS")

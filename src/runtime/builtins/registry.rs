@@ -5,6 +5,8 @@
 /// 与 typeck 注册表双向核对。
 pub const RUNTIME_BUILTIN_NAMES: &[&str] = &[
     "apply",
+    "assert",
+    "assert_eq",
     "atom",
     "bool",
     "car",

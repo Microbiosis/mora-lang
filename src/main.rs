@@ -56,6 +56,12 @@ fn dispatch() -> i32 {
                 println!(
                     "  mora build <file.mora>     Compile a script into an AOT MORABC02 standalone binary [--emit-bc] [-o <out>]"
                 );
+                println!(
+                    "  mora fmt [paths...]        Format Mora source files [--check] [--stdout]"
+                );
+                println!(
+                    "  mora test [paths...]       Discover & run *_test.mora / test_*.mora [--filter <pat>] [--jobs <N>]"
+                );
                 println!("  mora install <url>         Install a package from a URL");
                 println!("  mora install --clean       Remove stale/broken packages from vendor/");
                 println!();
@@ -63,8 +69,15 @@ fn dispatch() -> i32 {
                 println!("  mora --help                Show this help");
                 return 0;
             }
-            // 仅看 `args[1]` 是否为 `--version` / `--help`，以便在打印 banner 前提前退出；
-            // 其余子命令（`run`、`install`、`--repl`、`--check`）和脚本路径继续正常分派。
+            // `fmt` and `test` skip the interactive banner so stdout/stderr stay CI- and pipe-clean.
+            "fmt" => {
+                return mora::cli::fmt::run_fmt(&args[2..]);
+            }
+            "test" => {
+                return mora::cli::test_runner::run_test(&args[2..], None);
+            }
+            // 仅看 `args[1]` 是否为 `--version` / `--help` / `fmt` / `test`；
+            // 其余子命令（`run`、`build`、`install`、`--repl`、`--check`）和脚本路径继续正常分派。
             _ => {}
         }
     }
@@ -127,6 +140,12 @@ fn dispatch() -> i32 {
         }
         "build" => {
             run_build(&args[2..], opt_level);
+        }
+        "fmt" => {
+            return mora::cli::fmt::run_fmt(&args[2..]);
+        }
+        "test" => {
+            return mora::cli::test_runner::run_test(&args[2..], opt_level);
         }
         _ => run_file(&args[1], opt_level),
     }

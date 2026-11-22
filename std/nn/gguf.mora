@@ -509,7 +509,7 @@ task decode_tensor_payload(raw: any, name: string, dims: list<int>, ggml_type: i
 end
 
 -- Parse GGUF v2/v3 header from a Tensor<u8> buffer (header prefix or complete file).
-export task inspect_bytes(buf: any): GgufResult<GgufHeader>
+export task gguf_inspect_bytes(buf: any): GgufResult<GgufHeader>
   if type_of(buf) != "tensor" or buf.dtype() != "u8" then
     return GgufResult::Err("gguf: expected Tensor<u8> buffer")
   end
@@ -613,7 +613,7 @@ end
 
 -- Encode tensors + metadata into a compliant GGUF v3 binary Tensor<u8> buffer.
 -- Note: to store quantized Q8_0 tensors, pass raw bytes via `quantize_q8_0(t)` or standard hardware Tensors.
-export task encode(tensors: dict<string, any>, metadata: dict<string, any> = {}, alignment: int = 32): GgufResult<any>
+export task gguf_encode(tensors: dict<string, any>, metadata: dict<string, any> = {}, alignment: int = 32): GgufResult<any>
   if alignment <= 0 or (alignment % 8) != 0 then
     return GgufResult::Err("gguf: alignment must be a positive multiple of 8")
   end
@@ -698,8 +698,8 @@ export task encode(tensors: dict<string, any>, metadata: dict<string, any> = {},
 end
 
 -- Decode an in-memory GGUF Tensor<u8> buffer into tensors on `device` (default `"cpu"`).
-export task decode(buf: any, device: string = "cpu"): GgufResult<GgufFile>
-  let hdr_res = inspect_bytes(buf)
+export task gguf_decode(buf: any, device: string = "cpu"): GgufResult<GgufFile>
+  let hdr_res = gguf_inspect_bytes(buf)
   if !gg_is_ok(hdr_res) then
     return GgufResult::Err(gg_err(hdr_res))
   end
@@ -725,8 +725,8 @@ export task decode(buf: any, device: string = "cpu"): GgufResult<GgufFile>
 end
 
 -- Save tensors + metadata as a GGUF v3 checkpoint file on disk.
-export task save(path: string, tensors: dict<string, any>, metadata: dict<string, any> = {}, alignment: int = 32): GgufResult<int>
-  let enc = encode(tensors, metadata, alignment)
+export task gguf_save(path: string, tensors: dict<string, any>, metadata: dict<string, any> = {}, alignment: int = 32): GgufResult<int>
+  let enc = gguf_encode(tensors, metadata, alignment)
   if !gg_is_ok(enc) then
     return GgufResult::Err(gg_err(enc))
   end
@@ -737,7 +737,7 @@ end
 
 -- Lazily inspect a `.gguf` file header from disk using exponentially growing prefix range reads
 -- (reads ONLY the metadata/tensor-directory prefix, never the bulk tensor weight blob!).
-export task inspect(path: string): GgufResult<GgufHeader>
+export task gguf_inspect(path: string): GgufResult<GgufHeader>
   if !file.exists(path) then
     return GgufResult::Err("gguf: file not found: " + path)
   end
@@ -749,7 +749,7 @@ export task inspect(path: string): GgufResult<GgufHeader>
   while true
     let take = if win > total then total else win end
     let chunk = file.read_binary_range(path, 0, take)
-    let res = inspect_bytes(chunk)
+    let res = gguf_inspect_bytes(chunk)
     if gg_is_ok(res) then
       return res
     end
@@ -763,8 +763,8 @@ export task inspect(path: string): GgufResult<GgufHeader>
 end
 
 -- Lazily load a SINGLE named tensor from a `.gguf` file on disk via exact range I/O.
-export task load_tensor(path: string, name: string, device: string = "cpu"): GgufResult<any>
-  let hdr_res = inspect(path)
+export task gguf_load_tensor(path: string, name: string, device: string = "cpu"): GgufResult<any>
+  let hdr_res = gguf_inspect(path)
   if !gg_is_ok(hdr_res) then
     return GgufResult::Err(gg_err(hdr_res))
   end
@@ -778,10 +778,39 @@ export task load_tensor(path: string, name: string, device: string = "cpu"): Ggu
 end
 
 -- Load an entire `.gguf` checkpoint from disk onto `device` (default `"cpu"`).
-export task load(path: string, device: string = "cpu"): GgufResult<GgufFile>
+export task gguf_load(path: string, device: string = "cpu"): GgufResult<GgufFile>
   if !file.exists(path) then
     return GgufResult::Err("gguf: file not found: " + path)
   end
   let buf = file.read_binary(path)
-  return decode(buf, device)
+  return gguf_decode(buf, device)
+end
+
+-- Short aliases for single-module callers (`import "std/nn/gguf"`).
+export task inspect_bytes(buf: any): GgufResult<GgufHeader>
+  return gguf_inspect_bytes(buf)
+end
+
+export task encode(tensors: dict<string, any>, metadata: dict<string, any> = {}, alignment: int = 32): GgufResult<any>
+  return gguf_encode(tensors, metadata, alignment)
+end
+
+export task decode(buf: any, device: string = "cpu"): GgufResult<GgufFile>
+  return gguf_decode(buf, device)
+end
+
+export task save(path: string, tensors: dict<string, any>, metadata: dict<string, any> = {}, alignment: int = 32): GgufResult<int>
+  return gguf_save(path, tensors, metadata, alignment)
+end
+
+export task inspect(path: string): GgufResult<GgufHeader>
+  return gguf_inspect(path)
+end
+
+export task load_tensor(path: string, name: string, device: string = "cpu"): GgufResult<any>
+  return gguf_load_tensor(path, name, device)
+end
+
+export task load(path: string, device: string = "cpu"): GgufResult<GgufFile>
+  return gguf_load(path, device)
 end

@@ -95,7 +95,7 @@ fn pub_fn_census() -> BTreeMap<String, (String, usize)> {
     out
 }
 
-/// **普查规模**：`pub fn` 总数落在 `[250, 500]`（v0.110.0 瘦身后）。
+/// **普查规模**：`pub fn` 总数落在 `[250, 520]`（v0.110.1 补齐 P3-A/B/C 公开原语与 CLI 入口后）。
 ///
 /// 低于下界说明抽样的源码树变了；高于上界说明**新增了大量 public API**，
 /// 应重新做一次「零引用」分类。
@@ -103,8 +103,8 @@ fn pub_fn_census() -> BTreeMap<String, (String, usize)> {
 fn d386_pub_fn_census_scale_is_stable() {
     let c = pub_fn_census();
     assert!(
-        (250..=500).contains(&c.len()),
-        "`pub fn` 总数 {} 超出 [250, 500] —— 源码树结构变了？",
+        (250..=520).contains(&c.len()),
+        "`pub fn` 总数 {} 超出 [250, 520] —— 源码树结构变了？",
         c.len()
     );
 }

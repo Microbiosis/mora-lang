@@ -1,0 +1,60 @@
+-- AI Compute DAG, Autograd (`grad` / `jvp`), and KV-Cache Demo — Mora v0.110.1
+--
+-- Run:   mora examples/ai_compute_dag_and_autograd.mora
+-- Check: mora --check examples/ai_compute_dag_and_autograd.mora
+
+print("=== 1. Hardware Device Discovery & Telemetry ===")
+let devs: list<string> = Tensor::devices()
+print("Detected devices:", devs)
+let cpu_info: dict<string, string> = Tensor::device_info("cpu")
+print("CPU ISA:", cpu_info.get("compute_capability"), "threads:", cpu_info.get("multiprocessors"))
+
+print("=== 2. Reverse-Mode `grad` & Forward-Mode `jvp` ===")
+let loss_fn = fn(w: Tensor<f64, [2, 2], cpu>)
+  let x = tensor([[1.0, -0.5], [0.25, 2.0]], dtype = "f64")
+  let y = (x @ w).gelu()
+  return (y * y).sum()
+end
+let w0 = tensor([[0.4, -0.2], [0.3, 0.8]], dtype = "f64")
+let dw = grad(loss_fn)(w0)
+let v_tan = tensor([[1.0, 0.0], [0.0, 1.0]], dtype = "f64")
+let jvp_pair = jvp(loss_fn, w0, v_tan)
+let directional_from_grad = (dw * v_tan).sum()
+let hvp_vec = jvp(grad(loss_fn), w0, v_tan)[1]
+print("grad(loss)(w0) shape:", dw.shape(), "directional_deriv(jvp):", jvp_pair[1], "vs <grad, v>:", directional_from_grad, "HVP shape:", hvp_vec.shape())
+
+print("=== 3. Fused TensorComputeDag (FusedRmsNormLinear + FusedFlashAttention) ===")
+let x = tensor([[0.5, -1.2, 0.8, 0.3], [-0.4, 1.5, -0.7, 0.9]], dtype = "f32", device = "cpu")
+let g = tensor([1.1, 0.9, 1.2, 0.8], dtype = "f32", device = "cpu")
+let w = tensor([[0.3, -0.5, 0.7], [0.2, 0.4, -0.1], [-0.6, 0.8, 0.2], [0.5, -0.3, 0.9]], dtype = "f32", device = "cpu")
+let b = tensor([0.1, -0.2, 0.3], dtype = "f32", device = "cpu")
+
+let rms_mlp = fn(inp, gamma, weight, bias)((inp.rms_norm(0.00001) * gamma) @ weight + bias).gelu() end
+let raw_dag = trace_dag(rms_mlp, x, g, w, b)
+let compiled = raw_dag.compile()
+let mlp_out = compiled.run(x, g, w, b)
+print("RMSNorm+Linear+GELU nodes:", raw_dag.node_count(), "->", compiled.node_count(), "ops:", compiled.op_names())
+print("MLP output shape:", mlp_out.shape(), "sum:", mlp_out.sum())
+
+let q = Tensor::arange(0.0, 48.0, 1.0, dtype = "f32").reshape([1, 4, 3, 4]) * 0.05000000074505806f32
+let k = Tensor::arange(0.0, 12.0, 1.0, dtype = "f32").reshape([1, 1, 3, 4]) * 0.03999999910593033f32
+let v = Tensor::arange(1.0, 13.0, 1.0, dtype = "f32").reshape([1, 1, 3, 4]) * 0.10000000149011612f32
+let mask = tensor([[0.0, -1000000000.0, -1000000000.0], [0.0, 0.0, -1000000000.0], [0.0, 0.0, 0.0]], dtype = "f32")
+let attn_fn = fn(qq, kk, vv, mm)(((qq @ kk.transpose(-2, -1)) * 0.5f32) + mm).softmax() @ vv end
+let attn_dag = trace_dag(attn_fn, q, k, v, mask).compile()
+let attn_out = attn_dag.run(q, k, v, mask)
+print("FlashAttention ops:", attn_dag.op_names(), "out shape:", attn_out.shape())
+
+print("=== 4. Dynamic KV-Cache Paging with CoW Prefix Forking ===")
+let kv: kv_allocator = kv_allocator(total_pages = 4, page_tokens = 2, num_heads = 2, head_dim = 2, dtype = "f16")
+kv.alloc_seq(1)
+kv.append_tokens(1, 3)
+kv.write_kv(1, 0, tensor([[1.0, 2.0], [3.0, 4.0]], dtype = "f16"), tensor([[0.5, 1.5], [2.5, 3.5]], dtype = "f16"))
+kv.fork_seq(1, 2)
+kv.write_kv(2, 0, tensor([[9.0, 8.0], [7.0, 6.0]], dtype = "f16"), tensor([[1.0, 1.0], [2.0, 2.0]], dtype = "f16"))
+let seq1_k0 = kv.read_kv(1)[0][0].to_list()
+let seq2_k0 = kv.read_kv(2)[0][0].to_list()
+print("CoW isolated seq1[0]:", seq1_k0, "seq2[0]:", seq2_k0, "stats:", kv.stats())
+kv.free_seq(1)
+kv.free_seq(2)
+print("Reclaimed free pages:", kv.free_pages())

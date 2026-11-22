@@ -6,13 +6,13 @@
 
 **Mora** — an **AI-native statically-typed language** designed for **LLM internals, compute graphs & operators, LLM inference/training, and dynamic resource orchestration**, combining **Go-style cloud-native concurrency** with first-class language support for **HTTP and MCP services**.
 
-> **定位（v0.110.0）**：AI-native 静态类型语言，专为大模型底层、计算图与算子、大模型推理/训练与资源动态调控而设计，同时具备 Go 的云原生并发属性，原生提供对 HTTP 与 MCP 服务的语言级友好支持。
+> **定位（v0.110.1）**：AI-native 静态类型语言，专为大模型底层、计算图与算子、大模型推理/训练与资源动态调控而设计，同时具备 Go 的云原生并发属性，原生提供对 HTTP 与 MCP 服务的语言级友好支持。
 
 [Architecture](docs/architecture-diagram.md) · [CHANGELOG](CHANGELOG.md) · [Influences](docs/influences.md) · [Spec](docs/mora-spec.md)
 
 ## Highlights
 
-- **AI-native numeric, tensor & compute foundation** — strict `Int` (`i64`, overflow-checked) vs `Float` (`f64`) literals with hardware low-bitwidth `DType` suffixes (`f16`, `bf16`, `fp8`, `fp8_e5m2`, `f32`, `f64`, `i4`..`i64`, `u8`..`u64`, `bool`), 64-byte aligned compact `Tensor<DType, Shape, Device>` (`cpu`/`cuda:N`/`vulkan:N`/`metal:N`, `Tensor::devices()`, `Tensor::device_info()`, compact byte I/O `to_bytes`/`from_bytes`/`from_utf8`/`cat`) with zero-copy strided multi-dim slicing (`t[0..4, :, -1]`, `t[..., None]`), native matrix/tensor contraction `@` and power `**`, higher-order reverse/forward AD (`grad`/`value_and_grad`/`jvp`/`no_grad`, HVP), `TensorComputeDag` 4-pass fusion (`FusedFlashAttention`, `FusedRmsNormLinear`, `FusedLinearAct`, `FusedElementwise`) backed by zero-dependency native hardware GPU `DeviceBackend`s (dynamic CUDA Driver API + PTX ISA 7.0 `f64` kernels & VRAM slab arena, Vulkan 1.0 + pure-Rust SPIR-V 1.0 compute shaders, macOS Metal MSL) plus runtime-dispatched AVX2+FMA/NEON multi-threaded CPU kernels & `DagPlanCache`/`DagWorkspace`, PagedAttention `KVPageAllocator` (`kv_allocator` with byte quotas, priority preemption & watermark callbacks) + 64-byte aligned slab `MemoryPool` (`memory_pool`), scalar/tensor math (`math.*`, `stats.*`, `linalg.*`, `random.*`), and pure-Mora embedded standard libraries (`std/nn/safetensors` Hugging Face Safetensors, `std/nn/gguf` GGUF v2/v3 with Q8_0/Q4_0 dequantization, `std/math/bigint`, `std/testing`, `std/net/tls`, `std/net/http` with HTTPS/Router/Chunked/Keep-Alive/SSE, and `std/mcp` with HTTP+HTTPS+SSE/Stdio/`prompts`/`Struct::schema()`) — **with zero third-party Cargo dependencies**.
+- **AI-native numeric, tensor & compute foundation** — strict `Int` (`i64`, overflow-checked) vs `Float` (`f64`) literals with hardware low-bitwidth `DType` suffixes (`f16`, `bf16`, `fp8`, `fp8_e5m2`, `f32`, `f64`, `i4`..`i64`, `u8`..`u64`, `bool`), 64-byte aligned compact `Tensor<DType, Shape, Device>` (`cpu`/`cuda:N`/`vulkan:N`/`metal:N`, `t.is_vram_resident()`, `Tensor::devices()`, `Tensor::device_info()`, compact byte I/O `to_bytes`/`from_bytes`/`from_utf8`/`cat`) with persistent physical VRAM residency (`DeviceVramBuffer` + lazy D2H sync), zero-copy strided multi-dim slicing (`t[0..4, :, -1]`, `t[..., None]`), native matrix/tensor contraction `@` and power `**`, higher-order reverse/forward AD (`grad`/`value_and_grad`/`jvp`/`no_grad`, HVP), `TensorComputeDag` 4-pass fusion (`FusedFlashAttention`, `FusedRmsNormLinear`, `FusedLinearAct`, `FusedElementwise`) executing VRAM-to-VRAM on zero-dependency native hardware GPU `DeviceBackend`s (NVIDIA CUDA Driver API + 13 PTX ISA 7.0 `f64`/`f32`/`f16`/`bf16` kernels & `CudaVramArena`, Vulkan 1.0 + 6 pure-Rust SPIR-V 1.0 compute shaders covering all 5 fused kernels & native `f16`/`bf16`, macOS Metal MSL 6 kernels) plus runtime-dispatched AVX2+FMA/NEON multi-threaded CPU kernels & `DagPlanCache`/`DagWorkspace`, physical-VRAM-backed PagedAttention `KVPageAllocator` (`kv_allocator` with byte quotas, priority preemption & watermark callbacks) + 64-byte aligned slab `MemoryPool` (`memory_pool`), scalar/tensor math (`math.*`, `stats.*`, `linalg.*`, `random.*`), and pure-Mora embedded standard libraries (`std/nn/safetensors` Hugging Face Safetensors, `std/nn/gguf` GGUF v2/v3 with Q8_0/Q4_0 dequantization, `std/math/bigint`, `std/testing`, `std/net/tls`, `std/net/http` with HTTPS/Router/Chunked/Keep-Alive/SSE, and `std/mcp` with HTTP+HTTPS+SSE/Stdio/`prompts`/`Struct::schema()`) — **with zero third-party Cargo dependencies**.
 - **Single-pass Control SSA compiler, `MORABC02` AOT bytecode & stackful VM** — Lexer → iterative Pratt `ParserV3::compile` → `MirWitness[]` + `ControlProgram` SSA IR (`verify_program`) → SSA optimization (`--opt=0/1/2` or `MORA_OPT`: CopyProp, GVN-CSE, LICM, DCE) → heap-framed stackful VM (`runtime::vm`) with `O(1)` tail-call optimization (100,000+ frames), zero-source precompiled `MORABC02` single-binary builds (`mora build <file> -o <bin>`) and standalone `.morac` AOT bytecode artifacts (`mora build <file> --emit-bc` / `mora app.morac`).
 - **Unified Span-tracked Hindley-Milner type system** — single constraint solver (`src/typeck/check_mir.rs` + `src/typeck/hm/`) delivering 5 AI-native static checks (`DType`, `Shape`, `Device`, `Resource`, `Effect`), nominal generic `struct` (with defaults & compile-time `@tag(...)`) / payload `enum`, source-level `trait`/`impl`/`dyn Trait`, default & named keyword arguments, rigid multi-character generic parameters (`<T, Dtype>`), ML Value Restriction, effect-row subsumption, covariant `result<T, E>` & `task_handle<T>`, invariant `channel<T>`, fail-closed `unknown`, and cross-module `import` verification.
 - **Go-style cloud-native concurrency & zero-dependency native runtime** — first-class `spawn`, typed invariant `channel<T>` (unbuffered rendezvous & bounded FIFO), fair multi-arm `select` (`case recv`/`send`/`timeout`/`default`), hierarchical cooperative cancellation `context` (`task_handle<T>`), cancellable `sleep`, multi-threaded native `TaskScheduler`, non-blocking `AsyncIoReactor` (`tcp_listen` / `tcp_connect` / `tcp_listener` / `tcp_stream`), zero-dependency native OS TLS 1.2/1.3 (`tls_listen` / `tls_connect` / `tls_listener` / `tls_stream` via Windows Schannel & Unix OpenSSL/LibreSSL with strict CA & hostname verification + ALPN), and `FsPolicy` / `CheckedPath` filesystem confinement with isolated per-runtime virtual `cwd`.
@@ -51,6 +51,8 @@ mora run script.mora                   # explicit run subcommand
 mora build script.mora -o app          # compile into a zero-source MORABC02 single binary
 mora build script.mora --emit-bc -o a.morac  # emit precompiled .morac SSA bytecode artifact
 mora a.morac                           # execute .morac bytecode directly (zero parse/typeck)
+mora fmt [paths...] [--check] [--stdout]     # format Mora source files (shared with mora-lsp)
+mora test [paths...] [--filter pat] [--jobs N] # discover & run *_test.mora / test_*.mora concurrently
 mora --opt=1 script.mora               # SSA optimization: 0=off / 1=basic / >=2=aggressive
 mora --check script.mora               # type check only
 mora --repl                            # interactive REPL
@@ -168,7 +170,7 @@ print(total)
 | `linalg.*`  | `dot`, `norm`, `transpose`, `matmul`, `cross`, `outer`, `det`, `inv`, `solve`, `trace`, ... |
 | `random.*`  | deterministic / ambient PRNG helpers (`seed`, `rand`, `rand_int`, `normal`, `choice`, `shuffle`, ...) |
 
-Embedded pure-Mora standard library modules live under `std/`: `import "std/math/bigint"`, `import "std/testing"`, `import "std/net/http"`, and `import "std/mcp"`.
+Embedded pure-Mora standard library modules live under `std/`: `import "std/math/bigint"`, `import "std/testing"`, `import "std/nn/safetensors"`, `import "std/nn/gguf"`, `import "std/net/tls"`, `import "std/net/http"`, and `import "std/mcp"`. First-class assertions `assert(cond, msg?)` and polymorphic `assert_eq(a, b, msg?)` are built into the VM, HM type checker, and `MORABC02` bytecode format.
 
 ## LSP & editor support
 
@@ -215,8 +217,8 @@ Key modules under `src/`:
 - `value/` & `value.rs` — `Value` (including `Scalar`, `Tensor`, `ComputeDag`, `KVPageAllocator`, `MemoryPool`, `StructInstance`, `EnumVariant`, `DynTrait`, `Channel`, `TaskHandle`, `Context`, `TcpListener`, `TcpStream`, `Continuation`, `External(Arc<dyn HostObject>)`), 64-byte aligned packed `tensor.rs`, chunked persistent `list.rs`, lexical `Environment`, and `display.rs`
 - `flow/` & `flow.rs` — shared iterative RFC 8259 JSON parser/serializer and overflow-checked numeric tower
 - `lsp/` — bounded stdio transport, JSON-RPC router, and HM-unified LSP providers
-- `cli/` — shared CLI compilation, zero-source `MORABC02` single-binary bundler (`bundle.rs`), interactive REPL (`repl.rs`), and path helpers
-- `std/` — pure-Mora standard libraries (`std/math/bigint.mora`, `std/testing.mora`, `std/net/http.mora` with Router/Chunked/Keep-Alive/SSE, and `std/mcp.mora` with Tools/Resources/Prompts/`Struct::schema()`/Stdio)
+- `cli/` — shared CLI compilation, canonical source formatter (`fmt.rs`, shared with `mora-lsp`), native `TaskScheduler`-backed test runner (`test_runner.rs`), zero-source `MORABC02` single-binary bundler (`bundle.rs`), interactive REPL (`repl.rs`), and path helpers
+- `std/` — pure-Mora standard libraries (`std/math/bigint.mora`, `std/testing.mora`, `std/nn/safetensors.mora`, `std/nn/gguf.mora`, `std/net/tls.mora`, `std/net/http.mora` with HTTPS/Router/Chunked/Keep-Alive/SSE, and `std/mcp.mora` with Tools/Resources/Prompts/`Struct::schema()`/HTTPS/Stdio)
 - `error.rs` — unified domain-typed `MoraError` / `MoraResult` with `Span` diagnostics
 
 ### Architecture evolution (Wave 1–4)
@@ -228,10 +230,13 @@ Key modules under `src/`:
 
 ## Examples & tests
 
-Run the demo script or test suites:
+Run the runnable showcase scripts in `examples/` or the full test suite:
 
 ```bash
 cargo run -- examples/hm_basic_demo.mora
+cargo run -- examples/ai_compute_dag_and_autograd.mora
+cargo run -- examples/ml_weights_safetensors_gguf.mora
+cargo run -- examples/cloud_http_https_mcp.mora
 cargo test --all-targets
 ```
 

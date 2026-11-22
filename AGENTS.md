@@ -233,10 +233,10 @@
 
 ## Project layout
 
-- `src/` — core compiler, unified HM type checker, Control SSA IR (`MORABC02` codec), stackful VM, `TensorComputeDag` & CUDA/Vulkan/Metal/SIMD backends, `KVPageAllocator` & `MemoryPool`, zero-dependency native scheduler/reactor/TLS (`runtime/tls`), and binaries (`mora`, `mora-lsp`)
+- `src/` — core compiler, unified HM type checker, Control SSA IR (`MORABC02` codec), stackful VM, `TensorComputeDag` & VRAM-resident CUDA/Vulkan/Metal/SIMD backends (`f64`/`f32`/`f16`/`bf16`), physical-VRAM `KVPageAllocator` & `MemoryPool`, zero-dependency native scheduler/reactor/TLS (`runtime/tls`), CLI toolchain (`mora fmt`, `mora test`, `mora build`), and binaries (`mora`, `mora-lsp`)
 - `std/` — pure-Mora standard libraries (`std/math/bigint.mora`, `std/testing.mora`, `std/nn/safetensors.mora`, `std/nn/gguf.mora`, `std/net/tls.mora`, `std/net/http.mora` with HTTPS/Router/Chunked/Keep-Alive/SSE, and `std/mcp.mora` with Tools/Resources/Prompts/`Struct::schema()`/HTTPS/Stdio), embedded in the binary via `mora::resolve_std_module`
 - `tests/` — integration tests + property-based tests (self-hosted `std/testing.mora` generator)
-- `examples/` — runnable Mora demo scripts (CI also runs these against the release binary)
+- `examples/` — runnable Mora demo scripts (`hm_basic_demo.mora`, `ai_compute_dag_and_autograd.mora`, `ml_weights_safetensors_gguf.mora`, `cloud_http_https_mcp.mora`; verified by `tests/p3_cli_fmt_test_and_examples.rs`)
 - `docs/` — language spec, influences, learning plan, architecture diagram
 - `scripts/` — repo utility scripts (PowerShell helpers)
 - `editors/` — editor integrations (`vscode/`, `neovim/`, `helix/`, `sublime/`, `vim/`, `emacs/`)

@@ -33,6 +33,15 @@ impl HMInference {
         if matches!(name, "math" | "stats" | "linalg") {
             return None;
         }
+        if name == "assert_eq" {
+            let elem = self.fresh_type_var();
+            return Some(BuiltinCallSpec {
+                params: vec![elem.clone(), elem, Type::String],
+                min_arity: 2,
+                variadic: false,
+                return_type: Type::Nil,
+            });
+        }
         if name == "channel" {
             let elem = self.fresh_type_var();
             return Some(BuiltinCallSpec {

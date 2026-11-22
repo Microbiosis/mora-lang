@@ -1,0 +1,80 @@
+-- Cloud-Native Concurrency (`spawn` / `channel` / `select`), HTTP Router & MCP Server — Mora v0.110.1
+--
+-- Spins up an in-process loopback HTTP/MCP server, exercises Go-style concurrent channels
+-- with fair `select`, invokes a schema-validated `Struct::schema()` MCP tool and resource
+-- over HTTP JSON-RPC, and exits cleanly.
+--
+-- Run:   mora examples/cloud_http_https_mcp.mora
+-- Check: mora --check examples/cloud_http_https_mcp.mora
+
+import "std/net/http"
+import "std/mcp"
+
+print("=== 1. Go-Style Concurrency (`spawn` + `channel<string>` + `select`) ===")
+let ch_a = channel(2)
+let ch_b = channel(2)
+
+let w1 = spawn fn()
+  ch_a.send("worker-a:ready")
+end
+let w2 = spawn fn()
+  ch_b.send("worker-b:ready")
+end
+
+let received = 0
+while received < 2
+  select
+    case msg = ch_a.recv() => print("select recv:", msg)
+    case msg = ch_b.recv() => print("select recv:", msg)
+  end
+  assign received = received + 1
+end
+w1.join()
+w2.join()
+
+print("=== 2. Typed MCP Server (`Struct::schema()`) over Loopback HTTP ===")
+struct PredictArgs
+  prompt: string @tag(desc = "Prompt text")
+  max_tokens: int = 32 @tag(desc = "Token budget")
+end
+
+let srv = server("mora-showcase-mcp", "0.110.1")
+assign srv = srv.typed_tool("echo_budget", "Report prompt length and token budget", PredictArgs::schema(), fn(args: dict<string, any>)
+  let p = str(args.get("prompt"))
+  let budget = int(str(args.get("max_tokens")))
+  return "prompt_len=" + str(p.len()) + ",budget=" + str(budget)
+end)
+assign srv = srv.resource("mora://info", "info", "Runtime status", "text/plain", fn(_u: string) "mora-cloud-ready" end)
+
+let listener = tcp_listen("127.0.0.1:0")
+let addr = listener.local_addr()
+let srv_task = spawn fn()
+  return srv.serve_listener(listener, 3)
+end
+
+-- 1. Health endpoint
+let health = get(addr, "/health")
+assert(health.status == 200, "expected HTTP 200 from /health")
+print("GET /health ->", health.status, health.body)
+
+-- 2. JSON-RPC tools/call (validated against PredictArgs::schema())
+let tool_args: dict<string, any> = {}
+assign tool_args = tool_args.set("prompt", "Hello Mora").set("max_tokens", 64)
+let tool_params: dict<string, any> = {}
+assign tool_params = tool_params.set("name", "echo_budget").set("arguments", tool_args)
+let call_resp = call_http(addr, "tools/call", tool_params, 1)
+let tool_out = str(call_resp.get("result").get("content").get(0).get("text"))
+assert(tool_out == "prompt_len=10,budget=64", "unexpected MCP tool result")
+print("MCP tools/call ->", tool_out)
+
+-- 3. JSON-RPC resources/read
+let res_params: dict<string, any> = {}
+assign res_params = res_params.set("uri", "mora://info")
+let res_resp = call_http(addr, "resources/read", res_params, 2)
+let res_out = str(res_resp.get("result").get("contents").get(0).get("text"))
+assert(res_out == "mora-cloud-ready", "unexpected MCP resource result")
+print("MCP resources/read ->", res_out)
+
+let served = srv_task.join()
+listener.close()
+print("Served", served, "requests cleanly; exiting.")

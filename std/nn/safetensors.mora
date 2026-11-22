@@ -247,7 +247,7 @@ task parse_and_validate_header(header_bytes: any, header_len: int, trailing_data
 end
 
 -- Serialize a dict<string, Tensor> (+ optional string metadata) into a compliant Safetensors Tensor<u8> buffer.
-export task encode(tensors: dict<string, any>, metadata: dict<string, string> = {}): SafetensorsResult<any>
+export task safetensors_encode(tensors: dict<string, any>, metadata: dict<string, string> = {}): SafetensorsResult<any>
   let names = tensors.keys().sort()
   let hdr_obj: dict<string, any> = {}
   if metadata.len() > 0 then
@@ -306,7 +306,7 @@ export task encode(tensors: dict<string, any>, metadata: dict<string, string> = 
 end
 
 -- Inspect ONLY the header metadata from an in-memory Tensor<u8> buffer (no tensor deserialization).
-export task inspect_bytes(buf: any): SafetensorsResult<SafetensorsHeader>
+export task safetensors_inspect_bytes(buf: any): SafetensorsResult<SafetensorsHeader>
   if type_of(buf) != "tensor" or buf.dtype() != "u8" then
     return SafetensorsResult::Err("safetensors: expected Tensor<u8> buffer")
   end
@@ -348,8 +348,8 @@ task st_val(r: any): any
 end
 
 -- Decode an in-memory Tensor<u8> Safetensors buffer into tensors on `device` (default `"cpu"`).
-export task decode(buf: any, device: string = "cpu"): SafetensorsResult<SafetensorsFile>
-  let hdr_res = inspect_bytes(buf)
+export task safetensors_decode(buf: any, device: string = "cpu"): SafetensorsResult<SafetensorsFile>
+  let hdr_res = safetensors_inspect_bytes(buf)
   if !st_is_ok(hdr_res) then
     return SafetensorsResult::Err(st_err(hdr_res))
   end
@@ -366,8 +366,8 @@ export task decode(buf: any, device: string = "cpu"): SafetensorsResult<Safetens
 end
 
 -- Save tensors directly to disk using CheckedPath-confined binary I/O; returns total bytes written.
-export task save(path: string, tensors: dict<string, any>, metadata: dict<string, string> = {}): SafetensorsResult<int>
-  let enc = encode(tensors, metadata)
+export task safetensors_save(path: string, tensors: dict<string, any>, metadata: dict<string, string> = {}): SafetensorsResult<int>
+  let enc = safetensors_encode(tensors, metadata)
   if !st_is_ok(enc) then
     return SafetensorsResult::Err(st_err(enc))
   end
@@ -377,7 +377,7 @@ export task save(path: string, tensors: dict<string, any>, metadata: dict<string
 end
 
 -- Lazily inspect a `.safetensors` file header from disk (reads ONLY 8 + header_len bytes).
-export task inspect(path: string): SafetensorsResult<SafetensorsHeader>
+export task safetensors_inspect(path: string): SafetensorsResult<SafetensorsHeader>
   if !file.exists(path) then
     return SafetensorsResult::Err("safetensors: file not found: " + path)
   end
@@ -399,8 +399,8 @@ export task inspect(path: string): SafetensorsResult<SafetensorsHeader>
 end
 
 -- Lazily load a SINGLE named tensor from disk (reads ONLY header + that tensor's byte slice!).
-export task load_tensor(path: string, name: string, device: string = "cpu"): SafetensorsResult<any>
-  let hdr_res = inspect(path)
+export task safetensors_load_tensor(path: string, name: string, device: string = "cpu"): SafetensorsResult<any>
+  let hdr_res = safetensors_inspect(path)
   if !st_is_ok(hdr_res) then
     return SafetensorsResult::Err(st_err(hdr_res))
   end
@@ -415,10 +415,39 @@ export task load_tensor(path: string, name: string, device: string = "cpu"): Saf
 end
 
 -- Load an entire `.safetensors` checkpoint from disk onto `device` (default `"cpu"`).
-export task load(path: string, device: string = "cpu"): SafetensorsResult<SafetensorsFile>
+export task safetensors_load(path: string, device: string = "cpu"): SafetensorsResult<SafetensorsFile>
   if !file.exists(path) then
     return SafetensorsResult::Err("safetensors: file not found: " + path)
   end
   let buf = file.read_binary(path)
-  return decode(buf, device)
+  return safetensors_decode(buf, device)
+end
+
+-- Short aliases for single-module callers (`import "std/nn/safetensors"`).
+export task encode(tensors: dict<string, any>, metadata: dict<string, string> = {}): SafetensorsResult<any>
+  return safetensors_encode(tensors, metadata)
+end
+
+export task inspect_bytes(buf: any): SafetensorsResult<SafetensorsHeader>
+  return safetensors_inspect_bytes(buf)
+end
+
+export task decode(buf: any, device: string = "cpu"): SafetensorsResult<SafetensorsFile>
+  return safetensors_decode(buf, device)
+end
+
+export task save(path: string, tensors: dict<string, any>, metadata: dict<string, string> = {}): SafetensorsResult<int>
+  return safetensors_save(path, tensors, metadata)
+end
+
+export task inspect(path: string): SafetensorsResult<SafetensorsHeader>
+  return safetensors_inspect(path)
+end
+
+export task load_tensor(path: string, name: string, device: string = "cpu"): SafetensorsResult<any>
+  return safetensors_load_tensor(path, name, device)
+end
+
+export task load(path: string, device: string = "cpu"): SafetensorsResult<SafetensorsFile>
+  return safetensors_load(path, device)
 end

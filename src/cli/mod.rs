@@ -2,8 +2,10 @@
 //! main.rs 保留 dispatch + 执行入口。
 
 pub mod bundle;
+pub mod fmt;
 pub mod install;
 pub mod repl;
+pub mod test_runner;
 pub mod vendor;
 
 use std::fs;

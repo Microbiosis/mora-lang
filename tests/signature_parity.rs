@@ -103,6 +103,8 @@ fn call_for(name: &str) -> Option<&'static str> {
         "print" => "print(1)",
         "range" => "range(0, 3)",
         "len" => "len([1,2])",
+        "assert" => "assert(true)",
+        "assert_eq" => "assert_eq(1, 1)",
         "str" => "str(1)",
         "int" => "int(\"1\")",
         "float" => "float(\"1\")",

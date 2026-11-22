@@ -17,6 +17,7 @@ mod symbols;
 pub use completion::completion_v3;
 pub use definition::definition_v3;
 pub use folding::folding_range_v3;
+pub(crate) use formatting::format_mora_source;
 pub use formatting::formatting;
 pub use hover::hover_v3;
 pub use references::references_v3;

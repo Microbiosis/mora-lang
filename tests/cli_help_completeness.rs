@@ -38,7 +38,7 @@ use std::process::Command;
 /// 新增子命令时**必须**同时加进这里，否则本测试会红。
 const SUBCOMMANDS: &[&str] = &[
     // 顶层
-    "run", "build", "install",
+    "run", "build", "fmt", "test", "install",
 ];
 
 fn help_text() -> String {

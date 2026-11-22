@@ -45,6 +45,8 @@ pub(crate) fn eval_pure_builtin(
     args: &[Value],
 ) -> Option<MoraResult<Value>> {
     match id {
+        BuiltinFnId::Assert => Some(call_builtin_assert(args)),
+        BuiltinFnId::AssertEq => Some(call_builtin_assert_eq(args)),
         BuiltinFnId::Print => Some(call_builtin_print(args)),
         BuiltinFnId::Range => Some(call_builtin_range(args)),
         BuiltinFnId::Len => Some(call_builtin_len(args)),
@@ -679,4 +681,66 @@ pub(crate) fn call_builtin_sleep_core(core: &mut CoreRuntime, args: &[Value]) ->
     core.scheduler()
         .block_on(core.reactor().sleep(duration, core.task_context.as_ref()))?;
     Ok(Value::Nil)
+}
+
+pub(crate) fn call_builtin_assert(args: &[Value]) -> MoraResult<Value> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(MoraError::Runtime(format!(
+            "assert(cond, msg?) expects 1 or 2 arguments, got {}",
+            args.len()
+        )));
+    }
+    let Value::Bool(cond) = args[0] else {
+        return Err(MoraError::Runtime(format!(
+            "assert(cond, msg?) expects bool as first argument, got {}",
+            crate::flow::type_name(&args[0])
+        )));
+    };
+    if let Some(msg_val) = args.get(1)
+        && !matches!(msg_val, Value::String(_))
+    {
+        return Err(MoraError::Runtime(format!(
+            "assert(cond, msg?) expects string as optional message, got {}",
+            crate::flow::type_name(msg_val)
+        )));
+    }
+    if cond {
+        return Ok(Value::Nil);
+    }
+    match args.get(1) {
+        Some(Value::String(msg)) if !msg.is_empty() => {
+            Err(MoraError::Runtime(format!("Assertion failed: {msg}")))
+        }
+        _ => Err(MoraError::Runtime("Assertion failed".to_string())),
+    }
+}
+
+pub(crate) fn call_builtin_assert_eq(args: &[Value]) -> MoraResult<Value> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(MoraError::Runtime(format!(
+            "assert_eq(left, right, msg?) expects 2 or 3 arguments, got {}",
+            args.len()
+        )));
+    }
+    if let Some(msg_val) = args.get(2)
+        && !matches!(msg_val, Value::String(_))
+    {
+        return Err(MoraError::Runtime(format!(
+            "assert_eq(left, right, msg?) expects string as optional message, got {}",
+            crate::flow::type_name(msg_val)
+        )));
+    }
+    if crate::flow::values_equal(&args[0], &args[1]) {
+        return Ok(Value::Nil);
+    }
+    match args.get(2) {
+        Some(Value::String(msg)) if !msg.is_empty() => Err(MoraError::Runtime(format!(
+            "Assertion failed: {msg} (left: {}, right: {})",
+            args[0], args[1]
+        ))),
+        _ => Err(MoraError::Runtime(format!(
+            "Assertion failed: left ({}) != right ({})",
+            args[0], args[1]
+        ))),
+    }
 }

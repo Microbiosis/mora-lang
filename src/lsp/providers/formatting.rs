@@ -61,7 +61,7 @@ pub fn formatting(docs: &HashMap<String, DocumentState>, params: &Value, range: 
     //
     // 前提是 `simple_format` **保行数**（输出与源码的 `\n` 个数相等），
     // 否则「第 k 行」在两侧对不上，切出来的就不是被请求的那几行。
-    let formatted = simple_format(&text);
+    let formatted = format_mora_source(&text);
 
     let edit = if range {
         let s = match params.get("range") {
@@ -172,115 +172,425 @@ fn slice_edit(text: &str, formatted: &str, l0: usize, l1: usize) -> Option<TextE
     })
 }
 
-/// 简单 formatter：trim 行尾空白 + 缩进。基础但能跑。
+/// Canonical Mora source formatter shared by `mora fmt` and `mora-lsp`
+/// (`textDocument/formatting` & `textDocument/rangeFormatting`).
 ///
-/// **保行数不变式**（v0.104.6 D202）：输出的 `\n` 个数**必须**与输入相等。
-/// 两条依赖：
-/// ① 注释不能被吞（lexer 靠 `keep_comments(true)` 把 `--` 发成 token）；
-/// ② 空行不能被吞（`Newline` **无条件**换行，不再去重连续空行）。
-/// 少了任何一条，输出就会比输入**短**，`slice_edit` 的「第 k 行对第 k 行」
-/// 也就跟着失效。
-fn simple_format(text: &str) -> String {
-    // 扫描 token，按 indent 规则重新组装
-    //
-    // v0.104.6 D202：必须 `keep_comments(true)` —— 否则 lexer 静默丢弃 `--`，
-    // 而本函数是**从 token 流重建整份文档**：lexer 不发的东西就等于不存在，
-    // 于是格式化会**删光文件里所有注释**（实测 5 行含 3 处 `--` 的源码
-    // → 4 行 0 注释，而服务器声明了 `documentFormattingProvider: true`，
-    // 编辑器「保存时格式化」一按，用户的注释就没了）。
+/// Preserved invariants:
+/// - **Line count**: exact `\n` count matches input (required by `slice_edit` / `rangeFormatting`).
+/// - **Comments & blank lines**: `keep_comments(true)` preserves every `--` comment verbatim and
+///   keeps every blank line in place.
+/// - **Idiomatic spacing & 2-space block indentation**: tight call/index/member/generic spacing
+///   (`print(x)`, `a[0]`, `x.shape()`, `Tensor::ones(...)`, `list<string>`), unary operator
+///   attachment (`-x`, `!x`, `@tag`), clean `else` / `else if` / `end` / `}` outdenting, and
+///   strict idempotence (`format(format(s)) == format(s)`).
+pub(crate) fn format_mora_source(text: &str) -> String {
+    use crate::lexer::TokenType;
+
     let tokens = crate::lexer::Lexer::new(text)
         .keep_comments(true)
         .scan_tokens();
-    let mut out = String::new();
-    let mut depth: usize = 0;
-    let mut needs_indent = true;
 
-    use crate::lexer::TokenType;
+    // Group tokens by source line (preserving exact `\n` boundaries).
+    let mut lines: Vec<Vec<&TokenType>> = Vec::new();
+    let mut cur: Vec<&TokenType> = Vec::new();
+    let mut trailing_newline = false;
     for tok in &tokens {
         match &tok.token_type {
-            // v0.104.6 D202：**无条件**换行。
-            //
-            // 修前是 `if !last_was_newline { … }` —— 连续两个 `Newline`
-            // （即空行）只出**一个**换行，于是空行被吞：实测 6 行源码
-            // （含 2 个空行 + 1 个纯空白行）格式化成 4 行。
-            //
-            // 保留连续换行还让「输出第 k 行 ↔ 输入第 k 行」成立，
-            // `slice_edit` 的区间切片才可靠（见上）。
             TokenType::Newline => {
-                trim_trailing_spaces(&mut out);
-                out.push('\n');
-                needs_indent = true;
+                lines.push(std::mem::take(&mut cur));
+                trailing_newline = true;
             }
             TokenType::EOF => {
-                trim_trailing_spaces(&mut out);
-                // v0.104.6 D202：只补**源码本来就有**的收尾换行 ——
-                // 无条件补会凭空多出一个 `\n`，破坏上面的保行数不变式
-                // （`"a"` 会变成 `"a \n"`）。
-                if !out.is_empty() && !out.ends_with('\n') && text.ends_with('\n') {
-                    out.push('\n');
+                if !cur.is_empty() || !trailing_newline {
+                    lines.push(std::mem::take(&mut cur));
                 }
             }
-            TokenType::LBrace => {
-                if needs_indent {
-                    push_indent(&mut out, depth);
-                    needs_indent = false;
-                }
-                out.push_str(&token_text(&tok.token_type));
-                // v0.104.6 D196：花括号块**开启**一层
-                // （修前只有 RBrace 在减、开括号从不加 → 花括号块永远缩进 0）。
-                depth += 1;
-            }
-            // `(` / `[` 是**表达式**分组，不是块 —— 不参与层级
-            // （修前 LParen 也不加，但 RParen 却在减，见下）。
-            TokenType::LBracket | TokenType::LParen => {
-                if needs_indent {
-                    push_indent(&mut out, depth);
-                    needs_indent = false;
-                }
-                out.push_str(&token_text(&tok.token_type));
-            }
-            // v0.104.6 D196：`end` 是**闭合**关键字。
-            // 修前它 `depth += 1`（当作开启）—— 于是**循环/条件之外的语句
-            // 被缩进、循环体反而顶格**（实测 `for … end` + 一行顶层语句：
-            // 体顶格、顶层语句缩进 2）。此处改为先减后打印。
-            TokenType::End => {
-                depth = depth.saturating_sub(1);
-                if needs_indent {
-                    push_indent(&mut out, depth);
-                    needs_indent = false;
-                }
-                out.push_str("end");
-            }
-            TokenType::RBrace => {
-                depth = depth.saturating_sub(1);
-                out.push_str(&token_text(&tok.token_type));
-            }
-            // v0.104.6 D196：`)` / `]` **不改**层级（修前与 `}` 一起减，
-            // 于是 `print(x)` 会把层级减 1）。
-            TokenType::RBracket | TokenType::RParen => {
-                out.push_str(&token_text(&tok.token_type));
-            }
-            _ => {
-                if needs_indent {
-                    push_indent(&mut out, depth);
-                    needs_indent = false;
-                }
-                // v0.104.6 D202：注释走这条**普通 token** 路径 ——
-                // `token_text` 原样带出 `--` + 正文，于是
-                // 「行尾注释」仍留在行尾、「独立注释行」仍是独立的一行，
-                // 且不影响层级（`is_block_opener` 对 `Comment` 为假）。
-                out.push_str(&token_text(&tok.token_type));
-                out.push(' ');
-                // v0.104.6 D196：块的开端在这里**进入一层**。
-                // 修前只有 `End` / `Then` 会 `depth += 1`，而 `End` 是闭合方 ——
-                // 于是没有任何开启方，`depth` 只会朝错误方向走。
-                if is_block_opener(&tok.token_type) {
-                    depth += 1;
-                }
+            tt => {
+                cur.push(tt);
+                trailing_newline = false;
             }
         }
     }
+    if lines.is_empty() {
+        return String::new();
+    }
+
+    fn first_code_tok<'a>(
+        line: &[&'a crate::lexer::TokenType],
+    ) -> Option<&'a crate::lexer::TokenType> {
+        line.iter()
+            .copied()
+            .find(|t| !matches!(t, crate::lexer::TokenType::Comment(_)))
+    }
+
+    let next_code_line_first = |from_idx: usize| -> Option<&TokenType> {
+        for l in lines.iter().skip(from_idx + 1) {
+            if let Some(tok) = first_code_tok(l) {
+                return Some(tok);
+            }
+        }
+        None
+    };
+
+    let mut out = String::with_capacity(text.len() + 32);
+    let mut depth: usize = 0;
+    let mut trait_depths: Vec<usize> = Vec::new();
+
+    for (line_idx, line) in lines.iter().enumerate() {
+        if line_idx > 0 {
+            out.push('\n');
+        }
+        if line.is_empty() {
+            continue;
+        }
+
+        let first_code = first_code_tok(line);
+        let leading_outdent = match first_code {
+            Some(TokenType::End | TokenType::RBrace) => true,
+            Some(TokenType::Identifier(s)) if matches!(s.as_str(), "else" | "elif" | "elseif") => {
+                true
+            }
+            _ => false,
+        };
+        let line_depth = if leading_outdent {
+            depth.saturating_sub(1)
+        } else {
+            depth
+        };
+
+        push_indent(&mut out, line_depth);
+
+        let mut prev_prev: Option<&TokenType> = None;
+        let mut prev: Option<&TokenType> = None;
+        let mut angle_depth: usize = 0;
+        let mut bracket_depth: usize = 0;
+        let in_trait_body = trait_depths.last().copied() == Some(depth);
+        let has_end_on_line = line.iter().any(|t| matches!(t, TokenType::End));
+
+        for (i, &tt) in line.iter().enumerate() {
+            let next = line.get(i + 1).copied();
+            let opens_generic = matches!(tt, TokenType::Less)
+                && matches!(
+                    prev,
+                    Some(TokenType::Identifier(s))
+                        if matches!(
+                            s.as_str(),
+                            "list"
+                                | "dict"
+                                | "set"
+                                | "channel"
+                                | "Tensor"
+                                | "Result"
+                                | "Option"
+                                | "Box"
+                                | "Arc"
+                        )
+                );
+            let closes_generic = matches!(tt, TokenType::Greater) && angle_depth > 0;
+
+            let is_at_tag = matches!(prev, Some(TokenType::At))
+                && matches!(tt, TokenType::Identifier(s) if s == "tag")
+                && matches!(next, Some(TokenType::LParen));
+
+            if !is_at_tag
+                && needs_space(
+                    prev_prev,
+                    prev,
+                    tt,
+                    angle_depth,
+                    bracket_depth,
+                    opens_generic,
+                    closes_generic,
+                )
+            {
+                out.push(' ');
+            }
+
+            out.push_str(&token_text(tt));
+
+            if opens_generic {
+                angle_depth += 1;
+            } else if closes_generic {
+                angle_depth -= 1;
+            }
+            match tt {
+                TokenType::LBracket => bracket_depth += 1,
+                TokenType::RBracket => bracket_depth = bracket_depth.saturating_sub(1),
+                _ => {}
+            }
+
+            // Update block indentation depth for subsequent lines.
+            let after_else = matches!(prev, Some(TokenType::Identifier(s)) if s == "else");
+            match tt {
+                TokenType::End | TokenType::RBrace => {
+                    depth = depth.saturating_sub(1);
+                    if trait_depths.last().copied().is_some_and(|td| depth < td) {
+                        trait_depths.pop();
+                    }
+                }
+                TokenType::LBrace => {
+                    depth += 1;
+                }
+                TokenType::If if after_else => {
+                    // `else if ...` shares the enclosing `if`'s single `end`.
+                }
+                TokenType::Task if in_trait_body && !has_end_on_line => {
+                    // Bodyless trait method signature (`task foo(self): T`) is followed directly
+                    // by `end` or another `task`, so it does not open an indented block.
+                    let is_signature_only = matches!(
+                        next_code_line_first(line_idx),
+                        Some(TokenType::End | TokenType::Task)
+                    );
+                    if !is_signature_only {
+                        depth += 1;
+                    }
+                }
+                _ if is_block_opener_ctx(tt, prev, next) => {
+                    depth += 1;
+                    if matches!(tt, TokenType::Identifier(s) if s == "trait") {
+                        trait_depths.push(depth);
+                    }
+                }
+                _ => {}
+            }
+
+            if !matches!(tt, TokenType::Comment(_)) {
+                prev_prev = prev;
+                prev = Some(tt);
+            }
+        }
+        trim_trailing_spaces(&mut out);
+    }
+
+    if trailing_newline && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    // Guarantee exact newline count preservation (D202/D203 load-bearing invariant).
+    let src_newlines = text.matches('\n').count();
+    while out.matches('\n').count() < src_newlines {
+        out.push('\n');
+    }
     out
+}
+
+/// Decide whether a single space separates `prev` and `curr` on the same source line.
+fn needs_space(
+    prev_prev: Option<&crate::lexer::TokenType>,
+    prev: Option<&crate::lexer::TokenType>,
+    curr: &crate::lexer::TokenType,
+    angle_depth: usize,
+    bracket_depth: usize,
+    opens_generic: bool,
+    closes_generic: bool,
+) -> bool {
+    use crate::lexer::TokenType;
+
+    let Some(prev) = prev else {
+        return false;
+    };
+
+    // Always separate inline comments from preceding code.
+    if matches!(curr, TokenType::Comment(_)) {
+        return true;
+    }
+
+    // Tokens that attach tightly to the preceding token.
+    match curr {
+        TokenType::RParen
+        | TokenType::RBracket
+        | TokenType::Comma
+        | TokenType::Dot
+        | TokenType::DotDot
+        | TokenType::DotDotDot
+        | TokenType::ColonColon
+        | TokenType::Colon
+        | TokenType::Question => return false,
+        TokenType::RBrace => return false,
+        TokenType::LParen => {
+            if matches!(
+                prev,
+                TokenType::Fn
+                    | TokenType::RParen
+                    | TokenType::RBracket
+                    | TokenType::Self_
+                    | TokenType::LParen
+                    | TokenType::LBracket
+            ) {
+                return false;
+            }
+            if let TokenType::Identifier(s) = prev
+                && !is_spaced_before_paren(s)
+            {
+                return false;
+            }
+        }
+        TokenType::LBracket => {
+            if matches!(
+                prev,
+                TokenType::RParen | TokenType::RBracket | TokenType::Self_
+            ) {
+                return false;
+            }
+            if let TokenType::Identifier(s) = prev
+                && !is_spaced_before_bracket(s)
+            {
+                return false;
+            }
+        }
+        _ => {}
+    }
+
+    if opens_generic || closes_generic {
+        return false;
+    }
+
+    // Tokens that attach tightly to the following token.
+    match prev {
+        TokenType::LParen
+        | TokenType::LBracket
+        | TokenType::LBrace
+        | TokenType::Dot
+        | TokenType::DotDot
+        | TokenType::DotDotDot
+        | TokenType::ColonColon
+        | TokenType::Bang
+        | TokenType::Backtick
+        | TokenType::Amp => return false,
+        TokenType::Less if angle_depth > 0 => return false,
+        TokenType::Colon if angle_depth > 0 || bracket_depth > 0 => return false,
+        TokenType::Minus if is_unary_prefix_context(prev_prev) => return false,
+        TokenType::At if prev_prev.is_none() => return false,
+        _ => {}
+    }
+
+    true
+}
+
+fn is_spaced_before_paren(ident: &str) -> bool {
+    matches!(
+        ident,
+        "and"
+            | "or"
+            | "not"
+            | "while"
+            | "else"
+            | "elif"
+            | "elseif"
+            | "select"
+            | "spawn"
+            | "perform"
+            | "handle"
+            | "trait"
+            | "impl"
+            | "export"
+            | "assign"
+    )
+}
+
+fn is_spaced_before_bracket(ident: &str) -> bool {
+    is_spaced_before_paren(ident)
+}
+
+fn is_unary_prefix_context(prev_prev: Option<&crate::lexer::TokenType>) -> bool {
+    use crate::lexer::TokenType;
+    match prev_prev {
+        None => true,
+        Some(
+            TokenType::LParen
+            | TokenType::LBracket
+            | TokenType::LBrace
+            | TokenType::Comma
+            | TokenType::Colon
+            | TokenType::Assign
+            | TokenType::Plus
+            | TokenType::Minus
+            | TokenType::Star
+            | TokenType::StarStar
+            | TokenType::Slash
+            | TokenType::Percent
+            | TokenType::Equal
+            | TokenType::NotEqual
+            | TokenType::Less
+            | TokenType::Greater
+            | TokenType::LessEqual
+            | TokenType::GreaterEqual
+            | TokenType::Arrow
+            | TokenType::FatArrow
+            | TokenType::Pipe
+            | TokenType::Or
+            | TokenType::At
+            | TokenType::Return
+            | TokenType::If
+            | TokenType::Then
+            | TokenType::In
+            | TokenType::Do,
+        ) => true,
+        Some(TokenType::Identifier(s))
+            if matches!(
+                s.as_str(),
+                "and" | "or" | "not" | "else" | "elif" | "elseif"
+            ) =>
+        {
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Contextual block opener detection: keyword openers (`task`, `for`, `if`, `match`, `fn`,
+/// `macro`, `with`, `struct`, `enum`, `loop`) plus contextual identifier keywords (`while`,
+/// `worker`, `handle`, `observe`, `parallel`, `transaction`, `trait`, `impl`, `select`) when
+/// NOT used as a member/method/variable name (e.g. `self.handle(req, stream)`).
+fn is_block_opener_ctx(
+    tt: &crate::lexer::TokenType,
+    prev: Option<&crate::lexer::TokenType>,
+    next: Option<&crate::lexer::TokenType>,
+) -> bool {
+    use crate::lexer::TokenType;
+    match tt {
+        TokenType::Task
+        | TokenType::For
+        | TokenType::If
+        | TokenType::Match
+        | TokenType::Fn
+        | TokenType::Macro
+        | TokenType::With
+        | TokenType::Struct
+        | TokenType::Enum
+        | TokenType::Loop => true,
+        TokenType::Identifier(s)
+            if matches!(
+                s.as_str(),
+                "while"
+                    | "worker"
+                    | "handle"
+                    | "observe"
+                    | "parallel"
+                    | "transaction"
+                    | "trait"
+                    | "impl"
+                    | "select"
+            ) =>
+        {
+            let prev_blocks = matches!(
+                prev,
+                Some(TokenType::Dot | TokenType::ColonColon | TokenType::Let)
+            ) || matches!(prev, Some(TokenType::Identifier(p)) if p == "assign");
+            let next_blocks = matches!(
+                next,
+                Some(
+                    TokenType::Assign
+                        | TokenType::Colon
+                        | TokenType::Dot
+                        | TokenType::Comma
+                        | TokenType::RParen
+                        | TokenType::RBracket
+                )
+            ) || (s == "handle" && matches!(next, Some(TokenType::LParen)));
+            !prev_blocks && !next_blocks
+        }
+        _ => false,
+    }
 }
 
 /// 去掉行尾空格。格式化器不该在**每一行**末尾留下一个空格。
@@ -290,35 +600,6 @@ fn simple_format(text: &str) -> String {
 fn trim_trailing_spaces(out: &mut String) {
     while out.ends_with(' ') {
         out.pop();
-    }
-}
-
-/// v0.104.6 D196：这个 token 是否**开启**一个缩进层级。
-///
-/// 分两类来源，因为本语言的块开头一半是关键字、一半不是：
-/// - 关键字 token：`task` / `for` / `if` / `match` / `fn` / `macro` / `with`；
-/// - **标识符** token：`while` / `worker` / `handle` / `observe` /
-///   `parallel` / `transaction` —— 它们在 `lexer.rs` 的 `TokenType` 枚举里
-///   **根本不是关键字**（与 `else` 同类，见 `token_text` 的注释），
-///   只能按文本判断。
-///
-/// ⚠ `else` / `then` **不开**层级：`if x then … else … end` 里
-/// 开启方是 `if`，`then` / `else` 只是分隔符。
-fn is_block_opener(tt: &crate::lexer::TokenType) -> bool {
-    use crate::lexer::TokenType;
-    match tt {
-        TokenType::Task
-        | TokenType::For
-        | TokenType::If
-        | TokenType::Match
-        | TokenType::Fn
-        | TokenType::Macro
-        | TokenType::With => true,
-        TokenType::Identifier(s) => matches!(
-            s.as_str(),
-            "while" | "worker" | "handle" | "observe" | "parallel" | "transaction"
-        ),
-        _ => false,
     }
 }
 
@@ -453,7 +734,14 @@ fn token_text(tt: &crate::lexer::TokenType) -> String {
                 s
             }
         }
-        TokenType::TypedFloat(n, dt) => format!("{n}{}", dt.short_name()),
+        TokenType::TypedFloat(n, dt) => {
+            let s = n.to_string();
+            if n.is_finite() && !s.contains(['.', 'e', 'E']) {
+                format!("{s}.0{}", dt.short_name())
+            } else {
+                format!("{s}{}", dt.short_name())
+            }
+        }
         TokenType::Lifetime(s) => format!("'{}'", s),
         // v0.104.6 D202：注释**原样**带出。正文里已经含 `--` 之后的
         // 那个空格（`-- foo` 的正文是 `" foo"`），所以这里只补 `--` 前缀，

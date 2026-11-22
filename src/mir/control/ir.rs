@@ -110,6 +110,8 @@ impl SymbolTable {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum BuiltinFnId {
     Apply,
+    Assert,
+    AssertEq,
     Atom,
     Bool,
     Car,
@@ -159,6 +161,8 @@ impl BuiltinFnId {
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "apply" => Some(Self::Apply),
+            "assert" => Some(Self::Assert),
+            "assert_eq" => Some(Self::AssertEq),
             "atom" => Some(Self::Atom),
             "bool" => Some(Self::Bool),
             "car" => Some(Self::Car),
@@ -209,6 +213,8 @@ impl BuiltinFnId {
     pub fn name(self) -> &'static str {
         match self {
             Self::Apply => "apply",
+            Self::Assert => "assert",
+            Self::AssertEq => "assert_eq",
             Self::Atom => "atom",
             Self::Bool => "bool",
             Self::Car => "car",

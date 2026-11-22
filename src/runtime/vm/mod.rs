@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use crate::error::MoraResult;
 use crate::mir::control::{
-    ControlProgram, GlobalKind, OptLevel, lower_program_with_dyn_globals, optimize_program,
+    ControlProgram, FnId, GlobalKind, OptLevel, lower_program_with_dyn_globals, optimize_program,
 };
 use crate::mir::witness::MirWitness;
 use crate::runtime::CoreRuntime;
@@ -65,6 +65,33 @@ pub fn run_main_task(
     let Some(fn_id) = main_fn_id else {
         return Ok(Value::Nil);
     };
+    let frame = materialize_frame(prog, fn_id, globals, Arc::new(Vec::new()), &[])?;
+    let mut vm = VmEngine::new(core);
+    vm.run_frame(frame)
+}
+
+/// Discover all zero-argument `task test_*()` functions defined in `prog` in declaration order.
+pub(crate) fn list_zero_arg_test_tasks(prog: &ControlProgram) -> Vec<(String, FnId)> {
+    prog.globals
+        .iter()
+        .filter_map(|meta| match meta.kind {
+            GlobalKind::Task(fn_id)
+                if meta.name.starts_with("test_") && prog.func(fn_id).params.is_empty() =>
+            {
+                Some((meta.name.clone(), fn_id))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Execute a specific zero-argument task (`fn_id`) inside `prog` with its initialized `globals`.
+pub(crate) fn run_task_by_id(
+    prog: Arc<ControlProgram>,
+    fn_id: FnId,
+    globals: ModuleGlobals,
+    core: &mut CoreRuntime,
+) -> MoraResult<Value> {
     let frame = materialize_frame(prog, fn_id, globals, Arc::new(Vec::new()), &[])?;
     let mut vm = VmEngine::new(core);
     vm.run_frame(frame)

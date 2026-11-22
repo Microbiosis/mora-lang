@@ -2,9 +2,31 @@
 
 All notable changes to Mora will be documented in this file.
 
-## [0.110.1] — P3 ML 权重标准库（Safetensors / GGUF v3）与零依赖原生异步 TLS 1.2/1.3 & HTTPS
+## [0.110.1] — P3 全栈闭环：GPU VRAM 常驻与原生 f16/bf16 全核、工具链 `mora fmt`/`mora test`、ML 权重标准库与零依赖原生 TLS/HTTPS
 
-在不引入任何外部 Cargo 依赖（保持 `Cargo.toml` / `Cargo.lock` **0 生产依赖 / 0 测试依赖**）的前提下，补齐 AI 模型权重序列化与云原生加密传输两条完整标准库纵深链路。
+在不引入任何外部 Cargo 依赖（保持 `Cargo.toml` / `Cargo.lock` **0 生产依赖 / 0 测试依赖**）的前提下，完成 P3 全部三个子里程碑（P3-A GPU 全栈闭环、P3-B 工具链 CLI 与可运行示例、P3-C ML 权重与原生异步 TLS/HTTPS）。
+
+### GPU 全栈闭环：持久化 VRAM 常驻、原生 `f16`/`bf16` 核与 Vulkan/Metal 全 5 核对等（`tests/p3_gpu_vram_and_kernels.rs`）
+
+- **持久化 `DeviceVramBuffer`、零拷贝 VRAM-to-VRAM 计算图与物理显存 KV 页**：
+  - `DeviceBackend` 新增 `DeviceVramBuffer` trait、`VramTelemetry` 与 5 个 `run_*_vram` 零拷贝显存直派钩子；`TensorStorage` 升级为硬件 GPU 持久化显存常驻 + `host_stale` 懒 D2H 同步 + 原位改写（`fill_`/`add_`/`mul_`）自动回传显存；语言与 HM/LSP/内省新增 `Tensor.is_vram_resident() -> bool`，并在 `Tensor::device_info()` 与 `dag.backend_info()` 实时暴露 `vram_residency`/`vram_live_buffers`/`vram_live_bytes`/`vram_h2d_copies`/`vram_d2h_copies`/`vram_hits`/`native_f16_dispatches`/`native_bf16_dispatches`
+  - 修复 `compute_dag.rs` Pass 2 融合顺序（逆拓扑自顶向下匹配），使 `(X @ W + b).act()` 与 `RMSNorm + Linear + Act` 单遍融合为单个 `FusedLinearAct`/`FusedRmsNormLinear` 节点；链式 GPU DAG 实测 0 中间 H2D/D2H 拷贝
+  - `KVPageAllocator` 为 `cuda:N`/`vulkan:N`/`metal:N` 活跃物理页分配真实 GPU `DeviceVramBuffer` 并在 `free_seq`/`evict_*` 时 RAII 回收，新增 `vram_backed` 与 `vram_bytes_allocated` 统计项
+- **CUDA / Vulkan / Metal 原生 `f16`/`bf16` 核与全 5 核零回退**：
+  - CUDA PTX ISA 7.0 扩展至 **13 套核**：原生 `f64`/`f32`/`f16`/`bf16` `MatMul` 与 `FusedLinearAct`，外加 `mora_cast_to_f64`/`mora_cast_from_f64` 显存内类型转换核，使全部 5 类融合核在 `f64`/`f32`/`f16`/`bf16` 下均 100% 驻留显存执行
+  - 新增纯 Rust SPIR-V 1.0 生成器 `src/runtime/gpu/vulkan_spirv.rs`（零可选扩展），为 Vulkan 后端补齐全部 **6 条管线 / 全 5 类融合核**（含 broadcast 批量 ND `MatMul`、无竞争双元素/线程打包原生 `f16`/`bf16` `FusedLinearAct`、`FusedRmsNormLinear`、`FusedFlashAttention` 与 25 指令 `OpSwitch` 字节码 `FusedElementwise`），彻底消除宿主 `simd_kernels` 回退
+  - Metal 后端升级为持久化 `MetalVramBuffer` + 6 套原生 MSL 核（`f32`/`f16`/`bf16` 线性/批量矩阵乘、`RMSNorm`、`FlashAttention`、`FusedElementwise`）
+
+### 工具链 CLI（`mora fmt` / `mora test`）、一等 `assert`/`assert_eq` 与可运行示例（`tests/p3_cli_fmt_test_and_examples.rs`）
+
+- **`mora fmt [paths...] [--check] [--stdout]`（`src/cli/fmt.rs`）**：
+  - 与 `mora-lsp`（`src/lsp/providers/formatting.rs`）共享单一规范格式化器 `format_mora_source`，升级为地道紧凑排版（调用/成员/泛型/一元运算/`@tag(...)`/`else`/`trait` 签名与严格幂等性，同时完整保留行数、注释、空行与转义不变式），支持文件/目录递归、`--check`、`--stdout` 与 `-` 标准输入管道
+- **`mora test [paths...] [--filter <pat>] [--jobs <N>]`（`src/cli/test_runner.rs`）与一等断言原语**：
+  - 递归发现 `*_test.mora` / `test_*.mora`，经单遍编译与统一 HM 静态校验后，通过自研 `TaskScheduler` 并发隔离执行顶层断言与全部零参 `task test_*()`
+  - 贯通 IR（`BuiltinFnId::{Assert, AssertEq}`）、`MORABC02` 字节码（标签 43/44）、VM、统一 HM 类型检查（`assert(bool, string?)` 与多态 `assert_eq(T, T, string?)`）及 LSP 补全
+- **三大场景可运行 `examples/` 与权重标准库无冲突双导入**：
+  - 新增 `examples/ai_compute_dag_and_autograd.mora`、`examples/ml_weights_safetensors_gguf.mora` 与 `examples/cloud_http_https_mcp.mora`
+  - `std/nn/safetensors` 与 `std/nn/gguf` 补充无冲突前缀导出（`safetensors_*` / `gguf_*`，保留原短名别名），支持单脚本同时导入两模块完成 Safetensors → GGUF 转换与 Q8_0 量化
 
 ### ML 权重标准库与紧凑二进制张量原语（`tests/p3_std_nn_weights.rs`）
 

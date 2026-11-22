@@ -4323,7 +4323,7 @@ impl HMInference {
                 }
                 Ok((Type::String, acc_row))
             }
-            "is_contiguous" | "requires_grad" => {
+            "is_contiguous" | "requires_grad" | "is_vram_resident" => {
                 if !args.is_empty() {
                     return Err(vec![TypeError::ArityMismatch {
                         expected: 0,

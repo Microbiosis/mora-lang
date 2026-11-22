@@ -1,25 +1,36 @@
-//! v0.110.0: Native Vulkan 1.0 C API (`vulkan-1.dll` / `libvulkan.so.1` / `libMoltenVK.dylib`)
-//! Hardware Compute Backend with Pure-Rust SPIR-V 1.0 Shader Generation.
+//! v0.110.1: Native Vulkan 1.0 C API (`vulkan-1.dll` / `libvulkan.so.1` / `libMoltenVK.dylib`)
+//! Hardware Compute Backend with Pure-Rust SPIR-V 1.0 Shader Generation & Persistent VRAM Residency.
 //!
 //! Architecture:
 //! - Zero compile-time Vulkan SDK / `shaderc` / Cargo dependencies: dynamically opens the OS
 //!   Vulkan loader at runtime and enumerates physical GPUs, VRAM heaps, and compute queues.
-//! - Emits a spec-compliant SPIR-V 1.0 `GLCompute` shader directly in pure Rust (`Vec<u32>`)
-//!   implementing fused `Linear + Bias + Activation` (`None`/`Relu`/`Gelu`/`Silu`/`Tanh`/`Sigmoid`)
-//!   and `MatMul` directly on Vulkan `VkDevice` storage buffers via `vkCmdDispatch`.
-//! - Cleanly delegates non-SPIR-V-lowered fused ops to host SIMD while maintaining full hardware
-//!   telemetry and deterministic `Drop` cleanup of all Vulkan handles.
+//! - Compiles 6 spec-compliant SPIR-V 1.0 `GLCompute` pipelines directly in pure Rust
+//!   ([`crate::runtime::gpu::vulkan_spirv`]) covering ALL 5 `DeviceBackend` fused kernels
+//!   (`MatMul` 2D/batched ND, `FusedLinearAct`, `FusedRmsNormLinear`, `FusedFlashAttention`,
+//!   `FusedElementwise`) plus native packed `f16` (`UnpackHalf2x16`/`PackHalf2x16`) and `bf16`
+//!   compute shaders with zero optional Vulkan extensions.
+//! - Owns persistent RAII [`VulkanVramBuffer`] (`VkBuffer` + `VkDeviceMemory`) handles enabling
+//!   zero-copy VRAM-to-VRAM chained compute graph execution.
 
 use std::ffi::{CStr, c_char, c_void};
+use std::fmt;
 use std::ptr;
 use std::sync::Arc;
 
 use crate::common::sync::Mutex;
 
-use crate::common::{DType, Device};
+use crate::common::{
+    DType, Device, bf16_bits_to_f64, f16_bits_to_f64, f64_to_bf16_bits, f64_to_f16_bits,
+};
 use crate::error::{MoraError, MoraResult};
-use crate::runtime::compute_dag::{DeviceBackend, FusedAct, FusedEwStep};
-use crate::runtime::gpu::{DynLib, GpuDeviceInfo, HardwareBackendEntry};
+use crate::runtime::compute_dag::{
+    DeviceBackend, DeviceVramBuffer, FusedAct, FusedEwStep, VramTelemetry,
+};
+use crate::runtime::gpu::vulkan_spirv::{
+    emit_spirv_flash_attention_f32, emit_spirv_fused_elementwise_f32, emit_spirv_fused_linear_f32,
+    emit_spirv_fused_linear_half, emit_spirv_rms_norm_f32,
+};
+use crate::runtime::gpu::{DynLib, GpuDeviceInfo, HardwareBackendEntry, VramCounters};
 use crate::runtime::simd_kernels;
 
 // ── Vulkan 1.0 C ABI handles & constants (`vulkan_core.h`) ───────────────────
@@ -611,498 +622,329 @@ impl Drop for VkInstanceGuard {
     }
 }
 
-// ── Pure-Rust SPIR-V 1.0 Compute Shader Emitter ──────────────────────────────
+// ── Vulkan Compute Pipelines & Persistent VRAM Buffers ──────────────────────
 
-struct SpirvBuilder {
-    words: Vec<u32>,
-    next_id: u32,
-}
-
-impl SpirvBuilder {
-    fn new() -> Self {
-        Self {
-            words: vec![
-                0x0723_0203, // Magic
-                0x0001_0000, // SPIR-V 1.0
-                0x0000_0000, // Generator
-                0,           // Bound (patched on finish)
-                0,           // Schema
-            ],
-            next_id: 1,
-        }
-    }
-
-    fn alloc_id(&mut self) -> u32 {
-        let id = self.next_id;
-        self.next_id += 1;
-        id
-    }
-
-    fn inst(&mut self, opcode: u16, operands: &[u32]) {
-        let word_count = (1 + operands.len()) as u32;
-        self.words.push((word_count << 16) | u32::from(opcode));
-        self.words.extend_from_slice(operands);
-    }
-
-    fn push_str_words(dst: &mut Vec<u32>, s: &str) {
-        let bytes = s.as_bytes();
-        let total = bytes.len() + 1; // include NUL terminator
-        let n_words = total.div_ceil(4);
-        for w in 0..n_words {
-            let mut word = 0u32;
-            for b in 0..4 {
-                let idx = w * 4 + b;
-                let byte = if idx < bytes.len() { bytes[idx] } else { 0 };
-                word |= u32::from(byte) << (b * 8);
-            }
-            dst.push(word);
-        }
-    }
-
-    fn finish(mut self) -> Vec<u32> {
-        self.words[3] = self.next_id;
-        self.words
-    }
-}
-
-/// Emit a valid SPIR-V 1.0 `GLCompute` shader computing:
-/// `Out[row * N + col] = act(sum_{t=0..K} A[row * K + t] * B[t * N + col] + bias)`
-/// Bindings (DescriptorSet 0):
-/// - 0: `A: f32[]`, 1: `B: f32[]`, 2: `Bias: f32[]`, 3: `Out: f32[]`,
-/// - 4: `Params: u32[]` = `[M, N, K, has_bias, bias_len, act_code]`
-///   (`act_code`: `0=None`, `1=Relu`, `2=Gelu`, `3=Silu`, `4=Tanh`, `5=Sigmoid`).
-fn emit_spirv_fused_linear_f32() -> Vec<u32> {
-    const OP_EXT_INST_IMPORT: u16 = 11;
-    const OP_EXT_INST: u16 = 12;
-    const OP_MEMORY_MODEL: u16 = 14;
-    const OP_ENTRY_POINT: u16 = 15;
-    const OP_EXECUTION_MODE: u16 = 16;
-    const OP_CAPABILITY: u16 = 17;
-    const OP_TYPE_VOID: u16 = 19;
-    const OP_TYPE_BOOL: u16 = 20;
-    const OP_TYPE_INT: u16 = 21;
-    const OP_TYPE_FLOAT: u16 = 22;
-    const OP_TYPE_VECTOR: u16 = 23;
-    const OP_TYPE_RUNTIME_ARRAY: u16 = 29;
-    const OP_TYPE_STRUCT: u16 = 30;
-    const OP_TYPE_POINTER: u16 = 32;
-    const OP_TYPE_FUNCTION: u16 = 33;
-    const OP_CONSTANT: u16 = 43;
-    const OP_FUNCTION: u16 = 54;
-    const OP_FUNCTION_END: u16 = 56;
-    const OP_VARIABLE: u16 = 59;
-    const OP_LOAD: u16 = 61;
-    const OP_STORE: u16 = 62;
-    const OP_ACCESS_CHAIN: u16 = 65;
-    const OP_DECORATE: u16 = 71;
-    const OP_MEMBER_DECORATE: u16 = 72;
-    const OP_COMPOSITE_EXTRACT: u16 = 81;
-    const OP_FNEGATE: u16 = 127;
-    const OP_IADD: u16 = 128;
-    const OP_FADD: u16 = 129;
-    const OP_IMUL: u16 = 132;
-    const OP_FMUL: u16 = 133;
-    const OP_FDIV: u16 = 136;
-    const OP_UMOD: u16 = 137;
-    const OP_LOGICAL_AND: u16 = 167;
-    const OP_SELECT: u16 = 169;
-    const OP_IEQUAL: u16 = 170;
-    const OP_INOT_EQUAL: u16 = 171;
-    const OP_ULESS_THAN: u16 = 176;
-    const OP_PHI: u16 = 245;
-    const OP_LOOP_MERGE: u16 = 246;
-    const OP_SELECTION_MERGE: u16 = 247;
-    const OP_LABEL: u16 = 248;
-    const OP_BRANCH: u16 = 249;
-    const OP_BRANCH_CONDITIONAL: u16 = 250;
-    const OP_RETURN: u16 = 253;
-
-    const GLSL_TANH: u32 = 21;
-    const GLSL_EXP: u32 = 27;
-    const GLSL_FMAX: u32 = 40;
-    const GLSL_FCLAMP: u32 = 43;
-
-    const SC_INPUT: u32 = 1;
-    const SC_UNIFORM: u32 = 2;
-
-    const DEC_BUFFER_BLOCK: u32 = 3;
-    const DEC_ARRAY_STRIDE: u32 = 6;
-    const DEC_BUILT_IN: u32 = 11;
-    const DEC_BINDING: u32 = 33;
-    const DEC_DESCRIPTOR_SET: u32 = 34;
-    const DEC_OFFSET: u32 = 35;
-
-    let mut b = SpirvBuilder::new();
-
-    // Capabilities & GLSL.std.450 import
-    b.inst(OP_CAPABILITY, &[1]); // Shader
-    let glsl_ext = b.alloc_id();
-    let mut ext_ops = vec![glsl_ext];
-    SpirvBuilder::push_str_words(&mut ext_ops, "GLSL.std.450");
-    b.inst(OP_EXT_INST_IMPORT, &ext_ops);
-    b.inst(OP_MEMORY_MODEL, &[0, 1]); // Logical, GLSL450
-
-    let main_fn = b.alloc_id();
-    let var_gid = b.alloc_id();
-
-    let mut ep_ops = vec![5, main_fn]; // GLCompute = 5
-    SpirvBuilder::push_str_words(&mut ep_ops, "main");
-    ep_ops.push(var_gid);
-    b.inst(OP_ENTRY_POINT, &ep_ops);
-    b.inst(OP_EXECUTION_MODE, &[main_fn, 17, 16, 16, 1]); // LocalSize = 17
-
-    // Forward-allocate type & variable IDs used in decorations
-    let ty_f32_arr = b.alloc_id();
-    let ty_f32_buf = b.alloc_id();
-    let ty_u32_arr = b.alloc_id();
-    let ty_u32_buf = b.alloc_id();
-    let var_a = b.alloc_id();
-    let var_b = b.alloc_id();
-    let var_bias = b.alloc_id();
-    let var_out = b.alloc_id();
-    let var_params = b.alloc_id();
-
-    // Decorations
-    b.inst(OP_DECORATE, &[var_gid, DEC_BUILT_IN, 28]); // GlobalInvocationId = 28
-    b.inst(OP_DECORATE, &[ty_f32_arr, DEC_ARRAY_STRIDE, 4]);
-    b.inst(OP_DECORATE, &[ty_f32_buf, DEC_BUFFER_BLOCK]);
-    b.inst(OP_MEMBER_DECORATE, &[ty_f32_buf, 0, DEC_OFFSET, 0]);
-    b.inst(OP_DECORATE, &[ty_u32_arr, DEC_ARRAY_STRIDE, 4]);
-    b.inst(OP_DECORATE, &[ty_u32_buf, DEC_BUFFER_BLOCK]);
-    b.inst(OP_MEMBER_DECORATE, &[ty_u32_buf, 0, DEC_OFFSET, 0]);
-    for (binding, var_id) in [
-        (0u32, var_a),
-        (1, var_b),
-        (2, var_bias),
-        (3, var_out),
-        (4, var_params),
-    ] {
-        b.inst(OP_DECORATE, &[var_id, DEC_DESCRIPTOR_SET, 0]);
-        b.inst(OP_DECORATE, &[var_id, DEC_BINDING, binding]);
-    }
-
-    // Types
-    let ty_void = b.alloc_id();
-    b.inst(OP_TYPE_VOID, &[ty_void]);
-    let ty_fn = b.alloc_id();
-    b.inst(OP_TYPE_FUNCTION, &[ty_fn, ty_void]);
-    let ty_bool = b.alloc_id();
-    b.inst(OP_TYPE_BOOL, &[ty_bool]);
-    let ty_u32 = b.alloc_id();
-    b.inst(OP_TYPE_INT, &[ty_u32, 32, 0]);
-    let ty_f32 = b.alloc_id();
-    b.inst(OP_TYPE_FLOAT, &[ty_f32, 32]);
-    let ty_uvec3 = b.alloc_id();
-    b.inst(OP_TYPE_VECTOR, &[ty_uvec3, ty_u32, 3]);
-    let ptr_in_uvec3 = b.alloc_id();
-    b.inst(OP_TYPE_POINTER, &[ptr_in_uvec3, SC_INPUT, ty_uvec3]);
-
-    b.inst(OP_TYPE_RUNTIME_ARRAY, &[ty_f32_arr, ty_f32]);
-    b.inst(OP_TYPE_STRUCT, &[ty_f32_buf, ty_f32_arr]);
-    let ptr_unif_f32_buf = b.alloc_id();
-    b.inst(OP_TYPE_POINTER, &[ptr_unif_f32_buf, SC_UNIFORM, ty_f32_buf]);
-    let ptr_unif_f32 = b.alloc_id();
-    b.inst(OP_TYPE_POINTER, &[ptr_unif_f32, SC_UNIFORM, ty_f32]);
-
-    b.inst(OP_TYPE_RUNTIME_ARRAY, &[ty_u32_arr, ty_u32]);
-    b.inst(OP_TYPE_STRUCT, &[ty_u32_buf, ty_u32_arr]);
-    let ptr_unif_u32_buf = b.alloc_id();
-    b.inst(OP_TYPE_POINTER, &[ptr_unif_u32_buf, SC_UNIFORM, ty_u32_buf]);
-    let ptr_unif_u32 = b.alloc_id();
-    b.inst(OP_TYPE_POINTER, &[ptr_unif_u32, SC_UNIFORM, ty_u32]);
-
-    // Constants
-    let c_u0 = b.alloc_id();
-    b.inst(OP_CONSTANT, &[ty_u32, c_u0, 0]);
-    let c_u1 = b.alloc_id();
-    b.inst(OP_CONSTANT, &[ty_u32, c_u1, 1]);
-    let c_u2 = b.alloc_id();
-    b.inst(OP_CONSTANT, &[ty_u32, c_u2, 2]);
-    let c_u3 = b.alloc_id();
-    b.inst(OP_CONSTANT, &[ty_u32, c_u3, 3]);
-    let c_u4 = b.alloc_id();
-    b.inst(OP_CONSTANT, &[ty_u32, c_u4, 4]);
-    let c_u5 = b.alloc_id();
-    b.inst(OP_CONSTANT, &[ty_u32, c_u5, 5]);
-
-    let c_f0 = b.alloc_id();
-    b.inst(OP_CONSTANT, &[ty_f32, c_f0, 0.0f32.to_bits()]);
-    let c_f1 = b.alloc_id();
-    b.inst(OP_CONSTANT, &[ty_f32, c_f1, 1.0f32.to_bits()]);
-    let c_f05 = b.alloc_id();
-    b.inst(OP_CONSTANT, &[ty_f32, c_f05, 0.5f32.to_bits()]);
-    let c_gelu_a = b.alloc_id();
-    b.inst(OP_CONSTANT, &[ty_f32, c_gelu_a, 0.797_884_6_f32.to_bits()]);
-    let c_gelu_b = b.alloc_id();
-    b.inst(OP_CONSTANT, &[ty_f32, c_gelu_b, 0.044_715_f32.to_bits()]);
-    let c_f_lo = b.alloc_id();
-    b.inst(OP_CONSTANT, &[ty_f32, c_f_lo, (-40.0f32).to_bits()]);
-    let c_f_hi = b.alloc_id();
-    b.inst(OP_CONSTANT, &[ty_f32, c_f_hi, 40.0f32.to_bits()]);
-
-    // Module-scope variables
-    b.inst(OP_VARIABLE, &[ptr_in_uvec3, var_gid, SC_INPUT]);
-    b.inst(OP_VARIABLE, &[ptr_unif_f32_buf, var_a, SC_UNIFORM]);
-    b.inst(OP_VARIABLE, &[ptr_unif_f32_buf, var_b, SC_UNIFORM]);
-    b.inst(OP_VARIABLE, &[ptr_unif_f32_buf, var_bias, SC_UNIFORM]);
-    b.inst(OP_VARIABLE, &[ptr_unif_f32_buf, var_out, SC_UNIFORM]);
-    b.inst(OP_VARIABLE, &[ptr_unif_u32_buf, var_params, SC_UNIFORM]);
-
-    // Function main()
-    b.inst(OP_FUNCTION, &[ty_void, main_fn, 0, ty_fn]);
-    let lbl_entry = b.alloc_id();
-    let lbl_body = b.alloc_id();
-    let lbl_loop_hdr = b.alloc_id();
-    let lbl_loop_body = b.alloc_id();
-    let lbl_loop_cont = b.alloc_id();
-    let lbl_loop_exit = b.alloc_id();
-    let lbl_exit = b.alloc_id();
-
-    b.inst(OP_LABEL, &[lbl_entry]);
-
-    // Load GlobalInvocationId.x (col) & .y (row)
-    let gid_val = b.alloc_id();
-    b.inst(OP_LOAD, &[ty_uvec3, gid_val, var_gid]);
-    let col = b.alloc_id();
-    b.inst(OP_COMPOSITE_EXTRACT, &[ty_u32, col, gid_val, 0]);
-    let row = b.alloc_id();
-    b.inst(OP_COMPOSITE_EXTRACT, &[ty_u32, row, gid_val, 1]);
-
-    // Load Params[0..5] = M, N, K, has_bias, bias_len, act_code
-    let load_param = |b: &mut SpirvBuilder, idx_c: u32| -> u32 {
-        let p = b.alloc_id();
-        b.inst(OP_ACCESS_CHAIN, &[ptr_unif_u32, p, var_params, c_u0, idx_c]);
-        let v = b.alloc_id();
-        b.inst(OP_LOAD, &[ty_u32, v, p]);
-        v
-    };
-    let p_m = load_param(&mut b, c_u0);
-    let p_n = load_param(&mut b, c_u1);
-    let p_k = load_param(&mut b, c_u2);
-    let p_has_bias = load_param(&mut b, c_u3);
-    let p_bias_len = load_param(&mut b, c_u4);
-    let p_act = load_param(&mut b, c_u5);
-
-    let cmp_row = b.alloc_id();
-    b.inst(OP_ULESS_THAN, &[ty_bool, cmp_row, row, p_m]);
-    let cmp_col = b.alloc_id();
-    b.inst(OP_ULESS_THAN, &[ty_bool, cmp_col, col, p_n]);
-    let in_bounds = b.alloc_id();
-    b.inst(OP_LOGICAL_AND, &[ty_bool, in_bounds, cmp_row, cmp_col]);
-    b.inst(OP_SELECTION_MERGE, &[lbl_exit, 0]);
-    b.inst(OP_BRANCH_CONDITIONAL, &[in_bounds, lbl_body, lbl_exit]);
-
-    // Body: row_k = row * K
-    b.inst(OP_LABEL, &[lbl_body]);
-    let row_k = b.alloc_id();
-    b.inst(OP_IMUL, &[ty_u32, row_k, row, p_k]);
-    b.inst(OP_BRANCH, &[lbl_loop_hdr]);
-
-    // Loop header (SSA Phi nodes for t and acc)
-    let t_phi = b.alloc_id();
-    let acc_phi = b.alloc_id();
-    let t_next = b.alloc_id();
-    let acc_next = b.alloc_id();
-
-    b.inst(OP_LABEL, &[lbl_loop_hdr]);
-    b.inst(
-        OP_PHI,
-        &[ty_u32, t_phi, c_u0, lbl_body, t_next, lbl_loop_cont],
-    );
-    b.inst(
-        OP_PHI,
-        &[ty_f32, acc_phi, c_f0, lbl_body, acc_next, lbl_loop_cont],
-    );
-    let loop_cond = b.alloc_id();
-    b.inst(OP_ULESS_THAN, &[ty_bool, loop_cond, t_phi, p_k]);
-    b.inst(OP_LOOP_MERGE, &[lbl_loop_exit, lbl_loop_cont, 0]);
-    b.inst(
-        OP_BRANCH_CONDITIONAL,
-        &[loop_cond, lbl_loop_body, lbl_loop_exit],
-    );
-
-    // Loop body
-    b.inst(OP_LABEL, &[lbl_loop_body]);
-    let a_idx = b.alloc_id();
-    b.inst(OP_IADD, &[ty_u32, a_idx, row_k, t_phi]);
-    let a_ptr = b.alloc_id();
-    b.inst(OP_ACCESS_CHAIN, &[ptr_unif_f32, a_ptr, var_a, c_u0, a_idx]);
-    let a_val = b.alloc_id();
-    b.inst(OP_LOAD, &[ty_f32, a_val, a_ptr]);
-
-    let tn = b.alloc_id();
-    b.inst(OP_IMUL, &[ty_u32, tn, t_phi, p_n]);
-    let b_idx = b.alloc_id();
-    b.inst(OP_IADD, &[ty_u32, b_idx, tn, col]);
-    let b_ptr = b.alloc_id();
-    b.inst(OP_ACCESS_CHAIN, &[ptr_unif_f32, b_ptr, var_b, c_u0, b_idx]);
-    let b_val = b.alloc_id();
-    b.inst(OP_LOAD, &[ty_f32, b_val, b_ptr]);
-
-    let prod = b.alloc_id();
-    b.inst(OP_FMUL, &[ty_f32, prod, a_val, b_val]);
-    b.inst(OP_FADD, &[ty_f32, acc_next, acc_phi, prod]);
-    b.inst(OP_BRANCH, &[lbl_loop_cont]);
-
-    // Loop continue
-    b.inst(OP_LABEL, &[lbl_loop_cont]);
-    b.inst(OP_IADD, &[ty_u32, t_next, t_phi, c_u1]);
-    b.inst(OP_BRANCH, &[lbl_loop_hdr]);
-
-    // After dot product: optional bias + activation
-    b.inst(OP_LABEL, &[lbl_loop_exit]);
-    let bias_idx = b.alloc_id();
-    b.inst(OP_UMOD, &[ty_u32, bias_idx, col, p_bias_len]);
-    let bias_ptr = b.alloc_id();
-    b.inst(
-        OP_ACCESS_CHAIN,
-        &[ptr_unif_f32, bias_ptr, var_bias, c_u0, bias_idx],
-    );
-    let bias_val = b.alloc_id();
-    b.inst(OP_LOAD, &[ty_f32, bias_val, bias_ptr]);
-    let acc_plus_bias = b.alloc_id();
-    b.inst(OP_FADD, &[ty_f32, acc_plus_bias, acc_phi, bias_val]);
-    let has_bias_bool = b.alloc_id();
-    b.inst(OP_INOT_EQUAL, &[ty_bool, has_bias_bool, p_has_bias, c_u0]);
-    let x = b.alloc_id();
-    b.inst(
-        OP_SELECT,
-        &[ty_f32, x, has_bias_bool, acc_plus_bias, acc_phi],
-    );
-
-    // Compute activations cleanly (clamped for exp stability)
-    let v_relu = b.alloc_id();
-    b.inst(OP_EXT_INST, &[ty_f32, v_relu, glsl_ext, GLSL_FMAX, x, c_f0]);
-
-    let neg_x = b.alloc_id();
-    b.inst(OP_FNEGATE, &[ty_f32, neg_x, x]);
-    let neg_x_c = b.alloc_id();
-    b.inst(
-        OP_EXT_INST,
-        &[
-            ty_f32,
-            neg_x_c,
-            glsl_ext,
-            GLSL_FCLAMP,
-            neg_x,
-            c_f_lo,
-            c_f_hi,
-        ],
-    );
-    let exp_neg_x = b.alloc_id();
-    b.inst(
-        OP_EXT_INST,
-        &[ty_f32, exp_neg_x, glsl_ext, GLSL_EXP, neg_x_c],
-    );
-    let one_p_exp = b.alloc_id();
-    b.inst(OP_FADD, &[ty_f32, one_p_exp, c_f1, exp_neg_x]);
-    let v_sig = b.alloc_id();
-    b.inst(OP_FDIV, &[ty_f32, v_sig, c_f1, one_p_exp]);
-    let v_silu = b.alloc_id();
-    b.inst(OP_FMUL, &[ty_f32, v_silu, x, v_sig]);
-
-    let v_tanh = b.alloc_id();
-    b.inst(OP_EXT_INST, &[ty_f32, v_tanh, glsl_ext, GLSL_TANH, x]);
-
-    // GELU = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-    let x2 = b.alloc_id();
-    b.inst(OP_FMUL, &[ty_f32, x2, x, x]);
-    let x3 = b.alloc_id();
-    b.inst(OP_FMUL, &[ty_f32, x3, x2, x]);
-    let cx3 = b.alloc_id();
-    b.inst(OP_FMUL, &[ty_f32, cx3, c_gelu_b, x3]);
-    let inner1 = b.alloc_id();
-    b.inst(OP_FADD, &[ty_f32, inner1, x, cx3]);
-    let inner2 = b.alloc_id();
-    b.inst(OP_FMUL, &[ty_f32, inner2, c_gelu_a, inner1]);
-    let th = b.alloc_id();
-    b.inst(OP_EXT_INST, &[ty_f32, th, glsl_ext, GLSL_TANH, inner2]);
-    let one_p_th = b.alloc_id();
-    b.inst(OP_FADD, &[ty_f32, one_p_th, c_f1, th]);
-    let half_x = b.alloc_id();
-    b.inst(OP_FMUL, &[ty_f32, half_x, c_f05, x]);
-    let v_gelu = b.alloc_id();
-    b.inst(OP_FMUL, &[ty_f32, v_gelu, half_x, one_p_th]);
-
-    // Select final activation value based on act_code (0..=5)
-    let mut cur = x;
-    for (code_c, act_val) in [
-        (c_u1, v_relu),
-        (c_u2, v_gelu),
-        (c_u3, v_silu),
-        (c_u4, v_tanh),
-        (c_u5, v_sig),
-    ] {
-        let eq = b.alloc_id();
-        b.inst(OP_IEQUAL, &[ty_bool, eq, p_act, code_c]);
-        let next = b.alloc_id();
-        b.inst(OP_SELECT, &[ty_f32, next, eq, act_val, cur]);
-        cur = next;
-    }
-
-    // Out[row * N + col] = cur
-    let row_n = b.alloc_id();
-    b.inst(OP_IMUL, &[ty_u32, row_n, row, p_n]);
-    let out_idx = b.alloc_id();
-    b.inst(OP_IADD, &[ty_u32, out_idx, row_n, col]);
-    let out_ptr = b.alloc_id();
-    b.inst(
-        OP_ACCESS_CHAIN,
-        &[ptr_unif_f32, out_ptr, var_out, c_u0, out_idx],
-    );
-    b.inst(OP_STORE, &[out_ptr, cur]);
-    b.inst(OP_BRANCH, &[lbl_exit]);
-
-    b.inst(OP_LABEL, &[lbl_exit]);
-    b.inst(OP_RETURN, &[]);
-    b.inst(OP_FUNCTION_END, &[]);
-
-    b.finish()
-}
-
-struct VulkanState {
-    vk_dev: VkDevice,
-    queue: VkQueue,
+struct VkComputePipe {
     shader: VkShaderModule,
     ds_layout: VkDescriptorSetLayout,
     pipe_layout: VkPipelineLayout,
     pipeline: VkPipeline,
     desc_pool: VkDescriptorPool,
     desc_set: VkDescriptorSet,
+    num_bindings: u32,
+}
+
+impl VkComputePipe {
+    fn create(api: &VulkanApi, vk_dev: VkDevice, spv: &[u32], num_bindings: u32) -> Option<Self> {
+        let smci = VkShaderModuleCreateInfo {
+            s_type: VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+            p_next: ptr::null(),
+            flags: 0,
+            code_size: std::mem::size_of_val(spv),
+            p_code: spv.as_ptr(),
+        };
+        let mut shader: VkShaderModule = 0;
+        // SAFETY: `spv` is a 4-byte aligned valid SPIR-V 1.0 module.
+        if unsafe { (api.create_shader_module)(vk_dev, &smci, ptr::null(), &mut shader) }
+            != VK_SUCCESS
+        {
+            return None;
+        }
+
+        let bindings: Vec<VkDescriptorSetLayoutBinding> = (0..num_bindings)
+            .map(|i| VkDescriptorSetLayoutBinding {
+                binding: i,
+                descriptor_type: VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                descriptor_count: 1,
+                stage_flags: VK_SHADER_STAGE_COMPUTE_BIT,
+                p_immutable_samplers: ptr::null(),
+            })
+            .collect();
+        let dslci = VkDescriptorSetLayoutCreateInfo {
+            s_type: VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            p_next: ptr::null(),
+            flags: 0,
+            binding_count: num_bindings,
+            p_bindings: bindings.as_ptr(),
+        };
+        let mut ds_layout: VkDescriptorSetLayout = 0;
+        // SAFETY: Valid descriptor set layout info on `vk_dev`.
+        if unsafe {
+            (api.create_descriptor_set_layout)(vk_dev, &dslci, ptr::null(), &mut ds_layout)
+        } != VK_SUCCESS
+        {
+            // SAFETY: Clean up shader on failure.
+            unsafe {
+                (api.destroy_shader_module)(vk_dev, shader, ptr::null());
+            }
+            return None;
+        }
+
+        let plci = VkPipelineLayoutCreateInfo {
+            s_type: VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            p_next: ptr::null(),
+            flags: 0,
+            set_layout_count: 1,
+            p_set_layouts: &ds_layout,
+            push_constant_range_count: 0,
+            p_push_constant_ranges: ptr::null(),
+        };
+        let mut pipe_layout: VkPipelineLayout = 0;
+        // SAFETY: Valid pipeline layout referencing `ds_layout`.
+        if unsafe { (api.create_pipeline_layout)(vk_dev, &plci, ptr::null(), &mut pipe_layout) }
+            != VK_SUCCESS
+        {
+            // SAFETY: Clean up previously created handles.
+            unsafe {
+                (api.destroy_descriptor_set_layout)(vk_dev, ds_layout, ptr::null());
+                (api.destroy_shader_module)(vk_dev, shader, ptr::null());
+            }
+            return None;
+        }
+
+        let entry_name = b"main\0";
+        let cpci = VkComputePipelineCreateInfo {
+            s_type: VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+            p_next: ptr::null(),
+            flags: 0,
+            stage: VkPipelineShaderStageCreateInfo {
+                s_type: VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                p_next: ptr::null(),
+                flags: 0,
+                stage: VK_SHADER_STAGE_COMPUTE_BIT,
+                module: shader,
+                p_name: entry_name.as_ptr() as *const c_char,
+                p_specialization_info: ptr::null(),
+            },
+            layout: pipe_layout,
+            base_pipeline_handle: 0,
+            base_pipeline_index: -1,
+        };
+        let mut pipeline: VkPipeline = 0;
+        // SAFETY: Compiles SPIR-V 1.0 compute pipeline on `vk_dev`.
+        if unsafe {
+            (api.create_compute_pipelines)(vk_dev, 0, 1, &cpci, ptr::null(), &mut pipeline)
+        } != VK_SUCCESS
+        {
+            // SAFETY: Clean up on failure.
+            unsafe {
+                (api.destroy_pipeline_layout)(vk_dev, pipe_layout, ptr::null());
+                (api.destroy_descriptor_set_layout)(vk_dev, ds_layout, ptr::null());
+                (api.destroy_shader_module)(vk_dev, shader, ptr::null());
+            }
+            return None;
+        }
+
+        let pool_size = VkDescriptorPoolSize {
+            descriptor_type: VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            descriptor_count: num_bindings,
+        };
+        let dpci = VkDescriptorPoolCreateInfo {
+            s_type: VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            p_next: ptr::null(),
+            flags: 0,
+            max_sets: 1,
+            pool_size_count: 1,
+            p_pool_sizes: &pool_size,
+        };
+        let mut desc_pool: VkDescriptorPool = 0;
+        // SAFETY: Creates descriptor pool for one set of `num_bindings` SSBOs.
+        if unsafe { (api.create_descriptor_pool)(vk_dev, &dpci, ptr::null(), &mut desc_pool) }
+            != VK_SUCCESS
+        {
+            // SAFETY: Clean up on failure.
+            unsafe {
+                (api.destroy_pipeline)(vk_dev, pipeline, ptr::null());
+                (api.destroy_pipeline_layout)(vk_dev, pipe_layout, ptr::null());
+                (api.destroy_descriptor_set_layout)(vk_dev, ds_layout, ptr::null());
+                (api.destroy_shader_module)(vk_dev, shader, ptr::null());
+            }
+            return None;
+        }
+
+        let dsai = VkDescriptorSetAllocateInfo {
+            s_type: VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            p_next: ptr::null(),
+            descriptor_pool: desc_pool,
+            descriptor_set_count: 1,
+            p_set_layouts: &ds_layout,
+        };
+        let mut desc_set: VkDescriptorSet = 0;
+        // SAFETY: Allocates one descriptor set from `desc_pool`.
+        if unsafe { (api.allocate_descriptor_sets)(vk_dev, &dsai, &mut desc_set) } != VK_SUCCESS {
+            // SAFETY: Clean up on failure.
+            unsafe {
+                (api.destroy_descriptor_pool)(vk_dev, desc_pool, ptr::null());
+                (api.destroy_pipeline)(vk_dev, pipeline, ptr::null());
+                (api.destroy_pipeline_layout)(vk_dev, pipe_layout, ptr::null());
+                (api.destroy_descriptor_set_layout)(vk_dev, ds_layout, ptr::null());
+                (api.destroy_shader_module)(vk_dev, shader, ptr::null());
+            }
+            return None;
+        }
+
+        Some(Self {
+            shader,
+            ds_layout,
+            pipe_layout,
+            pipeline,
+            desc_pool,
+            desc_set,
+            num_bindings,
+        })
+    }
+
+    fn destroy(&self, api: &VulkanApi, vk_dev: VkDevice) {
+        // SAFETY: Destroys pipeline resources in reverse creation order while `vk_dev` is idle.
+        unsafe {
+            (api.destroy_descriptor_pool)(vk_dev, self.desc_pool, ptr::null());
+            (api.destroy_pipeline)(vk_dev, self.pipeline, ptr::null());
+            (api.destroy_pipeline_layout)(vk_dev, self.pipe_layout, ptr::null());
+            (api.destroy_descriptor_set_layout)(vk_dev, self.ds_layout, ptr::null());
+            (api.destroy_shader_module)(vk_dev, self.shader, ptr::null());
+        }
+    }
+}
+
+struct VulkanState {
+    vk_dev: VkDevice,
+    queue: VkQueue,
+    pipe_linear_f32: VkComputePipe,
+    pipe_linear_f16: VkComputePipe,
+    pipe_linear_bf16: VkComputePipe,
+    pipe_rms_norm_f32: VkComputePipe,
+    pipe_flash_attn_f32: VkComputePipe,
+    pipe_fused_ew_f32: VkComputePipe,
+    dummy_buf: VkBufferAlloc,
     cmd_pool: VkCommandPool,
     cmd_buf: VkCommandBuffer,
     mem_props: VkPhysicalDeviceMemoryProperties,
 }
 
-/// Live Vulkan 1.0 hardware compute [`DeviceBackend`] dispatching pure-Rust SPIR-V shaders.
-pub(crate) struct VulkanDeviceBackend {
+struct VulkanDeviceInner {
     device: Device,
     _inst_guard: Arc<VkInstanceGuard>,
     api: Arc<VulkanApi>,
-    info: GpuDeviceInfo,
     state: Mutex<VulkanState>,
+    counters: VramCounters,
 }
 
 // SAFETY: All Vulkan device/queue/command-buffer operations are serialized under `self.state.lock()`.
-unsafe impl Send for VulkanDeviceBackend {}
+unsafe impl Send for VulkanDeviceInner {}
 // SAFETY: Shared across tasks via `Mutex<VulkanState>` ensuring external synchronization rules.
-unsafe impl Sync for VulkanDeviceBackend {}
+unsafe impl Sync for VulkanDeviceInner {}
 
-impl Drop for VulkanDeviceBackend {
+impl Drop for VulkanDeviceInner {
     fn drop(&mut self) {
         let st = self.state.lock();
-        // SAFETY: Handles are destroyed in strict reverse creation order before `vkDestroyDevice`.
+        // SAFETY: Handles are destroyed in strict reverse creation order after all
+        // `VulkanVramBuffer`s holding `Arc<VulkanDeviceInner>` have already been dropped.
         unsafe {
             let _ = (self.api.queue_wait_idle)(st.queue);
             (self.api.destroy_command_pool)(st.vk_dev, st.cmd_pool, ptr::null());
-            (self.api.destroy_descriptor_pool)(st.vk_dev, st.desc_pool, ptr::null());
-            (self.api.destroy_pipeline)(st.vk_dev, st.pipeline, ptr::null());
-            (self.api.destroy_pipeline_layout)(st.vk_dev, st.pipe_layout, ptr::null());
-            (self.api.destroy_descriptor_set_layout)(st.vk_dev, st.ds_layout, ptr::null());
-            (self.api.destroy_shader_module)(st.vk_dev, st.shader, ptr::null());
+            (self.api.destroy_buffer)(st.vk_dev, st.dummy_buf.buffer, ptr::null());
+            (self.api.free_memory)(st.vk_dev, st.dummy_buf.memory, ptr::null());
+            st.pipe_fused_ew_f32.destroy(&self.api, st.vk_dev);
+            st.pipe_flash_attn_f32.destroy(&self.api, st.vk_dev);
+            st.pipe_rms_norm_f32.destroy(&self.api, st.vk_dev);
+            st.pipe_linear_bf16.destroy(&self.api, st.vk_dev);
+            st.pipe_linear_f16.destroy(&self.api, st.vk_dev);
+            st.pipe_linear_f32.destroy(&self.api, st.vk_dev);
             (self.api.destroy_device)(st.vk_dev, ptr::null());
         }
     }
+}
+
+/// Owned persistent Vulkan storage buffer (`VkBuffer` + `VkDeviceMemory`) with RAII cleanup.
+struct VulkanVramBuffer {
+    inner: Arc<VulkanDeviceInner>,
+    buffer: VkBuffer,
+    memory: VkDeviceMemory,
+    byte_len: usize,
+}
+
+impl fmt::Debug for VulkanVramBuffer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VulkanVramBuffer")
+            .field("device", &self.inner.device)
+            .field("buffer", &format_args!("0x{:x}", self.buffer))
+            .field("byte_len", &self.byte_len)
+            .finish()
+    }
+}
+
+impl Drop for VulkanVramBuffer {
+    fn drop(&mut self) {
+        let st = self.inner.state.lock();
+        // SAFETY: Serialized under device lock; queue is synchronized after every dispatch.
+        unsafe {
+            (self.inner.api.destroy_buffer)(st.vk_dev, self.buffer, ptr::null());
+            (self.inner.api.free_memory)(st.vk_dev, self.memory, ptr::null());
+        }
+        self.inner.counters.on_free(self.byte_len);
+    }
+}
+
+impl DeviceVramBuffer for VulkanVramBuffer {
+    fn device(&self) -> &Device {
+        &self.inner.device
+    }
+
+    fn byte_len(&self) -> usize {
+        self.byte_len
+    }
+
+    fn raw_handle(&self) -> u64 {
+        self.buffer
+    }
+
+    fn upload_bytes(&self, src: &[u8]) -> MoraResult<()> {
+        if src.len() != self.byte_len {
+            return Err(MoraError::Runtime(format!(
+                "VulkanVramBuffer::upload_bytes: expected {} bytes, got {}",
+                self.byte_len,
+                src.len()
+            )));
+        }
+        if src.is_empty() {
+            return Ok(());
+        }
+        let st = self.inner.state.lock();
+        let alloc = VkBufferAlloc {
+            buffer: self.buffer,
+            memory: self.memory,
+        };
+        VulkanDeviceBackend::write_host_buffer(&self.inner.api, st.vk_dev, &alloc, src)?;
+        self.inner.counters.on_h2d();
+        Ok(())
+    }
+
+    fn download_bytes(&self, dst: &mut [u8]) -> MoraResult<()> {
+        if dst.len() != self.byte_len {
+            return Err(MoraError::Runtime(format!(
+                "VulkanVramBuffer::download_bytes: expected {} bytes, got {}",
+                self.byte_len,
+                dst.len()
+            )));
+        }
+        if dst.is_empty() {
+            return Ok(());
+        }
+        let st = self.inner.state.lock();
+        let alloc = VkBufferAlloc {
+            buffer: self.buffer,
+            memory: self.memory,
+        };
+        VulkanDeviceBackend::read_host_buffer(&self.inner.api, st.vk_dev, &alloc, dst)?;
+        self.inner.counters.on_d2h();
+        Ok(())
+    }
+}
+
+/// Live Vulkan 1.0 hardware compute [`DeviceBackend`] dispatching 6 pure-Rust SPIR-V 1.0 shaders.
+pub(crate) struct VulkanDeviceBackend {
+    inner: Arc<VulkanDeviceInner>,
+    info: GpuDeviceInfo,
 }
 
 struct VkBufferAlloc {
@@ -1124,7 +966,16 @@ impl VulkanDeviceBackend {
         st: &VulkanState,
         size_bytes: usize,
     ) -> MoraResult<VkBufferAlloc> {
-        let alloc_size = size_bytes.max(16) as VkDeviceSize;
+        Self::alloc_host_buffer_raw(api, st.vk_dev, &st.mem_props, size_bytes)
+    }
+
+    fn alloc_host_buffer_raw(
+        api: &VulkanApi,
+        vk_dev: VkDevice,
+        mem_props: &VkPhysicalDeviceMemoryProperties,
+        size_bytes: usize,
+    ) -> MoraResult<VkBufferAlloc> {
+        let alloc_size = size_bytes.max(16).next_multiple_of(4) as VkDeviceSize;
         let bci = VkBufferCreateInfo {
             s_type: VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
             p_next: ptr::null(),
@@ -1137,7 +988,7 @@ impl VulkanDeviceBackend {
         };
         let mut buffer: VkBuffer = 0;
         // SAFETY: Valid `VkBufferCreateInfo` and live `VkDevice`.
-        let rc = unsafe { (api.create_buffer)(st.vk_dev, &bci, ptr::null(), &mut buffer) };
+        let rc = unsafe { (api.create_buffer)(vk_dev, &bci, ptr::null(), &mut buffer) };
         if rc != VK_SUCCESS {
             return Err(MoraError::Runtime(format!(
                 "Vulkan vkCreateBuffer failed: VkResult({rc})"
@@ -1148,14 +999,14 @@ impl VulkanDeviceBackend {
             alignment: 0,
             memory_type_bits: 0,
         };
-        // SAFETY: `buffer` is a valid `VkBuffer` owned by `st.vk_dev`.
+        // SAFETY: `buffer` is a valid `VkBuffer` owned by `vk_dev`.
         unsafe {
-            (api.get_buffer_memory_requirements)(st.vk_dev, buffer, &mut reqs);
+            (api.get_buffer_memory_requirements)(vk_dev, buffer, &mut reqs);
         }
-        let Some(mem_idx) = Self::find_host_mem_type(&st.mem_props, reqs.memory_type_bits) else {
+        let Some(mem_idx) = Self::find_host_mem_type(mem_props, reqs.memory_type_bits) else {
             // SAFETY: Clean up `buffer` on memory type lookup failure.
             unsafe {
-                (api.destroy_buffer)(st.vk_dev, buffer, ptr::null());
+                (api.destroy_buffer)(vk_dev, buffer, ptr::null());
             }
             return Err(MoraError::Runtime(
                 "Vulkan: no HOST_VISIBLE|HOST_COHERENT memory type available".to_string(),
@@ -1169,23 +1020,23 @@ impl VulkanDeviceBackend {
         };
         let mut memory: VkDeviceMemory = 0;
         // SAFETY: Valid `VkMemoryAllocateInfo` matching buffer memory requirements.
-        let rc = unsafe { (api.allocate_memory)(st.vk_dev, &mai, ptr::null(), &mut memory) };
+        let rc = unsafe { (api.allocate_memory)(vk_dev, &mai, ptr::null(), &mut memory) };
         if rc != VK_SUCCESS {
             // SAFETY: Destroy orphan buffer before returning error.
             unsafe {
-                (api.destroy_buffer)(st.vk_dev, buffer, ptr::null());
+                (api.destroy_buffer)(vk_dev, buffer, ptr::null());
             }
             return Err(MoraError::Runtime(format!(
                 "Vulkan vkAllocateMemory failed: VkResult({rc})"
             )));
         }
         // SAFETY: Binds `memory` to `buffer` at offset 0.
-        let rc = unsafe { (api.bind_buffer_memory)(st.vk_dev, buffer, memory, 0) };
+        let rc = unsafe { (api.bind_buffer_memory)(vk_dev, buffer, memory, 0) };
         if rc != VK_SUCCESS {
             // SAFETY: Release both buffer and memory on bind failure.
             unsafe {
-                (api.destroy_buffer)(st.vk_dev, buffer, ptr::null());
-                (api.free_memory)(st.vk_dev, memory, ptr::null());
+                (api.destroy_buffer)(vk_dev, buffer, ptr::null());
+                (api.free_memory)(vk_dev, memory, ptr::null());
             }
             return Err(MoraError::Runtime(format!(
                 "Vulkan vkBindBufferMemory failed: VkResult({rc})"
@@ -1258,80 +1109,61 @@ impl VulkanDeviceBackend {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn dispatch_linear_f32(
+    fn alloc_owned_vram(
         &self,
-        a: &[f32],
-        b: &[f32],
-        bias: &[f32],
-        m: usize,
-        n: usize,
-        k: usize,
-        act_code: u32,
-        out_f32: &mut [f32],
+        st: &VulkanState,
+        byte_len: usize,
+    ) -> MoraResult<Arc<VulkanVramBuffer>> {
+        let alloc = Self::alloc_host_buffer(&self.inner.api, st, byte_len)?;
+        self.inner.counters.on_alloc(byte_len);
+        Ok(Arc::new(VulkanVramBuffer {
+            inner: Arc::clone(&self.inner),
+            buffer: alloc.buffer,
+            memory: alloc.memory,
+            byte_len,
+        }))
+    }
+
+    fn upload_temp_slice<T: Copy>(
+        api: &VulkanApi,
+        st: &VulkanState,
+        temps: &mut Vec<VkBufferAlloc>,
+        data: &[T],
+    ) -> MoraResult<VkBuffer> {
+        let alloc = Self::alloc_host_buffer(api, st, std::mem::size_of_val(data))?;
+        let handle = alloc.buffer;
+        if let Err(e) = Self::write_host_buffer(api, st.vk_dev, &alloc, data) {
+            Self::free_host_buffer(api, st.vk_dev, alloc);
+            return Err(e);
+        }
+        temps.push(alloc);
+        Ok(handle)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_pipe(
+        api: &VulkanApi,
+        st: &VulkanState,
+        pipe: &VkComputePipe,
+        buffers: &[VkBuffer],
+        gx: u32,
+        gy: u32,
+        gz: u32,
     ) -> MoraResult<()> {
-        let st = self.state.lock();
-        let has_bias = if bias.is_empty() { 0u32 } else { 1u32 };
-        let bias_len = bias.len().max(1) as u32;
-        let dummy_bias = [0.0f32];
-        let eff_bias = if bias.is_empty() {
-            &dummy_bias[..]
-        } else {
-            bias
-        };
-        let params: [u32; 6] = [m as u32, n as u32, k as u32, has_bias, bias_len, act_code];
-
-        let mut bufs = Vec::with_capacity(5);
-        let run = (|| -> MoraResult<()> {
-            let buf_a = Self::alloc_host_buffer(&self.api, &st, std::mem::size_of_val(a))?;
-            bufs.push(buf_a);
-            let buf_b = Self::alloc_host_buffer(&self.api, &st, std::mem::size_of_val(b))?;
-            bufs.push(buf_b);
-            let buf_bias =
-                Self::alloc_host_buffer(&self.api, &st, std::mem::size_of_val(eff_bias))?;
-            bufs.push(buf_bias);
-            let buf_out = Self::alloc_host_buffer(&self.api, &st, std::mem::size_of_val(out_f32))?;
-            bufs.push(buf_out);
-            let buf_params =
-                Self::alloc_host_buffer(&self.api, &st, std::mem::size_of_val(&params))?;
-            bufs.push(buf_params);
-
-            Self::write_host_buffer(&self.api, st.vk_dev, &bufs[0], a)?;
-            Self::write_host_buffer(&self.api, st.vk_dev, &bufs[1], b)?;
-            Self::write_host_buffer(&self.api, st.vk_dev, &bufs[2], eff_bias)?;
-            Self::write_host_buffer(&self.api, st.vk_dev, &bufs[4], &params)?;
-
-            let infos: [VkDescriptorBufferInfo; 5] = [
-                VkDescriptorBufferInfo {
-                    buffer: bufs[0].buffer,
-                    offset: 0,
-                    range: VK_WHOLE_SIZE,
-                },
-                VkDescriptorBufferInfo {
-                    buffer: bufs[1].buffer,
-                    offset: 0,
-                    range: VK_WHOLE_SIZE,
-                },
-                VkDescriptorBufferInfo {
-                    buffer: bufs[2].buffer,
-                    offset: 0,
-                    range: VK_WHOLE_SIZE,
-                },
-                VkDescriptorBufferInfo {
-                    buffer: bufs[3].buffer,
-                    offset: 0,
-                    range: VK_WHOLE_SIZE,
-                },
-                VkDescriptorBufferInfo {
-                    buffer: bufs[4].buffer,
-                    offset: 0,
-                    range: VK_WHOLE_SIZE,
-                },
-            ];
-            let writes: [VkWriteDescriptorSet; 5] = std::array::from_fn(|i| VkWriteDescriptorSet {
+        debug_assert_eq!(buffers.len(), pipe.num_bindings as usize);
+        let infos: Vec<VkDescriptorBufferInfo> = buffers
+            .iter()
+            .map(|&buffer| VkDescriptorBufferInfo {
+                buffer,
+                offset: 0,
+                range: VK_WHOLE_SIZE,
+            })
+            .collect();
+        let writes: Vec<VkWriteDescriptorSet> = (0..buffers.len())
+            .map(|i| VkWriteDescriptorSet {
                 s_type: VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                 p_next: ptr::null(),
-                dst_set: st.desc_set,
+                dst_set: pipe.desc_set,
                 dst_binding: i as u32,
                 dst_array_element: 0,
                 descriptor_count: 1,
@@ -1339,94 +1171,276 @@ impl VulkanDeviceBackend {
                 p_image_info: ptr::null(),
                 p_buffer_info: &infos[i],
                 p_texel_buffer_view: ptr::null(),
-            });
-            // SAFETY: All 5 buffers and descriptor set belong to `st.vk_dev`.
-            unsafe {
-                (self.api.update_descriptor_sets)(
-                    st.vk_dev,
-                    writes.len() as u32,
-                    writes.as_ptr(),
-                    0,
-                    ptr::null(),
-                );
-            }
+            })
+            .collect();
+        // SAFETY: Every buffer handle in `buffers` and `pipe.desc_set` belong to `st.vk_dev`.
+        unsafe {
+            (api.update_descriptor_sets)(
+                st.vk_dev,
+                writes.len() as u32,
+                writes.as_ptr(),
+                0,
+                ptr::null(),
+            );
+        }
 
-            let begin = VkCommandBufferBeginInfo {
-                s_type: VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-                p_next: ptr::null(),
-                flags: VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-                p_inheritance_info: ptr::null(),
-            };
-            let gx = (n as u32).div_ceil(16).max(1);
-            let gy = (m as u32).div_ceil(16).max(1);
-            // SAFETY: Command buffer is serialized under `self.state.lock()` and reset before recording.
-            unsafe {
-                let rc = (self.api.reset_command_buffer)(st.cmd_buf, 0);
-                if rc != VK_SUCCESS {
-                    return Err(MoraError::Runtime(format!(
-                        "Vulkan vkResetCommandBuffer failed: VkResult({rc})"
-                    )));
-                }
-                let rc = (self.api.begin_command_buffer)(st.cmd_buf, &begin);
-                if rc != VK_SUCCESS {
-                    return Err(MoraError::Runtime(format!(
-                        "Vulkan vkBeginCommandBuffer failed: VkResult({rc})"
-                    )));
-                }
-                (self.api.cmd_bind_pipeline)(
-                    st.cmd_buf,
-                    VK_PIPELINE_BIND_POINT_COMPUTE,
-                    st.pipeline,
-                );
-                (self.api.cmd_bind_descriptor_sets)(
-                    st.cmd_buf,
-                    VK_PIPELINE_BIND_POINT_COMPUTE,
-                    st.pipe_layout,
-                    0,
-                    1,
-                    &st.desc_set,
-                    0,
-                    ptr::null(),
-                );
-                (self.api.cmd_dispatch)(st.cmd_buf, gx, gy, 1);
-                let rc = (self.api.end_command_buffer)(st.cmd_buf);
-                if rc != VK_SUCCESS {
-                    return Err(MoraError::Runtime(format!(
-                        "Vulkan vkEndCommandBuffer failed: VkResult({rc})"
-                    )));
-                }
-                let submit = VkSubmitInfo {
-                    s_type: VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                    p_next: ptr::null(),
-                    wait_semaphore_count: 0,
-                    p_wait_semaphores: ptr::null(),
-                    p_wait_dst_stage_mask: ptr::null(),
-                    command_buffer_count: 1,
-                    p_command_buffers: &st.cmd_buf,
-                    signal_semaphore_count: 0,
-                    p_signal_semaphores: ptr::null(),
-                };
-                let rc = (self.api.queue_submit)(st.queue, 1, &submit, 0);
-                if rc != VK_SUCCESS {
-                    return Err(MoraError::Runtime(format!(
-                        "Vulkan vkQueueSubmit failed: VkResult({rc})"
-                    )));
-                }
-                let rc = (self.api.queue_wait_idle)(st.queue);
-                if rc != VK_SUCCESS {
-                    return Err(MoraError::Runtime(format!(
-                        "Vulkan vkQueueWaitIdle failed: VkResult({rc})"
-                    )));
-                }
+        let begin = VkCommandBufferBeginInfo {
+            s_type: VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            p_next: ptr::null(),
+            flags: VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+            p_inheritance_info: ptr::null(),
+        };
+        // SAFETY: Command buffer is serialized under `self.inner.state.lock()` and reset before recording.
+        unsafe {
+            let rc = (api.reset_command_buffer)(st.cmd_buf, 0);
+            if rc != VK_SUCCESS {
+                return Err(MoraError::Runtime(format!(
+                    "Vulkan vkResetCommandBuffer failed: VkResult({rc})"
+                )));
             }
-            Self::read_host_buffer(&self.api, st.vk_dev, &bufs[3], out_f32)?;
+            let rc = (api.begin_command_buffer)(st.cmd_buf, &begin);
+            if rc != VK_SUCCESS {
+                return Err(MoraError::Runtime(format!(
+                    "Vulkan vkBeginCommandBuffer failed: VkResult({rc})"
+                )));
+            }
+            (api.cmd_bind_pipeline)(st.cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, pipe.pipeline);
+            (api.cmd_bind_descriptor_sets)(
+                st.cmd_buf,
+                VK_PIPELINE_BIND_POINT_COMPUTE,
+                pipe.pipe_layout,
+                0,
+                1,
+                &pipe.desc_set,
+                0,
+                ptr::null(),
+            );
+            (api.cmd_dispatch)(st.cmd_buf, gx.max(1), gy.max(1), gz.max(1));
+            let rc = (api.end_command_buffer)(st.cmd_buf);
+            if rc != VK_SUCCESS {
+                return Err(MoraError::Runtime(format!(
+                    "Vulkan vkEndCommandBuffer failed: VkResult({rc})"
+                )));
+            }
+            let submit = VkSubmitInfo {
+                s_type: VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                p_next: ptr::null(),
+                wait_semaphore_count: 0,
+                p_wait_semaphores: ptr::null(),
+                p_wait_dst_stage_mask: ptr::null(),
+                command_buffer_count: 1,
+                p_command_buffers: &st.cmd_buf,
+                signal_semaphore_count: 0,
+                p_signal_semaphores: ptr::null(),
+            };
+            let rc = (api.queue_submit)(st.queue, 1, &submit, 0);
+            if rc != VK_SUCCESS {
+                return Err(MoraError::Runtime(format!(
+                    "Vulkan vkQueueSubmit failed: VkResult({rc})"
+                )));
+            }
+            let rc = (api.queue_wait_idle)(st.queue);
+            if rc != VK_SUCCESS {
+                return Err(MoraError::Runtime(format!(
+                    "Vulkan vkQueueWaitIdle failed: VkResult({rc})"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn encode_ew_steps(steps: &[FusedEwStep]) -> (Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>) {
+        let mut ops = Vec::with_capacity(steps.len());
+        let mut arg_a = Vec::with_capacity(steps.len());
+        let mut arg_b = Vec::with_capacity(steps.len());
+        let mut imm_bits = Vec::with_capacity(steps.len());
+        for step in steps {
+            let (op, a, b, im) = match *step {
+                FusedEwStep::Add(a, b) => (0u32, a as u32, b as u32, 0.0f32),
+                FusedEwStep::Sub(a, b) => (1, a as u32, b as u32, 0.0),
+                FusedEwStep::Mul(a, b) => (2, a as u32, b as u32, 0.0),
+                FusedEwStep::Div(a, b) => (3, a as u32, b as u32, 0.0),
+                FusedEwStep::Pow(a, b) => (4, a as u32, b as u32, 0.0),
+                FusedEwStep::AddScalar(a, s) => (5, a as u32, 0, s as f32),
+                FusedEwStep::SubScalar(a, s, rev) => {
+                    (if rev { 7 } else { 6 }, a as u32, 0, s as f32)
+                }
+                FusedEwStep::MulScalar(a, s) => (8, a as u32, 0, s as f32),
+                FusedEwStep::DivScalar(a, s, rev) => {
+                    (if rev { 10 } else { 9 }, a as u32, 0, s as f32)
+                }
+                FusedEwStep::PowScalar(a, s, rev) => {
+                    (if rev { 12 } else { 11 }, a as u32, 0, s as f32)
+                }
+                FusedEwStep::Neg(a) => (13, a as u32, 0, 0.0),
+                FusedEwStep::Relu(a) => (14, a as u32, 0, 0.0),
+                FusedEwStep::Gelu(a) => (15, a as u32, 0, 0.0),
+                FusedEwStep::Silu(a) => (16, a as u32, 0, 0.0),
+                FusedEwStep::Tanh(a) => (17, a as u32, 0, 0.0),
+                FusedEwStep::Sigmoid(a) => (18, a as u32, 0, 0.0),
+                FusedEwStep::Exp(a) => (19, a as u32, 0, 0.0),
+                FusedEwStep::Ln(a) => (20, a as u32, 0, 0.0),
+                FusedEwStep::Sqrt(a) => (21, a as u32, 0, 0.0),
+                FusedEwStep::Sin(a) => (22, a as u32, 0, 0.0),
+                FusedEwStep::Cos(a) => (23, a as u32, 0, 0.0),
+                FusedEwStep::Abs(a) => (24, a as u32, 0, 0.0),
+            };
+            ops.push(op);
+            arg_a.push(a);
+            arg_b.push(b);
+            imm_bits.push(im.to_bits());
+        }
+        (ops, arg_a, arg_b, imm_bits)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_linear_batched_f32_host(
+        &self,
+        a: &[f32],
+        b: &[f32],
+        bias: &[f32],
+        a_bases: &[u32],
+        b_bases: &[u32],
+        batches: usize,
+        m: usize,
+        n: usize,
+        k: usize,
+        act: u32,
+        out_f32: &mut [f32],
+    ) -> MoraResult<()> {
+        let st = self.inner.state.lock();
+        let has_bias = if bias.is_empty() { 0u32 } else { 1u32 };
+        let bias_len = bias.len().max(1) as u32;
+        let params: [u32; 7] = [
+            m as u32,
+            n as u32,
+            k as u32,
+            has_bias,
+            bias_len,
+            act,
+            batches as u32,
+        ];
+        let mut temps = Vec::with_capacity(7);
+        let run = (|| -> MoraResult<()> {
+            let h_a = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, a)?;
+            let h_b = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, b)?;
+            self.inner.counters.on_h2d();
+            self.inner.counters.on_h2d();
+            let h_bias = if bias.is_empty() {
+                st.dummy_buf.buffer
+            } else {
+                self.inner.counters.on_h2d();
+                Self::upload_temp_slice(&self.inner.api, &st, &mut temps, bias)?
+            };
+            let out_alloc =
+                Self::alloc_host_buffer(&self.inner.api, &st, std::mem::size_of_val(out_f32))?;
+            let h_out = out_alloc.buffer;
+            let out_idx = temps.len();
+            temps.push(out_alloc);
+            let h_params = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &params)?;
+            let h_ab = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, a_bases)?;
+            let h_bb = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, b_bases)?;
+
+            Self::dispatch_pipe(
+                &self.inner.api,
+                &st,
+                &st.pipe_linear_f32,
+                &[h_a, h_b, h_bias, h_out, h_params, h_ab, h_bb],
+                (n as u32).div_ceil(16),
+                (m as u32).div_ceil(16),
+                batches as u32,
+            )?;
+            Self::read_host_buffer(&self.inner.api, st.vk_dev, &temps[out_idx], out_f32)?;
+            self.inner.counters.on_d2h();
             Ok(())
         })();
-
-        for alloc in bufs {
-            Self::free_host_buffer(&self.api, st.vk_dev, alloc);
+        for alloc in temps {
+            Self::free_host_buffer(&self.inner.api, st.vk_dev, alloc);
         }
         run
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_linear_batched_half_host(
+        &self,
+        a: &[f64],
+        b: &[f64],
+        bias: &[f64],
+        a_bases: &[u32],
+        b_bases: &[u32],
+        batches: usize,
+        m: usize,
+        n: usize,
+        k: usize,
+        act: u32,
+        is_bf16: bool,
+        out: &mut [f64],
+    ) -> MoraResult<()> {
+        let a_u32 = pack_f64_to_half_u32(a, is_bf16);
+        let b_u32 = pack_f64_to_half_u32(b, is_bf16);
+        let bias_u32 = pack_f64_to_half_u32(bias, is_bf16);
+        let out_words = (batches * m * n).div_ceil(2).max(1);
+        let mut out_u32 = vec![0u32; out_words];
+
+        let st = self.inner.state.lock();
+        let has_bias = if bias.is_empty() { 0u32 } else { 1u32 };
+        let bias_len = bias.len().max(1) as u32;
+        let params: [u32; 7] = [
+            m as u32,
+            n as u32,
+            k as u32,
+            has_bias,
+            bias_len,
+            act,
+            batches as u32,
+        ];
+        let mut temps = Vec::with_capacity(7);
+        let run = (|| -> MoraResult<()> {
+            let h_a = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &a_u32)?;
+            let h_b = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &b_u32)?;
+            self.inner.counters.on_h2d();
+            self.inner.counters.on_h2d();
+            let h_bias = if bias.is_empty() {
+                st.dummy_buf.buffer
+            } else {
+                self.inner.counters.on_h2d();
+                Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &bias_u32)?
+            };
+            let out_alloc =
+                Self::alloc_host_buffer(&self.inner.api, &st, std::mem::size_of_val(&out_u32[..]))?;
+            let h_out = out_alloc.buffer;
+            let out_idx = temps.len();
+            temps.push(out_alloc);
+            let h_params = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &params)?;
+            let h_ab = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, a_bases)?;
+            let h_bb = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, b_bases)?;
+
+            let pipe = if is_bf16 {
+                self.inner.counters.on_bf16_dispatch();
+                &st.pipe_linear_bf16
+            } else {
+                self.inner.counters.on_f16_dispatch();
+                &st.pipe_linear_f16
+            };
+            Self::dispatch_pipe(
+                &self.inner.api,
+                &st,
+                pipe,
+                &[h_a, h_b, h_bias, h_out, h_params, h_ab, h_bb],
+                (out_words as u32).div_ceil(64),
+                1,
+                1,
+            )?;
+            Self::read_host_buffer(&self.inner.api, st.vk_dev, &temps[out_idx], &mut out_u32)?;
+            self.inner.counters.on_d2h();
+            Ok(())
+        })();
+        for alloc in temps {
+            Self::free_host_buffer(&self.inner.api, st.vk_dev, alloc);
+        }
+        run?;
+        unpack_half_u32_to_f64(&out_u32, out, is_bf16);
+        Ok(())
     }
 }
 
@@ -1441,9 +1455,110 @@ fn act_code(act: FusedAct) -> u32 {
     }
 }
 
+fn pack_f64_to_half_u32(vals: &[f64], is_bf16: bool) -> Vec<u32> {
+    let n_words = vals.len().div_ceil(2);
+    let mut words = vec![0u32; n_words];
+    for (i, &v) in vals.iter().enumerate() {
+        let bits = if is_bf16 {
+            f64_to_bf16_bits(v)
+        } else {
+            f64_to_f16_bits(v)
+        };
+        if i.is_multiple_of(2) {
+            words[i / 2] |= u32::from(bits);
+        } else {
+            words[i / 2] |= u32::from(bits) << 16;
+        }
+    }
+    words
+}
+
+fn unpack_half_u32_to_f64(words: &[u32], out: &mut [f64], is_bf16: bool) {
+    for (i, dst) in out.iter_mut().enumerate() {
+        let w = words[i / 2];
+        let bits = if i.is_multiple_of(2) {
+            (w & 0xffff) as u16
+        } else {
+            (w >> 16) as u16
+        };
+        *dst = if is_bf16 {
+            bf16_bits_to_f64(bits)
+        } else {
+            f16_bits_to_f64(bits)
+        };
+    }
+}
+
+fn broadcast_batch_shapes(a: &[usize], b: &[usize]) -> MoraResult<Vec<usize>> {
+    let rank = a.len().max(b.len());
+    let mut out = vec![1usize; rank];
+    for i in 0..rank {
+        let da = if i < rank - a.len() {
+            1
+        } else {
+            a[i - (rank - a.len())]
+        };
+        let db = if i < rank - b.len() {
+            1
+        } else {
+            b[i - (rank - b.len())]
+        };
+        if da == db {
+            out[i] = da;
+        } else if da == 1 {
+            out[i] = db;
+        } else if db == 1 {
+            out[i] = da;
+        } else {
+            return Err(MoraError::Runtime(format!(
+                "Vulkan broadcast batch shape mismatch: {a:?} vs {b:?}"
+            )));
+        }
+    }
+    Ok(out)
+}
+
+fn map_broadcast_batch(flat_idx: usize, out_batch: &[usize], in_batch: &[usize]) -> usize {
+    if in_batch.is_empty() {
+        return 0;
+    }
+    let out_rank = out_batch.len();
+    let in_rank = in_batch.len();
+    let mut rem = flat_idx;
+    let mut in_flat = 0usize;
+    let mut in_stride = 1usize;
+    for d in (0..out_rank).rev() {
+        let dim = out_batch[d];
+        let coord = rem % dim;
+        rem /= dim;
+        let offset_from_right = out_rank - 1 - d;
+        if offset_from_right < in_rank {
+            let in_dim = in_batch[in_rank - 1 - offset_from_right];
+            let in_coord = if in_dim == 1 { 0 } else { coord };
+            in_flat += in_coord * in_stride;
+            in_stride *= in_dim;
+        }
+    }
+    in_flat
+}
+
+fn compute_broadcast_strides_u32(in_shape: &[usize], out_shape: &[usize]) -> Vec<u32> {
+    let ndim = out_shape.len();
+    let mut raw_strides = vec![1u32; in_shape.len()];
+    for i in (0..in_shape.len().saturating_sub(1)).rev() {
+        raw_strides[i] = raw_strides[i + 1] * (in_shape[i + 1] as u32);
+    }
+    let mut out = vec![0u32; ndim];
+    let pad = ndim.saturating_sub(in_shape.len());
+    for (i, &dim) in in_shape.iter().enumerate() {
+        out[pad + i] = if dim == 1 { 0 } else { raw_strides[i] };
+    }
+    out
+}
+
 impl DeviceBackend for VulkanDeviceBackend {
     fn kind(&self) -> Device {
-        self.device.clone()
+        self.inner.device.clone()
     }
 
     fn name(&self) -> &str {
@@ -1451,7 +1566,7 @@ impl DeviceBackend for VulkanDeviceBackend {
     }
 
     fn simd_isa(&self) -> &'static str {
-        "spirv-1.0-f32"
+        "spirv-1.0-f32/f16/bf16"
     }
 
     fn worker_threads(&self) -> usize {
@@ -1460,6 +1575,540 @@ impl DeviceBackend for VulkanDeviceBackend {
 
     fn is_available(&self) -> bool {
         true
+    }
+
+    fn supports_vram_residency(&self) -> bool {
+        true
+    }
+
+    fn alloc_vram_buffer(&self, byte_len: usize) -> MoraResult<Option<Arc<dyn DeviceVramBuffer>>> {
+        let st = self.inner.state.lock();
+        let buf = self.alloc_owned_vram(&st, byte_len)?;
+        Ok(Some(buf))
+    }
+
+    fn vram_telemetry(&self) -> VramTelemetry {
+        self.inner.counters.snapshot()
+    }
+
+    fn run_matmul_vram(
+        &self,
+        a: &dyn DeviceVramBuffer,
+        b: &dyn DeviceVramBuffer,
+        a_shape: &[usize],
+        b_shape: &[usize],
+        dtype: DType,
+    ) -> MoraResult<Option<Arc<dyn DeviceVramBuffer>>> {
+        if a_shape.len() < 2
+            || b_shape.len() < 2
+            || !matches!(dtype, DType::F32 | DType::F16 | DType::BF16)
+        {
+            return Ok(None);
+        }
+        let m = a_shape[a_shape.len() - 2];
+        let k = a_shape[a_shape.len() - 1];
+        let k2 = b_shape[b_shape.len() - 2];
+        let n = b_shape[b_shape.len() - 1];
+        if k != k2 {
+            return Err(MoraError::Runtime(format!(
+                "Vulkan MatMul inner dim mismatch: {k} != {k2}"
+            )));
+        }
+        let a_batch = &a_shape[..a_shape.len() - 2];
+        let b_batch = &b_shape[..b_shape.len() - 2];
+        let out_batch = broadcast_batch_shapes(a_batch, b_batch)?;
+        let batches = out_batch.iter().copied().product::<usize>().max(1);
+        let out_numel = batches * m * n;
+        if out_numel == 0 || k == 0 {
+            return Ok(None);
+        }
+        let a_bases: Vec<u32> = (0..batches)
+            .map(|bi| (map_broadcast_batch(bi, &out_batch, a_batch) * m * k) as u32)
+            .collect();
+        let b_bases: Vec<u32> = (0..batches)
+            .map(|bi| (map_broadcast_batch(bi, &out_batch, b_batch) * k * n) as u32)
+            .collect();
+        let params: [u32; 7] = [m as u32, n as u32, k as u32, 0, 1, 0, batches as u32];
+
+        let st = self.inner.state.lock();
+        let out_buf = self.alloc_owned_vram(&st, dtype.storage_bytes(out_numel))?;
+        let mut temps = Vec::with_capacity(3);
+        let run = (|| -> MoraResult<()> {
+            let h_params = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &params)?;
+            let h_ab = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &a_bases)?;
+            let h_bb = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &b_bases)?;
+            let bufs = [
+                a.raw_handle(),
+                b.raw_handle(),
+                st.dummy_buf.buffer,
+                out_buf.buffer,
+                h_params,
+                h_ab,
+                h_bb,
+            ];
+            match dtype {
+                DType::F32 => Self::dispatch_pipe(
+                    &self.inner.api,
+                    &st,
+                    &st.pipe_linear_f32,
+                    &bufs,
+                    (n as u32).div_ceil(16),
+                    (m as u32).div_ceil(16),
+                    batches as u32,
+                ),
+                DType::F16 => {
+                    self.inner.counters.on_f16_dispatch();
+                    Self::dispatch_pipe(
+                        &self.inner.api,
+                        &st,
+                        &st.pipe_linear_f16,
+                        &bufs,
+                        (out_numel.div_ceil(2) as u32).div_ceil(64),
+                        1,
+                        1,
+                    )
+                }
+                DType::BF16 => {
+                    self.inner.counters.on_bf16_dispatch();
+                    Self::dispatch_pipe(
+                        &self.inner.api,
+                        &st,
+                        &st.pipe_linear_bf16,
+                        &bufs,
+                        (out_numel.div_ceil(2) as u32).div_ceil(64),
+                        1,
+                        1,
+                    )
+                }
+                _ => unreachable!(),
+            }
+        })();
+        for alloc in temps {
+            Self::free_host_buffer(&self.inner.api, st.vk_dev, alloc);
+        }
+        run?;
+        self.inner.counters.on_vram_hit();
+        Ok(Some(out_buf))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_fused_linear_act_vram(
+        &self,
+        x: &dyn DeviceVramBuffer,
+        w: &dyn DeviceVramBuffer,
+        bias: Option<(&dyn DeviceVramBuffer, &[usize])>,
+        act: FusedAct,
+        m_total: usize,
+        k: usize,
+        n: usize,
+        _out_shape: &[usize],
+        dtype: DType,
+    ) -> MoraResult<Option<Arc<dyn DeviceVramBuffer>>> {
+        if !matches!(dtype, DType::F32 | DType::F16 | DType::BF16) || m_total * n == 0 {
+            return Ok(None);
+        }
+        let (h_bias_opt, has_bias, bias_len) = match bias {
+            None => (None, 0u32, 1u32),
+            Some((vb, bshape)) => {
+                let b_elems = bshape.iter().copied().product::<usize>().max(1);
+                if b_elems == n || b_elems == 1 {
+                    (Some(vb.raw_handle()), 1u32, b_elems as u32)
+                } else {
+                    return Ok(None);
+                }
+            }
+        };
+        let out_numel = m_total * n;
+        let params: [u32; 7] = [
+            m_total as u32,
+            n as u32,
+            k as u32,
+            has_bias,
+            bias_len,
+            act_code(act),
+            1,
+        ];
+        let zero_base = [0u32];
+
+        let st = self.inner.state.lock();
+        let out_buf = self.alloc_owned_vram(&st, dtype.storage_bytes(out_numel))?;
+        let mut temps = Vec::with_capacity(3);
+        let run = (|| -> MoraResult<()> {
+            let h_params = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &params)?;
+            let h_ab = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &zero_base)?;
+            let h_bb = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &zero_base)?;
+            let bufs = [
+                x.raw_handle(),
+                w.raw_handle(),
+                h_bias_opt.unwrap_or(st.dummy_buf.buffer),
+                out_buf.buffer,
+                h_params,
+                h_ab,
+                h_bb,
+            ];
+            match dtype {
+                DType::F32 => Self::dispatch_pipe(
+                    &self.inner.api,
+                    &st,
+                    &st.pipe_linear_f32,
+                    &bufs,
+                    (n as u32).div_ceil(16),
+                    (m_total as u32).div_ceil(16),
+                    1,
+                ),
+                DType::F16 => {
+                    self.inner.counters.on_f16_dispatch();
+                    Self::dispatch_pipe(
+                        &self.inner.api,
+                        &st,
+                        &st.pipe_linear_f16,
+                        &bufs,
+                        (out_numel.div_ceil(2) as u32).div_ceil(64),
+                        1,
+                        1,
+                    )
+                }
+                DType::BF16 => {
+                    self.inner.counters.on_bf16_dispatch();
+                    Self::dispatch_pipe(
+                        &self.inner.api,
+                        &st,
+                        &st.pipe_linear_bf16,
+                        &bufs,
+                        (out_numel.div_ceil(2) as u32).div_ceil(64),
+                        1,
+                        1,
+                    )
+                }
+                _ => unreachable!(),
+            }
+        })();
+        for alloc in temps {
+            Self::free_host_buffer(&self.inner.api, st.vk_dev, alloc);
+        }
+        run?;
+        self.inner.counters.on_vram_hit();
+        Ok(Some(out_buf))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_fused_rms_norm_linear_vram(
+        &self,
+        x: &dyn DeviceVramBuffer,
+        eps: f64,
+        gamma: Option<(&dyn DeviceVramBuffer, &[usize])>,
+        w: &dyn DeviceVramBuffer,
+        bias: Option<(&dyn DeviceVramBuffer, &[usize])>,
+        act: FusedAct,
+        m_total: usize,
+        k: usize,
+        n: usize,
+        _x_shape: &[usize],
+        _out_shape: &[usize],
+        dtype: DType,
+    ) -> MoraResult<Option<Arc<dyn DeviceVramBuffer>>> {
+        if dtype != DType::F32 || m_total * n == 0 || k == 0 {
+            return Ok(None);
+        }
+        let (h_gamma_opt, has_gamma, gamma_len) = match gamma {
+            None => (None, 0u32, 1u32),
+            Some((vg, gshape)) => {
+                let g_elems = gshape.iter().copied().product::<usize>().max(1);
+                if g_elems == k || g_elems == 1 {
+                    (Some(vg.raw_handle()), 1u32, g_elems as u32)
+                } else {
+                    return Ok(None);
+                }
+            }
+        };
+        let (h_bias_opt, has_bias, bias_len) = match bias {
+            None => (None, 0u32, 1u32),
+            Some((vb, bshape)) => {
+                let b_elems = bshape.iter().copied().product::<usize>().max(1);
+                if b_elems == n || b_elems == 1 {
+                    (Some(vb.raw_handle()), 1u32, b_elems as u32)
+                } else {
+                    return Ok(None);
+                }
+            }
+        };
+
+        let rms_params: [u32; 5] = [
+            m_total as u32,
+            k as u32,
+            has_gamma,
+            gamma_len,
+            (eps as f32).to_bits(),
+        ];
+        let lin_params: [u32; 7] = [
+            m_total as u32,
+            n as u32,
+            k as u32,
+            has_bias,
+            bias_len,
+            act_code(act),
+            1,
+        ];
+        let zero_base = [0u32];
+
+        let st = self.inner.state.lock();
+        let out_buf = self.alloc_owned_vram(&st, m_total * n * 4)?;
+        let mut temps = Vec::with_capacity(5);
+        let run = (|| -> MoraResult<()> {
+            let xnorm_alloc = Self::alloc_host_buffer(&self.inner.api, &st, m_total * k * 4)?;
+            let h_xnorm = xnorm_alloc.buffer;
+            temps.push(xnorm_alloc);
+            let h_rms_p = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &rms_params)?;
+            Self::dispatch_pipe(
+                &self.inner.api,
+                &st,
+                &st.pipe_rms_norm_f32,
+                &[
+                    x.raw_handle(),
+                    h_gamma_opt.unwrap_or(st.dummy_buf.buffer),
+                    h_xnorm,
+                    h_rms_p,
+                ],
+                (m_total as u32).div_ceil(64),
+                1,
+                1,
+            )?;
+
+            let h_lin_p = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &lin_params)?;
+            let h_ab = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &zero_base)?;
+            let h_bb = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &zero_base)?;
+            Self::dispatch_pipe(
+                &self.inner.api,
+                &st,
+                &st.pipe_linear_f32,
+                &[
+                    h_xnorm,
+                    w.raw_handle(),
+                    h_bias_opt.unwrap_or(st.dummy_buf.buffer),
+                    out_buf.buffer,
+                    h_lin_p,
+                    h_ab,
+                    h_bb,
+                ],
+                (n as u32).div_ceil(16),
+                (m_total as u32).div_ceil(16),
+                1,
+            )
+        })();
+        for alloc in temps {
+            Self::free_host_buffer(&self.inner.api, st.vk_dev, alloc);
+        }
+        run?;
+        self.inner.counters.on_vram_hit();
+        Ok(Some(out_buf))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_fused_flash_attention_vram(
+        &self,
+        q: &dyn DeviceVramBuffer,
+        k: &dyn DeviceVramBuffer,
+        v: &dyn DeviceVramBuffer,
+        mask: Option<(&dyn DeviceVramBuffer, &[usize])>,
+        q_shape: &[usize],
+        k_shape: &[usize],
+        v_shape: &[usize],
+        out_shape: &[usize],
+        scale: f64,
+        k_is_transposed: bool,
+        dtype: DType,
+    ) -> MoraResult<Option<Arc<dyn DeviceVramBuffer>>> {
+        if dtype != DType::F32 || q_shape.len() < 2 || k_shape.len() < 2 || v_shape.len() < 2 {
+            return Ok(None);
+        }
+        let s_q = q_shape[q_shape.len() - 2];
+        let d_k = q_shape[q_shape.len() - 1];
+        let (s_k, k_d) = if k_is_transposed {
+            (k_shape[k_shape.len() - 1], k_shape[k_shape.len() - 2])
+        } else {
+            (k_shape[k_shape.len() - 2], k_shape[k_shape.len() - 1])
+        };
+        let d_v = v_shape[v_shape.len() - 1];
+        if d_k != k_d || s_k != v_shape[v_shape.len() - 2] {
+            return Err(MoraError::Runtime(format!(
+                "Vulkan FlashAttention shape mismatch: Q={q_shape:?}, K={k_shape:?}, V={v_shape:?}"
+            )));
+        }
+        let batch_q = &q_shape[..q_shape.len() - 2];
+        let batch_k = &k_shape[..k_shape.len() - 2];
+        let batch_v = &v_shape[..v_shape.len() - 2];
+        let batch_out = &out_shape[..out_shape.len() - 2];
+        let batches = batch_out.iter().copied().product::<usize>().max(1);
+        let out_numel = batches * s_q * d_v;
+        if out_numel == 0 {
+            return Ok(None);
+        }
+
+        let q_bases: Vec<u32> = (0..batches)
+            .map(|b| (map_broadcast_batch(b, batch_out, batch_q) * s_q * d_k) as u32)
+            .collect();
+        let k_bases: Vec<u32> = (0..batches)
+            .map(|b| (map_broadcast_batch(b, batch_out, batch_k) * s_k * d_k) as u32)
+            .collect();
+        let v_bases: Vec<u32> = (0..batches)
+            .map(|b| (map_broadcast_batch(b, batch_out, batch_v) * s_k * d_v) as u32)
+            .collect();
+        let (h_mask_opt, mask_bases, mask_sq_s, mask_sk_s, has_mask) =
+            if let Some((vm, mshape)) = mask {
+                let mrank = mshape.len();
+                let m_sk = *mshape.last().unwrap_or(&1);
+                let m_sq = if mrank >= 2 { mshape[mrank - 2] } else { 1 };
+                let mbatch = if mrank >= 2 {
+                    &mshape[..mrank - 2]
+                } else {
+                    &[]
+                };
+                let sq_s = if m_sq == 1 { 0 } else { m_sk as u32 };
+                let sk_s = if m_sk == 1 { 0 } else { 1u32 };
+                let mb: Vec<u32> = (0..batches)
+                    .map(|b| (map_broadcast_batch(b, batch_out, mbatch) * m_sq * m_sk) as u32)
+                    .collect();
+                (Some(vm.raw_handle()), mb, sq_s, sk_s, 1u32)
+            } else {
+                (None, vec![0u32; batches], 0u32, 0u32, 0u32)
+            };
+
+        let params: [u32; 10] = [
+            batches as u32,
+            s_q as u32,
+            s_k as u32,
+            d_k as u32,
+            d_v as u32,
+            u32::from(k_is_transposed),
+            has_mask,
+            mask_sq_s,
+            mask_sk_s,
+            (scale as f32).to_bits(),
+        ];
+
+        let st = self.inner.state.lock();
+        let out_buf = self.alloc_owned_vram(&st, out_numel * 4)?;
+        let mut temps = Vec::with_capacity(5);
+        let run = (|| -> MoraResult<()> {
+            let h_qb = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &q_bases)?;
+            let h_kb = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &k_bases)?;
+            let h_vb = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &v_bases)?;
+            let h_mb = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &mask_bases)?;
+            let h_p = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &params)?;
+            Self::dispatch_pipe(
+                &self.inner.api,
+                &st,
+                &st.pipe_flash_attn_f32,
+                &[
+                    q.raw_handle(),
+                    k.raw_handle(),
+                    v.raw_handle(),
+                    h_mask_opt.unwrap_or(st.dummy_buf.buffer),
+                    out_buf.buffer,
+                    h_qb,
+                    h_kb,
+                    h_vb,
+                    h_mb,
+                    h_p,
+                ],
+                (d_v as u32).div_ceil(16),
+                (s_q as u32).div_ceil(16),
+                batches as u32,
+            )
+        })();
+        for alloc in temps {
+            Self::free_host_buffer(&self.inner.api, st.vk_dev, alloc);
+        }
+        run?;
+        self.inner.counters.on_vram_hit();
+        Ok(Some(out_buf))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_fused_elementwise_vram(
+        &self,
+        inputs: &[&dyn DeviceVramBuffer],
+        input_shapes: &[&[usize]],
+        steps: &[FusedEwStep],
+        out_shape: &[usize],
+        out_numel: usize,
+        dtype: DType,
+    ) -> MoraResult<Option<Arc<dyn DeviceVramBuffer>>> {
+        let total_slots = inputs.len() + steps.len();
+        if dtype != DType::F32
+            || out_numel == 0
+            || steps.is_empty()
+            || inputs.is_empty()
+            || inputs.len() > 4
+            || total_slots > 64
+            || out_shape.len() > 16
+        {
+            return Ok(None);
+        }
+        let eff_out_shape: Vec<usize> = if out_shape.is_empty() {
+            vec![1]
+        } else {
+            out_shape.to_vec()
+        };
+        let ndim = eff_out_shape.len();
+        let out_shape_u32: Vec<u32> = eff_out_shape.iter().map(|&d| d as u32).collect();
+        let mut all_strides: Vec<u32> = Vec::with_capacity(input_shapes.len() * ndim);
+        for s in input_shapes {
+            all_strides.extend(compute_broadcast_strides_u32(s, &eff_out_shape));
+        }
+        let (ops, arg_a, arg_b, imm_bits) = Self::encode_ew_steps(steps);
+        let mut meta = Vec::with_capacity(5 + steps.len() + inputs.len());
+        meta.push(ndim as u32);
+        meta.push(inputs.len() as u32);
+        meta.push(steps.len() as u32);
+        meta.push(out_numel as u32);
+        meta.push(0u32); // packed_mode = 0 (direct VkBuffer bindings)
+        meta.extend_from_slice(&imm_bits);
+        meta.resize(meta.len() + inputs.len(), 0);
+
+        let st = self.inner.state.lock();
+        let out_buf = self.alloc_owned_vram(&st, out_numel * 4)?;
+        let mut temps = Vec::with_capacity(6);
+        let run = (|| -> MoraResult<()> {
+            let h_st = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &all_strides)?;
+            let h_os = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &out_shape_u32)?;
+            let h_op = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &ops)?;
+            let h_aa = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &arg_a)?;
+            let h_ab = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &arg_b)?;
+            let h_mt = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &meta)?;
+            let in_h = |i: usize| {
+                inputs
+                    .get(i)
+                    .map_or(st.dummy_buf.buffer, |b| b.raw_handle())
+            };
+            Self::dispatch_pipe(
+                &self.inner.api,
+                &st,
+                &st.pipe_fused_ew_f32,
+                &[
+                    out_buf.buffer,
+                    in_h(0),
+                    in_h(1),
+                    in_h(2),
+                    in_h(3),
+                    h_st,
+                    h_os,
+                    h_op,
+                    h_aa,
+                    h_ab,
+                    h_mt,
+                ],
+                (out_numel as u32).div_ceil(64),
+                1,
+                1,
+            )
+        })();
+        for alloc in temps {
+            Self::free_host_buffer(&self.inner.api, st.vk_dev, alloc);
+        }
+        run?;
+        self.inner.counters.on_vram_hit();
+        Ok(Some(out_buf))
     }
 
     fn run_matmul_into(
@@ -1471,7 +2120,7 @@ impl DeviceBackend for VulkanDeviceBackend {
         dtype: DType,
         out: &mut Vec<f64>,
     ) -> MoraResult<()> {
-        if a_shape.len() != 2 || b_shape.len() != 2 {
+        if a_shape.len() < 2 || b_shape.len() < 2 {
             simd_kernels::matmul_simd_into(a, b, a_shape, b_shape, out)?;
             if dtype != DType::F64 {
                 for v in out.iter_mut() {
@@ -1480,25 +2129,65 @@ impl DeviceBackend for VulkanDeviceBackend {
             }
             return Ok(());
         }
-        let m = a_shape[0];
-        let k = a_shape[1];
-        let k2 = b_shape[0];
-        let n = b_shape[1];
+        let m = a_shape[a_shape.len() - 2];
+        let k = a_shape[a_shape.len() - 1];
+        let k2 = b_shape[b_shape.len() - 2];
+        let n = b_shape[b_shape.len() - 1];
         if k != k2 {
             return Err(MoraError::Runtime(format!(
                 "Vulkan MatMul inner dim mismatch: {k} != {k2}"
             )));
         }
-        let out_numel = m * n;
+        let a_batch = &a_shape[..a_shape.len() - 2];
+        let b_batch = &b_shape[..b_shape.len() - 2];
+        let out_batch = broadcast_batch_shapes(a_batch, b_batch)?;
+        let batches = out_batch.iter().copied().product::<usize>().max(1);
+        let out_numel = batches * m * n;
         out.resize(out_numel, 0.0);
         if out_numel == 0 || k == 0 {
             out.fill(0.0);
             return Ok(());
         }
+        let a_bases: Vec<u32> = (0..batches)
+            .map(|bi| (map_broadcast_batch(bi, &out_batch, a_batch) * m * k) as u32)
+            .collect();
+        let b_bases: Vec<u32> = (0..batches)
+            .map(|bi| (map_broadcast_batch(bi, &out_batch, b_batch) * k * n) as u32)
+            .collect();
+
+        if matches!(dtype, DType::F16 | DType::BF16) {
+            return self.dispatch_linear_batched_half_host(
+                a,
+                b,
+                &[],
+                &a_bases,
+                &b_bases,
+                batches,
+                m,
+                n,
+                k,
+                0,
+                dtype == DType::BF16,
+                out,
+            );
+        }
+
         let a_f32: Vec<f32> = a.iter().map(|&v| v as f32).collect();
         let b_f32: Vec<f32> = b.iter().map(|&v| v as f32).collect();
         let mut out_f32 = vec![0.0f32; out_numel];
-        self.dispatch_linear_f32(&a_f32, &b_f32, &[], m, n, k, 0, &mut out_f32)?;
+        self.dispatch_linear_batched_f32_host(
+            &a_f32,
+            &b_f32,
+            &[],
+            &a_bases,
+            &b_bases,
+            batches,
+            m,
+            n,
+            k,
+            0,
+            &mut out_f32,
+        )?;
         for (dst, &v) in out.iter_mut().zip(out_f32.iter()) {
             *dst = dtype.quantize_f64(f64::from(v));
         }
@@ -1524,11 +2213,9 @@ impl DeviceBackend for VulkanDeviceBackend {
         if out_numel == 0 {
             return Ok(());
         }
-        let bias_f32 = match bias {
-            None => Vec::new(),
-            Some((bvals, _)) if bvals.len() == n || bvals.len() == 1 => {
-                bvals.iter().map(|&v| v as f32).collect()
-            }
+        let bias_slice = match bias {
+            None => &[][..],
+            Some((bvals, _)) if bvals.len() == n || bvals.len() == 1 => bvals,
             Some(_) => {
                 simd_kernels::fused_linear_act_into(
                     x, w, bias, act, m_total, k, n, out_shape, dtype, out,
@@ -1536,13 +2223,34 @@ impl DeviceBackend for VulkanDeviceBackend {
                 return Ok(());
             }
         };
+        let zero_base = [0u32];
+        if matches!(dtype, DType::F16 | DType::BF16) {
+            return self.dispatch_linear_batched_half_host(
+                x,
+                w,
+                bias_slice,
+                &zero_base,
+                &zero_base,
+                1,
+                m_total,
+                n,
+                k,
+                act_code(act),
+                dtype == DType::BF16,
+                out,
+            );
+        }
         let x_f32: Vec<f32> = x.iter().map(|&v| v as f32).collect();
         let w_f32: Vec<f32> = w.iter().map(|&v| v as f32).collect();
+        let bias_f32: Vec<f32> = bias_slice.iter().map(|&v| v as f32).collect();
         let mut out_f32 = vec![0.0f32; out_numel];
-        self.dispatch_linear_f32(
+        self.dispatch_linear_batched_f32_host(
             &x_f32,
             &w_f32,
             &bias_f32,
+            &zero_base,
+            &zero_base,
+            1,
             m_total,
             n,
             k,
@@ -1572,10 +2280,14 @@ impl DeviceBackend for VulkanDeviceBackend {
         dtype: DType,
         out: &mut Vec<f64>,
     ) -> MoraResult<()> {
-        // Compute normalized input on host, then dispatch fused Linear+Bias+Act on Vulkan GPU!
+        let out_numel = m_total * n;
+        out.resize(out_numel, 0.0);
+        if out_numel == 0 || k == 0 {
+            return Ok(());
+        }
         let gamma_slice = match gamma {
-            None => None,
-            Some((gv, _)) if gv.len() == k || gv.len() == 1 => Some(gv),
+            None => &[][..],
+            Some((gv, _)) if gv.len() == k || gv.len() == 1 => gv,
             Some(_) => {
                 simd_kernels::fused_rms_norm_linear_into(
                     x, eps, gamma, w, bias, act, m_total, k, n, x_shape, out_shape, dtype, out,
@@ -1583,18 +2295,102 @@ impl DeviceBackend for VulkanDeviceBackend {
                 return Ok(());
             }
         };
-        let mut x_norm = vec![0.0f64; m_total * k];
-        for row in 0..m_total {
-            let src = &x[row * k..(row + 1) * k];
-            let dst = &mut x_norm[row * k..(row + 1) * k];
-            let sq: f64 = src.iter().map(|&v| v * v).sum();
-            let inv = 1.0 / (sq / (k as f64) + eps).sqrt();
-            for j in 0..k {
-                let g = gamma_slice.map_or(1.0, |gv| gv[j % gv.len()]);
-                dst[j] = src[j] * inv * g;
+        let bias_slice = match bias {
+            None => &[][..],
+            Some((bv, _)) if bv.len() == n || bv.len() == 1 => bv,
+            Some(_) => {
+                simd_kernels::fused_rms_norm_linear_into(
+                    x, eps, gamma, w, bias, act, m_total, k, n, x_shape, out_shape, dtype, out,
+                );
+                return Ok(());
             }
+        };
+
+        let x_f32: Vec<f32> = x.iter().map(|&v| v as f32).collect();
+        let w_f32: Vec<f32> = w.iter().map(|&v| v as f32).collect();
+        let gamma_f32: Vec<f32> = gamma_slice.iter().map(|&v| v as f32).collect();
+        let bias_f32: Vec<f32> = bias_slice.iter().map(|&v| v as f32).collect();
+        let rms_params: [u32; 5] = [
+            m_total as u32,
+            k as u32,
+            u32::from(!gamma_f32.is_empty()),
+            gamma_f32.len().max(1) as u32,
+            (eps as f32).to_bits(),
+        ];
+        let lin_params: [u32; 7] = [
+            m_total as u32,
+            n as u32,
+            k as u32,
+            u32::from(!bias_f32.is_empty()),
+            bias_f32.len().max(1) as u32,
+            act_code(act),
+            1,
+        ];
+        let zero_base = [0u32];
+        let mut out_f32 = vec![0.0f32; out_numel];
+
+        // Execute BOTH RMSNorm AND FusedLinearAct 100% on Vulkan GPU (zero host RMS!).
+        let st = self.inner.state.lock();
+        let mut temps = Vec::with_capacity(10);
+        let run = (|| -> MoraResult<()> {
+            let h_x = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &x_f32)?;
+            let h_w = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &w_f32)?;
+            self.inner.counters.on_h2d();
+            self.inner.counters.on_h2d();
+            let h_gamma = if gamma_f32.is_empty() {
+                st.dummy_buf.buffer
+            } else {
+                self.inner.counters.on_h2d();
+                Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &gamma_f32)?
+            };
+            let h_bias = if bias_f32.is_empty() {
+                st.dummy_buf.buffer
+            } else {
+                self.inner.counters.on_h2d();
+                Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &bias_f32)?
+            };
+            let xnorm_alloc = Self::alloc_host_buffer(&self.inner.api, &st, m_total * k * 4)?;
+            let h_xnorm = xnorm_alloc.buffer;
+            temps.push(xnorm_alloc);
+            let out_alloc = Self::alloc_host_buffer(&self.inner.api, &st, out_numel * 4)?;
+            let h_out = out_alloc.buffer;
+            let out_idx = temps.len();
+            temps.push(out_alloc);
+            let h_rms_p = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &rms_params)?;
+            let h_lin_p = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &lin_params)?;
+            let h_ab = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &zero_base)?;
+            let h_bb = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &zero_base)?;
+
+            Self::dispatch_pipe(
+                &self.inner.api,
+                &st,
+                &st.pipe_rms_norm_f32,
+                &[h_x, h_gamma, h_xnorm, h_rms_p],
+                (m_total as u32).div_ceil(64),
+                1,
+                1,
+            )?;
+            Self::dispatch_pipe(
+                &self.inner.api,
+                &st,
+                &st.pipe_linear_f32,
+                &[h_xnorm, h_w, h_bias, h_out, h_lin_p, h_ab, h_bb],
+                (n as u32).div_ceil(16),
+                (m_total as u32).div_ceil(16),
+                1,
+            )?;
+            Self::read_host_buffer(&self.inner.api, st.vk_dev, &temps[out_idx], &mut out_f32)?;
+            self.inner.counters.on_d2h();
+            Ok(())
+        })();
+        for alloc in temps {
+            Self::free_host_buffer(&self.inner.api, st.vk_dev, alloc);
         }
-        self.run_fused_linear_act_into(&x_norm, w, bias, act, m_total, k, n, out_shape, dtype, out)
+        run?;
+        for (dst, &v) in out.iter_mut().zip(out_f32.iter()) {
+            *dst = dtype.quantize_f64(f64::from(v));
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1613,20 +2409,143 @@ impl DeviceBackend for VulkanDeviceBackend {
         dtype: DType,
         out: &mut Vec<f64>,
     ) -> MoraResult<()> {
-        simd_kernels::fused_flash_attention_into(
-            q,
-            k,
-            v,
-            mask,
-            q_shape,
-            k_shape,
-            v_shape,
-            out_shape,
-            scale,
-            k_is_transposed,
-            dtype,
-            out,
-        )
+        if q_shape.len() < 2 || k_shape.len() < 2 || v_shape.len() < 2 {
+            return simd_kernels::fused_flash_attention_into(
+                q,
+                k,
+                v,
+                mask,
+                q_shape,
+                k_shape,
+                v_shape,
+                out_shape,
+                scale,
+                k_is_transposed,
+                dtype,
+                out,
+            );
+        }
+        let s_q = q_shape[q_shape.len() - 2];
+        let d_k = q_shape[q_shape.len() - 1];
+        let (s_k, k_d) = if k_is_transposed {
+            (k_shape[k_shape.len() - 1], k_shape[k_shape.len() - 2])
+        } else {
+            (k_shape[k_shape.len() - 2], k_shape[k_shape.len() - 1])
+        };
+        let d_v = v_shape[v_shape.len() - 1];
+        if d_k != k_d || s_k != v_shape[v_shape.len() - 2] {
+            return Err(MoraError::Runtime(format!(
+                "Vulkan FlashAttention shape mismatch: Q={q_shape:?}, K={k_shape:?}, V={v_shape:?}"
+            )));
+        }
+        let batch_q = &q_shape[..q_shape.len() - 2];
+        let batch_k = &k_shape[..k_shape.len() - 2];
+        let batch_v = &v_shape[..v_shape.len() - 2];
+        let batch_out = &out_shape[..out_shape.len() - 2];
+        let batches = batch_out.iter().copied().product::<usize>().max(1);
+        let out_numel = batches * s_q * d_v;
+        out.resize(out_numel, 0.0);
+        if out_numel == 0 {
+            return Ok(());
+        }
+
+        let q_f32: Vec<f32> = q.iter().map(|&x| x as f32).collect();
+        let k_f32: Vec<f32> = k.iter().map(|&x| x as f32).collect();
+        let v_f32: Vec<f32> = v.iter().map(|&x| x as f32).collect();
+        let q_bases: Vec<u32> = (0..batches)
+            .map(|b| (map_broadcast_batch(b, batch_out, batch_q) * s_q * d_k) as u32)
+            .collect();
+        let k_bases: Vec<u32> = (0..batches)
+            .map(|b| (map_broadcast_batch(b, batch_out, batch_k) * s_k * d_k) as u32)
+            .collect();
+        let v_bases: Vec<u32> = (0..batches)
+            .map(|b| (map_broadcast_batch(b, batch_out, batch_v) * s_k * d_v) as u32)
+            .collect();
+        let (mask_f32, mask_bases, mask_sq_s, mask_sk_s, has_mask) =
+            if let Some((mvals, mshape)) = mask {
+                let mrank = mshape.len();
+                let m_sk = *mshape.last().unwrap_or(&1);
+                let m_sq = if mrank >= 2 { mshape[mrank - 2] } else { 1 };
+                let mbatch = if mrank >= 2 {
+                    &mshape[..mrank - 2]
+                } else {
+                    &[]
+                };
+                let sq_s = if m_sq == 1 { 0 } else { m_sk as u32 };
+                let sk_s = if m_sk == 1 { 0 } else { 1u32 };
+                let mb: Vec<u32> = (0..batches)
+                    .map(|b| (map_broadcast_batch(b, batch_out, mbatch) * m_sq * m_sk) as u32)
+                    .collect();
+                (
+                    mvals.iter().map(|&x| x as f32).collect::<Vec<f32>>(),
+                    mb,
+                    sq_s,
+                    sk_s,
+                    1u32,
+                )
+            } else {
+                (Vec::new(), vec![0u32; batches], 0u32, 0u32, 0u32)
+            };
+        let params: [u32; 10] = [
+            batches as u32,
+            s_q as u32,
+            s_k as u32,
+            d_k as u32,
+            d_v as u32,
+            u32::from(k_is_transposed),
+            has_mask,
+            mask_sq_s,
+            mask_sk_s,
+            (scale as f32).to_bits(),
+        ];
+        let mut out_f32 = vec![0.0f32; out_numel];
+
+        let st = self.inner.state.lock();
+        let mut temps = Vec::with_capacity(10);
+        let run = (|| -> MoraResult<()> {
+            let h_q = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &q_f32)?;
+            let h_k = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &k_f32)?;
+            let h_v = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &v_f32)?;
+            self.inner.counters.on_h2d();
+            self.inner.counters.on_h2d();
+            self.inner.counters.on_h2d();
+            let h_mask = if mask_f32.is_empty() {
+                st.dummy_buf.buffer
+            } else {
+                self.inner.counters.on_h2d();
+                Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &mask_f32)?
+            };
+            let out_alloc = Self::alloc_host_buffer(&self.inner.api, &st, out_numel * 4)?;
+            let h_out = out_alloc.buffer;
+            let out_idx = temps.len();
+            temps.push(out_alloc);
+            let h_qb = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &q_bases)?;
+            let h_kb = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &k_bases)?;
+            let h_vb = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &v_bases)?;
+            let h_mb = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &mask_bases)?;
+            let h_p = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &params)?;
+
+            Self::dispatch_pipe(
+                &self.inner.api,
+                &st,
+                &st.pipe_flash_attn_f32,
+                &[h_q, h_k, h_v, h_mask, h_out, h_qb, h_kb, h_vb, h_mb, h_p],
+                (d_v as u32).div_ceil(16),
+                (s_q as u32).div_ceil(16),
+                batches as u32,
+            )?;
+            Self::read_host_buffer(&self.inner.api, st.vk_dev, &temps[out_idx], &mut out_f32)?;
+            self.inner.counters.on_d2h();
+            Ok(())
+        })();
+        for alloc in temps {
+            Self::free_host_buffer(&self.inner.api, st.vk_dev, alloc);
+        }
+        run?;
+        for (dst, &val) in out.iter_mut().zip(out_f32.iter()) {
+            *dst = dtype.quantize_f64(f64::from(val));
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1640,15 +2559,116 @@ impl DeviceBackend for VulkanDeviceBackend {
         dtype: DType,
         out: &mut Vec<f64>,
     ) -> MoraResult<()> {
-        simd_kernels::fused_elementwise_into(
-            input_flats,
-            input_shapes,
-            steps,
-            out_shape,
-            out_numel,
-            dtype,
-            out,
-        )
+        let total_slots = input_flats.len() + steps.len();
+        if out_numel == 0
+            || steps.is_empty()
+            || input_flats.is_empty()
+            || total_slots > 64
+            || out_shape.len() > 16
+        {
+            return simd_kernels::fused_elementwise_into(
+                input_flats,
+                input_shapes,
+                steps,
+                out_shape,
+                out_numel,
+                dtype,
+                out,
+            );
+        }
+        out.resize(out_numel, 0.0);
+
+        let eff_out_shape: Vec<usize> = if out_shape.is_empty() {
+            vec![1]
+        } else {
+            out_shape.to_vec()
+        };
+        let ndim = eff_out_shape.len();
+        let out_shape_u32: Vec<u32> = eff_out_shape.iter().map(|&d| d as u32).collect();
+        let mut all_strides: Vec<u32> = Vec::with_capacity(input_shapes.len() * ndim);
+        for s in input_shapes {
+            all_strides.extend(compute_broadcast_strides_u32(s, &eff_out_shape));
+        }
+        let (ops, arg_a, arg_b, imm_bits) = Self::encode_ew_steps(steps);
+        let packed_mode = input_flats.len() > 4;
+        let mut packed_in: Vec<f32> = Vec::new();
+        let mut in_offsets: Vec<u32> = Vec::with_capacity(input_flats.len());
+        if packed_mode {
+            for flat in input_flats {
+                in_offsets.push(packed_in.len() as u32);
+                packed_in.extend(flat.iter().map(|&v| v as f32));
+            }
+        } else {
+            in_offsets.resize(input_flats.len(), 0);
+        }
+
+        let mut meta = Vec::with_capacity(5 + steps.len() + input_flats.len());
+        meta.push(ndim as u32);
+        meta.push(input_flats.len() as u32);
+        meta.push(steps.len() as u32);
+        meta.push(out_numel as u32);
+        meta.push(u32::from(packed_mode));
+        meta.extend_from_slice(&imm_bits);
+        meta.extend_from_slice(&in_offsets);
+
+        let mut out_f32 = vec![0.0f32; out_numel];
+        let st = self.inner.state.lock();
+        let mut temps = Vec::with_capacity(11);
+        let run = (|| -> MoraResult<()> {
+            let out_alloc = Self::alloc_host_buffer(&self.inner.api, &st, out_numel * 4)?;
+            let h_out = out_alloc.buffer;
+            let out_idx = temps.len();
+            temps.push(out_alloc);
+
+            let (h_in0, h_in1, h_in2, h_in3) = if packed_mode {
+                self.inner.counters.on_h2d();
+                let h0 = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &packed_in)?;
+                (
+                    h0,
+                    st.dummy_buf.buffer,
+                    st.dummy_buf.buffer,
+                    st.dummy_buf.buffer,
+                )
+            } else {
+                let mut hs = [st.dummy_buf.buffer; 4];
+                for (i, flat) in input_flats.iter().enumerate() {
+                    let f32s: Vec<f32> = flat.iter().map(|&v| v as f32).collect();
+                    hs[i] = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &f32s)?;
+                    self.inner.counters.on_h2d();
+                }
+                (hs[0], hs[1], hs[2], hs[3])
+            };
+
+            let h_st = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &all_strides)?;
+            let h_os = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &out_shape_u32)?;
+            let h_op = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &ops)?;
+            let h_aa = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &arg_a)?;
+            let h_ab = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &arg_b)?;
+            let h_mt = Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &meta)?;
+
+            Self::dispatch_pipe(
+                &self.inner.api,
+                &st,
+                &st.pipe_fused_ew_f32,
+                &[
+                    h_out, h_in0, h_in1, h_in2, h_in3, h_st, h_os, h_op, h_aa, h_ab, h_mt,
+                ],
+                (out_numel as u32).div_ceil(64),
+                1,
+                1,
+            )?;
+            Self::read_host_buffer(&self.inner.api, st.vk_dev, &temps[out_idx], &mut out_f32)?;
+            self.inner.counters.on_d2h();
+            Ok(())
+        })();
+        for alloc in temps {
+            Self::free_host_buffer(&self.inner.api, st.vk_dev, alloc);
+        }
+        run?;
+        for (dst, &val) in out.iter_mut().zip(out_f32.iter()) {
+            *dst = dtype.quantize_f64(f64::from(val));
+        }
+        Ok(())
     }
 }
 
@@ -1693,158 +2713,56 @@ fn init_vulkan_device(
         (api.get_device_queue)(vk_dev, queue_family, 0, &mut queue);
     }
 
-    let spv = emit_spirv_fused_linear_f32();
-    let smci = VkShaderModuleCreateInfo {
-        s_type: VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-        p_next: ptr::null(),
-        flags: 0,
-        code_size: spv.len() * 4,
-        p_code: spv.as_ptr(),
-    };
-    let mut shader: VkShaderModule = 0;
-    // SAFETY: `spv` is a 4-byte aligned valid SPIR-V 1.0 module.
-    if unsafe { (api.create_shader_module)(vk_dev, &smci, ptr::null(), &mut shader) } != VK_SUCCESS
-    {
-        // SAFETY: Destroy logical device on shader creation failure.
-        unsafe {
-            (api.destroy_device)(vk_dev, ptr::null());
-        }
-        return None;
+    let mut created_pipes: Vec<VkComputePipe> = Vec::with_capacity(6);
+    let specs: [(Vec<u32>, u32); 6] = [
+        (emit_spirv_fused_linear_f32(), 7),
+        (emit_spirv_fused_linear_half(false), 7),
+        (emit_spirv_fused_linear_half(true), 7),
+        (emit_spirv_rms_norm_f32(), 4),
+        (emit_spirv_flash_attention_f32(), 10),
+        (emit_spirv_fused_elementwise_f32(), 11),
+    ];
+    for (spv, num_bindings) in specs {
+        let Some(pipe) = VkComputePipe::create(api, vk_dev, &spv, num_bindings) else {
+            for p in created_pipes.iter().rev() {
+                p.destroy(api, vk_dev);
+            }
+            // SAFETY: Destroys logical device after cleaning up previously built pipelines.
+            unsafe {
+                (api.destroy_device)(vk_dev, ptr::null());
+            }
+            return None;
+        };
+        created_pipes.push(pipe);
     }
+    let mut pipe_it = created_pipes.into_iter();
+    let pipe_linear_f32 = pipe_it.next()?;
+    let pipe_linear_f16 = pipe_it.next()?;
+    let pipe_linear_bf16 = pipe_it.next()?;
+    let pipe_rms_norm_f32 = pipe_it.next()?;
+    let pipe_flash_attn_f32 = pipe_it.next()?;
+    let pipe_fused_ew_f32 = pipe_it.next()?;
 
-    let bindings: [VkDescriptorSetLayoutBinding; 5] =
-        std::array::from_fn(|i| VkDescriptorSetLayoutBinding {
-            binding: i as u32,
-            descriptor_type: VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            descriptor_count: 1,
-            stage_flags: VK_SHADER_STAGE_COMPUTE_BIT,
-            p_immutable_samplers: ptr::null(),
-        });
-    let dslci = VkDescriptorSetLayoutCreateInfo {
-        s_type: VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        p_next: ptr::null(),
-        flags: 0,
-        binding_count: bindings.len() as u32,
-        p_bindings: bindings.as_ptr(),
+    let destroy_all_pipes = |vk_dev: VkDevice| {
+        pipe_fused_ew_f32.destroy(api, vk_dev);
+        pipe_flash_attn_f32.destroy(api, vk_dev);
+        pipe_rms_norm_f32.destroy(api, vk_dev);
+        pipe_linear_bf16.destroy(api, vk_dev);
+        pipe_linear_f16.destroy(api, vk_dev);
+        pipe_linear_f32.destroy(api, vk_dev);
     };
-    let mut ds_layout: VkDescriptorSetLayout = 0;
-    // SAFETY: Valid descriptor set layout info on `vk_dev`.
-    if unsafe { (api.create_descriptor_set_layout)(vk_dev, &dslci, ptr::null(), &mut ds_layout) }
-        != VK_SUCCESS
-    {
-        // SAFETY: Clean up shader + device on failure.
-        unsafe {
-            (api.destroy_shader_module)(vk_dev, shader, ptr::null());
-            (api.destroy_device)(vk_dev, ptr::null());
-        }
-        return None;
-    }
 
-    let plci = VkPipelineLayoutCreateInfo {
-        s_type: VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-        p_next: ptr::null(),
-        flags: 0,
-        set_layout_count: 1,
-        p_set_layouts: &ds_layout,
-        push_constant_range_count: 0,
-        p_push_constant_ranges: ptr::null(),
-    };
-    let mut pipe_layout: VkPipelineLayout = 0;
-    // SAFETY: Valid pipeline layout info referencing `ds_layout`.
-    if unsafe { (api.create_pipeline_layout)(vk_dev, &plci, ptr::null(), &mut pipe_layout) }
-        != VK_SUCCESS
-    {
-        // SAFETY: Clean up previously allocated Vulkan objects.
+    let Ok(dummy_buf) = VulkanDeviceBackend::alloc_host_buffer_raw(api, vk_dev, &mem_props, 16)
+    else {
+        destroy_all_pipes(vk_dev);
+        // SAFETY: Destroys logical device on dummy buffer allocation failure.
         unsafe {
-            (api.destroy_descriptor_set_layout)(vk_dev, ds_layout, ptr::null());
-            (api.destroy_shader_module)(vk_dev, shader, ptr::null());
             (api.destroy_device)(vk_dev, ptr::null());
         }
         return None;
-    }
-
-    let entry_name = b"main\0";
-    let cpci = VkComputePipelineCreateInfo {
-        s_type: VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-        p_next: ptr::null(),
-        flags: 0,
-        stage: VkPipelineShaderStageCreateInfo {
-            s_type: VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            p_next: ptr::null(),
-            flags: 0,
-            stage: VK_SHADER_STAGE_COMPUTE_BIT,
-            module: shader,
-            p_name: entry_name.as_ptr() as *const c_char,
-            p_specialization_info: ptr::null(),
-        },
-        layout: pipe_layout,
-        base_pipeline_handle: 0,
-        base_pipeline_index: -1,
     };
-    let mut pipeline: VkPipeline = 0;
-    // SAFETY: Compiles SPIR-V compute pipeline on the Vulkan driver.
-    if unsafe { (api.create_compute_pipelines)(vk_dev, 0, 1, &cpci, ptr::null(), &mut pipeline) }
-        != VK_SUCCESS
-    {
-        // SAFETY: Clean up previously allocated Vulkan objects.
-        unsafe {
-            (api.destroy_pipeline_layout)(vk_dev, pipe_layout, ptr::null());
-            (api.destroy_descriptor_set_layout)(vk_dev, ds_layout, ptr::null());
-            (api.destroy_shader_module)(vk_dev, shader, ptr::null());
-            (api.destroy_device)(vk_dev, ptr::null());
-        }
-        return None;
-    }
-
-    let pool_size = VkDescriptorPoolSize {
-        descriptor_type: VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        descriptor_count: 5,
-    };
-    let dpci = VkDescriptorPoolCreateInfo {
-        s_type: VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        p_next: ptr::null(),
-        flags: 0,
-        max_sets: 1,
-        pool_size_count: 1,
-        p_pool_sizes: &pool_size,
-    };
-    let mut desc_pool: VkDescriptorPool = 0;
-    // SAFETY: Creates descriptor pool holding 1 set of 5 SSBO bindings.
-    if unsafe { (api.create_descriptor_pool)(vk_dev, &dpci, ptr::null(), &mut desc_pool) }
-        != VK_SUCCESS
-    {
-        // SAFETY: Clean up on failure.
-        unsafe {
-            (api.destroy_pipeline)(vk_dev, pipeline, ptr::null());
-            (api.destroy_pipeline_layout)(vk_dev, pipe_layout, ptr::null());
-            (api.destroy_descriptor_set_layout)(vk_dev, ds_layout, ptr::null());
-            (api.destroy_shader_module)(vk_dev, shader, ptr::null());
-            (api.destroy_device)(vk_dev, ptr::null());
-        }
-        return None;
-    }
-
-    let dsai = VkDescriptorSetAllocateInfo {
-        s_type: VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-        p_next: ptr::null(),
-        descriptor_pool: desc_pool,
-        descriptor_set_count: 1,
-        p_set_layouts: &ds_layout,
-    };
-    let mut desc_set: VkDescriptorSet = 0;
-    // SAFETY: Allocates one descriptor set from `desc_pool`.
-    if unsafe { (api.allocate_descriptor_sets)(vk_dev, &dsai, &mut desc_set) } != VK_SUCCESS {
-        // SAFETY: Clean up on failure.
-        unsafe {
-            (api.destroy_descriptor_pool)(vk_dev, desc_pool, ptr::null());
-            (api.destroy_pipeline)(vk_dev, pipeline, ptr::null());
-            (api.destroy_pipeline_layout)(vk_dev, pipe_layout, ptr::null());
-            (api.destroy_descriptor_set_layout)(vk_dev, ds_layout, ptr::null());
-            (api.destroy_shader_module)(vk_dev, shader, ptr::null());
-            (api.destroy_device)(vk_dev, ptr::null());
-        }
-        return None;
-    }
+    let zeros = [0u32; 4];
+    let _ = VulkanDeviceBackend::write_host_buffer(api, vk_dev, &dummy_buf, &zeros);
 
     let cmdpci = VkCommandPoolCreateInfo {
         s_type: VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -1857,13 +2775,10 @@ fn init_vulkan_device(
     if unsafe { (api.create_command_pool)(vk_dev, &cmdpci, ptr::null(), &mut cmd_pool) }
         != VK_SUCCESS
     {
-        // SAFETY: Clean up on failure.
+        VulkanDeviceBackend::free_host_buffer(api, vk_dev, dummy_buf);
+        destroy_all_pipes(vk_dev);
+        // SAFETY: Clean up device on command pool failure.
         unsafe {
-            (api.destroy_descriptor_pool)(vk_dev, desc_pool, ptr::null());
-            (api.destroy_pipeline)(vk_dev, pipeline, ptr::null());
-            (api.destroy_pipeline_layout)(vk_dev, pipe_layout, ptr::null());
-            (api.destroy_descriptor_set_layout)(vk_dev, ds_layout, ptr::null());
-            (api.destroy_shader_module)(vk_dev, shader, ptr::null());
             (api.destroy_device)(vk_dev, ptr::null());
         }
         return None;
@@ -1879,14 +2794,14 @@ fn init_vulkan_device(
     let mut cmd_buf: VkCommandBuffer = ptr::null_mut();
     // SAFETY: Allocates one primary command buffer from `cmd_pool`.
     if unsafe { (api.allocate_command_buffers)(vk_dev, &cbai, &mut cmd_buf) } != VK_SUCCESS {
-        // SAFETY: Clean up on failure.
+        // SAFETY: Clean up command pool on failure.
         unsafe {
             (api.destroy_command_pool)(vk_dev, cmd_pool, ptr::null());
-            (api.destroy_descriptor_pool)(vk_dev, desc_pool, ptr::null());
-            (api.destroy_pipeline)(vk_dev, pipeline, ptr::null());
-            (api.destroy_pipeline_layout)(vk_dev, pipe_layout, ptr::null());
-            (api.destroy_descriptor_set_layout)(vk_dev, ds_layout, ptr::null());
-            (api.destroy_shader_module)(vk_dev, shader, ptr::null());
+        }
+        VulkanDeviceBackend::free_host_buffer(api, vk_dev, dummy_buf);
+        destroy_all_pipes(vk_dev);
+        // SAFETY: Clean up device on failure.
+        unsafe {
             (api.destroy_device)(vk_dev, ptr::null());
         }
         return None;
@@ -1895,12 +2810,13 @@ fn init_vulkan_device(
     Some(VulkanState {
         vk_dev,
         queue,
-        shader,
-        ds_layout,
-        pipe_layout,
-        pipeline,
-        desc_pool,
-        desc_set,
+        pipe_linear_f32,
+        pipe_linear_f16,
+        pipe_linear_bf16,
+        pipe_rms_norm_f32,
+        pipe_flash_attn_f32,
+        pipe_fused_ew_f32,
+        dummy_buf,
         cmd_pool,
         cmd_buf,
         mem_props,
@@ -2049,12 +2965,16 @@ pub(crate) fn probe_vulkan_backends() -> Vec<HardwareBackendEntry> {
             hardware_accelerated: true,
             driver_version: format!("0x{:x}", props.driver_version),
         };
-        let backend = Arc::new(VulkanDeviceBackend {
+        let inner = Arc::new(VulkanDeviceInner {
             device,
             _inst_guard: Arc::clone(&inst_guard),
             api: Arc::clone(&api),
-            info: info.clone(),
             state: Mutex::new(state),
+            counters: VramCounters::default(),
+        });
+        let backend = Arc::new(VulkanDeviceBackend {
+            inner,
+            info: info.clone(),
         });
         out.push(HardwareBackendEntry { info, backend });
     }
@@ -2066,11 +2986,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn spirv_emitter_produces_well_formed_header_and_bound() {
-        let words = emit_spirv_fused_linear_f32();
-        assert_eq!(words[0], 0x0723_0203, "SPIR-V magic");
-        assert_eq!(words[1], 0x0001_0000, "SPIR-V 1.0 version");
-        assert!(words[3] > 20, "valid non-zero SSA ID bound");
-        assert!(words.len() > 80, "non-trivial compute shader payload");
+    fn spirv_emitters_produce_well_formed_headers_and_bounds() {
+        let shaders: [(&str, Vec<u32>); 6] = [
+            ("fused_linear_f32", emit_spirv_fused_linear_f32()),
+            ("fused_linear_f16", emit_spirv_fused_linear_half(false)),
+            ("fused_linear_bf16", emit_spirv_fused_linear_half(true)),
+            ("rms_norm_f32", emit_spirv_rms_norm_f32()),
+            ("flash_attention_f32", emit_spirv_flash_attention_f32()),
+            ("fused_elementwise_f32", emit_spirv_fused_elementwise_f32()),
+        ];
+        for (name, words) in shaders {
+            assert_eq!(words[0], 0x0723_0203, "{name}: SPIR-V magic");
+            assert_eq!(words[1], 0x0001_0000, "{name}: SPIR-V 1.0 version");
+            assert!(words[3] > 20, "{name}: valid non-zero SSA ID bound");
+            assert!(
+                words.len() > 80,
+                "{name}: non-trivial compute shader payload"
+            );
+            // Walk every SPIR-V instruction word count to prove stream integrity.
+            let mut pc = 5usize;
+            while pc < words.len() {
+                let wc = (words[pc] >> 16) as usize;
+                assert!(wc >= 1, "{name}: invalid zero-word instruction at {pc}");
+                pc += wc;
+            }
+            assert_eq!(
+                pc,
+                words.len(),
+                "{name}: instruction stream must terminate cleanly at module end"
+            );
+        }
+    }
+
+    #[test]
+    fn vulkan_all_six_spirv_pipelines_compile_live_when_driver_present() {
+        let backends = probe_vulkan_backends();
+        if backends.is_empty() {
+            return;
+        }
+        // `probe_vulkan_backends()` compiles all 6 SPIR-V 1.0 compute pipelines via
+        // `vkCreateShaderModule` + `vkCreateComputePipelines`; reaching here proves all 6
+        // shaders passed live Vulkan driver SPIR-V validation & pipeline compilation!
+        for entry in &backends {
+            assert_eq!(entry.info.driver, "vulkan");
+            assert!(entry.info.hardware_accelerated);
+            assert!(entry.backend.supports_vram_residency());
+        }
     }
 }

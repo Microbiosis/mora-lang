@@ -17,8 +17,9 @@
 //!    (`Arc::strong_count(&storage) > 1 || is_view`).
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::common::sync::RwLock;
+use crate::common::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::common::{
     BinaryOp, DType, Device, ScalarValue, bf16_bits_to_f64, f16_bits_to_f64, f64_to_bf16_bits,
@@ -28,6 +29,7 @@ use crate::common::{
 use crate::error::{MoraError, MoraResult};
 use crate::runtime::CoreRuntime;
 use crate::runtime::autograd::{AutogradContext, TapeNodeId, TapeOp};
+use crate::runtime::compute_dag::DeviceVramBuffer;
 use crate::value::Value;
 use crate::value::list::List;
 
@@ -449,32 +451,158 @@ impl AlignedByteBuffer {
 }
 
 /// Shared compact contiguous storage backing one or more [`Tensor`] views.
+///
+/// On hardware GPU devices (`CUDA` / `Vulkan` / `Metal`), holds a real resident
+/// [`DeviceVramBuffer`] with lazy D2H synchronization (`host_stale = true` for GPU kernel
+/// outputs until host memory is actually read) so chained GPU DAGs run with zero intermediate
+/// H2D/D2H round-trips.
 #[derive(Debug)]
 pub struct TensorStorage {
     data: RwLock<AlignedByteBuffer>,
+    vram: RwLock<Option<Arc<dyn DeviceVramBuffer>>>,
+    host_stale: AtomicBool,
+    numel_for_sync: usize,
+    dtype_for_sync: DType,
 }
 
 impl TensorStorage {
     pub fn new(buf: AlignedByteBuffer) -> Arc<Self> {
+        let numel_for_sync = buf.len();
+        let dtype_for_sync = buf.dtype();
         Arc::new(Self {
             data: RwLock::new(buf),
+            vram: RwLock::new(None),
+            host_stale: AtomicBool::new(false),
+            numel_for_sync,
+            dtype_for_sync,
         })
+    }
+
+    /// Construct storage for `device`, immediately allocating & uploading a physical GPU
+    /// [`DeviceVramBuffer`] when `device` resolves to a live hardware GPU backend.
+    pub(crate) fn for_device(buf: AlignedByteBuffer, device: &Device) -> MoraResult<Arc<Self>> {
+        let numel_for_sync = buf.len();
+        let dtype_for_sync = buf.dtype();
+        let mut vram_opt: Option<Arc<dyn DeviceVramBuffer>> = None;
+        if !matches!(device, Device::Cpu) && buf.byte_len() > 0 {
+            let backend = crate::runtime::compute_dag::backend_for_device(device);
+            if backend.supports_vram_residency()
+                && let Some(vbuf) = backend.alloc_vram_buffer(buf.byte_len())?
+            {
+                let raw = buf.copy_bytes_out();
+                vbuf.upload_bytes(&raw)?;
+                vram_opt = Some(vbuf);
+            }
+        }
+        Ok(Arc::new(Self {
+            data: RwLock::new(buf),
+            vram: RwLock::new(vram_opt),
+            host_stale: AtomicBool::new(false),
+            numel_for_sync,
+            dtype_for_sync,
+        }))
+    }
+
+    /// Construct VRAM-resident storage directly from a GPU kernel output buffer with lazy D2H sync.
+    pub(crate) fn from_vram(
+        vram_buf: Arc<dyn DeviceVramBuffer>,
+        numel: usize,
+        dtype: DType,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            data: RwLock::new(AlignedByteBuffer::empty_detached(dtype)),
+            vram: RwLock::new(Some(vram_buf)),
+            host_stale: AtomicBool::new(true),
+            numel_for_sync: numel,
+            dtype_for_sync: dtype,
+        })
+    }
+
+    /// Ensure host `AlignedByteBuffer` holds up-to-date bytes (performing at most one lazy D2H
+    /// copy if this storage was produced directly in GPU VRAM).
+    #[inline]
+    pub(crate) fn ensure_host_synced(&self) {
+        if !self.host_stale.load(Ordering::Acquire) {
+            return;
+        }
+        let mut data_guard = self.data.write();
+        if !self.host_stale.load(Ordering::Acquire) {
+            return;
+        }
+        let vram_arc = self.vram.read().clone();
+        if let Some(vbuf) = vram_arc {
+            let mut raw = vec![0u8; vbuf.byte_len()];
+            if vbuf.download_bytes(&mut raw).is_ok()
+                && let Ok(aligned) = AlignedByteBuffer::from_raw_bytes(
+                    &raw,
+                    self.numel_for_sync,
+                    self.dtype_for_sync,
+                )
+            {
+                *data_guard = aligned;
+            }
+        }
+        self.host_stale.store(false, Ordering::Release);
+    }
+
+    #[inline]
+    pub(crate) fn read_host(&self) -> RwLockReadGuard<'_, AlignedByteBuffer> {
+        self.ensure_host_synced();
+        self.data.read()
+    }
+
+    #[inline]
+    pub(crate) fn write_host(&self) -> RwLockWriteGuard<'_, AlignedByteBuffer> {
+        self.ensure_host_synced();
+        self.data.write()
+    }
+
+    /// Push host mutations (`fill_`, `add_`, `mul_`) back into resident VRAM when present.
+    pub(crate) fn sync_host_to_vram(&self) {
+        let vram_arc = self.vram.read().clone();
+        if let Some(vbuf) = vram_arc {
+            let raw = self.data.read().copy_bytes_out();
+            if raw.len() == vbuf.byte_len() {
+                let _ = vbuf.upload_bytes(&raw);
+            }
+        }
+    }
+
+    /// Return `true` when this storage currently holds an active physical GPU [`DeviceVramBuffer`].
+    #[inline]
+    pub(crate) fn is_vram_resident(&self) -> bool {
+        self.vram.read().is_some()
+    }
+
+    /// Clone the underlying resident [`DeviceVramBuffer`] if present.
+    #[inline]
+    pub(crate) fn vram_buffer(&self) -> Option<Arc<dyn DeviceVramBuffer>> {
+        self.vram.read().clone()
     }
 
     /// Atomically detach and return the underlying 64-byte aligned buffer, leaving an empty
     /// detached placeholder so any stale handle reads cleanly return `0.0` without UB.
     pub(crate) fn detach_buffer(&self, dtype: DType) -> AlignedByteBuffer {
+        self.ensure_host_synced();
         let mut guard = self.data.write();
+        *self.vram.write() = None;
+        self.host_stale.store(false, Ordering::Release);
         std::mem::replace(&mut *guard, AlignedByteBuffer::empty_detached(dtype))
     }
 
     /// Physical packed storage byte length.
     pub fn byte_len(&self) -> usize {
+        if self.host_stale.load(Ordering::Acquire)
+            && let Some(vbuf) = self.vram.read().as_ref()
+        {
+            return vbuf.byte_len();
+        }
         self.data.read().byte_len()
     }
 
     /// 64-byte aligned base byte pointer for SIMD / GPU DMA kernels.
     pub fn aligned_byte_ptr(&self) -> *const u8 {
+        self.ensure_host_synced();
         self.data.read().aligned_byte_ptr()
     }
 }
@@ -589,8 +717,10 @@ impl Tensor {
             )));
         }
         let strides = contiguous_strides(&shape);
+        let storage =
+            TensorStorage::for_device(AlignedByteBuffer::from_f64_slice(&data, dtype), &device)?;
         Ok(Arc::new(Self {
-            storage: TensorStorage::new(AlignedByteBuffer::from_f64_slice(&data, dtype)),
+            storage,
             shape,
             strides,
             offset: 0,
@@ -620,8 +750,9 @@ impl Tensor {
         }
         let dtype = buf.dtype();
         let strides = contiguous_strides(&shape);
+        let storage = TensorStorage::for_device(buf, &device)?;
         Ok(Arc::new(Self {
-            storage: TensorStorage::new(buf),
+            storage,
             shape,
             strides,
             offset: 0,
@@ -631,6 +762,61 @@ impl Tensor {
             is_view: false,
             grad_nodes: Vec::new(),
         }))
+    }
+
+    /// Construct a contiguous VRAM-resident tensor directly from a GPU kernel output buffer
+    /// (zero immediate D2H copy; host memory is synced lazily on first host read).
+    pub(crate) fn from_vram_output(
+        vram_buf: Arc<dyn DeviceVramBuffer>,
+        shape: Vec<usize>,
+        dtype: DType,
+        device: Device,
+        requires_grad: bool,
+    ) -> MoraResult<Arc<Self>> {
+        let numel = checked_numel(&shape)?;
+        let expected_bytes = dtype.storage_bytes(numel);
+        if vram_buf.byte_len() != expected_bytes {
+            return Err(MoraError::Runtime(format!(
+                "Tensor::from_vram_output: VRAM buffer size {} does not match shape {:?} dtype {} ({expected_bytes} bytes)",
+                vram_buf.byte_len(),
+                shape,
+                dtype.short_name()
+            )));
+        }
+        let strides = contiguous_strides(&shape);
+        let storage = TensorStorage::from_vram(vram_buf, numel, dtype);
+        Ok(Arc::new(Self {
+            storage,
+            shape,
+            strides,
+            offset: 0,
+            dtype,
+            device,
+            requires_grad,
+            is_view: false,
+            grad_nodes: Vec::new(),
+        }))
+    }
+
+    /// Return `true` when this tensor's storage is physically resident in GPU VRAM.
+    #[inline]
+    pub(crate) fn is_vram_resident(&self) -> bool {
+        self.storage.is_vram_resident()
+    }
+
+    /// Return the underlying physical GPU [`DeviceVramBuffer`] when this tensor is a full,
+    /// contiguous, zero-offset view of that buffer (safe for direct GPU kernel dispatch).
+    #[inline]
+    pub(crate) fn vram_buffer_if_contiguous(&self) -> Option<Arc<dyn DeviceVramBuffer>> {
+        if !self.is_contiguous() || self.offset != 0 {
+            return None;
+        }
+        let buf = self.storage.vram_buffer()?;
+        if buf.device() == &self.device && buf.byte_len() == self.nbytes() {
+            Some(buf)
+        } else {
+            None
+        }
     }
 
     /// Construct a contiguous compact tensor losslessly from `Value`s.
@@ -651,8 +837,10 @@ impl Tensor {
             )));
         }
         let strides = contiguous_strides(&shape);
+        let storage =
+            TensorStorage::for_device(AlignedByteBuffer::from_values(values, dtype), &device)?;
         Ok(Arc::new(Self {
-            storage: TensorStorage::new(AlignedByteBuffer::from_values(values, dtype)),
+            storage,
             shape,
             strides,
             offset: 0,
@@ -672,8 +860,9 @@ impl Tensor {
     ) -> MoraResult<Arc<Self>> {
         let numel = checked_numel(&shape)?;
         let strides = contiguous_strides(&shape);
+        let storage = TensorStorage::for_device(AlignedByteBuffer::zeroed(numel, dtype), &device)?;
         Ok(Arc::new(Self {
-            storage: TensorStorage::new(AlignedByteBuffer::zeroed(numel, dtype)),
+            storage,
             shape,
             strides,
             offset: 0,
@@ -703,8 +892,12 @@ impl Tensor {
     ) -> MoraResult<Arc<Self>> {
         let numel = checked_numel(&shape)?;
         let strides = contiguous_strides(&shape);
+        let storage = TensorStorage::for_device(
+            AlignedByteBuffer::with_value(numel, fill_val, dtype),
+            &device,
+        )?;
         Ok(Arc::new(Self {
-            storage: TensorStorage::new(AlignedByteBuffer::with_value(numel, fill_val, dtype)),
+            storage,
             shape,
             strides,
             offset: 0,
@@ -822,7 +1015,7 @@ impl Tensor {
     /// Materialize the exact little-endian hardware-packed bytes of this tensor (handling slices/views).
     pub(crate) fn to_raw_byte_vec(self: &Arc<Self>) -> MoraResult<Vec<u8>> {
         let numel = self.numel();
-        let guard = self.storage.data.read();
+        let guard = self.storage.read_host();
         if self.is_contiguous() {
             if self.offset == 0 && numel == guard.len() {
                 return Ok(guard.copy_bytes_out());
@@ -846,7 +1039,7 @@ impl Tensor {
         }
         drop(guard);
         let contig = self.contiguous()?;
-        let guard = contig.storage.data.read();
+        let guard = contig.storage.read_host();
         Ok(guard.copy_bytes_out())
     }
 
@@ -1048,7 +1241,7 @@ impl Tensor {
         for (&c, &s) in coords.iter().zip(self.strides.iter()) {
             idx += (c as isize) * s;
         }
-        let guard = self.storage.data.read();
+        let guard = self.storage.read_host();
         guard.get_f64(idx as usize)
     }
 
@@ -1069,21 +1262,21 @@ impl Tensor {
     /// Read the element at logical flat row-major index `linear_idx` (`0..self.numel()`) as `f64`.
     pub fn get_linear(&self, linear_idx: usize) -> f64 {
         let phys = self.physical_index(linear_idx);
-        let guard = self.storage.data.read();
+        let guard = self.storage.read_host();
         guard.get_f64(phys)
     }
 
     /// Read the element at logical flat row-major index `linear_idx` as an exact Mora [`Value`].
     pub fn get_linear_value(&self, linear_idx: usize) -> Value {
         let phys = self.physical_index(linear_idx);
-        let guard = self.storage.data.read();
+        let guard = self.storage.read_host();
         guard.get_value(phys)
     }
 
     /// Materialize the logical elements of this tensor view as `f64` in contiguous row-major order.
     pub fn to_flat_vec(&self) -> Vec<f64> {
         let n = self.numel();
-        let guard = self.storage.data.read();
+        let guard = self.storage.read_host();
         if self.is_contiguous() {
             return (0..n).map(|i| guard.get_f64(self.offset + i)).collect();
         }
@@ -1094,7 +1287,7 @@ impl Tensor {
     /// Materialize the logical elements of this tensor view as exact Mora [`Value`]s.
     pub fn to_flat_values(&self) -> Vec<Value> {
         let n = self.numel();
-        let guard = self.storage.data.read();
+        let guard = self.storage.read_host();
         if self.is_contiguous() {
             return (0..n).map(|i| guard.get_value(self.offset + i)).collect();
         }
@@ -1188,19 +1381,14 @@ impl Tensor {
         )
     }
 
-    /// Transfer tensor to `device`.
+    /// Transfer tensor to `device` (allocating & uploading physical GPU VRAM when targeting a live GPU).
     pub fn to_device(self: &Arc<Self>, device: Device) -> MoraResult<Arc<Self>> {
         if self.device == device && !self.is_view && Arc::strong_count(&self.storage) == 1 {
             return Ok(Arc::clone(self));
         }
-        let vals = self.to_flat_values();
-        Self::from_values(
-            &vals,
-            self.shape.clone(),
-            self.dtype,
-            device,
-            self.requires_grad,
-        )
+        let raw = self.to_raw_byte_vec()?;
+        let aligned = AlignedByteBuffer::from_raw_bytes(&raw, self.numel(), self.dtype)?;
+        Self::from_aligned_buffer(aligned, self.shape.clone(), device, self.requires_grad)
     }
 
     /// Cast/quantize tensor to `dtype`.
@@ -1369,11 +1557,12 @@ impl Tensor {
             )));
         }
         let n = self.numel();
-        let mut guard = self.storage.data.write();
+        let mut guard = self.storage.write_host();
         for i in 0..n {
             guard.set_value(self.offset + i, val);
         }
         drop(guard);
+        self.storage.sync_host_to_vram();
         Ok(Arc::clone(self))
     }
 
@@ -1391,11 +1580,12 @@ impl Tensor {
             )));
         }
         let flat = res.to_flat_values();
-        let mut guard = self.storage.data.write();
+        let mut guard = self.storage.write_host();
         for (i, v) in flat.iter().enumerate() {
             guard.set_value(self.offset + i, v);
         }
         drop(guard);
+        self.storage.sync_host_to_vram();
         Ok(Arc::clone(self))
     }
 
@@ -1413,11 +1603,12 @@ impl Tensor {
             )));
         }
         let flat = res.to_flat_values();
-        let mut guard = self.storage.data.write();
+        let mut guard = self.storage.write_host();
         for (i, v) in flat.iter().enumerate() {
             guard.set_value(self.offset + i, v);
         }
         drop(guard);
+        self.storage.sync_host_to_vram();
         Ok(Arc::clone(self))
     }
 
@@ -1562,7 +1753,7 @@ impl Tensor {
             if let Some(ag) = autograd
                 && is_tracked
             {
-                let val = self.storage.data.read().get_f64(base as usize);
+                let val = self.storage.read_host().get_f64(base as usize);
                 let out =
                     Tensor::from_raw(vec![val], Vec::new(), self.dtype, self.device.clone(), true)?;
                 let src_numel = self.numel();
@@ -1573,7 +1764,7 @@ impl Tensor {
                 });
                 return Ok(Value::Tensor(tracked));
             }
-            let guard = self.storage.data.read();
+            let guard = self.storage.read_host();
             Ok(guard.get_value(base as usize))
         } else {
             let new_shape = self.shape[1..].to_vec();
@@ -1802,7 +1993,7 @@ impl Tensor {
                 && is_tracked
             {
                 let indices = build_gather_indices();
-                let val = self.storage.data.read().get_f64(new_offset as usize);
+                let val = self.storage.read_host().get_f64(new_offset as usize);
                 let out =
                     Tensor::from_raw(vec![val], Vec::new(), self.dtype, self.device.clone(), true)?;
                 let src_numel = self.numel();
@@ -1813,7 +2004,7 @@ impl Tensor {
                 });
                 return Ok(Value::Tensor(tracked));
             }
-            let guard = self.storage.data.read();
+            let guard = self.storage.read_host();
             return Ok(guard.get_value(new_offset as usize));
         }
 
@@ -1875,11 +2066,13 @@ impl Tensor {
         }
         let rhs_flat = other.to_flat_vec();
         let numel = self.numel();
-        let mut guard = self.storage.data.write();
+        let mut guard = self.storage.write_host();
         for (i, &rhs_v) in rhs_flat.iter().enumerate().take(numel) {
             let cur = guard.get_f64(self.offset + i);
             guard.set_f64(self.offset + i, cur + rhs_v);
         }
+        drop(guard);
+        self.storage.sync_host_to_vram();
         Ok(())
     }
 
@@ -1906,11 +2099,13 @@ impl Tensor {
         }
         let rhs_flat = other.to_flat_vec();
         let numel = self.numel();
-        let mut guard = self.storage.data.write();
+        let mut guard = self.storage.write_host();
         for (i, &rhs_v) in rhs_flat.iter().enumerate().take(numel) {
             let cur = guard.get_f64(self.offset + i);
             guard.set_f64(self.offset + i, cur * rhs_v);
         }
+        drop(guard);
+        self.storage.sync_host_to_vram();
         Ok(())
     }
 }
@@ -2201,12 +2396,11 @@ pub fn call_tensor_associated(
                 )));
             }
             let dev = parse_optional_device(args.first(), "Tensor::device_info")?;
-            let info = crate::runtime::gpu::hardware_device_info(&dev);
-            let map: std::collections::HashMap<String, Value> = info
-                .to_string_map()
-                .into_iter()
-                .map(|(k, v)| (k, Value::String(v)))
-                .collect();
+            let map: std::collections::HashMap<String, Value> =
+                crate::runtime::gpu::hardware_device_info_map(&dev)
+                    .into_iter()
+                    .map(|(k, v)| (k, Value::String(v)))
+                    .collect();
             Ok(Value::Dict(map))
         }
         "zeros" => {
@@ -2493,6 +2687,15 @@ pub fn call_tensor_method_tracked(
         "dtype" => Ok(Value::String(t.dtype.short_name().to_string())),
         "device" => Ok(Value::String(t.device.to_string())),
         "is_contiguous" => Ok(Value::Bool(t.is_contiguous())),
+        "is_vram_resident" => {
+            if !args.is_empty() {
+                return Err(MoraError::Runtime(format!(
+                    "Tensor.is_vram_resident() expects 0 arguments, got {}",
+                    args.len()
+                )));
+            }
+            Ok(Value::Bool(t.is_vram_resident()))
+        }
         "to_bytes" => {
             if !args.is_empty() {
                 return Err(MoraError::Runtime(format!(
@@ -3032,7 +3235,7 @@ fn read_broadcast_elem(t: &Tensor, broadcast_shape: &[usize], mut linear_idx: us
             phys += (t_coord as isize) * t.strides[t_axis];
         }
     }
-    let guard = t.storage.data.read();
+    let guard = t.storage.read_host();
     guard.get_f64(phys as usize)
 }
 

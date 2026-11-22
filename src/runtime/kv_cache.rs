@@ -15,12 +15,14 @@
 //!   callbacks can freely call `evict_preempt` / `free_seq` / `channel.send` with zero deadlock.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 
 use crate::common::sync::Mutex;
 
 use crate::common::{DType, Device};
 use crate::error::{MoraError, MoraResult};
+use crate::runtime::compute_dag::{DeviceBackend, DeviceVramBuffer, backend_for_device};
 use crate::value::Value;
 use crate::value::tensor::{AlignedByteBuffer, Tensor};
 
@@ -48,6 +50,10 @@ struct KvPoolInner {
     refcounts: Vec<usize>,
     k_pages: Vec<AlignedByteBuffer>,
     v_pages: Vec<AlignedByteBuffer>,
+    /// Physical GPU VRAM buffers backing active allocated KV pages (1:1 with `refcounts[pid] > 0`
+    /// when `KVPageAllocator.vram_backed == true`; dropped immediately when reclaimed to `free_pages`).
+    k_vram_pages: Vec<Option<Arc<dyn DeviceVramBuffer>>>,
+    v_vram_pages: Vec<Option<Arc<dyn DeviceVramBuffer>>>,
     seqs: HashMap<u64, SeqKvState>,
     tick: u64,
     max_bytes: Option<usize>,
@@ -58,8 +64,8 @@ struct KvPoolInner {
 }
 
 /// Paged KV-cache memory allocator with Copy-on-Write prefix sharing, hard byte quotas,
-/// priority-aware preemptive eviction, and rising-edge watermark callbacks.
-#[derive(Debug)]
+/// priority-aware preemptive eviction, rising-edge watermark callbacks, and real physical GPU VRAM
+/// page backing when instantiated on a live hardware GPU device.
 pub struct KVPageAllocator {
     pub total_pages: usize,
     pub page_tokens: usize,
@@ -70,7 +76,23 @@ pub struct KVPageAllocator {
     elems_per_page: usize,
     elems_per_token: usize,
     bytes_per_page: usize,
+    vram_backed: bool,
+    backend: Arc<dyn DeviceBackend>,
     inner: Mutex<KvPoolInner>,
+}
+
+impl fmt::Debug for KVPageAllocator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KVPageAllocator")
+            .field("total_pages", &self.total_pages)
+            .field("page_tokens", &self.page_tokens)
+            .field("num_heads", &self.num_heads)
+            .field("head_dim", &self.head_dim)
+            .field("dtype", &self.dtype)
+            .field("device", &self.device)
+            .field("vram_backed", &self.vram_backed)
+            .finish()
+    }
 }
 
 impl KVPageAllocator {
@@ -134,6 +156,8 @@ impl KVPageAllocator {
             v_pages.push(AlignedByteBuffer::zeroed(elems_per_page, dtype));
         }
         let bytes_per_page = k_pages[0].byte_len() + v_pages[0].byte_len();
+        let backend = backend_for_device(&device);
+        let vram_backed = backend.supports_vram_residency();
 
         Ok(Arc::new(Self {
             total_pages,
@@ -145,11 +169,15 @@ impl KVPageAllocator {
             elems_per_page,
             elems_per_token,
             bytes_per_page,
+            vram_backed,
+            backend,
             inner: Mutex::new(KvPoolInner {
                 free_pages,
                 refcounts,
                 k_pages,
                 v_pages,
+                k_vram_pages: vec![None; total_pages],
+                v_vram_pages: vec![None; total_pages],
                 seqs: HashMap::new(),
                 tick: 0,
                 max_bytes,
@@ -212,13 +240,58 @@ impl KVPageAllocator {
         Ok(())
     }
 
-    fn alloc_physical_page(inner: &mut KvPoolInner) -> MoraResult<usize> {
+    fn alloc_physical_page(&self, inner: &mut KvPoolInner) -> MoraResult<usize> {
         let pid = inner.free_pages.pop().ok_or_else(|| {
             MoraError::Runtime(format!(
                 "KVPageAllocator out of memory: all {} physical pages are in use",
                 inner.refcounts.len()
             ))
         })?;
+        if self.vram_backed {
+            let k_bytes = inner.k_pages[pid].byte_len();
+            let v_bytes = inner.v_pages[pid].byte_len();
+            let k_vram = match self.backend.alloc_vram_buffer(k_bytes) {
+                Ok(Some(b)) => b,
+                Ok(None) => {
+                    inner.free_pages.push(pid);
+                    return Err(MoraError::Runtime(
+                        "KVPageAllocator: GPU backend did not allocate physical VRAM K page"
+                            .to_string(),
+                    ));
+                }
+                Err(e) => {
+                    inner.free_pages.push(pid);
+                    return Err(e);
+                }
+            };
+            let v_vram = match self.backend.alloc_vram_buffer(v_bytes) {
+                Ok(Some(b)) => b,
+                Ok(None) => {
+                    inner.free_pages.push(pid);
+                    return Err(MoraError::Runtime(
+                        "KVPageAllocator: GPU backend did not allocate physical VRAM V page"
+                            .to_string(),
+                    ));
+                }
+                Err(e) => {
+                    inner.free_pages.push(pid);
+                    return Err(e);
+                }
+            };
+            inner.k_pages[pid].repurpose_zeroed(self.elems_per_page, self.dtype);
+            inner.v_pages[pid].repurpose_zeroed(self.elems_per_page, self.dtype);
+            let zero_k = inner.k_pages[pid].copy_bytes_out();
+            let zero_v = inner.v_pages[pid].copy_bytes_out();
+            if let Err(e) = k_vram
+                .upload_bytes(&zero_k)
+                .and_then(|()| v_vram.upload_bytes(&zero_v))
+            {
+                inner.free_pages.push(pid);
+                return Err(e);
+            }
+            inner.k_vram_pages[pid] = Some(k_vram);
+            inner.v_vram_pages[pid] = Some(v_vram);
+        }
         inner.refcounts[pid] = 1;
         Ok(pid)
     }
@@ -229,6 +302,8 @@ impl KVPageAllocator {
         }
         inner.refcounts[pid] -= 1;
         if inner.refcounts[pid] == 0 {
+            inner.k_vram_pages[pid] = None;
+            inner.v_vram_pages[pid] = None;
             inner.free_pages.push(pid);
             true
         } else {
@@ -417,7 +492,15 @@ impl KVPageAllocator {
 
         let mut newly = Vec::with_capacity(extra);
         for _ in 0..extra {
-            newly.push(Self::alloc_physical_page(&mut inner)?);
+            match self.alloc_physical_page(&mut inner) {
+                Ok(pid) => newly.push(pid),
+                Err(e) => {
+                    for pid in newly {
+                        let _ = Self::release_physical_page(&mut inner, pid);
+                    }
+                    return Err(e);
+                }
+            }
         }
         let page_table = {
             let seq = inner.seqs.get_mut(&seq_id).expect("checked");
@@ -535,7 +618,7 @@ impl KVPageAllocator {
 
         let target_pid = if inner.refcounts[cur_pid] > 1 {
             self.ensure_can_allocate(&inner, 1, seq_id)?;
-            let new_pid = Self::alloc_physical_page(&mut inner)?;
+            let new_pid = self.alloc_physical_page(&mut inner)?;
             let cloned_k = inner.k_pages[cur_pid].clone();
             let cloned_v = inner.v_pages[cur_pid].clone();
             inner.k_pages[new_pid] = cloned_k;
@@ -553,6 +636,16 @@ impl KVPageAllocator {
             inner.k_pages[target_pid].set_f64(elem_offset + i, kv);
             inner.v_pages[target_pid].set_f64(elem_offset + i, vv);
         }
+        if self.vram_backed {
+            if let Some(k_vram) = inner.k_vram_pages[target_pid].clone() {
+                let raw = inner.k_pages[target_pid].copy_bytes_out();
+                k_vram.upload_bytes(&raw)?;
+            }
+            if let Some(v_vram) = inner.v_vram_pages[target_pid].clone() {
+                let raw = inner.v_pages[target_pid].copy_bytes_out();
+                v_vram.upload_bytes(&raw)?;
+            }
+        }
         if let Some(seq) = inner.seqs.get_mut(&seq_id) {
             seq.last_access_tick = tick;
         }
@@ -561,6 +654,7 @@ impl KVPageAllocator {
     }
 
     /// Materialize `[K, V]` tensors of shape `[num_tokens, num_heads, head_dim]` for `seq_id`.
+    /// When physically backed by GPU VRAM, reads directly from the sequence's resident VRAM pages.
     pub fn read_kv(&self, seq_id: u64) -> MoraResult<(Arc<Tensor>, Arc<Tensor>)> {
         let mut inner = self.inner.lock();
         let tick = Self::next_tick(&mut inner);
@@ -571,15 +665,43 @@ impl KVPageAllocator {
         let num_tokens = seq.num_tokens;
         let page_table = seq.page_table.clone();
 
+        let mut downloaded_pages: HashMap<usize, (AlignedByteBuffer, AlignedByteBuffer)> =
+            HashMap::new();
+        if self.vram_backed {
+            for &pid in &page_table {
+                if let std::collections::hash_map::Entry::Vacant(e) = downloaded_pages.entry(pid)
+                    && let (Some(k_vram), Some(v_vram)) = (
+                        inner.k_vram_pages[pid].as_ref(),
+                        inner.v_vram_pages[pid].as_ref(),
+                    )
+                {
+                    let mut raw_k = vec![0u8; k_vram.byte_len()];
+                    let mut raw_v = vec![0u8; v_vram.byte_len()];
+                    k_vram.download_bytes(&mut raw_k)?;
+                    v_vram.download_bytes(&mut raw_v)?;
+                    let kb =
+                        AlignedByteBuffer::from_raw_bytes(&raw_k, self.elems_per_page, self.dtype)?;
+                    let vb =
+                        AlignedByteBuffer::from_raw_bytes(&raw_v, self.elems_per_page, self.dtype)?;
+                    e.insert((kb, vb));
+                }
+            }
+        }
+
         let total_elems = num_tokens * self.elems_per_token;
         let mut k_out = Vec::with_capacity(total_elems);
         let mut v_out = Vec::with_capacity(total_elems);
         for t_idx in 0..num_tokens {
             let pid = page_table[t_idx / self.page_tokens];
             let offset = (t_idx % self.page_tokens) * self.elems_per_token;
+            let (k_src, v_src) = if let Some((kb, vb)) = downloaded_pages.get(&pid) {
+                (kb, vb)
+            } else {
+                (&inner.k_pages[pid], &inner.v_pages[pid])
+            };
             for i in 0..self.elems_per_token {
-                k_out.push(inner.k_pages[pid].get_f64(offset + i));
-                v_out.push(inner.v_pages[pid].get_f64(offset + i));
+                k_out.push(k_src.get_f64(offset + i));
+                v_out.push(v_src.get_f64(offset + i));
             }
         }
         let shape = vec![num_tokens, self.num_heads, self.head_dim];
@@ -724,6 +846,14 @@ impl KVPageAllocator {
         let cow_shared = inner.refcounts.iter().filter(|&&rc| rc > 1).count();
         let bytes = self.bytes_used_inner(&inner);
         let quota_bytes = self.effective_quota_bytes_inner(&inner);
+        let vram_bytes_allocated: usize = inner
+            .k_vram_pages
+            .iter()
+            .zip(inner.v_vram_pages.iter())
+            .map(|(k, v)| {
+                k.as_ref().map_or(0, |b| b.byte_len()) + v.as_ref().map_or(0, |b| b.byte_len())
+            })
+            .sum();
         let mut m = HashMap::new();
         m.insert(
             "total_pages".to_string(),
@@ -741,6 +871,14 @@ impl KVPageAllocator {
         );
         m.insert("bytes_used".to_string(), Value::Int(bytes as i64));
         m.insert("quota_bytes".to_string(), Value::Int(quota_bytes as i64));
+        m.insert(
+            "vram_backed".to_string(),
+            Value::Int(i64::from(self.vram_backed)),
+        );
+        m.insert(
+            "vram_bytes_allocated".to_string(),
+            Value::Int(vram_bytes_allocated as i64),
+        );
         m.insert(
             "page_tokens".to_string(),
             Value::Int(self.page_tokens as i64),

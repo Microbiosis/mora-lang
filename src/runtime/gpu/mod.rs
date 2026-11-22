@@ -13,14 +13,109 @@
 pub(crate) mod cuda;
 pub(crate) mod metal;
 pub(crate) mod vulkan;
+mod vulkan_spirv;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::common::Device;
 pub(crate) use crate::common::dynlib::DynLib;
-use crate::runtime::compute_dag::DeviceBackend;
+use crate::runtime::compute_dag::{DeviceBackend, VramTelemetry};
 use crate::runtime::simd_kernels;
+
+/// Shared lock-free atomic counters tracking live GPU VRAM residency & transfers per device.
+#[derive(Debug, Default)]
+pub(crate) struct VramCounters {
+    pub live_buffers: AtomicU64,
+    pub live_bytes: AtomicU64,
+    pub h2d_copies: AtomicU64,
+    pub d2h_copies: AtomicU64,
+    pub vram_hits: AtomicU64,
+    pub native_f16_dispatches: AtomicU64,
+    pub native_bf16_dispatches: AtomicU64,
+}
+
+impl VramCounters {
+    pub(crate) fn on_alloc(&self, bytes: usize) {
+        self.live_buffers.fetch_add(1, Ordering::Relaxed);
+        self.live_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    pub(crate) fn on_free(&self, bytes: usize) {
+        self.live_buffers.fetch_sub(1, Ordering::Relaxed);
+        self.live_bytes.fetch_sub(bytes as u64, Ordering::Relaxed);
+    }
+
+    pub(crate) fn on_h2d(&self) {
+        self.h2d_copies.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn on_d2h(&self) {
+        self.d2h_copies.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn on_vram_hit(&self) {
+        self.vram_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn on_f16_dispatch(&self) {
+        self.native_f16_dispatches.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn on_bf16_dispatch(&self) {
+        self.native_bf16_dispatches.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn snapshot(&self) -> VramTelemetry {
+        VramTelemetry {
+            live_buffers: self.live_buffers.load(Ordering::Relaxed),
+            live_bytes: self.live_bytes.load(Ordering::Relaxed),
+            h2d_copies: self.h2d_copies.load(Ordering::Relaxed),
+            d2h_copies: self.d2h_copies.load(Ordering::Relaxed),
+            vram_hits: self.vram_hits.load(Ordering::Relaxed),
+            native_f16_dispatches: self.native_f16_dispatches.load(Ordering::Relaxed),
+            native_bf16_dispatches: self.native_bf16_dispatches.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Merge live [`VramTelemetry`] metrics into a string telemetry map (`Tensor::device_info`, `dag.backend_info`).
+pub(crate) fn insert_vram_telemetry_map(
+    map: &mut HashMap<String, String>,
+    vram_resident_supported: bool,
+    telemetry: VramTelemetry,
+) {
+    map.insert(
+        "vram_residency".to_string(),
+        vram_resident_supported.to_string(),
+    );
+    map.insert(
+        "vram_live_buffers".to_string(),
+        telemetry.live_buffers.to_string(),
+    );
+    map.insert(
+        "vram_live_bytes".to_string(),
+        telemetry.live_bytes.to_string(),
+    );
+    map.insert(
+        "vram_h2d_copies".to_string(),
+        telemetry.h2d_copies.to_string(),
+    );
+    map.insert(
+        "vram_d2h_copies".to_string(),
+        telemetry.d2h_copies.to_string(),
+    );
+    map.insert("vram_hits".to_string(), telemetry.vram_hits.to_string());
+    map.insert(
+        "native_f16_dispatches".to_string(),
+        telemetry.native_f16_dispatches.to_string(),
+    );
+    map.insert(
+        "native_bf16_dispatches".to_string(),
+        telemetry.native_bf16_dispatches.to_string(),
+    );
+}
 
 /// Rich runtime hardware telemetry for a host CPU or detected physical GPU device.
 #[derive(Debug, Clone)]
@@ -160,6 +255,22 @@ pub(crate) fn hardware_device_info(device: &Device) -> GpuDeviceInfo {
         return entry.info.clone();
     }
     GpuDeviceInfo::emulated_info(device)
+}
+
+/// Inspect full hardware + live VRAM residency telemetry map for `device`.
+pub(crate) fn hardware_device_info_map(device: &Device) -> HashMap<String, String> {
+    let info = hardware_device_info(device);
+    let mut map = info.to_string_map();
+    if let Some(backend) = resolve_hardware_backend(device) {
+        insert_vram_telemetry_map(
+            &mut map,
+            backend.supports_vram_residency(),
+            backend.vram_telemetry(),
+        );
+    } else {
+        insert_vram_telemetry_map(&mut map, false, VramTelemetry::default());
+    }
+    map
 }
 
 /// List all detected execution devices (always includes `"cpu"`, plus live hardware GPUs).

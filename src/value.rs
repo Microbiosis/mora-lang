@@ -646,6 +646,7 @@ impl Value {
                 "dtype",
                 "device",
                 "is_contiguous",
+                "is_vram_resident",
                 "contiguous",
                 "reshape",
                 "transpose",

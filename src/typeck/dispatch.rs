@@ -1492,10 +1492,9 @@ fn method_signature_builtin(receiver: &Type, method: &str) -> Option<Signature> 
             vec![("self".to_string(), receiver.clone())],
             Type::String,
         )),
-        (Type::Tensor { .. }, "is_contiguous" | "requires_grad") => Some(Signature::new(
-            vec![("self".to_string(), receiver.clone())],
-            Type::Bool,
-        )),
+        (Type::Tensor { .. }, "is_contiguous" | "requires_grad" | "is_vram_resident") => Some(
+            Signature::new(vec![("self".to_string(), receiver.clone())], Type::Bool),
+        ),
         (
             Type::Tensor { .. },
             "contiguous" | "abs" | "sqrt" | "exp" | "ln" | "relu" | "gelu" | "silu" | "tanh"

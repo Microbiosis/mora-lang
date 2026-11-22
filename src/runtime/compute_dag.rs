@@ -33,7 +33,32 @@ use crate::runtime::autograd::{
     AutogradTape, TapeOp, scatter_add_flat, sum_axis_flat, transpose_flat,
 };
 use crate::runtime::simd_kernels;
-use crate::value::tensor::{Tensor, checked_numel, quantize_for_dtype};
+use crate::value::tensor::{AlignedByteBuffer, Tensor, checked_numel, quantize_for_dtype};
+
+/// Live VRAM residency, transfer, and native low-precision dispatch counters for a [`DeviceBackend`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VramTelemetry {
+    pub live_buffers: u64,
+    pub live_bytes: u64,
+    pub h2d_copies: u64,
+    pub d2h_copies: u64,
+    pub vram_hits: u64,
+    pub native_f16_dispatches: u64,
+    pub native_bf16_dispatches: u64,
+}
+
+/// Owned GPU VRAM allocation (`CUdeviceptr`, `VkBuffer + VkDeviceMemory`, or `MTLBuffer`)
+/// with deterministic RAII release back to the owning hardware device/arena on [`Drop`].
+pub trait DeviceVramBuffer: Send + Sync + std::fmt::Debug {
+    fn device(&self) -> &Device;
+    fn byte_len(&self) -> usize;
+    /// Underlying driver buffer handle (`CUdeviceptr`, `VkBuffer`, or `MTLBuffer` address).
+    fn raw_handle(&self) -> u64;
+    /// Upload exact hardware-packed little-endian bytes (`src.len() == self.byte_len()`).
+    fn upload_bytes(&self, src: &[u8]) -> MoraResult<()>;
+    /// Download exact hardware-packed little-endian bytes (`dst.len() == self.byte_len()`).
+    fn download_bytes(&self, dst: &mut [u8]) -> MoraResult<()>;
+}
 
 /// Activation fused into `DagOp::FusedLinearAct` and `DagOp::FusedRmsNormLinear`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -188,6 +213,103 @@ pub trait DeviceBackend: Send + Sync {
         dtype: DType,
         out: &mut Vec<f64>,
     ) -> MoraResult<()>;
+
+    /// Whether this backend owns physical GPU VRAM supporting resident [`DeviceVramBuffer`]s.
+    fn supports_vram_residency(&self) -> bool {
+        false
+    }
+
+    /// Allocate a physical GPU VRAM buffer of `byte_len` bytes on this backend (`None` on CPU/emulated).
+    fn alloc_vram_buffer(&self, _byte_len: usize) -> MoraResult<Option<Arc<dyn DeviceVramBuffer>>> {
+        Ok(None)
+    }
+
+    /// Snapshot live VRAM allocation, H2D/D2H copy, cache-hit, and native f16/bf16 dispatch counters.
+    fn vram_telemetry(&self) -> VramTelemetry {
+        VramTelemetry::default()
+    }
+
+    /// Zero-copy VRAM-to-VRAM MatMul kernel operating directly on resident [`DeviceVramBuffer`]s.
+    fn run_matmul_vram(
+        &self,
+        _a: &dyn DeviceVramBuffer,
+        _b: &dyn DeviceVramBuffer,
+        _a_shape: &[usize],
+        _b_shape: &[usize],
+        _dtype: DType,
+    ) -> MoraResult<Option<Arc<dyn DeviceVramBuffer>>> {
+        Ok(None)
+    }
+
+    /// Zero-copy VRAM-to-VRAM `FusedLinearAct` kernel operating directly on resident buffers.
+    #[allow(clippy::too_many_arguments)]
+    fn run_fused_linear_act_vram(
+        &self,
+        _x: &dyn DeviceVramBuffer,
+        _w: &dyn DeviceVramBuffer,
+        _bias: Option<(&dyn DeviceVramBuffer, &[usize])>,
+        _act: FusedAct,
+        _m_total: usize,
+        _k: usize,
+        _n: usize,
+        _out_shape: &[usize],
+        _dtype: DType,
+    ) -> MoraResult<Option<Arc<dyn DeviceVramBuffer>>> {
+        Ok(None)
+    }
+
+    /// Zero-copy VRAM-to-VRAM `FusedRmsNormLinear` kernel operating directly on resident buffers.
+    #[allow(clippy::too_many_arguments)]
+    fn run_fused_rms_norm_linear_vram(
+        &self,
+        _x: &dyn DeviceVramBuffer,
+        _eps: f64,
+        _gamma: Option<(&dyn DeviceVramBuffer, &[usize])>,
+        _w: &dyn DeviceVramBuffer,
+        _bias: Option<(&dyn DeviceVramBuffer, &[usize])>,
+        _act: FusedAct,
+        _m_total: usize,
+        _k: usize,
+        _n: usize,
+        _x_shape: &[usize],
+        _out_shape: &[usize],
+        _dtype: DType,
+    ) -> MoraResult<Option<Arc<dyn DeviceVramBuffer>>> {
+        Ok(None)
+    }
+
+    /// Zero-copy VRAM-to-VRAM `FusedFlashAttention` kernel operating directly on resident buffers.
+    #[allow(clippy::too_many_arguments)]
+    fn run_fused_flash_attention_vram(
+        &self,
+        _q: &dyn DeviceVramBuffer,
+        _k: &dyn DeviceVramBuffer,
+        _v: &dyn DeviceVramBuffer,
+        _mask: Option<(&dyn DeviceVramBuffer, &[usize])>,
+        _q_shape: &[usize],
+        _k_shape: &[usize],
+        _v_shape: &[usize],
+        _out_shape: &[usize],
+        _scale: f64,
+        _k_is_transposed: bool,
+        _dtype: DType,
+    ) -> MoraResult<Option<Arc<dyn DeviceVramBuffer>>> {
+        Ok(None)
+    }
+
+    /// Zero-copy VRAM-to-VRAM `FusedElementwise` kernel operating directly on resident buffers.
+    #[allow(clippy::too_many_arguments)]
+    fn run_fused_elementwise_vram(
+        &self,
+        _inputs: &[&dyn DeviceVramBuffer],
+        _input_shapes: &[&[usize]],
+        _steps: &[FusedEwStep],
+        _out_shape: &[usize],
+        _out_numel: usize,
+        _dtype: DType,
+    ) -> MoraResult<Option<Arc<dyn DeviceVramBuffer>>> {
+        Ok(None)
+    }
 }
 
 /// Native host CPU backend executing multi-threaded cache-blocked SIMD fused kernels.
@@ -1648,7 +1770,10 @@ impl TensorComputeDag {
                 }
             };
 
-            for idx in 0..nodes.len() {
+            // Traverse top-down (reverse topological order) so `(X @ W + b).act()` matches the
+            // outer activation + bias + matmul as a single `FusedLinearAct`/`FusedRmsNormLinear`
+            // before the inner `Add` would be rewritten with `act = None`.
+            for idx in (0..nodes.len()).rev() {
                 if let Some((inner, act)) = as_act(&nodes[idx].op)
                     && uses[inner] == 1
                 {
@@ -1980,6 +2105,223 @@ fn extract_rms_norm_source(
     }
 }
 
+fn resolve_node_vram(
+    dag: &TensorComputeDag,
+    node_id: usize,
+    inputs: &[Arc<Tensor>],
+    mem: &DagMemoryPlan,
+    slot_vram: &[Option<Arc<dyn DeviceVramBuffer>>],
+) -> Option<Arc<dyn DeviceVramBuffer>> {
+    match &dag.nodes[node_id].op {
+        DagOp::Input(slot) => inputs[*slot].vram_buffer_if_contiguous(),
+        DagOp::ConstTensor(t) => t.vram_buffer_if_contiguous(),
+        _ => mem
+            .node_slots
+            .get(node_id)
+            .copied()
+            .flatten()
+            .and_then(|s_id| slot_vram[s_id].clone()),
+    }
+}
+
+fn try_eval_node_vram(
+    backend: &dyn DeviceBackend,
+    dag: &TensorComputeDag,
+    node: &DagNode,
+    inputs: &[Arc<Tensor>],
+    mem: &DagMemoryPlan,
+    slot_vram: &[Option<Arc<dyn DeviceVramBuffer>>],
+) -> MoraResult<Option<Arc<dyn DeviceVramBuffer>>> {
+    if !backend.supports_vram_residency() {
+        return Ok(None);
+    }
+    let get_v = |id: usize| resolve_node_vram(dag, id, inputs, mem, slot_vram);
+    let shape_of = |id: usize| dag.nodes[id].shape.as_slice();
+    let out_numel = checked_numel(&node.shape)?;
+
+    let run_ew_vram =
+        |ids: &[usize], steps: &[FusedEwStep]| -> MoraResult<Option<Arc<dyn DeviceVramBuffer>>> {
+            let mut owned = Vec::with_capacity(ids.len());
+            for &id in ids {
+                let Some(buf) = get_v(id) else {
+                    return Ok(None);
+                };
+                if buf.device() != &node.device {
+                    return Ok(None);
+                }
+                owned.push(buf);
+            }
+            let refs: Vec<&dyn DeviceVramBuffer> = owned.iter().map(|b| b.as_ref()).collect();
+            let shapes: Vec<&[usize]> = ids.iter().map(|&id| shape_of(id)).collect();
+            backend.run_fused_elementwise_vram(
+                &refs,
+                &shapes,
+                steps,
+                &node.shape,
+                out_numel,
+                node.dtype,
+            )
+        };
+
+    match &node.op {
+        DagOp::Input(_) | DagOp::ConstTensor(_) => Ok(None),
+        DagOp::Reshape(a, _) | DagOp::Identity(a) => Ok(get_v(*a)),
+        DagOp::MatMul(a, b) => {
+            let (Some(va), Some(vb)) = (get_v(*a), get_v(*b)) else {
+                return Ok(None);
+            };
+            backend.run_matmul_vram(
+                va.as_ref(),
+                vb.as_ref(),
+                shape_of(*a),
+                shape_of(*b),
+                node.dtype,
+            )
+        }
+        DagOp::FusedLinearAct { x, w, bias, act } => {
+            let (Some(vx), Some(vw)) = (get_v(*x), get_v(*w)) else {
+                return Ok(None);
+            };
+            let vbias = match bias {
+                None => None,
+                Some(b_id) => {
+                    let Some(vb) = get_v(*b_id) else {
+                        return Ok(None);
+                    };
+                    Some((vb, shape_of(*b_id)))
+                }
+            };
+            let x_shape = shape_of(*x);
+            let w_shape = shape_of(*w);
+            let k = w_shape[0];
+            let n = w_shape[1];
+            let m_total = checked_numel(x_shape)? / k.max(1);
+            let bias_ref = vbias.as_ref().map(|(b, s)| (b.as_ref(), *s));
+            backend.run_fused_linear_act_vram(
+                vx.as_ref(),
+                vw.as_ref(),
+                bias_ref,
+                *act,
+                m_total,
+                k,
+                n,
+                &node.shape,
+                node.dtype,
+            )
+        }
+        DagOp::FusedRmsNormLinear {
+            x,
+            eps,
+            gamma,
+            w,
+            bias,
+            act,
+        } => {
+            let (Some(vx), Some(vw)) = (get_v(*x), get_v(*w)) else {
+                return Ok(None);
+            };
+            let vgamma = match gamma {
+                None => None,
+                Some(g_id) => {
+                    let Some(vg) = get_v(*g_id) else {
+                        return Ok(None);
+                    };
+                    Some((vg, shape_of(*g_id)))
+                }
+            };
+            let vbias = match bias {
+                None => None,
+                Some(b_id) => {
+                    let Some(vb) = get_v(*b_id) else {
+                        return Ok(None);
+                    };
+                    Some((vb, shape_of(*b_id)))
+                }
+            };
+            let x_shape = shape_of(*x);
+            let w_shape = shape_of(*w);
+            let k = w_shape[0];
+            let n = w_shape[1];
+            let m_total = checked_numel(x_shape)? / k.max(1);
+            let gamma_ref = vgamma.as_ref().map(|(g, s)| (g.as_ref(), *s));
+            let bias_ref = vbias.as_ref().map(|(b, s)| (b.as_ref(), *s));
+            backend.run_fused_rms_norm_linear_vram(
+                vx.as_ref(),
+                *eps,
+                gamma_ref,
+                vw.as_ref(),
+                bias_ref,
+                *act,
+                m_total,
+                k,
+                n,
+                x_shape,
+                &node.shape,
+                node.dtype,
+            )
+        }
+        DagOp::FusedFlashAttention {
+            q,
+            k,
+            v,
+            mask,
+            scale,
+            k_is_transposed,
+        } => {
+            let (Some(vq), Some(vk), Some(vv)) = (get_v(*q), get_v(*k), get_v(*v)) else {
+                return Ok(None);
+            };
+            let vmask = match mask {
+                None => None,
+                Some(m_id) => {
+                    let Some(vm) = get_v(*m_id) else {
+                        return Ok(None);
+                    };
+                    Some((vm, shape_of(*m_id)))
+                }
+            };
+            let mask_ref = vmask.as_ref().map(|(m, s)| (m.as_ref(), *s));
+            backend.run_fused_flash_attention_vram(
+                vq.as_ref(),
+                vk.as_ref(),
+                vv.as_ref(),
+                mask_ref,
+                shape_of(*q),
+                shape_of(*k),
+                shape_of(*v),
+                &node.shape,
+                *scale,
+                *k_is_transposed,
+                node.dtype,
+            )
+        }
+        DagOp::FusedElementwise { inputs: ids, steps } => run_ew_vram(ids, steps),
+        DagOp::Add(a, b) => run_ew_vram(&[*a, *b], &[FusedEwStep::Add(0, 1)]),
+        DagOp::Sub(a, b) => run_ew_vram(&[*a, *b], &[FusedEwStep::Sub(0, 1)]),
+        DagOp::Mul(a, b) => run_ew_vram(&[*a, *b], &[FusedEwStep::Mul(0, 1)]),
+        DagOp::Div(a, b) => run_ew_vram(&[*a, *b], &[FusedEwStep::Div(0, 1)]),
+        DagOp::Pow(a, b) => run_ew_vram(&[*a, *b], &[FusedEwStep::Pow(0, 1)]),
+        DagOp::AddScalar(a, c) => run_ew_vram(&[*a], &[FusedEwStep::AddScalar(0, *c)]),
+        DagOp::SubScalar(a, c, r) => run_ew_vram(&[*a], &[FusedEwStep::SubScalar(0, *c, *r)]),
+        DagOp::MulScalar(a, c) => run_ew_vram(&[*a], &[FusedEwStep::MulScalar(0, *c)]),
+        DagOp::DivScalar(a, c, r) => run_ew_vram(&[*a], &[FusedEwStep::DivScalar(0, *c, *r)]),
+        DagOp::PowScalar(a, c, r) => run_ew_vram(&[*a], &[FusedEwStep::PowScalar(0, *c, *r)]),
+        DagOp::Neg(a) => run_ew_vram(&[*a], &[FusedEwStep::Neg(0)]),
+        DagOp::Relu(a) => run_ew_vram(&[*a], &[FusedEwStep::Relu(0)]),
+        DagOp::Gelu(a) => run_ew_vram(&[*a], &[FusedEwStep::Gelu(0)]),
+        DagOp::Silu(a) => run_ew_vram(&[*a], &[FusedEwStep::Silu(0)]),
+        DagOp::Tanh(a) => run_ew_vram(&[*a], &[FusedEwStep::Tanh(0)]),
+        DagOp::Sigmoid(a) => run_ew_vram(&[*a], &[FusedEwStep::Sigmoid(0)]),
+        DagOp::Exp(a) => run_ew_vram(&[*a], &[FusedEwStep::Exp(0)]),
+        DagOp::Ln(a) => run_ew_vram(&[*a], &[FusedEwStep::Ln(0)]),
+        DagOp::Sqrt(a) => run_ew_vram(&[*a], &[FusedEwStep::Sqrt(0)]),
+        DagOp::Sin(a) => run_ew_vram(&[*a], &[FusedEwStep::Sin(0)]),
+        DagOp::Cos(a) => run_ew_vram(&[*a], &[FusedEwStep::Cos(0)]),
+        DagOp::Abs(a) => run_ew_vram(&[*a], &[FusedEwStep::Abs(0)]),
+        _ => Ok(None),
+    }
+}
+
 fn execute_dag_with_workspace(
     dag: &TensorComputeDag,
     mem: &DagMemoryPlan,
@@ -2010,7 +2352,11 @@ fn execute_dag_with_workspace(
         }
     }
 
-    let input_flats: Vec<Vec<f64>> = inputs.iter().map(|t| t.to_flat_vec()).collect();
+    // Lazily decoded host views of inputs (never materialized on pure VRAM-to-VRAM GPU execution!).
+    let mut input_flats: Vec<Option<Vec<f64>>> = vec![None; inputs.len()];
+    let mut slot_vram: Vec<Option<Arc<dyn DeviceVramBuffer>>> = vec![None; mem.slots.len()];
+    let mut slot_host_valid: Vec<bool> = vec![false; mem.slots.len()];
+    let mut slot_meta: Vec<(usize, DType)> = vec![(0, DType::F64); mem.slots.len()];
 
     for (idx, node) in dag.nodes.iter().enumerate() {
         if matches!(node.op, DagOp::Input(_) | DagOp::ConstTensor(_)) {
@@ -2025,6 +2371,61 @@ fn execute_dag_with_workspace(
         }
 
         let dst_slot_opt = mem.node_slots[idx];
+
+        // ── Zero-copy GPU VRAM-to-VRAM fast path ──
+        let backend = backend_for_device(&node.device);
+        if backend.supports_vram_residency()
+            && let Some(out_vram) =
+                try_eval_node_vram(backend.as_ref(), dag, node, inputs, mem, &slot_vram)?
+        {
+            if idx == dag.output {
+                return Tensor::from_vram_output(
+                    out_vram,
+                    node.shape.clone(),
+                    node.dtype,
+                    node.device.clone(),
+                    false,
+                );
+            }
+            if let Some(s_id) = dst_slot_opt {
+                let numel = checked_numel(&node.shape)?;
+                slot_vram[s_id] = Some(out_vram);
+                slot_host_valid[s_id] = false;
+                slot_meta[s_id] = (numel, node.dtype);
+            }
+            continue;
+        }
+
+        // Materialize host slices lazily for any predecessors required by host/hybrid dispatch.
+        for pred in node.op.inputs() {
+            match &dag.nodes[pred].op {
+                DagOp::Input(slot) => {
+                    if input_flats[*slot].is_none() {
+                        input_flats[*slot] = Some(inputs[*slot].to_flat_vec());
+                    }
+                }
+                DagOp::ConstTensor(_) => {}
+                _ => {
+                    if let Some(s_id) = mem.node_slots[pred]
+                        && !slot_host_valid[s_id]
+                        && let Some(vbuf) = &slot_vram[s_id]
+                    {
+                        let (numel, dt) = slot_meta[s_id];
+                        let mut raw = vec![0u8; vbuf.byte_len()];
+                        vbuf.download_bytes(&mut raw)?;
+                        let aligned = AlignedByteBuffer::from_raw_bytes(&raw, numel, dt)?;
+                        let dst_slot = &mut ws.slots[s_id];
+                        dst_slot.clear();
+                        dst_slot.reserve(numel);
+                        for i in 0..numel {
+                            dst_slot.push(aligned.get_f64(i));
+                        }
+                        slot_host_valid[s_id] = true;
+                    }
+                }
+            }
+        }
+
         // Move the physical destination buffer out via O(1) swap so we can borrow all live source slots immutably!
         let mut dst_buf: Vec<f64> = if let Some(s_id) = dst_slot_opt {
             debug_assert!(
@@ -2075,6 +2476,10 @@ fn execute_dag_with_workspace(
             return out_tensor;
         }
         finalize_slot(ws, dst_buf);
+        if let Some(s_id) = dst_slot_opt {
+            slot_host_valid[s_id] = true;
+            slot_vram[s_id] = None;
+        }
     }
 
     Err(MoraError::Runtime(
@@ -2086,13 +2491,15 @@ fn execute_dag_with_workspace(
 fn read_node_slice<'a>(
     dag: &'a TensorComputeDag,
     node_id: usize,
-    input_flats: &'a [Vec<f64>],
+    input_flats: &'a [Option<Vec<f64>>],
     const_flats: &'a [Option<Vec<f64>>],
     mem: &DagMemoryPlan,
     slots: &'a [Vec<f64>],
 ) -> &'a [f64] {
     match &dag.nodes[node_id].op {
-        DagOp::Input(slot) => &input_flats[*slot],
+        DagOp::Input(slot) => input_flats[*slot]
+            .as_deref()
+            .expect("input flat lazily populated"),
         DagOp::ConstTensor(_) => const_flats[node_id]
             .as_deref()
             .expect("const_flat pre-decoded"),
@@ -2106,7 +2513,7 @@ fn read_node_slice<'a>(
 fn eval_node_into(
     dag: &TensorComputeDag,
     node: &DagNode,
-    input_flats: &[Vec<f64>],
+    input_flats: &[Option<Vec<f64>>],
     const_flats: &[Option<Vec<f64>>],
     mem: &DagMemoryPlan,
     slots: &[Vec<f64>],

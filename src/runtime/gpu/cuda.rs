@@ -16,15 +16,20 @@
 
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
+use std::fmt;
 use std::ptr;
 use std::sync::Arc;
 
 use crate::common::sync::Mutex;
 
-use crate::common::{DType, Device};
+use crate::common::{
+    DType, Device, bf16_bits_to_f64, f16_bits_to_f64, f64_to_bf16_bits, f64_to_f16_bits,
+};
 use crate::error::{MoraError, MoraResult};
-use crate::runtime::compute_dag::{DeviceBackend, FusedAct, FusedEwStep};
-use crate::runtime::gpu::{DynLib, GpuDeviceInfo, HardwareBackendEntry};
+use crate::runtime::compute_dag::{
+    DeviceBackend, DeviceVramBuffer, FusedAct, FusedEwStep, VramTelemetry,
+};
+use crate::runtime::gpu::{DynLib, GpuDeviceInfo, HardwareBackendEntry, VramCounters};
 use crate::runtime::simd_kernels;
 
 type CuResult = c_int;
@@ -256,11 +261,19 @@ impl CudaVramArena {
 struct CudaKernels {
     module: CuModule,
     matmul_f64: CuFunction,
+    matmul_f32: CuFunction,
+    matmul_f16: CuFunction,
+    matmul_bf16: CuFunction,
     fused_linear_act_f64: CuFunction,
+    fused_linear_act_f32: CuFunction,
+    fused_linear_act_f16: CuFunction,
+    fused_linear_act_bf16: CuFunction,
     rms_inv_f64: CuFunction,
     fused_rms_linear_act_f64: CuFunction,
     fused_flash_attention_f64: CuFunction,
     fused_ew_f64: CuFunction,
+    cast_to_f64: CuFunction,
+    cast_from_f64: CuFunction,
 }
 
 struct CudaContextState {
@@ -269,26 +282,26 @@ struct CudaContextState {
     arena: CudaVramArena,
 }
 
-/// Live NVIDIA CUDA hardware [`DeviceBackend`] executing native PTX ISA 7.0 `f64` kernels on VRAM.
-pub(crate) struct CudaDeviceBackend {
+struct CudaDeviceInner {
     device: Device,
     cu_dev: CuDevice,
     api: Arc<CudaDriverApi>,
-    info: GpuDeviceInfo,
     /// Serializes context binding + arena/kernel launch safely across concurrent Mora `spawn` tasks.
     state: Mutex<CudaContextState>,
+    counters: VramCounters,
 }
 
-// SAFETY: `CudaDeviceBackend` guards its `CUcontext`, `CUmodule`, `CUfunction`s, and `CudaVramArena`
+// SAFETY: `CudaDeviceInner` guards its `CUcontext`, `CUmodule`, `CUfunction`s, and `CudaVramArena`
 // inside a `Mutex`, and binds `cuCtxSetCurrent` on every locked operation before calling CUDA APIs.
-unsafe impl Send for CudaDeviceBackend {}
+unsafe impl Send for CudaDeviceInner {}
 // SAFETY: All CUDA operations occur strictly under `self.state.lock()` with `cuCtxSetCurrent`.
-unsafe impl Sync for CudaDeviceBackend {}
+unsafe impl Sync for CudaDeviceInner {}
 
-impl Drop for CudaDeviceBackend {
+impl Drop for CudaDeviceInner {
     fn drop(&mut self) {
         let mut st = self.state.lock();
-        // SAFETY: Context is valid until `cuDevicePrimaryCtxRelease_v2` below.
+        // SAFETY: Context is valid until `cuDevicePrimaryCtxRelease_v2` below; all `CudaVramBuffer`s
+        // holding `Arc<CudaDeviceInner>` have already been dropped before this runs.
         unsafe {
             let _ = (self.api.cu_ctx_set_current)(st.ctx);
             st.arena.drain(&self.api);
@@ -299,6 +312,103 @@ impl Drop for CudaDeviceBackend {
             let _ = (self.api.cu_primary_ctx_release)(self.cu_dev);
         }
     }
+}
+
+/// Owned physical CUDA VRAM buffer (`CUdeviceptr`) with RAII return to `CudaVramArena`.
+struct CudaVramBuffer {
+    inner: Arc<CudaDeviceInner>,
+    ptr: CuDevicePtr,
+    cap: usize,
+    byte_len: usize,
+}
+
+impl fmt::Debug for CudaVramBuffer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CudaVramBuffer")
+            .field("device", &self.inner.device)
+            .field("ptr", &format_args!("0x{:x}", self.ptr))
+            .field("byte_len", &self.byte_len)
+            .finish()
+    }
+}
+
+impl Drop for CudaVramBuffer {
+    fn drop(&mut self) {
+        let mut st = self.inner.state.lock();
+        // SAFETY: Bind retained primary context before releasing `CUdeviceptr` to arena.
+        let _ = unsafe { (self.inner.api.cu_ctx_set_current)(st.ctx) };
+        st.arena.release(&self.inner.api, self.ptr, self.cap);
+        self.inner.counters.on_free(self.byte_len);
+    }
+}
+
+impl DeviceVramBuffer for CudaVramBuffer {
+    fn device(&self) -> &Device {
+        &self.inner.device
+    }
+
+    fn byte_len(&self) -> usize {
+        self.byte_len
+    }
+
+    fn raw_handle(&self) -> u64 {
+        self.ptr
+    }
+
+    fn upload_bytes(&self, src: &[u8]) -> MoraResult<()> {
+        if src.len() != self.byte_len {
+            return Err(MoraError::Runtime(format!(
+                "CudaVramBuffer::upload_bytes: expected {} bytes, got {}",
+                self.byte_len,
+                src.len()
+            )));
+        }
+        if src.is_empty() {
+            return Ok(());
+        }
+        let st = self.inner.state.lock();
+        // SAFETY: Bind retained primary CUDA context before H2D copy.
+        let rc_ctx = unsafe { (self.inner.api.cu_ctx_set_current)(st.ctx) };
+        cu_check(rc_ctx, "cuCtxSetCurrent(upload_bytes)")?;
+        // SAFETY: `self.ptr` has capacity `self.cap >= self.byte_len == src.len()`.
+        let rc = unsafe {
+            (self.inner.api.cu_memcpy_htod)(self.ptr, src.as_ptr() as *const c_void, src.len())
+        };
+        cu_check(rc, "cuMemcpyHtoD_v2(upload_bytes)")?;
+        self.inner.counters.on_h2d();
+        Ok(())
+    }
+
+    fn download_bytes(&self, dst: &mut [u8]) -> MoraResult<()> {
+        if dst.len() != self.byte_len {
+            return Err(MoraError::Runtime(format!(
+                "CudaVramBuffer::download_bytes: expected {} bytes, got {}",
+                self.byte_len,
+                dst.len()
+            )));
+        }
+        if dst.is_empty() {
+            return Ok(());
+        }
+        let st = self.inner.state.lock();
+        // SAFETY: Bind retained primary CUDA context before D2H copy.
+        let rc_ctx = unsafe { (self.inner.api.cu_ctx_set_current)(st.ctx) };
+        cu_check(rc_ctx, "cuCtxSetCurrent(download_bytes)")?;
+        // SAFETY: `self.ptr` has exact initialized `self.byte_len == dst.len()` bytes.
+        let rc = unsafe {
+            (self.inner.api.cu_memcpy_dtoh)(dst.as_mut_ptr() as *mut c_void, self.ptr, dst.len())
+        };
+        cu_check(rc, "cuMemcpyDtoH_v2(download_bytes)")?;
+        self.inner.counters.on_d2h();
+        Ok(())
+    }
+}
+
+/// Live NVIDIA CUDA hardware [`DeviceBackend`] executing native PTX ISA 7.0 `f64`/`f32`/`f16`/`bf16`
+/// kernels directly on persistent GPU VRAM.
+pub(crate) struct CudaDeviceBackend {
+    inner: Arc<CudaDeviceInner>,
+    info: GpuDeviceInfo,
 }
 
 /// Native PTX ISA 7.0 (`sm_50`) double-precision GPU compute kernels for Mora `TensorComputeDag`.
@@ -1310,6 +1420,773 @@ EW_WRITE_OUT:
 EW_EXIT:
     ret;
 }
+
+// Helper: f32 activation evaluated via high-accuracy f64 transcendental path
+.func (.reg .f32 res) mora_apply_act_f32(.reg .f32 x, .reg .u32 act)
+{
+    .reg .f64 %fd0, %fd1;
+    cvt.f64.f32 %fd0, x;
+    call (%fd1), mora_apply_act, (%fd0, act);
+    cvt.rn.f32.f64 res, %fd1;
+    ret;
+}
+
+// Helper: BF16 (low 16 bits in .u32) -> F32 (.f32) exact bit-shift
+.func (.reg .f32 res) mora_bf16_to_f32(.reg .u32 h)
+{
+    .reg .u32 %r0;
+    shl.b32 %r0, h, 16;
+    mov.b32 res, %r0;
+    ret;
+}
+
+// Helper: F32 (.f32) -> BF16 (low 16 bits in .u32) with IEEE round-to-nearest-even & NaN preservation
+.func (.reg .u32 res) mora_f32_to_bf16(.reg .f32 x)
+{
+    .reg .pred %p0;
+    .reg .u32 %r<6>;
+    mov.b32 %r0, x;
+    and.b32 %r1, %r0, 0x7fffffff;
+    setp.gt.u32 %p0, %r1, 0x7f800000;
+    @%p0 bra BF16_NAN;
+    shr.b32 %r2, %r0, 16;
+    and.b32 %r2, %r2, 1;
+    add.u32 %r3, %r2, 0x7fff;
+    add.u32 %r4, %r0, %r3;
+    shr.b32 res, %r4, 16;
+    ret;
+BF16_NAN:
+    shr.b32 %r5, %r0, 16;
+    or.b32 res, %r5, 0x0040;
+    ret;
+}
+
+// Kernel 6: Native f32 Batched/2D MatMul directly on 4-byte VRAM buffers.
+.visible .entry mora_matmul_f32(
+    .param .u64 p_out,
+    .param .u64 p_a,
+    .param .u64 p_b,
+    .param .u64 p_a_bases,
+    .param .u64 p_b_bases,
+    .param .u32 batches,
+    .param .u32 m,
+    .param .u32 n,
+    .param .u32 k
+)
+{
+    .reg .pred %p<4>;
+    .reg .u32 %r<14>;
+    .reg .u64 %rd<16>;
+    .reg .f32 %f<4>;
+
+    ld.param.u64 %rd0, [p_out];
+    ld.param.u64 %rd1, [p_a];
+    ld.param.u64 %rd2, [p_b];
+    ld.param.u64 %rd3, [p_a_bases];
+    ld.param.u64 %rd4, [p_b_bases];
+    ld.param.u32 %r0, [batches];
+    ld.param.u32 %r1, [m];
+    ld.param.u32 %r2, [n];
+    ld.param.u32 %r3, [k];
+
+    mov.u32 %r4, %ctaid.x;
+    mov.u32 %r5, %ntid.x;
+    mov.u32 %r6, %tid.x;
+    mad.lo.u32 %r7, %r4, %r5, %r6; // col
+
+    mov.u32 %r4, %ctaid.y;
+    mov.u32 %r5, %ntid.y;
+    mov.u32 %r6, %tid.y;
+    mad.lo.u32 %r8, %r4, %r5, %r6; // row
+
+    mov.u32 %r9, %ctaid.z; // batch
+
+    setp.lt.u32 %p0, %r8, %r1;
+    setp.lt.u32 %p1, %r7, %r2;
+    setp.lt.u32 %p2, %r9, %r0;
+    and.pred %p3, %p0, %p1;
+    and.pred %p3, %p3, %p2;
+    @!%p3 bra MM32_EXIT;
+
+    cvt.u64.u32 %rd5, %r9;
+    shl.b64 %rd6, %rd5, 3;
+    add.u64 %rd7, %rd3, %rd6;
+    ld.global.u64 %rd8, [%rd7];
+    add.u64 %rd7, %rd4, %rd6;
+    ld.global.u64 %rd9, [%rd7];
+
+    mul.wide.u32 %rd10, %r8, %r3;
+    add.u64 %rd8, %rd8, %rd10;
+
+    mov.f32 %f0, 0f00000000;
+    mov.u32 %r10, 0;
+
+MM32_LOOP:
+    setp.ge.u32 %p0, %r10, %r3;
+    @%p0 bra MM32_DONE;
+
+    cvt.u64.u32 %rd11, %r10;
+    add.u64 %rd12, %rd8, %rd11;
+    shl.b64 %rd12, %rd12, 2;
+    add.u64 %rd12, %rd1, %rd12;
+    ld.global.f32 %f1, [%rd12];
+
+    mul.wide.u32 %rd13, %r10, %r2;
+    add.u64 %rd13, %rd13, %rd9;
+    cvt.u64.u32 %rd14, %r7;
+    add.u64 %rd13, %rd13, %rd14;
+    shl.b64 %rd13, %rd13, 2;
+    add.u64 %rd13, %rd2, %rd13;
+    ld.global.f32 %f2, [%rd13];
+
+    fma.rn.f32 %f0, %f1, %f2, %f0;
+    add.u32 %r10, %r10, 1;
+    bra MM32_LOOP;
+
+MM32_DONE:
+    mul.wide.u32 %rd11, %r1, %r2;
+    mul.lo.u64 %rd12, %rd5, %rd11;
+    mul.wide.u32 %rd13, %r8, %r2;
+    add.u64 %rd12, %rd12, %rd13;
+    cvt.u64.u32 %rd14, %r7;
+    add.u64 %rd12, %rd12, %rd14;
+    shl.b64 %rd12, %rd12, 2;
+    add.u64 %rd12, %rd0, %rd12;
+    st.global.f32 [%rd12], %f0;
+
+MM32_EXIT:
+    ret;
+}
+
+// Kernel 7: Native f32 Fused Linear + optional Bias + Activation directly on 4-byte VRAM buffers.
+.visible .entry mora_fused_linear_act_f32(
+    .param .u64 p_out,
+    .param .u64 p_x,
+    .param .u64 p_w,
+    .param .u64 p_bias,
+    .param .u32 has_bias,
+    .param .u32 bias_len,
+    .param .u32 m_total,
+    .param .u32 k,
+    .param .u32 n,
+    .param .u32 act_code
+)
+{
+    .reg .pred %p<3>;
+    .reg .u32 %r<13>;
+    .reg .u64 %rd<12>;
+    .reg .f32 %f<5>;
+
+    ld.param.u64 %rd0, [p_out];
+    ld.param.u64 %rd1, [p_x];
+    ld.param.u64 %rd2, [p_w];
+    ld.param.u64 %rd3, [p_bias];
+    ld.param.u32 %r0, [has_bias];
+    ld.param.u32 %r1, [bias_len];
+    ld.param.u32 %r2, [m_total];
+    ld.param.u32 %r3, [k];
+    ld.param.u32 %r4, [n];
+    ld.param.u32 %r5, [act_code];
+
+    mov.u32 %r6, %ctaid.x;
+    mov.u32 %r7, %ntid.x;
+    mov.u32 %r8, %tid.x;
+    mad.lo.u32 %r9, %r6, %r7, %r8; // col
+
+    mov.u32 %r6, %ctaid.y;
+    mov.u32 %r7, %ntid.y;
+    mov.u32 %r8, %tid.y;
+    mad.lo.u32 %r10, %r6, %r7, %r8; // row
+
+    setp.lt.u32 %p0, %r10, %r2;
+    setp.lt.u32 %p1, %r9, %r4;
+    and.pred %p2, %p0, %p1;
+    @!%p2 bra FLA32_EXIT;
+
+    mul.wide.u32 %rd4, %r10, %r3;
+    mov.f32 %f0, 0f00000000;
+    mov.u32 %r11, 0;
+
+FLA32_LOOP:
+    setp.ge.u32 %p0, %r11, %r3;
+    @%p0 bra FLA32_AFTER_DOT;
+
+    cvt.u64.u32 %rd5, %r11;
+    add.u64 %rd6, %rd4, %rd5;
+    shl.b64 %rd6, %rd6, 2;
+    add.u64 %rd6, %rd1, %rd6;
+    ld.global.f32 %f1, [%rd6];
+
+    mul.wide.u32 %rd7, %r11, %r4;
+    cvt.u64.u32 %rd8, %r9;
+    add.u64 %rd7, %rd7, %rd8;
+    shl.b64 %rd7, %rd7, 2;
+    add.u64 %rd7, %rd2, %rd7;
+    ld.global.f32 %f2, [%rd7];
+
+    fma.rn.f32 %f0, %f1, %f2, %f0;
+    add.u32 %r11, %r11, 1;
+    bra FLA32_LOOP;
+
+FLA32_AFTER_DOT:
+    setp.eq.u32 %p0, %r0, 0;
+    @%p0 bra FLA32_ACT;
+    rem.u32 %r12, %r9, %r1;
+    cvt.u64.u32 %rd5, %r12;
+    shl.b64 %rd5, %rd5, 2;
+    add.u64 %rd5, %rd3, %rd5;
+    ld.global.f32 %f3, [%rd5];
+    add.rn.f32 %f0, %f0, %f3;
+
+FLA32_ACT:
+    call (%f4), mora_apply_act_f32, (%f0, %r5);
+
+    mul.wide.u32 %rd9, %r10, %r4;
+    cvt.u64.u32 %rd10, %r9;
+    add.u64 %rd9, %rd9, %rd10;
+    shl.b64 %rd9, %rd9, 2;
+    add.u64 %rd9, %rd0, %rd9;
+    st.global.f32 [%rd9], %f4;
+
+FLA32_EXIT:
+    ret;
+}
+
+// Kernel 8: Native FP16 (IEEE-754 binary16, 2-byte VRAM) Batched/2D MatMul with f32 accumulation.
+.visible .entry mora_matmul_f16(
+    .param .u64 p_out,
+    .param .u64 p_a,
+    .param .u64 p_b,
+    .param .u64 p_a_bases,
+    .param .u64 p_b_bases,
+    .param .u32 batches,
+    .param .u32 m,
+    .param .u32 n,
+    .param .u32 k
+)
+{
+    .reg .pred %p<4>;
+    .reg .u32 %r<14>;
+    .reg .u64 %rd<16>;
+    .reg .b16 %h<4>;
+    .reg .f32 %f<4>;
+
+    ld.param.u64 %rd0, [p_out];
+    ld.param.u64 %rd1, [p_a];
+    ld.param.u64 %rd2, [p_b];
+    ld.param.u64 %rd3, [p_a_bases];
+    ld.param.u64 %rd4, [p_b_bases];
+    ld.param.u32 %r0, [batches];
+    ld.param.u32 %r1, [m];
+    ld.param.u32 %r2, [n];
+    ld.param.u32 %r3, [k];
+
+    mov.u32 %r4, %ctaid.x;
+    mov.u32 %r5, %ntid.x;
+    mov.u32 %r6, %tid.x;
+    mad.lo.u32 %r7, %r4, %r5, %r6; // col
+
+    mov.u32 %r4, %ctaid.y;
+    mov.u32 %r5, %ntid.y;
+    mov.u32 %r6, %tid.y;
+    mad.lo.u32 %r8, %r4, %r5, %r6; // row
+
+    mov.u32 %r9, %ctaid.z; // batch
+
+    setp.lt.u32 %p0, %r8, %r1;
+    setp.lt.u32 %p1, %r7, %r2;
+    setp.lt.u32 %p2, %r9, %r0;
+    and.pred %p3, %p0, %p1;
+    and.pred %p3, %p3, %p2;
+    @!%p3 bra MM16_EXIT;
+
+    cvt.u64.u32 %rd5, %r9;
+    shl.b64 %rd6, %rd5, 3;
+    add.u64 %rd7, %rd3, %rd6;
+    ld.global.u64 %rd8, [%rd7];
+    add.u64 %rd7, %rd4, %rd6;
+    ld.global.u64 %rd9, [%rd7];
+
+    mul.wide.u32 %rd10, %r8, %r3;
+    add.u64 %rd8, %rd8, %rd10;
+
+    mov.f32 %f0, 0f00000000;
+    mov.u32 %r10, 0;
+
+MM16_LOOP:
+    setp.ge.u32 %p0, %r10, %r3;
+    @%p0 bra MM16_DONE;
+
+    cvt.u64.u32 %rd11, %r10;
+    add.u64 %rd12, %rd8, %rd11;
+    shl.b64 %rd12, %rd12, 1;
+    add.u64 %rd12, %rd1, %rd12;
+    ld.global.b16 %h0, [%rd12];
+    cvt.f32.f16 %f1, %h0;
+
+    mul.wide.u32 %rd13, %r10, %r2;
+    add.u64 %rd13, %rd13, %rd9;
+    cvt.u64.u32 %rd14, %r7;
+    add.u64 %rd13, %rd13, %rd14;
+    shl.b64 %rd13, %rd13, 1;
+    add.u64 %rd13, %rd2, %rd13;
+    ld.global.b16 %h1, [%rd13];
+    cvt.f32.f16 %f2, %h1;
+
+    fma.rn.f32 %f0, %f1, %f2, %f0;
+    add.u32 %r10, %r10, 1;
+    bra MM16_LOOP;
+
+MM16_DONE:
+    cvt.rn.f16.f32 %h2, %f0;
+    mul.wide.u32 %rd11, %r1, %r2;
+    mul.lo.u64 %rd12, %rd5, %rd11;
+    mul.wide.u32 %rd13, %r8, %r2;
+    add.u64 %rd12, %rd12, %rd13;
+    cvt.u64.u32 %rd14, %r7;
+    add.u64 %rd12, %rd12, %rd14;
+    shl.b64 %rd12, %rd12, 1;
+    add.u64 %rd12, %rd0, %rd12;
+    st.global.b16 [%rd12], %h2;
+
+MM16_EXIT:
+    ret;
+}
+
+// Kernel 9: Native FP16 Fused Linear + optional Bias + Activation on 2-byte VRAM buffers.
+.visible .entry mora_fused_linear_act_f16(
+    .param .u64 p_out,
+    .param .u64 p_x,
+    .param .u64 p_w,
+    .param .u64 p_bias,
+    .param .u32 has_bias,
+    .param .u32 bias_len,
+    .param .u32 m_total,
+    .param .u32 k,
+    .param .u32 n,
+    .param .u32 act_code
+)
+{
+    .reg .pred %p<3>;
+    .reg .u32 %r<13>;
+    .reg .u64 %rd<12>;
+    .reg .b16 %h<4>;
+    .reg .f32 %f<5>;
+
+    ld.param.u64 %rd0, [p_out];
+    ld.param.u64 %rd1, [p_x];
+    ld.param.u64 %rd2, [p_w];
+    ld.param.u64 %rd3, [p_bias];
+    ld.param.u32 %r0, [has_bias];
+    ld.param.u32 %r1, [bias_len];
+    ld.param.u32 %r2, [m_total];
+    ld.param.u32 %r3, [k];
+    ld.param.u32 %r4, [n];
+    ld.param.u32 %r5, [act_code];
+
+    mov.u32 %r6, %ctaid.x;
+    mov.u32 %r7, %ntid.x;
+    mov.u32 %r8, %tid.x;
+    mad.lo.u32 %r9, %r6, %r7, %r8; // col
+
+    mov.u32 %r6, %ctaid.y;
+    mov.u32 %r7, %ntid.y;
+    mov.u32 %r8, %tid.y;
+    mad.lo.u32 %r10, %r6, %r7, %r8; // row
+
+    setp.lt.u32 %p0, %r10, %r2;
+    setp.lt.u32 %p1, %r9, %r4;
+    and.pred %p2, %p0, %p1;
+    @!%p2 bra FLA16_EXIT;
+
+    mul.wide.u32 %rd4, %r10, %r3;
+    mov.f32 %f0, 0f00000000;
+    mov.u32 %r11, 0;
+
+FLA16_LOOP:
+    setp.ge.u32 %p0, %r11, %r3;
+    @%p0 bra FLA16_AFTER_DOT;
+
+    cvt.u64.u32 %rd5, %r11;
+    add.u64 %rd6, %rd4, %rd5;
+    shl.b64 %rd6, %rd6, 1;
+    add.u64 %rd6, %rd1, %rd6;
+    ld.global.b16 %h0, [%rd6];
+    cvt.f32.f16 %f1, %h0;
+
+    mul.wide.u32 %rd7, %r11, %r4;
+    cvt.u64.u32 %rd8, %r9;
+    add.u64 %rd7, %rd7, %rd8;
+    shl.b64 %rd7, %rd7, 1;
+    add.u64 %rd7, %rd2, %rd7;
+    ld.global.b16 %h1, [%rd7];
+    cvt.f32.f16 %f2, %h1;
+
+    fma.rn.f32 %f0, %f1, %f2, %f0;
+    add.u32 %r11, %r11, 1;
+    bra FLA16_LOOP;
+
+FLA16_AFTER_DOT:
+    setp.eq.u32 %p0, %r0, 0;
+    @%p0 bra FLA16_ACT;
+    rem.u32 %r12, %r9, %r1;
+    cvt.u64.u32 %rd5, %r12;
+    shl.b64 %rd5, %rd5, 1;
+    add.u64 %rd5, %rd3, %rd5;
+    ld.global.b16 %h2, [%rd5];
+    cvt.f32.f16 %f3, %h2;
+    add.rn.f32 %f0, %f0, %f3;
+
+FLA16_ACT:
+    call (%f4), mora_apply_act_f32, (%f0, %r5);
+    cvt.rn.f16.f32 %h3, %f4;
+
+    mul.wide.u32 %rd9, %r10, %r4;
+    cvt.u64.u32 %rd10, %r9;
+    add.u64 %rd9, %rd9, %rd10;
+    shl.b64 %rd9, %rd9, 1;
+    add.u64 %rd9, %rd0, %rd9;
+    st.global.b16 [%rd9], %h3;
+
+FLA16_EXIT:
+    ret;
+}
+
+// Kernel 10: Native BF16 (2-byte VRAM) Batched/2D MatMul with f32 accumulation & RNE rounding.
+.visible .entry mora_matmul_bf16(
+    .param .u64 p_out,
+    .param .u64 p_a,
+    .param .u64 p_b,
+    .param .u64 p_a_bases,
+    .param .u64 p_b_bases,
+    .param .u32 batches,
+    .param .u32 m,
+    .param .u32 n,
+    .param .u32 k
+)
+{
+    .reg .pred %p<4>;
+    .reg .u32 %r<14>;
+    .reg .u64 %rd<16>;
+    .reg .u16 %u<4>;
+    .reg .f32 %f<4>;
+
+    ld.param.u64 %rd0, [p_out];
+    ld.param.u64 %rd1, [p_a];
+    ld.param.u64 %rd2, [p_b];
+    ld.param.u64 %rd3, [p_a_bases];
+    ld.param.u64 %rd4, [p_b_bases];
+    ld.param.u32 %r0, [batches];
+    ld.param.u32 %r1, [m];
+    ld.param.u32 %r2, [n];
+    ld.param.u32 %r3, [k];
+
+    mov.u32 %r4, %ctaid.x;
+    mov.u32 %r5, %ntid.x;
+    mov.u32 %r6, %tid.x;
+    mad.lo.u32 %r7, %r4, %r5, %r6; // col
+
+    mov.u32 %r4, %ctaid.y;
+    mov.u32 %r5, %ntid.y;
+    mov.u32 %r6, %tid.y;
+    mad.lo.u32 %r8, %r4, %r5, %r6; // row
+
+    mov.u32 %r9, %ctaid.z; // batch
+
+    setp.lt.u32 %p0, %r8, %r1;
+    setp.lt.u32 %p1, %r7, %r2;
+    setp.lt.u32 %p2, %r9, %r0;
+    and.pred %p3, %p0, %p1;
+    and.pred %p3, %p3, %p2;
+    @!%p3 bra MMBF_EXIT;
+
+    cvt.u64.u32 %rd5, %r9;
+    shl.b64 %rd6, %rd5, 3;
+    add.u64 %rd7, %rd3, %rd6;
+    ld.global.u64 %rd8, [%rd7];
+    add.u64 %rd7, %rd4, %rd6;
+    ld.global.u64 %rd9, [%rd7];
+
+    mul.wide.u32 %rd10, %r8, %r3;
+    add.u64 %rd8, %rd8, %rd10;
+
+    mov.f32 %f0, 0f00000000;
+    mov.u32 %r10, 0;
+
+MMBF_LOOP:
+    setp.ge.u32 %p0, %r10, %r3;
+    @%p0 bra MMBF_DONE;
+
+    cvt.u64.u32 %rd11, %r10;
+    add.u64 %rd12, %rd8, %rd11;
+    shl.b64 %rd12, %rd12, 1;
+    add.u64 %rd12, %rd1, %rd12;
+    ld.global.u16 %u0, [%rd12];
+    cvt.u32.u16 %r11, %u0;
+    call (%f1), mora_bf16_to_f32, (%r11);
+
+    mul.wide.u32 %rd13, %r10, %r2;
+    add.u64 %rd13, %rd13, %rd9;
+    cvt.u64.u32 %rd14, %r7;
+    add.u64 %rd13, %rd13, %rd14;
+    shl.b64 %rd13, %rd13, 1;
+    add.u64 %rd13, %rd2, %rd13;
+    ld.global.u16 %u1, [%rd13];
+    cvt.u32.u16 %r12, %u1;
+    call (%f2), mora_bf16_to_f32, (%r12);
+
+    fma.rn.f32 %f0, %f1, %f2, %f0;
+    add.u32 %r10, %r10, 1;
+    bra MMBF_LOOP;
+
+MMBF_DONE:
+    call (%r13), mora_f32_to_bf16, (%f0);
+    cvt.u16.u32 %u2, %r13;
+    mul.wide.u32 %rd11, %r1, %r2;
+    mul.lo.u64 %rd12, %rd5, %rd11;
+    mul.wide.u32 %rd13, %r8, %r2;
+    add.u64 %rd12, %rd12, %rd13;
+    cvt.u64.u32 %rd14, %r7;
+    add.u64 %rd12, %rd12, %rd14;
+    shl.b64 %rd12, %rd12, 1;
+    add.u64 %rd12, %rd0, %rd12;
+    st.global.u16 [%rd12], %u2;
+
+MMBF_EXIT:
+    ret;
+}
+
+// Kernel 11: Native BF16 Fused Linear + optional Bias + Activation on 2-byte VRAM buffers.
+.visible .entry mora_fused_linear_act_bf16(
+    .param .u64 p_out,
+    .param .u64 p_x,
+    .param .u64 p_w,
+    .param .u64 p_bias,
+    .param .u32 has_bias,
+    .param .u32 bias_len,
+    .param .u32 m_total,
+    .param .u32 k,
+    .param .u32 n,
+    .param .u32 act_code
+)
+{
+    .reg .pred %p<3>;
+    .reg .u32 %r<16>;
+    .reg .u64 %rd<12>;
+    .reg .u16 %u<4>;
+    .reg .f32 %f<5>;
+
+    ld.param.u64 %rd0, [p_out];
+    ld.param.u64 %rd1, [p_x];
+    ld.param.u64 %rd2, [p_w];
+    ld.param.u64 %rd3, [p_bias];
+    ld.param.u32 %r0, [has_bias];
+    ld.param.u32 %r1, [bias_len];
+    ld.param.u32 %r2, [m_total];
+    ld.param.u32 %r3, [k];
+    ld.param.u32 %r4, [n];
+    ld.param.u32 %r5, [act_code];
+
+    mov.u32 %r6, %ctaid.x;
+    mov.u32 %r7, %ntid.x;
+    mov.u32 %r8, %tid.x;
+    mad.lo.u32 %r9, %r6, %r7, %r8; // col
+
+    mov.u32 %r6, %ctaid.y;
+    mov.u32 %r7, %ntid.y;
+    mov.u32 %r8, %tid.y;
+    mad.lo.u32 %r10, %r6, %r7, %r8; // row
+
+    setp.lt.u32 %p0, %r10, %r2;
+    setp.lt.u32 %p1, %r9, %r4;
+    and.pred %p2, %p0, %p1;
+    @!%p2 bra FLABF_EXIT;
+
+    mul.wide.u32 %rd4, %r10, %r3;
+    mov.f32 %f0, 0f00000000;
+    mov.u32 %r11, 0;
+
+FLABF_LOOP:
+    setp.ge.u32 %p0, %r11, %r3;
+    @%p0 bra FLABF_AFTER_DOT;
+
+    cvt.u64.u32 %rd5, %r11;
+    add.u64 %rd6, %rd4, %rd5;
+    shl.b64 %rd6, %rd6, 1;
+    add.u64 %rd6, %rd1, %rd6;
+    ld.global.u16 %u0, [%rd6];
+    cvt.u32.u16 %r13, %u0;
+    call (%f1), mora_bf16_to_f32, (%r13);
+
+    mul.wide.u32 %rd7, %r11, %r4;
+    cvt.u64.u32 %rd8, %r9;
+    add.u64 %rd7, %rd7, %rd8;
+    shl.b64 %rd7, %rd7, 1;
+    add.u64 %rd7, %rd2, %rd7;
+    ld.global.u16 %u1, [%rd7];
+    cvt.u32.u16 %r14, %u1;
+    call (%f2), mora_bf16_to_f32, (%r14);
+
+    fma.rn.f32 %f0, %f1, %f2, %f0;
+    add.u32 %r11, %r11, 1;
+    bra FLABF_LOOP;
+
+FLABF_AFTER_DOT:
+    setp.eq.u32 %p0, %r0, 0;
+    @%p0 bra FLABF_ACT;
+    rem.u32 %r12, %r9, %r1;
+    cvt.u64.u32 %rd5, %r12;
+    shl.b64 %rd5, %rd5, 1;
+    add.u64 %rd5, %rd3, %rd5;
+    ld.global.u16 %u2, [%rd5];
+    cvt.u32.u16 %r13, %u2;
+    call (%f3), mora_bf16_to_f32, (%r13);
+    add.rn.f32 %f0, %f0, %f3;
+
+FLABF_ACT:
+    call (%f4), mora_apply_act_f32, (%f0, %r5);
+    call (%r15), mora_f32_to_bf16, (%f4);
+    cvt.u16.u32 %u3, %r15;
+
+    mul.wide.u32 %rd9, %r10, %r4;
+    cvt.u64.u32 %rd10, %r9;
+    add.u64 %rd9, %rd9, %rd10;
+    shl.b64 %rd9, %rd9, 1;
+    add.u64 %rd9, %rd0, %rd9;
+    st.global.u16 [%rd9], %u3;
+
+FLABF_EXIT:
+    ret;
+}
+
+// -- On-device VRAM DType conversion kernels (0 PCIe H2D/D2H for f32/f16/bf16 VRAM pipelines) --
+// fmt: 0 = f32, 1 = f16, 2 = bf16
+.visible .entry mora_cast_to_f64(
+    .param .u64 p_dst,
+    .param .u64 p_src,
+    .param .u32 p_n,
+    .param .u32 p_fmt
+)
+{
+    .reg .pred %p<4>;
+    .reg .u32 %r<8>;
+    .reg .u16 %u<2>;
+    .reg .b16 %h<2>;
+    .reg .u64 %rd<8>;
+    .reg .f32 %f<2>;
+    .reg .f64 %fd<2>;
+
+    ld.param.u64 %rd0, [p_dst];
+    ld.param.u64 %rd1, [p_src];
+    ld.param.u32 %r0, [p_n];
+    ld.param.u32 %r1, [p_fmt];
+
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mov.u32 %r4, %tid.x;
+    mad.lo.u32 %r5, %r2, %r3, %r4;
+    setp.ge.u32 %p0, %r5, %r0;
+    @%p0 bra C2F64_EXIT;
+
+    cvt.u64.u32 %rd2, %r5;
+    setp.eq.u32 %p1, %r1, 0;
+    @%p1 bra C2F64_F32;
+    setp.eq.u32 %p2, %r1, 1;
+    @%p2 bra C2F64_F16;
+
+    // bf16 -> f64
+    shl.b64 %rd3, %rd2, 1;
+    add.u64 %rd3, %rd1, %rd3;
+    ld.global.u16 %u0, [%rd3];
+    cvt.u32.u16 %r6, %u0;
+    call (%f0), mora_bf16_to_f32, (%r6);
+    cvt.f64.f32 %fd0, %f0;
+    bra C2F64_STORE;
+
+C2F64_F32:
+    shl.b64 %rd3, %rd2, 2;
+    add.u64 %rd3, %rd1, %rd3;
+    ld.global.f32 %f0, [%rd3];
+    cvt.f64.f32 %fd0, %f0;
+    bra C2F64_STORE;
+
+C2F64_F16:
+    shl.b64 %rd3, %rd2, 1;
+    add.u64 %rd3, %rd1, %rd3;
+    ld.global.b16 %h0, [%rd3];
+    cvt.f32.f16 %f0, %h0;
+    cvt.f64.f32 %fd0, %f0;
+
+C2F64_STORE:
+    shl.b64 %rd4, %rd2, 3;
+    add.u64 %rd4, %rd0, %rd4;
+    st.global.f64 [%rd4], %fd0;
+
+C2F64_EXIT:
+    ret;
+}
+
+.visible .entry mora_cast_from_f64(
+    .param .u64 p_dst,
+    .param .u64 p_src,
+    .param .u32 p_n,
+    .param .u32 p_fmt
+)
+{
+    .reg .pred %p<4>;
+    .reg .u32 %r<8>;
+    .reg .u16 %u<2>;
+    .reg .b16 %h<2>;
+    .reg .u64 %rd<8>;
+    .reg .f32 %f<2>;
+    .reg .f64 %fd<2>;
+
+    ld.param.u64 %rd0, [p_dst];
+    ld.param.u64 %rd1, [p_src];
+    ld.param.u32 %r0, [p_n];
+    ld.param.u32 %r1, [p_fmt];
+
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mov.u32 %r4, %tid.x;
+    mad.lo.u32 %r5, %r2, %r3, %r4;
+    setp.ge.u32 %p0, %r5, %r0;
+    @%p0 bra CF64_EXIT;
+
+    cvt.u64.u32 %rd2, %r5;
+    shl.b64 %rd3, %rd2, 3;
+    add.u64 %rd3, %rd1, %rd3;
+    ld.global.f64 %fd0, [%rd3];
+    cvt.rn.f32.f64 %f0, %fd0;
+
+    setp.eq.u32 %p1, %r1, 0;
+    @%p1 bra CF64_F32;
+    setp.eq.u32 %p2, %r1, 1;
+    @%p2 bra CF64_F16;
+
+    // f64 -> bf16
+    call (%r6), mora_f32_to_bf16, (%f0);
+    cvt.u16.u32 %u0, %r6;
+    shl.b64 %rd4, %rd2, 1;
+    add.u64 %rd4, %rd0, %rd4;
+    st.global.u16 [%rd4], %u0;
+    bra CF64_EXIT;
+
+CF64_F32:
+    shl.b64 %rd4, %rd2, 2;
+    add.u64 %rd4, %rd0, %rd4;
+    st.global.f32 [%rd4], %f0;
+    bra CF64_EXIT;
+
+CF64_F16:
+    cvt.rn.f16.f32 %h0, %f0;
+    shl.b64 %rd4, %rd2, 1;
+    add.u64 %rd4, %rd0, %rd4;
+    st.global.b16 [%rd4], %h0;
+
+CF64_EXIT:
+    ret;
+}
 "#;
 
 fn load_kernel_fn(api: &CudaDriverApi, module: CuModule, name: &str) -> MoraResult<CuFunction> {
@@ -1361,11 +2238,19 @@ fn compile_cuda_kernels(api: &CudaDriverApi) -> MoraResult<CudaKernels> {
     let kernels = CudaKernels {
         module,
         matmul_f64: load_kernel_fn(api, module, "mora_matmul_f64")?,
+        matmul_f32: load_kernel_fn(api, module, "mora_matmul_f32")?,
+        matmul_f16: load_kernel_fn(api, module, "mora_matmul_f16")?,
+        matmul_bf16: load_kernel_fn(api, module, "mora_matmul_bf16")?,
         fused_linear_act_f64: load_kernel_fn(api, module, "mora_fused_linear_act_f64")?,
+        fused_linear_act_f32: load_kernel_fn(api, module, "mora_fused_linear_act_f32")?,
+        fused_linear_act_f16: load_kernel_fn(api, module, "mora_fused_linear_act_f16")?,
+        fused_linear_act_bf16: load_kernel_fn(api, module, "mora_fused_linear_act_bf16")?,
         rms_inv_f64: load_kernel_fn(api, module, "mora_rms_inv_f64")?,
         fused_rms_linear_act_f64: load_kernel_fn(api, module, "mora_fused_rms_linear_act_f64")?,
         fused_flash_attention_f64: load_kernel_fn(api, module, "mora_fused_flash_attention_f64")?,
         fused_ew_f64: load_kernel_fn(api, module, "mora_fused_ew_f64")?,
+        cast_to_f64: load_kernel_fn(api, module, "mora_cast_to_f64")?,
+        cast_from_f64: load_kernel_fn(api, module, "mora_cast_from_f64")?,
     };
     Ok(kernels)
 }
@@ -1501,11 +2386,281 @@ impl CudaDeviceBackend {
         };
         cu_check(rc, "cuMemcpyDtoH_v2")
     }
+
+    fn alloc_owned_vram(
+        &self,
+        st: &mut CudaContextState,
+        byte_len: usize,
+    ) -> MoraResult<Arc<CudaVramBuffer>> {
+        let (ptr, cap) = st.arena.alloc(&self.inner.api, byte_len.max(8))?;
+        self.inner.counters.on_alloc(byte_len);
+        Ok(Arc::new(CudaVramBuffer {
+            inner: Arc::clone(&self.inner),
+            ptr,
+            cap,
+            byte_len,
+        }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_matmul_kernel(
+        api: &CudaDriverApi,
+        kernel: CuFunction,
+        mut d_out: CuDevicePtr,
+        mut d_a: CuDevicePtr,
+        mut d_b: CuDevicePtr,
+        mut d_ab: CuDevicePtr,
+        mut d_bb: CuDevicePtr,
+        batches: usize,
+        m: usize,
+        n: usize,
+        k: usize,
+        label: &str,
+    ) -> MoraResult<()> {
+        let mut batches_u = batches as u32;
+        let mut m_u = m as u32;
+        let mut n_u = n as u32;
+        let mut k_u = k as u32;
+        let mut params: [*mut c_void; 9] = [
+            &raw mut d_out as *mut c_void,
+            &raw mut d_a as *mut c_void,
+            &raw mut d_b as *mut c_void,
+            &raw mut d_ab as *mut c_void,
+            &raw mut d_bb as *mut c_void,
+            &raw mut batches_u as *mut c_void,
+            &raw mut m_u as *mut c_void,
+            &raw mut n_u as *mut c_void,
+            &raw mut k_u as *mut c_void,
+        ];
+        let gx = n_u.div_ceil(16).max(1);
+        let gy = m_u.div_ceil(16).max(1);
+        // SAFETY: Parameter layout matches `mora_matmul_{f64,f32,f16,bf16}` PTX signature exactly.
+        let rc = unsafe {
+            (api.cu_launch_kernel)(
+                kernel,
+                gx,
+                gy,
+                batches_u,
+                16,
+                16,
+                1,
+                0,
+                ptr::null_mut(),
+                params.as_mut_ptr(),
+                ptr::null_mut(),
+            )
+        };
+        cu_check(rc, label)?;
+        // SAFETY: Synchronize default stream to guarantee completion before readback/reuse.
+        let rc_sync = unsafe { (api.cu_ctx_synchronize)() };
+        cu_check(rc_sync, label)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_linear_act_kernel(
+        api: &CudaDriverApi,
+        kernel: CuFunction,
+        mut d_out: CuDevicePtr,
+        mut d_x: CuDevicePtr,
+        mut d_w: CuDevicePtr,
+        mut d_bias: CuDevicePtr,
+        mut hb: u32,
+        mut bl: u32,
+        m_total: usize,
+        k: usize,
+        n: usize,
+        act: FusedAct,
+        label: &str,
+    ) -> MoraResult<()> {
+        let mut m_u = m_total as u32;
+        let mut k_u = k as u32;
+        let mut n_u = n as u32;
+        let mut ac = act_code(act);
+        let mut params: [*mut c_void; 10] = [
+            &raw mut d_out as *mut c_void,
+            &raw mut d_x as *mut c_void,
+            &raw mut d_w as *mut c_void,
+            &raw mut d_bias as *mut c_void,
+            &raw mut hb as *mut c_void,
+            &raw mut bl as *mut c_void,
+            &raw mut m_u as *mut c_void,
+            &raw mut k_u as *mut c_void,
+            &raw mut n_u as *mut c_void,
+            &raw mut ac as *mut c_void,
+        ];
+        let gx = n_u.div_ceil(16).max(1);
+        let gy = m_u.div_ceil(16).max(1);
+        // SAFETY: Parameter layout matches `mora_fused_linear_act_{f64,f32,f16,bf16}` PTX signature.
+        let rc = unsafe {
+            (api.cu_launch_kernel)(
+                kernel,
+                gx,
+                gy,
+                1,
+                16,
+                16,
+                1,
+                0,
+                ptr::null_mut(),
+                params.as_mut_ptr(),
+                ptr::null_mut(),
+            )
+        };
+        cu_check(rc, label)?;
+        // SAFETY: Synchronize default stream to guarantee completion before readback/reuse.
+        let rc_sync = unsafe { (api.cu_ctx_synchronize)() };
+        cu_check(rc_sync, label)
+    }
+
+    fn encode_ew_steps(steps: &[FusedEwStep]) -> (Vec<u32>, Vec<u32>, Vec<u32>, Vec<f64>) {
+        let mut ops = Vec::with_capacity(steps.len());
+        let mut arg_a = Vec::with_capacity(steps.len());
+        let mut arg_b = Vec::with_capacity(steps.len());
+        let mut imm = Vec::with_capacity(steps.len());
+        for step in steps {
+            let (op, a, b, im) = match *step {
+                FusedEwStep::Add(a, b) => (0u32, a as u32, b as u32, 0.0),
+                FusedEwStep::Sub(a, b) => (1, a as u32, b as u32, 0.0),
+                FusedEwStep::Mul(a, b) => (2, a as u32, b as u32, 0.0),
+                FusedEwStep::Div(a, b) => (3, a as u32, b as u32, 0.0),
+                FusedEwStep::Pow(a, b) => (4, a as u32, b as u32, 0.0),
+                FusedEwStep::AddScalar(a, s) => (5, a as u32, 0, s),
+                FusedEwStep::SubScalar(a, s, rev) => (if rev { 7 } else { 6 }, a as u32, 0, s),
+                FusedEwStep::MulScalar(a, s) => (8, a as u32, 0, s),
+                FusedEwStep::DivScalar(a, s, rev) => (if rev { 10 } else { 9 }, a as u32, 0, s),
+                FusedEwStep::PowScalar(a, s, rev) => (if rev { 12 } else { 11 }, a as u32, 0, s),
+                FusedEwStep::Neg(a) => (13, a as u32, 0, 0.0),
+                FusedEwStep::Relu(a) => (14, a as u32, 0, 0.0),
+                FusedEwStep::Gelu(a) => (15, a as u32, 0, 0.0),
+                FusedEwStep::Silu(a) => (16, a as u32, 0, 0.0),
+                FusedEwStep::Tanh(a) => (17, a as u32, 0, 0.0),
+                FusedEwStep::Sigmoid(a) => (18, a as u32, 0, 0.0),
+                FusedEwStep::Exp(a) => (19, a as u32, 0, 0.0),
+                FusedEwStep::Ln(a) => (20, a as u32, 0, 0.0),
+                FusedEwStep::Sqrt(a) => (21, a as u32, 0, 0.0),
+                FusedEwStep::Sin(a) => (22, a as u32, 0, 0.0),
+                FusedEwStep::Cos(a) => (23, a as u32, 0, 0.0),
+                FusedEwStep::Abs(a) => (24, a as u32, 0, 0.0),
+            };
+            ops.push(op);
+            arg_a.push(a);
+            arg_b.push(b);
+            imm.push(im);
+        }
+        (ops, arg_a, arg_b, imm)
+    }
+
+    fn cast_fmt_code(dtype: DType) -> Option<u32> {
+        match dtype {
+            DType::F32 => Some(0),
+            DType::F16 => Some(1),
+            DType::BF16 => Some(2),
+            _ => None,
+        }
+    }
+
+    /// Ensure a resident VRAM tensor buffer is viewable as `f64` device memory without PCIe transfers.
+    fn vram_ptr_as_f64(
+        api: &CudaDriverApi,
+        st: &mut CudaContextState,
+        buf: &dyn DeviceVramBuffer,
+        dtype: DType,
+        temp_allocs: &mut Vec<(CuDevicePtr, usize)>,
+    ) -> MoraResult<CuDevicePtr> {
+        if dtype == DType::F64 {
+            return Ok(buf.raw_handle());
+        }
+        let Some(mut fmt) = Self::cast_fmt_code(dtype) else {
+            return Err(MoraError::Runtime(format!(
+                "CUDA VRAM f64 cast unsupported for dtype {}",
+                dtype.short_name()
+            )));
+        };
+        let elem_bytes = dtype.storage_bytes(1).max(1);
+        let numel = buf.byte_len() / elem_bytes;
+        let (mut d_dst, cap) = st.arena.alloc(api, numel.max(1) * 8)?;
+        temp_allocs.push((d_dst, cap));
+        if numel == 0 {
+            return Ok(d_dst);
+        }
+        let mut d_src = buf.raw_handle();
+        let mut n_u = numel as u32;
+        let mut params: [*mut c_void; 4] = [
+            &raw mut d_dst as *mut c_void,
+            &raw mut d_src as *mut c_void,
+            &raw mut n_u as *mut c_void,
+            &raw mut fmt as *mut c_void,
+        ];
+        let blocks = n_u.div_ceil(128).max(1);
+        // SAFETY: Parameter layout matches `mora_cast_to_f64` PTX signature exactly.
+        let rc = unsafe {
+            (api.cu_launch_kernel)(
+                st.kernels.cast_to_f64,
+                blocks,
+                1,
+                1,
+                128,
+                1,
+                1,
+                0,
+                ptr::null_mut(),
+                params.as_mut_ptr(),
+                ptr::null_mut(),
+            )
+        };
+        cu_check(rc, "cuLaunchKernel(mora_cast_to_f64)")?;
+        Ok(d_dst)
+    }
+
+    /// Cast an `f64` device buffer directly into a target `f32`/`f16`/`bf16` resident VRAM buffer.
+    fn launch_cast_from_f64(
+        api: &CudaDriverApi,
+        st: &CudaContextState,
+        mut d_dst: CuDevicePtr,
+        mut d_src: CuDevicePtr,
+        numel: usize,
+        dtype: DType,
+    ) -> MoraResult<()> {
+        let Some(mut fmt) = Self::cast_fmt_code(dtype) else {
+            return Err(MoraError::Runtime(format!(
+                "CUDA VRAM cast-from-f64 unsupported for dtype {}",
+                dtype.short_name()
+            )));
+        };
+        if numel == 0 {
+            return Ok(());
+        }
+        let mut n_u = numel as u32;
+        let mut params: [*mut c_void; 4] = [
+            &raw mut d_dst as *mut c_void,
+            &raw mut d_src as *mut c_void,
+            &raw mut n_u as *mut c_void,
+            &raw mut fmt as *mut c_void,
+        ];
+        let blocks = n_u.div_ceil(128).max(1);
+        // SAFETY: Parameter layout matches `mora_cast_from_f64` PTX signature exactly.
+        let rc = unsafe {
+            (api.cu_launch_kernel)(
+                st.kernels.cast_from_f64,
+                blocks,
+                1,
+                1,
+                128,
+                1,
+                1,
+                0,
+                ptr::null_mut(),
+                params.as_mut_ptr(),
+                ptr::null_mut(),
+            )
+        };
+        cu_check(rc, "cuLaunchKernel(mora_cast_from_f64)")
+    }
 }
 
 impl DeviceBackend for CudaDeviceBackend {
     fn kind(&self) -> Device {
-        self.device.clone()
+        self.inner.device.clone()
     }
 
     fn name(&self) -> &str {
@@ -1513,7 +2668,7 @@ impl DeviceBackend for CudaDeviceBackend {
     }
 
     fn simd_isa(&self) -> &'static str {
-        "ptx-sm50-f64"
+        "ptx-sm50-f64/f32/f16/bf16"
     }
 
     fn worker_threads(&self) -> usize {
@@ -1522,6 +2677,687 @@ impl DeviceBackend for CudaDeviceBackend {
 
     fn is_available(&self) -> bool {
         true
+    }
+
+    fn supports_vram_residency(&self) -> bool {
+        true
+    }
+
+    fn alloc_vram_buffer(&self, byte_len: usize) -> MoraResult<Option<Arc<dyn DeviceVramBuffer>>> {
+        let mut st = self.inner.state.lock();
+        // SAFETY: Bind retained primary CUDA context before allocating VRAM.
+        let rc_ctx = unsafe { (self.inner.api.cu_ctx_set_current)(st.ctx) };
+        cu_check(rc_ctx, "cuCtxSetCurrent(alloc_vram_buffer)")?;
+        let buf = self.alloc_owned_vram(&mut st, byte_len)?;
+        Ok(Some(buf))
+    }
+
+    fn vram_telemetry(&self) -> VramTelemetry {
+        self.inner.counters.snapshot()
+    }
+
+    fn run_matmul_vram(
+        &self,
+        a: &dyn DeviceVramBuffer,
+        b: &dyn DeviceVramBuffer,
+        a_shape: &[usize],
+        b_shape: &[usize],
+        dtype: DType,
+    ) -> MoraResult<Option<Arc<dyn DeviceVramBuffer>>> {
+        if a_shape.len() < 2
+            || b_shape.len() < 2
+            || !matches!(dtype, DType::F64 | DType::F32 | DType::F16 | DType::BF16)
+        {
+            return Ok(None);
+        }
+        let m = a_shape[a_shape.len() - 2];
+        let k = a_shape[a_shape.len() - 1];
+        let k2 = b_shape[b_shape.len() - 2];
+        let n = b_shape[b_shape.len() - 1];
+        if k != k2 {
+            return Err(MoraError::Runtime(format!(
+                "CUDA MatMul inner dim mismatch: {k} != {k2}"
+            )));
+        }
+        let a_batch = &a_shape[..a_shape.len() - 2];
+        let b_batch = &b_shape[..b_shape.len() - 2];
+        let out_batch = broadcast_batch_shapes(a_batch, b_batch)?;
+        let batches = out_batch.iter().copied().product::<usize>().max(1);
+        let out_numel = batches * m * n;
+        let out_bytes = dtype.storage_bytes(out_numel);
+        if out_numel == 0 || k == 0 {
+            return Ok(None);
+        }
+
+        let a_bases: Vec<u64> = (0..batches)
+            .map(|bi| (map_broadcast_batch(bi, &out_batch, a_batch) * m * k) as u64)
+            .collect();
+        let b_bases: Vec<u64> = (0..batches)
+            .map(|bi| (map_broadcast_batch(bi, &out_batch, b_batch) * k * n) as u64)
+            .collect();
+
+        let mut st = self.inner.state.lock();
+        // SAFETY: Bind retained primary CUDA context.
+        let rc_ctx = unsafe { (self.inner.api.cu_ctx_set_current)(st.ctx) };
+        cu_check(rc_ctx, "cuCtxSetCurrent(matmul_vram)")?;
+
+        let out_buf = self.alloc_owned_vram(&mut st, out_bytes)?;
+        let mut temp_allocs: Vec<(CuDevicePtr, usize)> = Vec::with_capacity(2);
+        let kernel = match dtype {
+            DType::F64 => st.kernels.matmul_f64,
+            DType::F32 => st.kernels.matmul_f32,
+            DType::F16 => st.kernels.matmul_f16,
+            DType::BF16 => st.kernels.matmul_bf16,
+            _ => unreachable!(),
+        };
+        let label = match dtype {
+            DType::F64 => "mora_matmul_f64(vram)",
+            DType::F32 => "mora_matmul_f32(vram)",
+            DType::F16 => "mora_matmul_f16(vram)",
+            DType::BF16 => "mora_matmul_bf16(vram)",
+            _ => unreachable!(),
+        };
+
+        let res = (|| -> MoraResult<()> {
+            let (d_ab, c_ab) = Self::upload_slice(&self.inner.api, &mut st.arena, &a_bases)?;
+            temp_allocs.push((d_ab, c_ab));
+            let (d_bb, c_bb) = Self::upload_slice(&self.inner.api, &mut st.arena, &b_bases)?;
+            temp_allocs.push((d_bb, c_bb));
+            Self::launch_matmul_kernel(
+                &self.inner.api,
+                kernel,
+                out_buf.ptr,
+                a.raw_handle(),
+                b.raw_handle(),
+                d_ab,
+                d_bb,
+                batches,
+                m,
+                n,
+                k,
+                label,
+            )
+        })();
+
+        for (p, c) in temp_allocs {
+            st.arena.release(&self.inner.api, p, c);
+        }
+        res?;
+        self.inner.counters.on_vram_hit();
+        if dtype == DType::F16 {
+            self.inner.counters.on_f16_dispatch();
+        } else if dtype == DType::BF16 {
+            self.inner.counters.on_bf16_dispatch();
+        }
+        Ok(Some(out_buf))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_fused_linear_act_vram(
+        &self,
+        x: &dyn DeviceVramBuffer,
+        w: &dyn DeviceVramBuffer,
+        bias: Option<(&dyn DeviceVramBuffer, &[usize])>,
+        act: FusedAct,
+        m_total: usize,
+        k: usize,
+        n: usize,
+        _out_shape: &[usize],
+        dtype: DType,
+    ) -> MoraResult<Option<Arc<dyn DeviceVramBuffer>>> {
+        if !matches!(dtype, DType::F64 | DType::F32 | DType::F16 | DType::BF16) {
+            return Ok(None);
+        }
+        let out_numel = m_total * n;
+        if out_numel == 0 {
+            return Ok(None);
+        }
+        let (d_bias, hb, bl) = match bias {
+            None => (0u64, 0u32, 1u32),
+            Some((vb, bshape)) => {
+                let b_elems = bshape.iter().copied().product::<usize>().max(1);
+                if b_elems == n || b_elems == 1 {
+                    (vb.raw_handle(), 1u32, b_elems as u32)
+                } else {
+                    return Ok(None);
+                }
+            }
+        };
+
+        let out_bytes = dtype.storage_bytes(out_numel);
+        let mut st = self.inner.state.lock();
+        // SAFETY: Bind retained primary CUDA context.
+        let rc_ctx = unsafe { (self.inner.api.cu_ctx_set_current)(st.ctx) };
+        cu_check(rc_ctx, "cuCtxSetCurrent(fused_linear_act_vram)")?;
+
+        let out_buf = self.alloc_owned_vram(&mut st, out_bytes)?;
+        let kernel = match dtype {
+            DType::F64 => st.kernels.fused_linear_act_f64,
+            DType::F32 => st.kernels.fused_linear_act_f32,
+            DType::F16 => st.kernels.fused_linear_act_f16,
+            DType::BF16 => st.kernels.fused_linear_act_bf16,
+            _ => unreachable!(),
+        };
+        let label = match dtype {
+            DType::F64 => "mora_fused_linear_act_f64(vram)",
+            DType::F32 => "mora_fused_linear_act_f32(vram)",
+            DType::F16 => "mora_fused_linear_act_f16(vram)",
+            DType::BF16 => "mora_fused_linear_act_bf16(vram)",
+            _ => unreachable!(),
+        };
+
+        Self::launch_linear_act_kernel(
+            &self.inner.api,
+            kernel,
+            out_buf.ptr,
+            x.raw_handle(),
+            w.raw_handle(),
+            d_bias,
+            hb,
+            bl,
+            m_total,
+            k,
+            n,
+            act,
+            label,
+        )?;
+        self.inner.counters.on_vram_hit();
+        if dtype == DType::F16 {
+            self.inner.counters.on_f16_dispatch();
+        } else if dtype == DType::BF16 {
+            self.inner.counters.on_bf16_dispatch();
+        }
+        Ok(Some(out_buf))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_fused_rms_norm_linear_vram(
+        &self,
+        x: &dyn DeviceVramBuffer,
+        eps: f64,
+        gamma: Option<(&dyn DeviceVramBuffer, &[usize])>,
+        w: &dyn DeviceVramBuffer,
+        bias: Option<(&dyn DeviceVramBuffer, &[usize])>,
+        act: FusedAct,
+        m_total: usize,
+        k: usize,
+        n: usize,
+        _x_shape: &[usize],
+        _out_shape: &[usize],
+        dtype: DType,
+    ) -> MoraResult<Option<Arc<dyn DeviceVramBuffer>>> {
+        if !matches!(dtype, DType::F64 | DType::F32 | DType::F16 | DType::BF16)
+            || m_total * n == 0
+            || k == 0
+        {
+            return Ok(None);
+        }
+        let (gamma_buf, mut hg, mut gl) = match gamma {
+            None => (None, 0u32, 1u32),
+            Some((vg, gshape)) => {
+                let g_elems = gshape.iter().copied().product::<usize>().max(1);
+                if g_elems == k || g_elems == 1 {
+                    (Some(vg), 1u32, g_elems as u32)
+                } else {
+                    return Ok(None);
+                }
+            }
+        };
+        let (bias_buf, mut hb, mut bl) = match bias {
+            None => (None, 0u32, 1u32),
+            Some((vb, bshape)) => {
+                let b_elems = bshape.iter().copied().product::<usize>().max(1);
+                if b_elems == n || b_elems == 1 {
+                    (Some(vb), 1u32, b_elems as u32)
+                } else {
+                    return Ok(None);
+                }
+            }
+        };
+
+        let mut st = self.inner.state.lock();
+        // SAFETY: Bind retained primary CUDA context.
+        let rc_ctx = unsafe { (self.inner.api.cu_ctx_set_current)(st.ctx) };
+        cu_check(rc_ctx, "cuCtxSetCurrent(rms_norm_linear_vram)")?;
+
+        let out_numel = m_total * n;
+        let out_buf = self.alloc_owned_vram(&mut st, dtype.storage_bytes(out_numel))?;
+        let mut temp_allocs: Vec<(CuDevicePtr, usize)> = Vec::with_capacity(6);
+
+        let res = (|| -> MoraResult<()> {
+            let (mut d_inv, c_inv) = st.arena.alloc(&self.inner.api, m_total * 8)?;
+            temp_allocs.push((d_inv, c_inv));
+            let mut d_x =
+                Self::vram_ptr_as_f64(&self.inner.api, &mut st, x, dtype, &mut temp_allocs)?;
+            let mut d_w =
+                Self::vram_ptr_as_f64(&self.inner.api, &mut st, w, dtype, &mut temp_allocs)?;
+            let mut d_gamma = match gamma_buf {
+                Some(vg) => {
+                    Self::vram_ptr_as_f64(&self.inner.api, &mut st, vg, dtype, &mut temp_allocs)?
+                }
+                None => 0u64,
+            };
+            let mut d_bias = match bias_buf {
+                Some(vb) => {
+                    Self::vram_ptr_as_f64(&self.inner.api, &mut st, vb, dtype, &mut temp_allocs)?
+                }
+                None => 0u64,
+            };
+            let mut d_out_f64 = if dtype == DType::F64 {
+                out_buf.ptr
+            } else {
+                let (p, c) = st.arena.alloc(&self.inner.api, out_numel * 8)?;
+                temp_allocs.push((p, c));
+                p
+            };
+            let mut m_u = m_total as u32;
+            let mut k_u = k as u32;
+            let mut n_u = n as u32;
+            let mut eps_v = eps;
+            let mut ac = act_code(act);
+
+            let mut p1: [*mut c_void; 5] = [
+                &raw mut d_inv as *mut c_void,
+                &raw mut d_x as *mut c_void,
+                &raw mut m_u as *mut c_void,
+                &raw mut k_u as *mut c_void,
+                &raw mut eps_v as *mut c_void,
+            ];
+            let rms_blocks = m_u.div_ceil(128).max(1);
+            // SAFETY: Parameter layout matches `mora_rms_inv_f64` PTX signature.
+            let rc1 = unsafe {
+                (self.inner.api.cu_launch_kernel)(
+                    st.kernels.rms_inv_f64,
+                    rms_blocks,
+                    1,
+                    1,
+                    128,
+                    1,
+                    1,
+                    0,
+                    ptr::null_mut(),
+                    p1.as_mut_ptr(),
+                    ptr::null_mut(),
+                )
+            };
+            cu_check(rc1, "cuLaunchKernel(mora_rms_inv_f64, vram)")?;
+
+            let mut p2: [*mut c_void; 14] = [
+                &raw mut d_out_f64 as *mut c_void,
+                &raw mut d_x as *mut c_void,
+                &raw mut d_inv as *mut c_void,
+                &raw mut d_gamma as *mut c_void,
+                &raw mut hg as *mut c_void,
+                &raw mut gl as *mut c_void,
+                &raw mut d_w as *mut c_void,
+                &raw mut d_bias as *mut c_void,
+                &raw mut hb as *mut c_void,
+                &raw mut bl as *mut c_void,
+                &raw mut m_u as *mut c_void,
+                &raw mut k_u as *mut c_void,
+                &raw mut n_u as *mut c_void,
+                &raw mut ac as *mut c_void,
+            ];
+            let gx = n_u.div_ceil(16).max(1);
+            let gy = m_u.div_ceil(16).max(1);
+            // SAFETY: Parameter layout matches `mora_fused_rms_linear_act_f64` PTX signature.
+            let rc2 = unsafe {
+                (self.inner.api.cu_launch_kernel)(
+                    st.kernels.fused_rms_linear_act_f64,
+                    gx,
+                    gy,
+                    1,
+                    16,
+                    16,
+                    1,
+                    0,
+                    ptr::null_mut(),
+                    p2.as_mut_ptr(),
+                    ptr::null_mut(),
+                )
+            };
+            cu_check(rc2, "cuLaunchKernel(mora_fused_rms_linear_act_f64, vram)")?;
+            if dtype != DType::F64 {
+                Self::launch_cast_from_f64(
+                    &self.inner.api,
+                    &st,
+                    out_buf.ptr,
+                    d_out_f64,
+                    out_numel,
+                    dtype,
+                )?;
+            }
+            // SAFETY: Synchronize default stream before returning resident VRAM buffer.
+            let rc_sync = unsafe { (self.inner.api.cu_ctx_synchronize)() };
+            cu_check(rc_sync, "cuCtxSynchronize(rms_norm_linear_vram)")
+        })();
+
+        for (p, c) in temp_allocs {
+            st.arena.release(&self.inner.api, p, c);
+        }
+        res?;
+        self.inner.counters.on_vram_hit();
+        Ok(Some(out_buf))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_fused_flash_attention_vram(
+        &self,
+        q: &dyn DeviceVramBuffer,
+        k: &dyn DeviceVramBuffer,
+        v: &dyn DeviceVramBuffer,
+        mask: Option<(&dyn DeviceVramBuffer, &[usize])>,
+        q_shape: &[usize],
+        k_shape: &[usize],
+        v_shape: &[usize],
+        out_shape: &[usize],
+        scale: f64,
+        k_is_transposed: bool,
+        dtype: DType,
+    ) -> MoraResult<Option<Arc<dyn DeviceVramBuffer>>> {
+        if !matches!(dtype, DType::F64 | DType::F32 | DType::F16 | DType::BF16)
+            || q_shape.len() < 2
+            || k_shape.len() < 2
+            || v_shape.len() < 2
+        {
+            return Ok(None);
+        }
+        let s_q = q_shape[q_shape.len() - 2];
+        let d_k = q_shape[q_shape.len() - 1];
+        let (s_k, k_d) = if k_is_transposed {
+            (k_shape[k_shape.len() - 1], k_shape[k_shape.len() - 2])
+        } else {
+            (k_shape[k_shape.len() - 2], k_shape[k_shape.len() - 1])
+        };
+        let d_v = v_shape[v_shape.len() - 1];
+        if d_k != k_d || s_k != v_shape[v_shape.len() - 2] {
+            return Err(MoraError::Runtime(format!(
+                "CUDA FlashAttention shape mismatch: Q={q_shape:?}, K={k_shape:?}, V={v_shape:?}"
+            )));
+        }
+        let batch_q = &q_shape[..q_shape.len() - 2];
+        let batch_k = &k_shape[..k_shape.len() - 2];
+        let batch_v = &v_shape[..v_shape.len() - 2];
+        let batch_out = &out_shape[..out_shape.len() - 2];
+        let batches = batch_out.iter().copied().product::<usize>().max(1);
+        let out_numel = batches * s_q * d_v;
+        if out_numel == 0 {
+            return Ok(None);
+        }
+
+        let q_bases: Vec<u64> = (0..batches)
+            .map(|b| (map_broadcast_batch(b, batch_out, batch_q) * s_q * d_k) as u64)
+            .collect();
+        let k_bases: Vec<u64> = (0..batches)
+            .map(|b| (map_broadcast_batch(b, batch_out, batch_k) * s_k * d_k) as u64)
+            .collect();
+        let v_bases: Vec<u64> = (0..batches)
+            .map(|b| (map_broadcast_batch(b, batch_out, batch_v) * s_k * d_v) as u64)
+            .collect();
+
+        let (mask_buf, mask_bases, mut mask_sq_s, mut mask_sk_s, mut has_mask_u) =
+            if let Some((vm, mshape)) = mask {
+                let mrank = mshape.len();
+                let m_sk = *mshape.last().unwrap_or(&1);
+                let m_sq = if mrank >= 2 { mshape[mrank - 2] } else { 1 };
+                let mbatch = if mrank >= 2 {
+                    &mshape[..mrank - 2]
+                } else {
+                    &[]
+                };
+                let sq_stride = if m_sq == 1 { 0 } else { m_sk as u32 };
+                let sk_stride = if m_sk == 1 { 0 } else { 1u32 };
+                let mbases: Vec<u64> = (0..batches)
+                    .map(|b| (map_broadcast_batch(b, batch_out, mbatch) * m_sq * m_sk) as u64)
+                    .collect();
+                (Some(vm), mbases, sq_stride, sk_stride, 1u32)
+            } else {
+                (None, Vec::new(), 0u32, 0u32, 0u32)
+            };
+
+        let mut st = self.inner.state.lock();
+        // SAFETY: Bind retained primary CUDA context.
+        let rc_ctx = unsafe { (self.inner.api.cu_ctx_set_current)(st.ctx) };
+        cu_check(rc_ctx, "cuCtxSetCurrent(flash_attn_vram)")?;
+
+        let out_buf = self.alloc_owned_vram(&mut st, dtype.storage_bytes(out_numel))?;
+        let mut temp_allocs: Vec<(CuDevicePtr, usize)> = Vec::with_capacity(9);
+        let res = (|| -> MoraResult<()> {
+            let mut dev_q =
+                Self::vram_ptr_as_f64(&self.inner.api, &mut st, q, dtype, &mut temp_allocs)?;
+            let mut dev_k =
+                Self::vram_ptr_as_f64(&self.inner.api, &mut st, k, dtype, &mut temp_allocs)?;
+            let mut dev_v =
+                Self::vram_ptr_as_f64(&self.inner.api, &mut st, v, dtype, &mut temp_allocs)?;
+            let mut dev_mask = match mask_buf {
+                Some(vm) => {
+                    Self::vram_ptr_as_f64(&self.inner.api, &mut st, vm, dtype, &mut temp_allocs)?
+                }
+                None => 0u64,
+            };
+            let mut dev_out = if dtype == DType::F64 {
+                out_buf.ptr
+            } else {
+                let (p, c) = st.arena.alloc(&self.inner.api, out_numel * 8)?;
+                temp_allocs.push((p, c));
+                p
+            };
+            let (mut dev_qb, c_qb) = Self::upload_slice(&self.inner.api, &mut st.arena, &q_bases)?;
+            temp_allocs.push((dev_qb, c_qb));
+            let (mut dev_kb, c_kb) = Self::upload_slice(&self.inner.api, &mut st.arena, &k_bases)?;
+            temp_allocs.push((dev_kb, c_kb));
+            let (mut dev_vb, c_vb) = Self::upload_slice(&self.inner.api, &mut st.arena, &v_bases)?;
+            temp_allocs.push((dev_vb, c_vb));
+            let mut dev_mb = if has_mask_u != 0 {
+                let (pmb, cmb) = Self::upload_slice(&self.inner.api, &mut st.arena, &mask_bases)?;
+                temp_allocs.push((pmb, cmb));
+                pmb
+            } else {
+                0u64
+            };
+
+            let mut batches_u = batches as u32;
+            let mut sq_u = s_q as u32;
+            let mut sk_u = s_k as u32;
+            let mut dk_u = d_k as u32;
+            let mut dv_u = d_v as u32;
+            let mut kt_u = u32::from(k_is_transposed);
+            let mut scale_v = scale;
+
+            let mut params: [*mut c_void; 19] = [
+                &raw mut dev_out as *mut c_void,
+                &raw mut dev_q as *mut c_void,
+                &raw mut dev_k as *mut c_void,
+                &raw mut dev_v as *mut c_void,
+                &raw mut dev_qb as *mut c_void,
+                &raw mut dev_kb as *mut c_void,
+                &raw mut dev_vb as *mut c_void,
+                &raw mut dev_mask as *mut c_void,
+                &raw mut dev_mb as *mut c_void,
+                &raw mut has_mask_u as *mut c_void,
+                &raw mut mask_sq_s as *mut c_void,
+                &raw mut mask_sk_s as *mut c_void,
+                &raw mut batches_u as *mut c_void,
+                &raw mut sq_u as *mut c_void,
+                &raw mut sk_u as *mut c_void,
+                &raw mut dk_u as *mut c_void,
+                &raw mut dv_u as *mut c_void,
+                &raw mut kt_u as *mut c_void,
+                &raw mut scale_v as *mut c_void,
+            ];
+            let gx = dv_u.div_ceil(16).max(1);
+            let gy = sq_u.div_ceil(16).max(1);
+            // SAFETY: Parameter layout matches `mora_fused_flash_attention_f64` PTX signature.
+            let rc_fa = unsafe {
+                (self.inner.api.cu_launch_kernel)(
+                    st.kernels.fused_flash_attention_f64,
+                    gx,
+                    gy,
+                    batches_u,
+                    16,
+                    16,
+                    1,
+                    0,
+                    ptr::null_mut(),
+                    params.as_mut_ptr(),
+                    ptr::null_mut(),
+                )
+            };
+            cu_check(
+                rc_fa,
+                "cuLaunchKernel(mora_fused_flash_attention_f64, vram)",
+            )?;
+            if dtype != DType::F64 {
+                Self::launch_cast_from_f64(
+                    &self.inner.api,
+                    &st,
+                    out_buf.ptr,
+                    dev_out,
+                    out_numel,
+                    dtype,
+                )?;
+            }
+            // SAFETY: Synchronize default stream before returning resident VRAM buffer.
+            let rc_sync = unsafe { (self.inner.api.cu_ctx_synchronize)() };
+            cu_check(rc_sync, "cuCtxSynchronize(flash_attn_vram)")
+        })();
+
+        for (p, c) in temp_allocs {
+            st.arena.release(&self.inner.api, p, c);
+        }
+        res?;
+        self.inner.counters.on_vram_hit();
+        Ok(Some(out_buf))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_fused_elementwise_vram(
+        &self,
+        inputs: &[&dyn DeviceVramBuffer],
+        input_shapes: &[&[usize]],
+        steps: &[FusedEwStep],
+        out_shape: &[usize],
+        out_numel: usize,
+        dtype: DType,
+    ) -> MoraResult<Option<Arc<dyn DeviceVramBuffer>>> {
+        let total_slots = inputs.len() + steps.len();
+        if !matches!(dtype, DType::F64 | DType::F32 | DType::F16 | DType::BF16)
+            || out_numel == 0
+            || steps.is_empty()
+            || total_slots > 64
+            || out_shape.len() > 16
+        {
+            return Ok(None);
+        }
+        let eff_out_shape: Vec<usize> = if out_shape.is_empty() {
+            vec![1]
+        } else {
+            out_shape.to_vec()
+        };
+        let ndim = eff_out_shape.len();
+        let out_shape_u32: Vec<u32> = eff_out_shape.iter().map(|&d| d as u32).collect();
+        let mut all_strides: Vec<u64> = Vec::with_capacity(input_shapes.len() * ndim);
+        for s in input_shapes {
+            all_strides.extend(compute_broadcast_strides(s, &eff_out_shape));
+        }
+        let (ops, arg_a, arg_b, imm) = Self::encode_ew_steps(steps);
+
+        let mut st = self.inner.state.lock();
+        // SAFETY: Bind retained primary CUDA context.
+        let rc_ctx = unsafe { (self.inner.api.cu_ctx_set_current)(st.ctx) };
+        cu_check(rc_ctx, "cuCtxSetCurrent(fused_ew_vram)")?;
+
+        let out_buf = self.alloc_owned_vram(&mut st, dtype.storage_bytes(out_numel))?;
+        let mut temp_allocs: Vec<(CuDevicePtr, usize)> = Vec::with_capacity(8 + inputs.len());
+        let res = (|| -> MoraResult<()> {
+            let mut dev_in_ptrs: Vec<u64> = Vec::with_capacity(inputs.len());
+            for inp in inputs {
+                let p =
+                    Self::vram_ptr_as_f64(&self.inner.api, &mut st, *inp, dtype, &mut temp_allocs)?;
+                dev_in_ptrs.push(p);
+            }
+            let mut d_out = if dtype == DType::F64 {
+                out_buf.ptr
+            } else {
+                let (p, c) = st.arena.alloc(&self.inner.api, out_numel * 8)?;
+                temp_allocs.push((p, c));
+                p
+            };
+            let (mut d_in_ptrs, c_ip) =
+                Self::upload_slice(&self.inner.api, &mut st.arena, &dev_in_ptrs)?;
+            temp_allocs.push((d_in_ptrs, c_ip));
+            let (mut d_strides, c_st) =
+                Self::upload_slice(&self.inner.api, &mut st.arena, &all_strides)?;
+            temp_allocs.push((d_strides, c_st));
+            let (mut d_oshape, c_os) =
+                Self::upload_slice(&self.inner.api, &mut st.arena, &out_shape_u32)?;
+            temp_allocs.push((d_oshape, c_os));
+            let (mut d_ops, c_ops) = Self::upload_slice(&self.inner.api, &mut st.arena, &ops)?;
+            temp_allocs.push((d_ops, c_ops));
+            let (mut d_a, c_a) = Self::upload_slice(&self.inner.api, &mut st.arena, &arg_a)?;
+            temp_allocs.push((d_a, c_a));
+            let (mut d_b, c_b) = Self::upload_slice(&self.inner.api, &mut st.arena, &arg_b)?;
+            temp_allocs.push((d_b, c_b));
+            let (mut d_imm, c_imm) = Self::upload_slice(&self.inner.api, &mut st.arena, &imm)?;
+            temp_allocs.push((d_imm, c_imm));
+
+            let mut ndim_u = ndim as u32;
+            let mut n_in_u = inputs.len() as u32;
+            let mut n_st_u = steps.len() as u32;
+            let mut numel_u = out_numel as u32;
+            let mut params: [*mut c_void; 12] = [
+                &raw mut d_out as *mut c_void,
+                &raw mut d_in_ptrs as *mut c_void,
+                &raw mut d_strides as *mut c_void,
+                &raw mut d_oshape as *mut c_void,
+                &raw mut ndim_u as *mut c_void,
+                &raw mut n_in_u as *mut c_void,
+                &raw mut d_ops as *mut c_void,
+                &raw mut d_a as *mut c_void,
+                &raw mut d_b as *mut c_void,
+                &raw mut d_imm as *mut c_void,
+                &raw mut n_st_u as *mut c_void,
+                &raw mut numel_u as *mut c_void,
+            ];
+            let blocks = numel_u.div_ceil(128).max(1);
+            // SAFETY: Parameter layout matches `mora_fused_ew_f64` PTX signature.
+            let rc_ew = unsafe {
+                (self.inner.api.cu_launch_kernel)(
+                    st.kernels.fused_ew_f64,
+                    blocks,
+                    1,
+                    1,
+                    128,
+                    1,
+                    1,
+                    0,
+                    ptr::null_mut(),
+                    params.as_mut_ptr(),
+                    ptr::null_mut(),
+                )
+            };
+            cu_check(rc_ew, "cuLaunchKernel(mora_fused_ew_f64, vram)")?;
+            if dtype != DType::F64 {
+                Self::launch_cast_from_f64(
+                    &self.inner.api,
+                    &st,
+                    out_buf.ptr,
+                    d_out,
+                    out_numel,
+                    dtype,
+                )?;
+            }
+            // SAFETY: Synchronize default stream before returning resident VRAM buffer.
+            let rc_sync = unsafe { (self.inner.api.cu_ctx_synchronize)() };
+            cu_check(rc_sync, "cuCtxSynchronize(fused_ew_vram)")
+        })();
+
+        for (p, c) in temp_allocs {
+            st.arena.release(&self.inner.api, p, c);
+        }
+        res?;
+        self.inner.counters.on_vram_hit();
+        Ok(Some(out_buf))
     }
 
     fn run_matmul_into(
@@ -1566,67 +3402,114 @@ impl DeviceBackend for CudaDeviceBackend {
             .map(|bi| (map_broadcast_batch(bi, &out_batch, b_batch) * k * n) as u64)
             .collect();
 
-        let mut st = self.state.lock();
+        let mut st = self.inner.state.lock();
         // SAFETY: Bind this device's retained primary CUDA context to the calling thread.
-        let rc_ctx = unsafe { (self.api.cu_ctx_set_current)(st.ctx) };
+        let rc_ctx = unsafe { (self.inner.api.cu_ctx_set_current)(st.ctx) };
         cu_check(rc_ctx, "cuCtxSetCurrent")?;
 
         let mut allocs: Vec<(CuDevicePtr, usize)> = Vec::with_capacity(5);
         let res = (|| -> MoraResult<()> {
-            let (mut d_out, c_out) = st.arena.alloc(&self.api, out_numel * 8)?;
-            allocs.push((d_out, c_out));
-            let (mut d_a, c_a) = Self::upload_slice(&self.api, &mut st.arena, a)?;
-            allocs.push((d_a, c_a));
-            let (mut d_b, c_b) = Self::upload_slice(&self.api, &mut st.arena, b)?;
-            allocs.push((d_b, c_b));
-            let (mut d_ab, c_ab) = Self::upload_slice(&self.api, &mut st.arena, &a_bases)?;
+            let (d_ab, c_ab) = Self::upload_slice(&self.inner.api, &mut st.arena, &a_bases)?;
             allocs.push((d_ab, c_ab));
-            let (mut d_bb, c_bb) = Self::upload_slice(&self.api, &mut st.arena, &b_bases)?;
+            let (d_bb, c_bb) = Self::upload_slice(&self.inner.api, &mut st.arena, &b_bases)?;
             allocs.push((d_bb, c_bb));
 
-            let mut batches_u = batches as u32;
-            let mut m_u = m as u32;
-            let mut n_u = n as u32;
-            let mut k_u = k as u32;
-            let mut params: [*mut c_void; 9] = [
-                &raw mut d_out as *mut c_void,
-                &raw mut d_a as *mut c_void,
-                &raw mut d_b as *mut c_void,
-                &raw mut d_ab as *mut c_void,
-                &raw mut d_bb as *mut c_void,
-                &raw mut batches_u as *mut c_void,
-                &raw mut m_u as *mut c_void,
-                &raw mut n_u as *mut c_void,
-                &raw mut k_u as *mut c_void,
-            ];
-            let gx = (n as u32).div_ceil(16).max(1);
-            let gy = (m as u32).div_ceil(16).max(1);
-            // SAFETY: Parameter layout matches `mora_matmul_f64` PTX entry signature exactly.
-            let rc = unsafe {
-                (self.api.cu_launch_kernel)(
-                    st.kernels.matmul_f64,
-                    gx,
-                    gy,
-                    batches_u,
-                    16,
-                    16,
-                    1,
-                    0,
-                    ptr::null_mut(),
-                    params.as_mut_ptr(),
-                    ptr::null_mut(),
-                )
-            };
-            cu_check(rc, "cuLaunchKernel(mora_matmul_f64)")?;
-            // SAFETY: Synchronize default stream before D2H copy.
-            let rc_sync = unsafe { (self.api.cu_ctx_synchronize)() };
-            cu_check(rc_sync, "cuCtxSynchronize(mora_matmul_f64)")?;
-            Self::download_slice(&self.api, d_out, out)?;
-            Ok(())
+            match dtype {
+                DType::F16 | DType::BF16 => {
+                    let is_bf16 = dtype == DType::BF16;
+                    let a_u16: Vec<u16> = a
+                        .iter()
+                        .map(|&v| {
+                            if is_bf16 {
+                                f64_to_bf16_bits(v)
+                            } else {
+                                f64_to_f16_bits(v)
+                            }
+                        })
+                        .collect();
+                    let b_u16: Vec<u16> = b
+                        .iter()
+                        .map(|&v| {
+                            if is_bf16 {
+                                f64_to_bf16_bits(v)
+                            } else {
+                                f64_to_f16_bits(v)
+                            }
+                        })
+                        .collect();
+                    let (d_out, c_out) = st.arena.alloc(&self.inner.api, out_numel * 2)?;
+                    allocs.push((d_out, c_out));
+                    let (d_a, c_a) = Self::upload_slice(&self.inner.api, &mut st.arena, &a_u16)?;
+                    allocs.push((d_a, c_a));
+                    let (d_b, c_b) = Self::upload_slice(&self.inner.api, &mut st.arena, &b_u16)?;
+                    allocs.push((d_b, c_b));
+                    self.inner.counters.on_h2d();
+                    self.inner.counters.on_h2d();
+                    let (kernel, label) = if is_bf16 {
+                        self.inner.counters.on_bf16_dispatch();
+                        (st.kernels.matmul_bf16, "mora_matmul_bf16")
+                    } else {
+                        self.inner.counters.on_f16_dispatch();
+                        (st.kernels.matmul_f16, "mora_matmul_f16")
+                    };
+                    Self::launch_matmul_kernel(
+                        &self.inner.api,
+                        kernel,
+                        d_out,
+                        d_a,
+                        d_b,
+                        d_ab,
+                        d_bb,
+                        batches,
+                        m,
+                        n,
+                        k,
+                        label,
+                    )?;
+                    let mut out_u16 = vec![0u16; out_numel];
+                    Self::download_slice(&self.inner.api, d_out, &mut out_u16)?;
+                    self.inner.counters.on_d2h();
+                    for (dst, &bits) in out.iter_mut().zip(out_u16.iter()) {
+                        *dst = if is_bf16 {
+                            bf16_bits_to_f64(bits)
+                        } else {
+                            f16_bits_to_f64(bits)
+                        };
+                    }
+                    Ok(())
+                }
+                _ => {
+                    let (d_out, c_out) = st.arena.alloc(&self.inner.api, out_numel * 8)?;
+                    allocs.push((d_out, c_out));
+                    let (d_a, c_a) = Self::upload_slice(&self.inner.api, &mut st.arena, a)?;
+                    allocs.push((d_a, c_a));
+                    let (d_b, c_b) = Self::upload_slice(&self.inner.api, &mut st.arena, b)?;
+                    allocs.push((d_b, c_b));
+                    self.inner.counters.on_h2d();
+                    self.inner.counters.on_h2d();
+                    Self::launch_matmul_kernel(
+                        &self.inner.api,
+                        st.kernels.matmul_f64,
+                        d_out,
+                        d_a,
+                        d_b,
+                        d_ab,
+                        d_bb,
+                        batches,
+                        m,
+                        n,
+                        k,
+                        "mora_matmul_f64",
+                    )?;
+                    Self::download_slice(&self.inner.api, d_out, out)?;
+                    self.inner.counters.on_d2h();
+                    Ok(())
+                }
+            }
         })();
 
         for (p, c) in allocs {
-            st.arena.release(&self.api, p, c);
+            st.arena.release(&self.inner.api, p, c);
         }
         res?;
         quantize_slice_in_place(out, dtype);
@@ -1671,73 +3554,121 @@ impl DeviceBackend for CudaDeviceBackend {
             return Ok(());
         };
 
-        let mut st = self.state.lock();
+        let mut st = self.inner.state.lock();
         // SAFETY: Bind retained primary context.
-        let rc_ctx = unsafe { (self.api.cu_ctx_set_current)(st.ctx) };
+        let rc_ctx = unsafe { (self.inner.api.cu_ctx_set_current)(st.ctx) };
         cu_check(rc_ctx, "cuCtxSetCurrent")?;
 
         let mut allocs: Vec<(CuDevicePtr, usize)> = Vec::with_capacity(4);
         let res = (|| -> MoraResult<()> {
-            let (mut d_out, c_out) = st.arena.alloc(&self.api, out_numel * 8)?;
-            allocs.push((d_out, c_out));
-            let (mut d_x, c_x) = Self::upload_slice(&self.api, &mut st.arena, x)?;
-            allocs.push((d_x, c_x));
-            let (mut d_w, c_w) = Self::upload_slice(&self.api, &mut st.arena, w)?;
-            allocs.push((d_w, c_w));
-            let (mut d_bias, has_bias_u, bias_len_u) = if !bias_slice.is_empty() {
-                let (p, c) = Self::upload_slice(&self.api, &mut st.arena, bias_slice)?;
-                allocs.push((p, c));
-                (p, 1u32, bias_slice.len() as u32)
-            } else {
-                (0u64, 0u32, 1u32)
-            };
-
-            let mut hb = has_bias_u;
-            let mut bl = bias_len_u;
-            let mut m_u = m_total as u32;
-            let mut k_u = k as u32;
-            let mut n_u = n as u32;
-            let mut ac = act_code(act);
-            let mut params: [*mut c_void; 10] = [
-                &raw mut d_out as *mut c_void,
-                &raw mut d_x as *mut c_void,
-                &raw mut d_w as *mut c_void,
-                &raw mut d_bias as *mut c_void,
-                &raw mut hb as *mut c_void,
-                &raw mut bl as *mut c_void,
-                &raw mut m_u as *mut c_void,
-                &raw mut k_u as *mut c_void,
-                &raw mut n_u as *mut c_void,
-                &raw mut ac as *mut c_void,
-            ];
-            let gx = n_u.div_ceil(16).max(1);
-            let gy = m_u.div_ceil(16).max(1);
-            // SAFETY: Parameter layout matches `mora_fused_linear_act_f64` PTX signature.
-            let rc = unsafe {
-                (self.api.cu_launch_kernel)(
-                    st.kernels.fused_linear_act_f64,
-                    gx,
-                    gy,
-                    1,
-                    16,
-                    16,
-                    1,
-                    0,
-                    ptr::null_mut(),
-                    params.as_mut_ptr(),
-                    ptr::null_mut(),
-                )
-            };
-            cu_check(rc, "cuLaunchKernel(mora_fused_linear_act_f64)")?;
-            // SAFETY: Synchronize default stream before D2H copy.
-            let rc_sync = unsafe { (self.api.cu_ctx_synchronize)() };
-            cu_check(rc_sync, "cuCtxSynchronize(mora_fused_linear_act_f64)")?;
-            Self::download_slice(&self.api, d_out, out)?;
-            Ok(())
+            match dtype {
+                DType::F16 | DType::BF16 => {
+                    let is_bf16 = dtype == DType::BF16;
+                    let enc = |v: f64| {
+                        if is_bf16 {
+                            f64_to_bf16_bits(v)
+                        } else {
+                            f64_to_f16_bits(v)
+                        }
+                    };
+                    let x_u16: Vec<u16> = x.iter().map(|&v| enc(v)).collect();
+                    let w_u16: Vec<u16> = w.iter().map(|&v| enc(v)).collect();
+                    let (d_out, c_out) = st.arena.alloc(&self.inner.api, out_numel * 2)?;
+                    allocs.push((d_out, c_out));
+                    let (d_x, c_x) = Self::upload_slice(&self.inner.api, &mut st.arena, &x_u16)?;
+                    allocs.push((d_x, c_x));
+                    let (d_w, c_w) = Self::upload_slice(&self.inner.api, &mut st.arena, &w_u16)?;
+                    allocs.push((d_w, c_w));
+                    self.inner.counters.on_h2d();
+                    self.inner.counters.on_h2d();
+                    let (d_bias, hb, bl) = if !bias_slice.is_empty() {
+                        let b_u16: Vec<u16> = bias_slice.iter().map(|&v| enc(v)).collect();
+                        let (p, c) = Self::upload_slice(&self.inner.api, &mut st.arena, &b_u16)?;
+                        allocs.push((p, c));
+                        self.inner.counters.on_h2d();
+                        (p, 1u32, b_u16.len() as u32)
+                    } else {
+                        (0u64, 0u32, 1u32)
+                    };
+                    let (kernel, label) = if is_bf16 {
+                        self.inner.counters.on_bf16_dispatch();
+                        (
+                            st.kernels.fused_linear_act_bf16,
+                            "mora_fused_linear_act_bf16",
+                        )
+                    } else {
+                        self.inner.counters.on_f16_dispatch();
+                        (st.kernels.fused_linear_act_f16, "mora_fused_linear_act_f16")
+                    };
+                    Self::launch_linear_act_kernel(
+                        &self.inner.api,
+                        kernel,
+                        d_out,
+                        d_x,
+                        d_w,
+                        d_bias,
+                        hb,
+                        bl,
+                        m_total,
+                        k,
+                        n,
+                        act,
+                        label,
+                    )?;
+                    let mut out_u16 = vec![0u16; out_numel];
+                    Self::download_slice(&self.inner.api, d_out, &mut out_u16)?;
+                    self.inner.counters.on_d2h();
+                    for (dst, &bits) in out.iter_mut().zip(out_u16.iter()) {
+                        *dst = if is_bf16 {
+                            bf16_bits_to_f64(bits)
+                        } else {
+                            f16_bits_to_f64(bits)
+                        };
+                    }
+                    Ok(())
+                }
+                _ => {
+                    let (d_out, c_out) = st.arena.alloc(&self.inner.api, out_numel * 8)?;
+                    allocs.push((d_out, c_out));
+                    let (d_x, c_x) = Self::upload_slice(&self.inner.api, &mut st.arena, x)?;
+                    allocs.push((d_x, c_x));
+                    let (d_w, c_w) = Self::upload_slice(&self.inner.api, &mut st.arena, w)?;
+                    allocs.push((d_w, c_w));
+                    self.inner.counters.on_h2d();
+                    self.inner.counters.on_h2d();
+                    let (d_bias, hb, bl) = if !bias_slice.is_empty() {
+                        let (p, c) =
+                            Self::upload_slice(&self.inner.api, &mut st.arena, bias_slice)?;
+                        allocs.push((p, c));
+                        self.inner.counters.on_h2d();
+                        (p, 1u32, bias_slice.len() as u32)
+                    } else {
+                        (0u64, 0u32, 1u32)
+                    };
+                    Self::launch_linear_act_kernel(
+                        &self.inner.api,
+                        st.kernels.fused_linear_act_f64,
+                        d_out,
+                        d_x,
+                        d_w,
+                        d_bias,
+                        hb,
+                        bl,
+                        m_total,
+                        k,
+                        n,
+                        act,
+                        "mora_fused_linear_act_f64",
+                    )?;
+                    Self::download_slice(&self.inner.api, d_out, out)?;
+                    self.inner.counters.on_d2h();
+                    Ok(())
+                }
+            }
         })();
 
         for (p, c) in allocs {
-            st.arena.release(&self.api, p, c);
+            st.arena.release(&self.inner.api, p, c);
         }
         res?;
         quantize_slice_in_place(out, dtype);
@@ -1783,31 +3714,35 @@ impl DeviceBackend for CudaDeviceBackend {
             return Ok(());
         };
 
-        let mut st = self.state.lock();
+        let mut st = self.inner.state.lock();
         // SAFETY: Bind retained primary CUDA context.
-        let rc_ctx = unsafe { (self.api.cu_ctx_set_current)(st.ctx) };
+        let rc_ctx = unsafe { (self.inner.api.cu_ctx_set_current)(st.ctx) };
         cu_check(rc_ctx, "cuCtxSetCurrent")?;
 
         let mut allocs: Vec<(CuDevicePtr, usize)> = Vec::with_capacity(6);
         let res = (|| -> MoraResult<()> {
-            let (mut d_out, c_out) = st.arena.alloc(&self.api, out_numel * 8)?;
+            let (mut d_out, c_out) = st.arena.alloc(&self.inner.api, out_numel * 8)?;
             allocs.push((d_out, c_out));
-            let (mut d_inv, c_inv) = st.arena.alloc(&self.api, m_total * 8)?;
+            let (mut d_inv, c_inv) = st.arena.alloc(&self.inner.api, m_total * 8)?;
             allocs.push((d_inv, c_inv));
-            let (mut d_x, c_x) = Self::upload_slice(&self.api, &mut st.arena, x)?;
+            let (mut d_x, c_x) = Self::upload_slice(&self.inner.api, &mut st.arena, x)?;
             allocs.push((d_x, c_x));
-            let (mut d_w, c_w) = Self::upload_slice(&self.api, &mut st.arena, w)?;
+            let (mut d_w, c_w) = Self::upload_slice(&self.inner.api, &mut st.arena, w)?;
             allocs.push((d_w, c_w));
+            self.inner.counters.on_h2d();
+            self.inner.counters.on_h2d();
             let (mut d_gamma, mut hg, mut gl) = if !gamma_slice.is_empty() {
-                let (p, c) = Self::upload_slice(&self.api, &mut st.arena, gamma_slice)?;
+                let (p, c) = Self::upload_slice(&self.inner.api, &mut st.arena, gamma_slice)?;
                 allocs.push((p, c));
+                self.inner.counters.on_h2d();
                 (p, 1u32, gamma_slice.len() as u32)
             } else {
                 (0u64, 0u32, 1u32)
             };
             let (mut d_bias, mut hb, mut bl) = if !bias_slice.is_empty() {
-                let (p, c) = Self::upload_slice(&self.api, &mut st.arena, bias_slice)?;
+                let (p, c) = Self::upload_slice(&self.inner.api, &mut st.arena, bias_slice)?;
                 allocs.push((p, c));
+                self.inner.counters.on_h2d();
                 (p, 1u32, bias_slice.len() as u32)
             } else {
                 (0u64, 0u32, 1u32)
@@ -1819,7 +3754,6 @@ impl DeviceBackend for CudaDeviceBackend {
             let mut eps_v = eps;
             let mut ac = act_code(act);
 
-            // Stage 1: compute inv_rms[0..m_total] on GPU (O(m_total) scratch only)
             let mut p1: [*mut c_void; 5] = [
                 &raw mut d_inv as *mut c_void,
                 &raw mut d_x as *mut c_void,
@@ -1830,7 +3764,7 @@ impl DeviceBackend for CudaDeviceBackend {
             let rms_blocks = m_u.div_ceil(128).max(1);
             // SAFETY: Parameter layout matches `mora_rms_inv_f64` PTX signature.
             let rc1 = unsafe {
-                (self.api.cu_launch_kernel)(
+                (self.inner.api.cu_launch_kernel)(
                     st.kernels.rms_inv_f64,
                     rms_blocks,
                     1,
@@ -1846,7 +3780,6 @@ impl DeviceBackend for CudaDeviceBackend {
             };
             cu_check(rc1, "cuLaunchKernel(mora_rms_inv_f64)")?;
 
-            // Stage 2: fused normalized matmul + gamma + bias + activation on GPU
             let mut p2: [*mut c_void; 14] = [
                 &raw mut d_out as *mut c_void,
                 &raw mut d_x as *mut c_void,
@@ -1867,7 +3800,7 @@ impl DeviceBackend for CudaDeviceBackend {
             let gy = m_u.div_ceil(16).max(1);
             // SAFETY: Parameter layout matches `mora_fused_rms_linear_act_f64` PTX signature.
             let rc2 = unsafe {
-                (self.api.cu_launch_kernel)(
+                (self.inner.api.cu_launch_kernel)(
                     st.kernels.fused_rms_linear_act_f64,
                     gx,
                     gy,
@@ -1883,14 +3816,15 @@ impl DeviceBackend for CudaDeviceBackend {
             };
             cu_check(rc2, "cuLaunchKernel(mora_fused_rms_linear_act_f64)")?;
             // SAFETY: Synchronize default stream before D2H copy.
-            let rc_sync = unsafe { (self.api.cu_ctx_synchronize)() };
+            let rc_sync = unsafe { (self.inner.api.cu_ctx_synchronize)() };
             cu_check(rc_sync, "cuCtxSynchronize(mora_fused_rms_linear_act_f64)")?;
-            Self::download_slice(&self.api, d_out, out)?;
+            Self::download_slice(&self.inner.api, d_out, out)?;
+            self.inner.counters.on_d2h();
             Ok(())
         })();
 
         for (p, c) in allocs {
-            st.arena.release(&self.api, p, c);
+            st.arena.release(&self.inner.api, p, c);
         }
         res?;
         quantize_slice_in_place(out, dtype);
@@ -1984,31 +3918,35 @@ impl DeviceBackend for CudaDeviceBackend {
                 (&[][..], Vec::new(), 0u32, 0u32, 0u32)
             };
 
-        let mut st = self.state.lock();
+        let mut st = self.inner.state.lock();
         // SAFETY: Bind retained primary CUDA context.
-        let rc_ctx = unsafe { (self.api.cu_ctx_set_current)(st.ctx) };
+        let rc_ctx = unsafe { (self.inner.api.cu_ctx_set_current)(st.ctx) };
         cu_check(rc_ctx, "cuCtxSetCurrent")?;
 
         let mut allocs: Vec<(CuDevicePtr, usize)> = Vec::with_capacity(9);
         let res = (|| -> MoraResult<()> {
-            let (mut dev_out, c_out) = st.arena.alloc(&self.api, out_numel * 8)?;
+            let (mut dev_out, c_out) = st.arena.alloc(&self.inner.api, out_numel * 8)?;
             allocs.push((dev_out, c_out));
-            let (mut dev_q, c_q) = Self::upload_slice(&self.api, &mut st.arena, q)?;
+            let (mut dev_q, c_q) = Self::upload_slice(&self.inner.api, &mut st.arena, q)?;
             allocs.push((dev_q, c_q));
-            let (mut dev_k, c_k) = Self::upload_slice(&self.api, &mut st.arena, k)?;
+            let (mut dev_k, c_k) = Self::upload_slice(&self.inner.api, &mut st.arena, k)?;
             allocs.push((dev_k, c_k));
-            let (mut dev_v, c_v) = Self::upload_slice(&self.api, &mut st.arena, v)?;
+            let (mut dev_v, c_v) = Self::upload_slice(&self.inner.api, &mut st.arena, v)?;
             allocs.push((dev_v, c_v));
-            let (mut dev_qb, c_qb) = Self::upload_slice(&self.api, &mut st.arena, &q_bases)?;
+            self.inner.counters.on_h2d();
+            self.inner.counters.on_h2d();
+            self.inner.counters.on_h2d();
+            let (mut dev_qb, c_qb) = Self::upload_slice(&self.inner.api, &mut st.arena, &q_bases)?;
             allocs.push((dev_qb, c_qb));
-            let (mut dev_kb, c_kb) = Self::upload_slice(&self.api, &mut st.arena, &k_bases)?;
+            let (mut dev_kb, c_kb) = Self::upload_slice(&self.inner.api, &mut st.arena, &k_bases)?;
             allocs.push((dev_kb, c_kb));
-            let (mut dev_vb, c_vb) = Self::upload_slice(&self.api, &mut st.arena, &v_bases)?;
+            let (mut dev_vb, c_vb) = Self::upload_slice(&self.inner.api, &mut st.arena, &v_bases)?;
             allocs.push((dev_vb, c_vb));
             let (mut dev_mask, mut dev_mb) = if has_mask_u != 0 {
-                let (pm, cm) = Self::upload_slice(&self.api, &mut st.arena, mask_vals)?;
+                let (pm, cm) = Self::upload_slice(&self.inner.api, &mut st.arena, mask_vals)?;
                 allocs.push((pm, cm));
-                let (pmb, cmb) = Self::upload_slice(&self.api, &mut st.arena, &mask_bases)?;
+                self.inner.counters.on_h2d();
+                let (pmb, cmb) = Self::upload_slice(&self.inner.api, &mut st.arena, &mask_bases)?;
                 allocs.push((pmb, cmb));
                 (pm, pmb)
             } else {
@@ -2048,7 +3986,7 @@ impl DeviceBackend for CudaDeviceBackend {
             let gy = sq_u.div_ceil(16).max(1);
             // SAFETY: Parameter layout matches `mora_fused_flash_attention_f64` PTX signature.
             let rc_fa = unsafe {
-                (self.api.cu_launch_kernel)(
+                (self.inner.api.cu_launch_kernel)(
                     st.kernels.fused_flash_attention_f64,
                     gx,
                     gy,
@@ -2064,14 +4002,15 @@ impl DeviceBackend for CudaDeviceBackend {
             };
             cu_check(rc_fa, "cuLaunchKernel(mora_fused_flash_attention_f64)")?;
             // SAFETY: Synchronize default stream before D2H copy.
-            let rc_sync = unsafe { (self.api.cu_ctx_synchronize)() };
+            let rc_sync = unsafe { (self.inner.api.cu_ctx_synchronize)() };
             cu_check(rc_sync, "cuCtxSynchronize(mora_fused_flash_attention_f64)")?;
-            Self::download_slice(&self.api, dev_out, out)?;
+            Self::download_slice(&self.inner.api, dev_out, out)?;
+            self.inner.counters.on_d2h();
             Ok(())
         })();
 
         for (p, c) in allocs {
-            st.arena.release(&self.api, p, c);
+            st.arena.release(&self.inner.api, p, c);
         }
         res?;
         quantize_slice_in_place(out, dtype);
@@ -2116,71 +4055,41 @@ impl DeviceBackend for CudaDeviceBackend {
             all_strides.extend(compute_broadcast_strides(s, &eff_out_shape));
         }
 
-        let mut ops = Vec::with_capacity(steps.len());
-        let mut arg_a = Vec::with_capacity(steps.len());
-        let mut arg_b = Vec::with_capacity(steps.len());
-        let mut imm = Vec::with_capacity(steps.len());
-        for step in steps {
-            let (op, a, b, im) = match *step {
-                FusedEwStep::Add(a, b) => (0u32, a as u32, b as u32, 0.0),
-                FusedEwStep::Sub(a, b) => (1, a as u32, b as u32, 0.0),
-                FusedEwStep::Mul(a, b) => (2, a as u32, b as u32, 0.0),
-                FusedEwStep::Div(a, b) => (3, a as u32, b as u32, 0.0),
-                FusedEwStep::Pow(a, b) => (4, a as u32, b as u32, 0.0),
-                FusedEwStep::AddScalar(a, s) => (5, a as u32, 0, s),
-                FusedEwStep::SubScalar(a, s, rev) => (if rev { 7 } else { 6 }, a as u32, 0, s),
-                FusedEwStep::MulScalar(a, s) => (8, a as u32, 0, s),
-                FusedEwStep::DivScalar(a, s, rev) => (if rev { 10 } else { 9 }, a as u32, 0, s),
-                FusedEwStep::PowScalar(a, s, rev) => (if rev { 12 } else { 11 }, a as u32, 0, s),
-                FusedEwStep::Neg(a) => (13, a as u32, 0, 0.0),
-                FusedEwStep::Relu(a) => (14, a as u32, 0, 0.0),
-                FusedEwStep::Gelu(a) => (15, a as u32, 0, 0.0),
-                FusedEwStep::Silu(a) => (16, a as u32, 0, 0.0),
-                FusedEwStep::Tanh(a) => (17, a as u32, 0, 0.0),
-                FusedEwStep::Sigmoid(a) => (18, a as u32, 0, 0.0),
-                FusedEwStep::Exp(a) => (19, a as u32, 0, 0.0),
-                FusedEwStep::Ln(a) => (20, a as u32, 0, 0.0),
-                FusedEwStep::Sqrt(a) => (21, a as u32, 0, 0.0),
-                FusedEwStep::Sin(a) => (22, a as u32, 0, 0.0),
-                FusedEwStep::Cos(a) => (23, a as u32, 0, 0.0),
-                FusedEwStep::Abs(a) => (24, a as u32, 0, 0.0),
-            };
-            ops.push(op);
-            arg_a.push(a);
-            arg_b.push(b);
-            imm.push(im);
-        }
+        let (ops, arg_a, arg_b, imm) = Self::encode_ew_steps(steps);
 
-        let mut st = self.state.lock();
+        let mut st = self.inner.state.lock();
         // SAFETY: Bind retained primary CUDA context.
-        let rc_ctx = unsafe { (self.api.cu_ctx_set_current)(st.ctx) };
+        let rc_ctx = unsafe { (self.inner.api.cu_ctx_set_current)(st.ctx) };
         cu_check(rc_ctx, "cuCtxSetCurrent")?;
 
         let mut allocs: Vec<(CuDevicePtr, usize)> = Vec::with_capacity(input_flats.len() + 8);
         let res = (|| -> MoraResult<()> {
-            let (mut d_out, c_out) = st.arena.alloc(&self.api, out_numel * 8)?;
+            let (mut d_out, c_out) = st.arena.alloc(&self.inner.api, out_numel * 8)?;
             allocs.push((d_out, c_out));
 
             let mut dev_in_ptrs = Vec::with_capacity(input_flats.len());
             for flat in input_flats {
-                let (p, c) = Self::upload_slice(&self.api, &mut st.arena, flat)?;
+                let (p, c) = Self::upload_slice(&self.inner.api, &mut st.arena, flat)?;
                 allocs.push((p, c));
+                self.inner.counters.on_h2d();
                 dev_in_ptrs.push(p);
             }
-            let (mut d_in_ptrs, c_ip) = Self::upload_slice(&self.api, &mut st.arena, &dev_in_ptrs)?;
+            let (mut d_in_ptrs, c_ip) =
+                Self::upload_slice(&self.inner.api, &mut st.arena, &dev_in_ptrs)?;
             allocs.push((d_in_ptrs, c_ip));
-            let (mut d_strides, c_st) = Self::upload_slice(&self.api, &mut st.arena, &all_strides)?;
+            let (mut d_strides, c_st) =
+                Self::upload_slice(&self.inner.api, &mut st.arena, &all_strides)?;
             allocs.push((d_strides, c_st));
             let (mut d_oshape, c_os) =
-                Self::upload_slice(&self.api, &mut st.arena, &out_shape_u32)?;
+                Self::upload_slice(&self.inner.api, &mut st.arena, &out_shape_u32)?;
             allocs.push((d_oshape, c_os));
-            let (mut d_ops, c_ops) = Self::upload_slice(&self.api, &mut st.arena, &ops)?;
+            let (mut d_ops, c_ops) = Self::upload_slice(&self.inner.api, &mut st.arena, &ops)?;
             allocs.push((d_ops, c_ops));
-            let (mut d_a, c_a) = Self::upload_slice(&self.api, &mut st.arena, &arg_a)?;
+            let (mut d_a, c_a) = Self::upload_slice(&self.inner.api, &mut st.arena, &arg_a)?;
             allocs.push((d_a, c_a));
-            let (mut d_b, c_b) = Self::upload_slice(&self.api, &mut st.arena, &arg_b)?;
+            let (mut d_b, c_b) = Self::upload_slice(&self.inner.api, &mut st.arena, &arg_b)?;
             allocs.push((d_b, c_b));
-            let (mut d_imm, c_imm) = Self::upload_slice(&self.api, &mut st.arena, &imm)?;
+            let (mut d_imm, c_imm) = Self::upload_slice(&self.inner.api, &mut st.arena, &imm)?;
             allocs.push((d_imm, c_imm));
 
             let mut ndim_u = ndim as u32;
@@ -2205,7 +4114,7 @@ impl DeviceBackend for CudaDeviceBackend {
             let blocks = numel_u.div_ceil(128).max(1);
             // SAFETY: Parameter layout matches `mora_fused_ew_f64` PTX signature.
             let rc_ew = unsafe {
-                (self.api.cu_launch_kernel)(
+                (self.inner.api.cu_launch_kernel)(
                     st.kernels.fused_ew_f64,
                     blocks,
                     1,
@@ -2221,14 +4130,15 @@ impl DeviceBackend for CudaDeviceBackend {
             };
             cu_check(rc_ew, "cuLaunchKernel(mora_fused_ew_f64)")?;
             // SAFETY: Synchronize default stream before D2H copy.
-            let rc_sync = unsafe { (self.api.cu_ctx_synchronize)() };
+            let rc_sync = unsafe { (self.inner.api.cu_ctx_synchronize)() };
             cu_check(rc_sync, "cuCtxSynchronize(mora_fused_ew_f64)")?;
-            Self::download_slice(&self.api, d_out, out)?;
+            Self::download_slice(&self.inner.api, d_out, out)?;
+            self.inner.counters.on_d2h();
             Ok(())
         })();
 
         for (p, c) in allocs {
-            st.arena.release(&self.api, p, c);
+            st.arena.release(&self.inner.api, p, c);
         }
         res?;
         quantize_slice_in_place(out, dtype);
@@ -2341,16 +4251,20 @@ pub(crate) fn probe_cuda_backends() -> Vec<HardwareBackendEntry> {
             driver_version: driver_version.clone(),
         };
 
-        let backend = Arc::new(CudaDeviceBackend {
+        let inner = Arc::new(CudaDeviceInner {
             device,
             cu_dev,
             api: Arc::clone(&api),
-            info: info.clone(),
             state: Mutex::new(CudaContextState {
                 ctx,
                 kernels,
                 arena: CudaVramArena::new(),
             }),
+            counters: VramCounters::default(),
+        });
+        let backend = Arc::new(CudaDeviceBackend {
+            inner,
+            info: info.clone(),
         });
         out.push(HardwareBackendEntry { info, backend });
     }

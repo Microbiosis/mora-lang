@@ -20,8 +20,36 @@ use std::time::{Duration, Instant};
 use crate::common::sync::Mutex;
 use crate::error::{MoraError, MoraResult};
 use crate::runtime::CoreRuntime;
-use crate::runtime::vm::{execute_method_named, execute_value, execute_value_named};
+use crate::runtime::vm::{
+    CallAction, VmEngine, VmOutcome, VmYield, resolve_method_call_named, resolve_value_call_named,
+};
 use crate::value::Value;
+
+/// Cooperative VM instruction budget per M:N fiber timeslice on `ExecutorPool`.
+const FIBER_STEP_BUDGET: usize = 2048;
+
+/// Cooperative 1-poll yield future that hands the current M:N worker back to `ExecutorPool`.
+struct YieldNow {
+    yielded: bool,
+}
+
+impl Future for YieldNow {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut PollContext<'_>) -> Poll<()> {
+        if self.yielded {
+            Poll::Ready(())
+        } else {
+            self.yielded = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+}
+
+fn yield_now() -> YieldNow {
+    YieldNow { yielded: false }
+}
 
 // ─── Native Min-Heap Timer Driver (`sleep` / `sleep_until`) ─────────────────
 
@@ -781,27 +809,40 @@ impl<T> SharedTaskState<T> {
     }
 }
 
+struct ExecutorTaskState {
+    queued: bool,
+    running: bool,
+    requeue: bool,
+    future: Option<BoxFuture<()>>,
+}
+
 struct ExecutorTask {
-    queued: AtomicBool,
     aborted: Arc<AtomicBool>,
-    future_slot: Arc<Mutex<Option<BoxFuture<()>>>>,
+    state: Mutex<ExecutorTaskState>,
     pool: Arc<ExecutorPool>,
 }
 
 struct ExecutorPool {
+    worker_threads: usize,
     queue: StdMutex<VecDeque<Arc<ExecutorTask>>>,
     cv: StdCondvar,
     shutdown: AtomicBool,
+    fiber_preemptions: AtomicU64,
+    fiber_async_suspensions: AtomicU64,
 }
 
 impl ExecutorPool {
     fn new(worker_threads: usize) -> Arc<Self> {
+        let count = worker_threads.max(1);
         let pool = Arc::new(Self {
+            worker_threads: count,
             queue: StdMutex::new(VecDeque::new()),
             cv: StdCondvar::new(),
             shutdown: AtomicBool::new(false),
+            fiber_preemptions: AtomicU64::new(0),
+            fiber_async_suspensions: AtomicU64::new(0),
         });
-        for i in 0..worker_threads.max(1) {
+        for i in 0..count {
             let p = Arc::clone(&pool);
             thread::Builder::new()
                 .name(format!("mora-worker-{i}"))
@@ -812,7 +853,22 @@ impl ExecutorPool {
     }
 
     fn enqueue(&self, task: Arc<ExecutorTask>) {
-        if !task.queued.swap(true, Ordering::AcqRel) {
+        let should_push = {
+            let mut st = task.state.lock();
+            if task.aborted.load(Ordering::Acquire) {
+                st.future = None;
+                false
+            } else if st.running {
+                st.requeue = true;
+                false
+            } else if st.future.is_some() && !st.queued {
+                st.queued = true;
+                true
+            } else {
+                false
+            }
+        };
+        if should_push {
             let mut q = self.queue.lock().unwrap_or_else(|p| p.into_inner());
             q.push_back(task);
             drop(q);
@@ -835,8 +891,8 @@ impl Wake for ExecutorTask {
 
     fn wake_by_ref(self: &Arc<Self>) {
         if self.aborted.load(Ordering::Acquire) {
-            if let Some(mut g) = self.future_slot.try_lock() {
-                let _ = g.take();
+            if let Some(mut st) = self.state.try_lock() {
+                st.future = None;
             }
             return;
         }
@@ -861,27 +917,49 @@ fn worker_loop(pool: Arc<ExecutorPool>) {
         let Some(task) = task else {
             return;
         };
-        task.queued.store(false, Ordering::Release);
-        if task.aborted.load(Ordering::Acquire) {
-            let _ = task.future_slot.lock().take();
-            continue;
-        }
-        let mut fut_opt = task.future_slot.lock().take();
+        let mut fut_opt = {
+            let mut st = task.state.lock();
+            st.queued = false;
+            st.requeue = false;
+            if task.aborted.load(Ordering::Acquire) {
+                st.future = None;
+                None
+            } else if let Some(f) = st.future.take() {
+                st.running = true;
+                Some(f)
+            } else {
+                None
+            }
+        };
         if let Some(mut fut) = fut_opt.take() {
             let waker = Waker::from(Arc::clone(&task));
             let mut cx = PollContext::from_waker(&waker);
-            match catch_unwind(AssertUnwindSafe(|| fut.as_mut().poll(&mut cx))) {
-                Ok(Poll::Ready(())) => {}
-                Ok(Poll::Pending) => {
-                    if !task.aborted.load(Ordering::Acquire) {
-                        *task.future_slot.lock() = Some(fut);
-                        // Re-check in case a wake arrived while the future was checked out
-                        if task.queued.load(Ordering::Acquire) {
-                            pool.cv.notify_one();
+            let poll_res = catch_unwind(AssertUnwindSafe(|| fut.as_mut().poll(&mut cx)));
+            let requeue_now = {
+                let mut st = task.state.lock();
+                st.running = false;
+                match poll_res {
+                    Ok(Poll::Pending) if !task.aborted.load(Ordering::Acquire) => {
+                        st.future = Some(fut);
+                        if st.requeue && !st.queued {
+                            st.requeue = false;
+                            st.queued = true;
+                            true
+                        } else {
+                            false
                         }
                     }
+                    _ => {
+                        st.requeue = false;
+                        false
+                    }
                 }
-                Err(_) => {}
+            };
+            if requeue_now {
+                let mut q = pool.queue.lock().unwrap_or_else(|p| p.into_inner());
+                q.push_back(task);
+                drop(q);
+                pool.cv.notify_one();
             }
         }
     }
@@ -1181,7 +1259,6 @@ impl TaskScheduler {
         let child_ctx = ctx.child();
         let fut = build(child_ctx.clone());
         let aborted = Arc::new(AtomicBool::new(false));
-        let future_slot: Arc<Mutex<Option<BoxFuture<()>>>> = Arc::new(Mutex::new(None));
         let shared = Arc::new(SharedTaskState {
             done: AtomicBool::new(false),
             aborted: AtomicBool::new(false),
@@ -1213,11 +1290,14 @@ impl TaskScheduler {
                 gn.notify_waiters();
             }
         });
-        *future_slot.lock() = Some(wrapped);
         let exec_task = Arc::new(ExecutorTask {
-            queued: AtomicBool::new(false),
             aborted,
-            future_slot,
+            state: Mutex::new(ExecutorTaskState {
+                queued: false,
+                running: false,
+                requeue: false,
+                future: Some(wrapped),
+            }),
             pool: Arc::clone(&self.pool),
         });
         self.pool.enqueue(exec_task);
@@ -1279,8 +1359,18 @@ impl TaskScheduler {
         }
     }
 
+    /// Return `(worker_threads, fiber_preemptions, fiber_async_suspensions)` telemetry
+    /// for the M:N cooperative VM fiber executor pool.
+    pub fn fiber_stats(&self) -> (usize, u64, u64) {
+        (
+            self.pool.worker_threads,
+            self.pool.fiber_preemptions.load(Ordering::Relaxed),
+            self.pool.fiber_async_suspensions.load(Ordering::Relaxed),
+        )
+    }
+
     /// Execute a first-class Mora callable [`Value`] on an isolated [`CoreRuntime`] clone
-    /// inside the blocking pool, propagating cancellation/deadlines cooperatively into `VmEngine`.
+    /// as a cooperative M:N VM fiber scheduled on `ExecutorPool` (zero extra OS threads).
     pub fn spawn_mora_task(
         &self,
         callee: Value,
@@ -1290,10 +1380,13 @@ impl TaskScheduler {
     ) -> TaskHandle<Value> {
         let mut isolated = core.clone();
         isolated.autograd = crate::runtime::autograd::AutogradContext::new();
-        self.spawn_blocking(ctx, move |task_ctx| {
-            task_ctx.status()?;
-            isolated.task_context = Some(task_ctx);
-            execute_value(callee, args, &mut isolated)
+        let pool = Arc::clone(&self.pool);
+        self.spawn(ctx, move |task_ctx| async move {
+            isolated.task_context = Some(task_ctx.clone());
+            run_mora_fiber_loop(&mut isolated, &task_ctx, &pool, |rt| {
+                resolve_value_call_named(callee, args, Vec::new(), rt)
+            })
+            .await
         })
     }
 
@@ -1405,7 +1498,7 @@ impl TaskScheduler {
         self.spawn_mora_value_named(callee, args, Vec::new(), core, ctx)
     }
 
-    /// Spawn a callable Mora value with named keyword arguments on an isolated VM task.
+    /// Spawn a callable Mora value with named keyword arguments as a cooperative M:N fiber.
     pub(crate) fn spawn_mora_value_named(
         &self,
         callee: Value,
@@ -1416,14 +1509,17 @@ impl TaskScheduler {
     ) -> Arc<MoraTaskHandle> {
         let mut isolated = core.clone();
         isolated.autograd = crate::runtime::autograd::AutogradContext::new();
-        self.spawn_blocking_mora(ctx, move |task_ctx| {
-            task_ctx.status()?;
-            isolated.task_context = Some(task_ctx);
-            execute_value_named(callee, args, named_args, &mut isolated)
+        let pool = Arc::clone(&self.pool);
+        self.spawn_mora_fiber(ctx, move |task_ctx| async move {
+            isolated.task_context = Some(task_ctx.clone());
+            run_mora_fiber_loop(&mut isolated, &task_ctx, &pool, |rt| {
+                resolve_value_call_named(callee, args, named_args, rt)
+            })
+            .await
         })
     }
 
-    /// Spawn a method invocation with named keyword arguments on an isolated VM task.
+    /// Spawn a method invocation with named keyword arguments as a cooperative M:N fiber.
     pub(crate) fn spawn_mora_method_named(
         &self,
         receiver: Value,
@@ -1435,16 +1531,27 @@ impl TaskScheduler {
     ) -> Arc<MoraTaskHandle> {
         let mut isolated = core.clone();
         isolated.autograd = crate::runtime::autograd::AutogradContext::new();
-        self.spawn_blocking_mora(ctx, move |task_ctx| {
-            task_ctx.status()?;
-            isolated.task_context = Some(task_ctx);
-            execute_method_named(receiver, &method, args, named_args, &mut isolated)
+        let pool = Arc::clone(&self.pool);
+        self.spawn_mora_fiber(ctx, move |task_ctx| async move {
+            isolated.task_context = Some(task_ctx.clone());
+            run_mora_fiber_loop(&mut isolated, &task_ctx, &pool, |rt| {
+                resolve_method_call_named(
+                    rt,
+                    receiver,
+                    &method,
+                    args,
+                    named_args,
+                    crate::common::Span::default(),
+                )
+            })
+            .await
         })
     }
 
-    fn spawn_blocking_mora<F>(&self, ctx: &TaskContext, f: F) -> Arc<MoraTaskHandle>
+    fn spawn_mora_fiber<F, Fut>(&self, ctx: &TaskContext, build: F) -> Arc<MoraTaskHandle>
     where
-        F: FnOnce(TaskContext) -> MoraResult<Value> + Send + 'static,
+        F: FnOnce(TaskContext) -> Fut + Send + 'static,
+        Fut: Future<Output = MoraResult<Value>> + Send + 'static,
     {
         let child_ctx = ctx.child();
         let inner_ctx = child_ctx.clone();
@@ -1455,14 +1562,21 @@ impl TaskScheduler {
             waiter: AsyncNotify::new(),
         });
         let watcher_shared = Arc::clone(&task_handle);
-        thread::spawn(move || {
-            let outcome = match catch_unwind(AssertUnwindSafe(|| f(inner_ctx))) {
-                Ok(res) => res,
-                Err(payload) => Err(MoraError::Task(format!(
-                    "task panicked: {}",
-                    panic_payload_message(payload)
-                ))),
-            };
+        let fut = build(inner_ctx);
+        let aborted = Arc::new(AtomicBool::new(false));
+        let wrapped: BoxFuture<()> = Box::pin(async move {
+            let mut inner = Box::pin(fut);
+            let outcome = std::future::poll_fn(|cx| {
+                match catch_unwind(AssertUnwindSafe(|| inner.as_mut().poll(cx))) {
+                    Ok(Poll::Ready(res)) => Poll::Ready(res),
+                    Ok(Poll::Pending) => Poll::Pending,
+                    Err(payload) => Poll::Ready(Err(MoraError::Task(format!(
+                        "task panicked: {}",
+                        panic_payload_message(payload)
+                    )))),
+                }
+            })
+            .await;
             {
                 let mut g = watcher_shared.result.lock();
                 if g.is_none() {
@@ -1472,7 +1586,65 @@ impl TaskScheduler {
             watcher_shared.done.store(true, Ordering::Release);
             watcher_shared.waiter.notify_waiters();
         });
+        let exec_task = Arc::new(ExecutorTask {
+            aborted,
+            state: Mutex::new(ExecutorTaskState {
+                queued: false,
+                running: false,
+                requeue: false,
+                future: Some(wrapped),
+            }),
+            pool: Arc::clone(&self.pool),
+        });
+        self.pool.enqueue(exec_task);
         task_handle
+    }
+}
+
+/// Cooperative M:N fiber driver executing a Mora VM call stack across step-budget preemptions
+/// and non-blocking async I/O / timer / channel suspensions on `ExecutorPool`.
+async fn run_mora_fiber_loop<F>(
+    isolated: &mut CoreRuntime,
+    task_ctx: &TaskContext,
+    pool: &ExecutorPool,
+    init_action: F,
+) -> MoraResult<Value>
+where
+    F: FnOnce(&mut CoreRuntime) -> MoraResult<CallAction>,
+{
+    task_ctx.status()?;
+    let action = init_action(isolated)?;
+    let mut outcome = VmEngine::new(isolated).run_action_with_budget(action, FIBER_STEP_BUDGET)?;
+    loop {
+        match outcome {
+            VmOutcome::Completed(val) => return Ok(val),
+            VmOutcome::Suspended {
+                frames,
+                yield_reason: VmYield::Preempt,
+            } => {
+                pool.fiber_preemptions.fetch_add(1, Ordering::Relaxed);
+                yield_now().await;
+                task_ctx.status()?;
+                outcome =
+                    VmEngine::with_frames(isolated, frames).run_with_budget(FIBER_STEP_BUDGET)?;
+            }
+            VmOutcome::Suspended {
+                frames,
+                yield_reason: VmYield::AwaitFuture(fut),
+            } => {
+                pool.fiber_async_suspensions.fetch_add(1, Ordering::Relaxed);
+                let awaited = match race2(task_ctx.cancelled(), fut).await {
+                    Select2::First(err) => Err(err),
+                    Select2::Second(res) => res,
+                };
+                outcome = match awaited {
+                    Ok(val) => VmEngine::with_frames(isolated, frames)
+                        .resume_with_value(val, FIBER_STEP_BUDGET)?,
+                    Err(err) => VmEngine::with_frames(isolated, frames)
+                        .resume_with_error(err, FIBER_STEP_BUDGET)?,
+                };
+            }
+        }
     }
 }
 

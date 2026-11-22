@@ -24,11 +24,18 @@ use crate::runtime::builtins::traits::{
 use crate::value::{BuiltinKind, MODULE_OBJECTS, StructDefRuntime, Value};
 
 use super::continuation::{CombinatorFrame, ScriptFrame, materialize_frame_named};
+use std::future::Future;
+use std::pin::Pin;
+
+/// P4-2: Boxed `Send` future awaited cooperatively by `VmEngine` without blocking OS worker threads.
+pub type VmFuture = Pin<Box<dyn Future<Output = MoraResult<Value>> + Send>>;
 
 /// Deferred or stackful call dispatch action returned by builtin/callee resolution.
 pub enum CallAction {
     /// Immediate synchronous return value.
     Done(Value),
+    /// P4-2: Suspend the VM call stack cooperatively until the async operation resolves.
+    AwaitFuture(VmFuture),
     /// Push a compiled `ScriptFrame` (optionally wrapping propagated errors with `error_prefix`).
     PushFrame {
         frame: ScriptFrame,
@@ -531,6 +538,18 @@ pub fn resolve_builtin_call_named(
                 args: expr_args,
             })
         }
+        BuiltinFnId::Sleep => {
+            let ms_val = args.first().ok_or_else(|| {
+                MoraError::Runtime("sleep(ms) requires 1 numeric argument".into())
+            })?;
+            let duration = crate::runtime::builtins::duration_from_ms(ms_val, "sleep")?;
+            let reactor = Arc::clone(core.reactor());
+            let ctx = core.task_context.clone();
+            Ok(CallAction::AwaitFuture(Box::pin(async move {
+                reactor.sleep(duration, ctx.as_ref()).await?;
+                Ok(Value::Nil)
+            })))
+        }
         BuiltinFnId::TcpListen => {
             if args.len() != 1 {
                 return Err(MoraError::Runtime(format!(
@@ -547,11 +566,11 @@ pub fn resolve_builtin_call_named(
             if let Some(c) = core.task_context.as_ref() {
                 c.status()?;
             }
-            let listener = core
-                .reactor()
-                .scheduler()
-                .block_on(crate::runtime::reactor::MoraTcpListener::bind(addr))?;
-            Ok(CallAction::Done(Value::TcpListener(listener)))
+            let addr = addr.clone();
+            Ok(CallAction::AwaitFuture(Box::pin(async move {
+                let listener = crate::runtime::reactor::MoraTcpListener::bind(&addr).await?;
+                Ok(Value::TcpListener(listener))
+            })))
         }
         BuiltinFnId::TcpConnect => {
             if args.is_empty() || args.len() > 3 {
@@ -583,11 +602,17 @@ pub fn resolve_builtin_call_named(
                     )));
                 }
             };
-            let eff_ctx = explicit_ctx.as_ref().or(core.task_context.as_ref());
-            let stream = core.reactor().scheduler().block_on(
-                crate::runtime::reactor::MoraTcpStream::connect(addr, timeout, eff_ctx),
-            )?;
-            Ok(CallAction::Done(Value::TcpStream(stream)))
+            let addr = addr.clone();
+            let eff_ctx = explicit_ctx.or_else(|| core.task_context.clone());
+            Ok(CallAction::AwaitFuture(Box::pin(async move {
+                let stream = crate::runtime::reactor::MoraTcpStream::connect(
+                    &addr,
+                    timeout,
+                    eff_ctx.as_ref(),
+                )
+                .await?;
+                Ok(Value::TcpStream(stream))
+            })))
         }
         BuiltinFnId::TlsListen => {
             if args.len() != 2 {
@@ -635,11 +660,11 @@ pub fn resolve_builtin_call_named(
                 key_pem,
                 alpn_protocols,
             };
-            let listener = core
-                .reactor()
-                .scheduler()
-                .block_on(crate::runtime::tls::MoraTlsListener::bind(addr, &cfg))?;
-            Ok(CallAction::Done(Value::TlsListener(listener)))
+            let addr = addr.clone();
+            Ok(CallAction::AwaitFuture(Box::pin(async move {
+                let listener = crate::runtime::tls::MoraTlsListener::bind(&addr, &cfg).await?;
+                Ok(Value::TlsListener(listener))
+            })))
         }
         BuiltinFnId::TlsConnect => {
             if args.is_empty() || args.len() > 5 {
@@ -736,17 +761,24 @@ pub fn resolve_builtin_call_named(
                     )));
                 }
             };
-            let eff_ctx = explicit_ctx.as_ref().or(core.task_context.as_ref());
+            let addr = addr.clone();
+            let eff_ctx = explicit_ctx.or_else(|| core.task_context.clone());
             let cfg = crate::runtime::tls::TlsClientConfig {
                 server_name,
                 ca_pem,
                 alpn_protocols,
                 insecure_skip_verify,
             };
-            let stream = core.reactor().scheduler().block_on(
-                crate::runtime::tls::MoraTlsStream::connect(addr, &cfg, timeout, eff_ctx),
-            )?;
-            Ok(CallAction::Done(Value::TlsStream(stream)))
+            Ok(CallAction::AwaitFuture(Box::pin(async move {
+                let stream = crate::runtime::tls::MoraTlsStream::connect(
+                    &addr,
+                    &cfg,
+                    timeout,
+                    eff_ctx.as_ref(),
+                )
+                .await?;
+                Ok(Value::TlsStream(stream))
+            })))
         }
         BuiltinFnId::Jvp => {
             if args.len() != 3 {
@@ -1686,9 +1718,12 @@ fn resolve_channel_method(
             let val = args.into_iter().next().ok_or_else(|| {
                 MoraError::Runtime("channel.send() requires 1 value argument".to_string())
             })?;
-            core.scheduler()
-                .block_on(ch.send_async(val, core.task_context.as_ref()))?;
-            Ok(CallAction::Done(Value::Nil))
+            let ch = Arc::clone(ch);
+            let ctx = core.task_context.clone();
+            Ok(CallAction::AwaitFuture(Box::pin(async move {
+                ch.send_async(val, ctx.as_ref()).await?;
+                Ok(Value::Nil)
+            })))
         }
         "try_send" => {
             let val = args.into_iter().next().ok_or_else(|| {
@@ -1707,8 +1742,10 @@ fn resolve_channel_method(
                     "channel.send_ctx(val, ctx): second argument must be a Context".to_string(),
                 ));
             };
-            core.scheduler().block_on(async {
-                match core.task_context.as_ref() {
+            let ch = Arc::clone(ch);
+            let outer_ctx = core.task_context.clone();
+            Ok(CallAction::AwaitFuture(Box::pin(async move {
+                match outer_ctx.as_ref() {
                     Some(outer) => {
                         outer.status()?;
                         match crate::runtime::scheduler::race2(
@@ -1718,19 +1755,25 @@ fn resolve_channel_method(
                         .await
                         {
                             crate::runtime::scheduler::Select2::First(err) => Err(err),
-                            crate::runtime::scheduler::Select2::Second(res) => res,
+                            crate::runtime::scheduler::Select2::Second(res) => {
+                                res?;
+                                Ok(Value::Nil)
+                            }
                         }
                     }
-                    None => ch.send_async(val, Some(&explicit_ctx)).await,
+                    None => {
+                        ch.send_async(val, Some(&explicit_ctx)).await?;
+                        Ok(Value::Nil)
+                    }
                 }
-            })?;
-            Ok(CallAction::Done(Value::Nil))
+            })))
         }
         "recv" => {
-            let val = core
-                .scheduler()
-                .block_on(ch.recv_async(core.task_context.as_ref()))?;
-            Ok(CallAction::Done(val))
+            let ch = Arc::clone(ch);
+            let ctx = core.task_context.clone();
+            Ok(CallAction::AwaitFuture(Box::pin(async move {
+                ch.recv_async(ctx.as_ref()).await
+            })))
         }
         "try_recv" => {
             let opt = ch.try_recv()?;
@@ -1742,8 +1785,10 @@ fn resolve_channel_method(
                     "channel.recv_ctx(ctx) requires 1 Context argument".to_string(),
                 ));
             };
-            let val = core.scheduler().block_on(async {
-                match core.task_context.as_ref() {
+            let ch = Arc::clone(ch);
+            let outer_ctx = core.task_context.clone();
+            Ok(CallAction::AwaitFuture(Box::pin(async move {
+                match outer_ctx.as_ref() {
                     Some(outer) => {
                         outer.status()?;
                         match crate::runtime::scheduler::race2(
@@ -1758,8 +1803,7 @@ fn resolve_channel_method(
                     }
                     None => ch.recv_async(Some(&explicit_ctx)).await,
                 }
-            })?;
-            Ok(CallAction::Done(val))
+            })))
         }
         "close" => {
             ch.close();
@@ -1782,10 +1826,11 @@ fn resolve_task_handle_method(
 ) -> MoraResult<CallAction> {
     match method {
         "join" => {
-            let val = core
-                .scheduler()
-                .block_on(handle.join_async(core.task_context.as_ref()))?;
-            Ok(CallAction::Done(val))
+            let handle = Arc::clone(handle);
+            let ctx = core.task_context.clone();
+            Ok(CallAction::AwaitFuture(Box::pin(async move {
+                handle.join_async(ctx.as_ref()).await
+            })))
         }
         "abort" => {
             handle.abort();
@@ -1885,12 +1930,12 @@ fn resolve_tcp_listener_method(
                 )));
             }
             let explicit_ctx = parse_optional_tcp_ctx(args.first(), "tcp_listener.accept")?;
-            let eff_ctx = explicit_ctx.as_ref().or(core.task_context.as_ref());
-            let stream = core
-                .reactor()
-                .scheduler()
-                .block_on(listener.accept(eff_ctx))?;
-            Ok(CallAction::Done(Value::TcpStream(stream)))
+            let eff_ctx = explicit_ctx.or_else(|| core.task_context.clone());
+            let listener = Arc::clone(listener);
+            Ok(CallAction::AwaitFuture(Box::pin(async move {
+                let stream = listener.accept(eff_ctx.as_ref()).await?;
+                Ok(Value::TcpStream(stream))
+            })))
         }
         "local_addr" => {
             if !args.is_empty() {
@@ -1944,15 +1989,15 @@ fn resolve_tcp_stream_method(
             }
             let max_bytes = parse_tcp_max_bytes(args.first(), 65536, "tcp_stream.read")?;
             let explicit_ctx = parse_optional_tcp_ctx(args.get(1), "tcp_stream.read")?;
-            let eff_ctx = explicit_ctx.as_ref().or(core.task_context.as_ref());
-            let bytes = core
-                .reactor()
-                .scheduler()
-                .block_on(stream.read_bytes(max_bytes, eff_ctx))?;
-            let text = String::from_utf8(bytes).map_err(|e| {
-                MoraError::Io(format!("tcp_stream.read: invalid UTF-8 payload: {e}"))
-            })?;
-            Ok(CallAction::Done(Value::String(text)))
+            let eff_ctx = explicit_ctx.or_else(|| core.task_context.clone());
+            let stream = Arc::clone(stream);
+            Ok(CallAction::AwaitFuture(Box::pin(async move {
+                let bytes = stream.read_bytes(max_bytes, eff_ctx.as_ref()).await?;
+                let text = String::from_utf8(bytes).map_err(|e| {
+                    MoraError::Io(format!("tcp_stream.read: invalid UTF-8 payload: {e}"))
+                })?;
+                Ok(Value::String(text))
+            })))
         }
         "read_bytes" => {
             if args.len() > 2 {
@@ -1963,13 +2008,13 @@ fn resolve_tcp_stream_method(
             }
             let max_bytes = parse_tcp_max_bytes(args.first(), 65536, "tcp_stream.read_bytes")?;
             let explicit_ctx = parse_optional_tcp_ctx(args.get(1), "tcp_stream.read_bytes")?;
-            let eff_ctx = explicit_ctx.as_ref().or(core.task_context.as_ref());
-            let bytes = core
-                .reactor()
-                .scheduler()
-                .block_on(stream.read_bytes(max_bytes, eff_ctx))?;
-            let vals: Vec<Value> = bytes.into_iter().map(|b| Value::Int(b as i64)).collect();
-            Ok(CallAction::Done(Value::List(vals.into())))
+            let eff_ctx = explicit_ctx.or_else(|| core.task_context.clone());
+            let stream = Arc::clone(stream);
+            Ok(CallAction::AwaitFuture(Box::pin(async move {
+                let bytes = stream.read_bytes(max_bytes, eff_ctx.as_ref()).await?;
+                let vals: Vec<Value> = bytes.into_iter().map(|b| Value::Int(b as i64)).collect();
+                Ok(Value::List(vals.into()))
+            })))
         }
         "read_line" => {
             if args.len() > 2 {
@@ -1980,15 +2025,15 @@ fn resolve_tcp_stream_method(
             }
             let max_bytes = parse_tcp_max_bytes(args.first(), 65536, "tcp_stream.read_line")?;
             let explicit_ctx = parse_optional_tcp_ctx(args.get(1), "tcp_stream.read_line")?;
-            let eff_ctx = explicit_ctx.as_ref().or(core.task_context.as_ref());
-            let bytes = core
-                .reactor()
-                .scheduler()
-                .block_on(stream.read_line_bytes(max_bytes, eff_ctx))?;
-            let text = String::from_utf8(bytes).map_err(|e| {
-                MoraError::Io(format!("tcp_stream.read_line: invalid UTF-8 line: {e}"))
-            })?;
-            Ok(CallAction::Done(Value::String(text)))
+            let eff_ctx = explicit_ctx.or_else(|| core.task_context.clone());
+            let stream = Arc::clone(stream);
+            Ok(CallAction::AwaitFuture(Box::pin(async move {
+                let bytes = stream.read_line_bytes(max_bytes, eff_ctx.as_ref()).await?;
+                let text = String::from_utf8(bytes).map_err(|e| {
+                    MoraError::Io(format!("tcp_stream.read_line: invalid UTF-8 line: {e}"))
+                })?;
+                Ok(Value::String(text))
+            })))
         }
         "write" => {
             if args.is_empty() || args.len() > 2 {
@@ -2004,12 +2049,13 @@ fn resolve_tcp_stream_method(
                 )));
             };
             let explicit_ctx = parse_optional_tcp_ctx(args.get(1), "tcp_stream.write")?;
-            let eff_ctx = explicit_ctx.as_ref().or(core.task_context.as_ref());
-            let n = core
-                .reactor()
-                .scheduler()
-                .block_on(stream.write_bytes(data.as_bytes(), eff_ctx))?;
-            Ok(CallAction::Done(Value::Int(n as i64)))
+            let eff_ctx = explicit_ctx.or_else(|| core.task_context.clone());
+            let stream = Arc::clone(stream);
+            let payload = data.as_bytes().to_vec();
+            Ok(CallAction::AwaitFuture(Box::pin(async move {
+                let n = stream.write_bytes(&payload, eff_ctx.as_ref()).await?;
+                Ok(Value::Int(n as i64))
+            })))
         }
         "write_bytes" => {
             if args.is_empty() || args.len() > 2 {
@@ -2042,12 +2088,12 @@ fn resolve_tcp_stream_method(
                 }
             }
             let explicit_ctx = parse_optional_tcp_ctx(args.get(1), "tcp_stream.write_bytes")?;
-            let eff_ctx = explicit_ctx.as_ref().or(core.task_context.as_ref());
-            let n = core
-                .reactor()
-                .scheduler()
-                .block_on(stream.write_bytes(&raw, eff_ctx))?;
-            Ok(CallAction::Done(Value::Int(n as i64)))
+            let eff_ctx = explicit_ctx.or_else(|| core.task_context.clone());
+            let stream = Arc::clone(stream);
+            Ok(CallAction::AwaitFuture(Box::pin(async move {
+                let n = stream.write_bytes(&raw, eff_ctx.as_ref()).await?;
+                Ok(Value::Int(n as i64))
+            })))
         }
         "shutdown" => {
             if !args.is_empty() {
@@ -2056,8 +2102,11 @@ fn resolve_tcp_stream_method(
                     args.len()
                 )));
             }
-            core.reactor().scheduler().block_on(stream.shutdown())?;
-            Ok(CallAction::Done(Value::Nil))
+            let stream = Arc::clone(stream);
+            Ok(CallAction::AwaitFuture(Box::pin(async move {
+                stream.shutdown().await?;
+                Ok(Value::Nil)
+            })))
         }
         "close" => {
             if !args.is_empty() {
@@ -2066,8 +2115,11 @@ fn resolve_tcp_stream_method(
                     args.len()
                 )));
             }
-            core.reactor().scheduler().block_on(stream.close());
-            Ok(CallAction::Done(Value::Nil))
+            let stream = Arc::clone(stream);
+            Ok(CallAction::AwaitFuture(Box::pin(async move {
+                stream.close().await;
+                Ok(Value::Nil)
+            })))
         }
         "is_closed" => {
             if !args.is_empty() {
@@ -2158,12 +2210,12 @@ fn resolve_tls_listener_method(
                 )));
             }
             let explicit_ctx = parse_optional_tcp_ctx(args.first(), "tls_listener.accept")?;
-            let eff_ctx = explicit_ctx.as_ref().or(core.task_context.as_ref());
-            let stream = core
-                .reactor()
-                .scheduler()
-                .block_on(listener.accept(eff_ctx))?;
-            Ok(CallAction::Done(Value::TlsStream(stream)))
+            let eff_ctx = explicit_ctx.or_else(|| core.task_context.clone());
+            let listener = Arc::clone(listener);
+            Ok(CallAction::AwaitFuture(Box::pin(async move {
+                let stream = listener.accept(eff_ctx.as_ref()).await?;
+                Ok(Value::TlsStream(stream))
+            })))
         }
         "local_addr" => {
             if !args.is_empty() {
@@ -2217,15 +2269,15 @@ fn resolve_tls_stream_method(
             }
             let max_bytes = parse_tcp_max_bytes(args.first(), 65536, "tls_stream.read")?;
             let explicit_ctx = parse_optional_tcp_ctx(args.get(1), "tls_stream.read")?;
-            let eff_ctx = explicit_ctx.as_ref().or(core.task_context.as_ref());
-            let bytes = core
-                .reactor()
-                .scheduler()
-                .block_on(stream.read_bytes(max_bytes, eff_ctx))?;
-            let text = String::from_utf8(bytes).map_err(|e| {
-                MoraError::Io(format!("tls_stream.read: invalid UTF-8 payload: {e}"))
-            })?;
-            Ok(CallAction::Done(Value::String(text)))
+            let eff_ctx = explicit_ctx.or_else(|| core.task_context.clone());
+            let stream = Arc::clone(stream);
+            Ok(CallAction::AwaitFuture(Box::pin(async move {
+                let bytes = stream.read_bytes(max_bytes, eff_ctx.as_ref()).await?;
+                let text = String::from_utf8(bytes).map_err(|e| {
+                    MoraError::Io(format!("tls_stream.read: invalid UTF-8 payload: {e}"))
+                })?;
+                Ok(Value::String(text))
+            })))
         }
         "read_bytes" => {
             if args.len() > 2 {
@@ -2236,13 +2288,13 @@ fn resolve_tls_stream_method(
             }
             let max_bytes = parse_tcp_max_bytes(args.first(), 65536, "tls_stream.read_bytes")?;
             let explicit_ctx = parse_optional_tcp_ctx(args.get(1), "tls_stream.read_bytes")?;
-            let eff_ctx = explicit_ctx.as_ref().or(core.task_context.as_ref());
-            let bytes = core
-                .reactor()
-                .scheduler()
-                .block_on(stream.read_bytes(max_bytes, eff_ctx))?;
-            let vals: Vec<Value> = bytes.into_iter().map(|b| Value::Int(b as i64)).collect();
-            Ok(CallAction::Done(Value::List(vals.into())))
+            let eff_ctx = explicit_ctx.or_else(|| core.task_context.clone());
+            let stream = Arc::clone(stream);
+            Ok(CallAction::AwaitFuture(Box::pin(async move {
+                let bytes = stream.read_bytes(max_bytes, eff_ctx.as_ref()).await?;
+                let vals: Vec<Value> = bytes.into_iter().map(|b| Value::Int(b as i64)).collect();
+                Ok(Value::List(vals.into()))
+            })))
         }
         "read_line" => {
             if args.len() > 2 {
@@ -2253,15 +2305,15 @@ fn resolve_tls_stream_method(
             }
             let max_bytes = parse_tcp_max_bytes(args.first(), 65536, "tls_stream.read_line")?;
             let explicit_ctx = parse_optional_tcp_ctx(args.get(1), "tls_stream.read_line")?;
-            let eff_ctx = explicit_ctx.as_ref().or(core.task_context.as_ref());
-            let bytes = core
-                .reactor()
-                .scheduler()
-                .block_on(stream.read_line_bytes(max_bytes, eff_ctx))?;
-            let text = String::from_utf8(bytes).map_err(|e| {
-                MoraError::Io(format!("tls_stream.read_line: invalid UTF-8 line: {e}"))
-            })?;
-            Ok(CallAction::Done(Value::String(text)))
+            let eff_ctx = explicit_ctx.or_else(|| core.task_context.clone());
+            let stream = Arc::clone(stream);
+            Ok(CallAction::AwaitFuture(Box::pin(async move {
+                let bytes = stream.read_line_bytes(max_bytes, eff_ctx.as_ref()).await?;
+                let text = String::from_utf8(bytes).map_err(|e| {
+                    MoraError::Io(format!("tls_stream.read_line: invalid UTF-8 line: {e}"))
+                })?;
+                Ok(Value::String(text))
+            })))
         }
         "write" => {
             if args.is_empty() || args.len() > 2 {
@@ -2277,12 +2329,13 @@ fn resolve_tls_stream_method(
                 )));
             };
             let explicit_ctx = parse_optional_tcp_ctx(args.get(1), "tls_stream.write")?;
-            let eff_ctx = explicit_ctx.as_ref().or(core.task_context.as_ref());
-            let n = core
-                .reactor()
-                .scheduler()
-                .block_on(stream.write_bytes(data.as_bytes(), eff_ctx))?;
-            Ok(CallAction::Done(Value::Int(n as i64)))
+            let eff_ctx = explicit_ctx.or_else(|| core.task_context.clone());
+            let stream = Arc::clone(stream);
+            let payload = data.as_bytes().to_vec();
+            Ok(CallAction::AwaitFuture(Box::pin(async move {
+                let n = stream.write_bytes(&payload, eff_ctx.as_ref()).await?;
+                Ok(Value::Int(n as i64))
+            })))
         }
         "write_bytes" => {
             if args.is_empty() || args.len() > 2 {
@@ -2315,12 +2368,12 @@ fn resolve_tls_stream_method(
                 }
             }
             let explicit_ctx = parse_optional_tcp_ctx(args.get(1), "tls_stream.write_bytes")?;
-            let eff_ctx = explicit_ctx.as_ref().or(core.task_context.as_ref());
-            let n = core
-                .reactor()
-                .scheduler()
-                .block_on(stream.write_bytes(&raw, eff_ctx))?;
-            Ok(CallAction::Done(Value::Int(n as i64)))
+            let eff_ctx = explicit_ctx.or_else(|| core.task_context.clone());
+            let stream = Arc::clone(stream);
+            Ok(CallAction::AwaitFuture(Box::pin(async move {
+                let n = stream.write_bytes(&raw, eff_ctx.as_ref()).await?;
+                Ok(Value::Int(n as i64))
+            })))
         }
         "shutdown" => {
             if !args.is_empty() {
@@ -2329,8 +2382,11 @@ fn resolve_tls_stream_method(
                     args.len()
                 )));
             }
-            core.reactor().scheduler().block_on(stream.shutdown())?;
-            Ok(CallAction::Done(Value::Nil))
+            let stream = Arc::clone(stream);
+            Ok(CallAction::AwaitFuture(Box::pin(async move {
+                stream.shutdown().await?;
+                Ok(Value::Nil)
+            })))
         }
         "close" => {
             if !args.is_empty() {
@@ -2339,8 +2395,11 @@ fn resolve_tls_stream_method(
                     args.len()
                 )));
             }
-            core.reactor().scheduler().block_on(stream.close());
-            Ok(CallAction::Done(Value::Nil))
+            let stream = Arc::clone(stream);
+            Ok(CallAction::AwaitFuture(Box::pin(async move {
+                stream.close().await;
+                Ok(Value::Nil)
+            })))
         }
         "is_closed" => {
             if !args.is_empty() {

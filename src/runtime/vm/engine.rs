@@ -35,19 +35,42 @@ use crate::value::{
 };
 
 use super::builtins::{
-    CallAction, resolve_builtin_call_named, resolve_dyn_call_named, resolve_method_call_named,
-    resolve_value_call, resolve_value_call_named,
+    CallAction, VmFuture, resolve_builtin_call_named, resolve_dyn_call_named,
+    resolve_method_call_named, resolve_value_call, resolve_value_call_named,
 };
 use super::continuation::{
-    CallFrame, CapturedContinuation, CombinatorFrame, HandleBarrierState, ModuleGlobals,
-    ParallelFrame, ScriptFrame, TransactionState, UpvalueCell, UpvalueValue,
-    clone_isolated_globals, clone_worker_upvalues, materialize_frame, materialize_frame_named,
-    materialize_handler_frame, resolve_captures, restore_globals, snapshot_globals,
+    CallFrame, CapturedContinuation, CapturedFrames, CombinatorFrame, HandleBarrierState,
+    ModuleGlobals, ParallelFrame, RegSlot, ScriptFrame, SelectResumeState, TransactionState,
+    UpvalueCell, UpvalueValue, clone_isolated_globals, clone_worker_upvalues, materialize_frame,
+    materialize_frame_named, materialize_handler_frame, resolve_captures, restore_globals,
+    snapshot_globals,
 };
 use super::value_ops::{
     eval_assert, eval_quasiquote, index_assign_value, index_value_tracked, make_dyn_trait,
     match_pattern,
 };
+
+/// P4-2: Reason why a cooperative M:N VM execution suspended and yielded its heap call stack.
+pub enum VmYield {
+    /// Instruction step-budget quantum exhausted; fiber yields cooperatively so sibling fibers
+    /// on the M:N `TaskScheduler` pool never starve on tight CPU loops.
+    Preempt,
+    /// Fiber suspended awaiting an async operation (`sleep`, `channel`, `select`, `join`,
+    /// TCP/TLS I/O) without blocking any OS worker thread.
+    AwaitFuture(VmFuture),
+}
+
+/// P4-2: Outcome of driving [`VmEngine`] with a cooperative instruction step budget.
+pub enum VmOutcome {
+    /// Execution finished with a final return value.
+    Completed(Value),
+    /// Execution yielded its captured heap call stack (`CapturedFrames` — shared with delimited
+    /// continuations) for cooperative preemption or non-blocking async I/O resumption.
+    Suspended {
+        frames: CapturedFrames,
+        yield_reason: VmYield,
+    },
+}
 
 /// Result of running a single instruction inside the active [`ScriptFrame`].
 enum StepOutcome {
@@ -62,7 +85,11 @@ enum StepOutcome {
 /// Heap-framed stackful virtual machine engine.
 pub struct VmEngine<'a> {
     pub core: &'a mut CoreRuntime,
-    frames: Vec<CallFrame>,
+    frames: CapturedFrames,
+    /// Remaining step budget when running in cooperative M:N mode (`None` = unbounded sync run).
+    step_budget: Option<usize>,
+    /// Deferred cooperative yield (preemption or async future) emitted by the most recent step.
+    pending_yield: Option<VmYield>,
 }
 
 impl<'a> VmEngine<'a> {
@@ -71,6 +98,18 @@ impl<'a> VmEngine<'a> {
         Self {
             core,
             frames: Vec::new(),
+            step_budget: None,
+            pending_yield: None,
+        }
+    }
+
+    /// Create a VM initialized with a previously suspended [`CapturedFrames`] stack.
+    pub fn with_frames(core: &'a mut CoreRuntime, frames: CapturedFrames) -> Self {
+        Self {
+            core,
+            frames,
+            step_budget: None,
+            pending_yield: None,
         }
     }
 
@@ -83,7 +122,7 @@ impl<'a> VmEngine<'a> {
     /// Push an arbitrary resolved [`CallAction`] (e.g. `Closure`, `Compose`, `Partial`, `Continuation`).
     pub fn run_action(&mut self, action: CallAction) -> MoraResult<Value> {
         self.apply_action(action)?;
-        if self.frames.is_empty() {
+        if self.frames.is_empty() && self.pending_yield.is_none() {
             // Immediate synchronous action delivered its result into nothing; shouldn't happen unless Done.
             unreachable!("run_action called with immediate action; handled in apply_root_action")
         }
@@ -101,26 +140,120 @@ impl<'a> VmEngine<'a> {
         }
     }
 
+    /// P4-2: Drive the current `self.frames` stack cooperatively for up to `max_steps`
+    /// instructions, returning [`VmOutcome::Suspended`] on budget exhaustion or async I/O.
+    pub fn run_with_budget(&mut self, max_steps: usize) -> MoraResult<VmOutcome> {
+        self.step_budget = Some(max_steps.max(1));
+        self.run_loop_budgeted()
+    }
+
+    /// P4-2: Start executing a root [`CallAction`] cooperatively under `max_steps`.
+    pub(crate) fn run_action_with_budget(
+        &mut self,
+        action: CallAction,
+        max_steps: usize,
+    ) -> MoraResult<VmOutcome> {
+        match action {
+            CallAction::Done(v) => Ok(VmOutcome::Completed(v)),
+            other => {
+                self.apply_action(other)?;
+                self.run_with_budget(max_steps)
+            }
+        }
+    }
+
+    /// P4-2: Resume a suspended [`VmEngine`] by delivering a resolved async `value` into the
+    /// top captured frame and continuing cooperatively for up to `max_steps` instructions.
+    pub(crate) fn resume_with_value(
+        &mut self,
+        value: Value,
+        max_steps: usize,
+    ) -> MoraResult<VmOutcome> {
+        self.step_budget = Some(max_steps.max(1));
+        if let Some(root_val) = self.deliver_value(value)? {
+            return Ok(VmOutcome::Completed(root_val));
+        }
+        self.run_loop_budgeted()
+    }
+
+    /// P4-2: Resume a suspended [`VmEngine`] by propagating an async error through active
+    /// `transaction` / `ErrorContext` / `NoGradGuard` unwind handlers.
+    pub(crate) fn resume_with_error(
+        &mut self,
+        err: MoraError,
+        max_steps: usize,
+    ) -> MoraResult<VmOutcome> {
+        self.step_budget = Some(max_steps.max(1));
+        self.handle_error(err)?;
+        self.run_loop_budgeted()
+    }
+
+    /// Synchronous execution driver (top-level `execute_program` / REPL): drives any emitted
+    /// [`VmYield::AwaitFuture`] inline via `scheduler().block_on(...)` until completion.
     fn run_loop(&mut self) -> MoraResult<Value> {
-        while let Some(top) = self.frames.pop() {
-            match top {
-                CallFrame::Script(mut frame) => {
-                    match self.step_script(&mut frame) {
-                        ScriptStep::Completed(val) => {
-                            if let Some(root_val) = self.deliver_value(val)? {
-                                return Ok(root_val);
+        self.step_budget = None;
+        loop {
+            match self.run_loop_budgeted()? {
+                VmOutcome::Completed(v) => return Ok(v),
+                VmOutcome::Suspended {
+                    frames,
+                    yield_reason,
+                } => {
+                    self.frames = frames;
+                    match yield_reason {
+                        VmYield::Preempt => continue,
+                        VmYield::AwaitFuture(fut) => {
+                            let res = self.core.scheduler().block_on(fut);
+                            match res {
+                                Ok(val) => {
+                                    if let Some(root_val) = self.deliver_value(val)? {
+                                        return Ok(root_val);
+                                    }
+                                }
+                                Err(err) => {
+                                    self.handle_error(err)?;
+                                }
                             }
-                        }
-                        ScriptStep::Suspended => {
-                            // `step_script` already pushed sub-frames above/around or unwound cleanly.
-                        }
-                        ScriptStep::Err(msg) => {
-                            self.handle_error(msg)?;
                         }
                     }
                 }
+            }
+        }
+    }
+
+    fn run_loop_budgeted(&mut self) -> MoraResult<VmOutcome> {
+        loop {
+            if let Some(yield_reason) = self.pending_yield.take() {
+                return Ok(VmOutcome::Suspended {
+                    frames: std::mem::take(&mut self.frames),
+                    yield_reason,
+                });
+            }
+            let Some(top) = self.frames.pop() else {
+                return Ok(VmOutcome::Completed(Value::Nil));
+            };
+            match top {
+                CallFrame::Script(mut frame) => match self.step_script(&mut frame) {
+                    ScriptStep::Completed(val) => {
+                        if let Some(root_val) = self.deliver_value(val)? {
+                            return Ok(VmOutcome::Completed(root_val));
+                        }
+                    }
+                    ScriptStep::Suspended => {
+                        // `step_script` already pushed sub-frames or set `self.pending_yield`.
+                    }
+                    ScriptStep::Preempted => {
+                        self.frames.push(CallFrame::Script(frame));
+                        return Ok(VmOutcome::Suspended {
+                            frames: std::mem::take(&mut self.frames),
+                            yield_reason: VmYield::Preempt,
+                        });
+                    }
+                    ScriptStep::Err(msg) => {
+                        self.handle_error(msg)?;
+                    }
+                },
                 CallFrame::HandleBarrier(_) => {
-                    // Barriers only receive control when unwinding or returning; should not sit bare on top.
                     unreachable!("HandleBarrier popped directly without return delivery")
                 }
                 CallFrame::AutoResume(_) => {
@@ -149,7 +282,6 @@ impl<'a> VmEngine<'a> {
                 }
             }
         }
-        Ok(Value::Nil)
     }
 
     /// Deliver a returned `val` into whatever continuation frame sits at the top of `self.frames`.
@@ -557,6 +689,67 @@ impl<'a> VmEngine<'a> {
                 Ok(None)
             }
             CombinatorFrame::BoolNot => Ok(Some(Value::Bool(!is_truthy(&reply)))),
+            CombinatorFrame::SelectResume(st) => {
+                let (arm_idx, received_val) = match reply {
+                    Value::List(items) if items.len() == 2 => {
+                        let idx = match &items[0] {
+                            Value::Int(i) => *i as usize,
+                            _ => {
+                                return Err(MoraError::Runtime(
+                                    "internal select resume received invalid arm index".into(),
+                                ));
+                            }
+                        };
+                        (idx, items[1].clone())
+                    }
+                    _ => {
+                        return Err(MoraError::Runtime(
+                            "internal select resume received malformed winner payload".into(),
+                        ));
+                    }
+                };
+                let (body_fn, captures, arm_args) = match &st.arms[arm_idx] {
+                    ControlSelectArm::Recv {
+                        has_binding,
+                        body_fn,
+                        captures,
+                        ..
+                    } => (
+                        *body_fn,
+                        captures,
+                        if *has_binding {
+                            vec![received_val]
+                        } else {
+                            Vec::new()
+                        },
+                    ),
+                    ControlSelectArm::Send {
+                        body_fn, captures, ..
+                    }
+                    | ControlSelectArm::Timeout {
+                        body_fn, captures, ..
+                    }
+                    | ControlSelectArm::Default { body_fn, captures } => {
+                        (*body_fn, captures, Vec::new())
+                    }
+                };
+                let target_func = st.program.func(body_fn);
+                let upvalues = resolve_captures(
+                    captures,
+                    &st.parent_locals,
+                    &st.parent_upvalues,
+                    target_func,
+                );
+                let body_frame = materialize_frame(
+                    Arc::clone(&st.program),
+                    body_fn,
+                    Arc::clone(&st.globals),
+                    Arc::new(upvalues),
+                    &arm_args,
+                )?;
+                self.frames.push(CallFrame::Script(Box::new(body_frame)));
+                Ok(None)
+            }
             CombinatorFrame::WatermarkCallbacks {
                 final_result,
                 mut pending,
@@ -594,6 +787,10 @@ impl<'a> VmEngine<'a> {
                         // return an unreachable guard never hit because a parent sits on stack!
                         let _ = root_val;
                     }
+                    return Ok(());
+                }
+                CallAction::AwaitFuture(fut) => {
+                    self.pending_yield = Some(VmYield::AwaitFuture(fut));
                     return Ok(());
                 }
                 CallAction::PushFrame {
@@ -660,6 +857,10 @@ impl<'a> VmEngine<'a> {
         loop {
             match cur {
                 CallAction::Done(_) => return Ok(()),
+                CallAction::AwaitFuture(fut) => {
+                    self.pending_yield = Some(VmYield::AwaitFuture(fut));
+                    return Ok(());
+                }
                 CallAction::PushFrame {
                     frame,
                     error_prefix,
@@ -1064,6 +1265,7 @@ impl<'a> VmEngine<'a> {
 enum ScriptStep {
     Completed(Value),
     Suspended,
+    Preempted,
     Err(MoraError),
 }
 
@@ -1071,6 +1273,12 @@ impl<'a> VmEngine<'a> {
     fn step_script(&mut self, frame: &mut ScriptFrame) -> ScriptStep {
         let mut cancel_budget: u32 = 0;
         loop {
+            if let Some(ref mut rem) = self.step_budget {
+                if *rem == 0 {
+                    return ScriptStep::Preempted;
+                }
+                *rem -= 1;
+            }
             if cancel_budget == 0 {
                 if let Err(err) = self.core.check_cancelled() {
                     return ScriptStep::Err(err);
@@ -1089,7 +1297,7 @@ impl<'a> VmEngine<'a> {
                     }
                     StepOutcome::Yielded => {
                         // `exec_inst` already updated `frame.pc` / `frame.resume_dst`, re-pushed
-                        // `frame` cleanly, and pushed callee frames above it!
+                        // `frame` cleanly, and pushed callee frames or set `self.pending_yield`!
                         return ScriptStep::Suspended;
                     }
                     StepOutcome::Err(e) => return ScriptStep::Err(e),
@@ -1098,13 +1306,20 @@ impl<'a> VmEngine<'a> {
                 let term = frame.func().blocks[block_idx].terminator.clone();
                 match term {
                     ControlTerminator::Jump { target, args } => {
-                        let vals: Vec<Value> = args
-                            .iter()
-                            .map(|r| frame.regs[r.0 as usize].clone())
-                            .collect();
-                        let target_params = frame.func().blocks[target.0 as usize].params.clone();
-                        for (p, v) in target_params.into_iter().zip(vals) {
-                            frame.regs[p.0 as usize] = v;
+                        if args.len() == 1 {
+                            let p = frame.func().blocks[target.0 as usize].params[0];
+                            let slot = frame.regs[args[0].0 as usize].clone();
+                            frame.regs[p.0 as usize] = slot;
+                        } else if !args.is_empty() {
+                            let slots: Vec<RegSlot> = args
+                                .iter()
+                                .map(|r| frame.regs[r.0 as usize].clone())
+                                .collect();
+                            let target_params =
+                                frame.func().blocks[target.0 as usize].params.clone();
+                            for (p, s) in target_params.into_iter().zip(slots) {
+                                frame.regs[p.0 as usize] = s;
+                            }
                         }
                         frame.block_id = target;
                         frame.pc = 0;
@@ -1116,27 +1331,33 @@ impl<'a> VmEngine<'a> {
                         else_bb,
                         else_args,
                     } => {
-                        let truthy = is_truthy(&frame.regs[cond.0 as usize]);
+                        // Zero-boxing inline truthiness check on 16B RegSlot!
+                        let truthy = frame.regs[cond.0 as usize].is_truthy();
                         let (target, arg_regs) = if truthy {
                             (then_bb, then_args)
                         } else {
                             (else_bb, else_args)
                         };
-                        let vals: Vec<Value> = arg_regs
-                            .iter()
-                            .map(|r| frame.regs[r.0 as usize].clone())
-                            .collect();
-                        let target_params = frame.func().blocks[target.0 as usize].params.clone();
-                        for (p, v) in target_params.into_iter().zip(vals) {
-                            frame.regs[p.0 as usize] = v;
+                        if arg_regs.len() == 1 {
+                            let p = frame.func().blocks[target.0 as usize].params[0];
+                            let slot = frame.regs[arg_regs[0].0 as usize].clone();
+                            frame.regs[p.0 as usize] = slot;
+                        } else if !arg_regs.is_empty() {
+                            let slots: Vec<RegSlot> = arg_regs
+                                .iter()
+                                .map(|r| frame.regs[r.0 as usize].clone())
+                                .collect();
+                            let target_params =
+                                frame.func().blocks[target.0 as usize].params.clone();
+                            for (p, s) in target_params.into_iter().zip(slots) {
+                                frame.regs[p.0 as usize] = s;
+                            }
                         }
                         frame.block_id = target;
                         frame.pc = 0;
                     }
                     ControlTerminator::Return(opt_r) | ControlTerminator::Halt(opt_r) => {
-                        let val = opt_r
-                            .map(|r| frame.regs[r.0 as usize].clone())
-                            .unwrap_or(Value::Nil);
+                        let val = opt_r.map(|r| frame.get_val(r)).unwrap_or(Value::Nil);
                         return ScriptStep::Completed(val);
                     }
                     ControlTerminator::Perform {
@@ -1145,10 +1366,7 @@ impl<'a> VmEngine<'a> {
                         resume_bb,
                     } => {
                         let effect_name = frame.program.symbols.resolve(effect).to_string();
-                        let arg_vals: Vec<Value> = args
-                            .iter()
-                            .map(|r| frame.regs[r.0 as usize].clone())
-                            .collect();
+                        let arg_vals: Vec<Value> = args.iter().map(|r| frame.get_val(*r)).collect();
                         frame.block_id = resume_bb;
                         frame.pc = 0;
                         frame.resume_dst = None;
@@ -1176,16 +1394,17 @@ impl<'a> VmEngine<'a> {
                         )));
                     }
                     ControlTerminator::TailCall { target, args } => {
-                        let arg_vals: Vec<Value> = args
-                            .iter()
-                            .map(|r| frame.regs[r.0 as usize].clone())
-                            .collect();
+                        let arg_vals: Vec<Value> = args.iter().map(|r| frame.get_val(*r)).collect();
                         let action = match self.resolve_callee(frame, &target, arg_vals) {
                             Ok(a) => a,
                             Err(e) => return ScriptStep::Err(e),
                         };
                         match action {
                             CallAction::Done(val) => return ScriptStep::Completed(val),
+                            CallAction::AwaitFuture(fut) => {
+                                self.pending_yield = Some(VmYield::AwaitFuture(fut));
+                                return ScriptStep::Suspended;
+                            }
                             CallAction::PushFrame {
                                 frame: next_frame,
                                 error_prefix: None,
@@ -1249,7 +1468,7 @@ impl<'a> VmEngine<'a> {
                 })
             }
             CalleeTarget::Value(r) => {
-                let val = frame.regs[r.0 as usize].clone();
+                let val = frame.get_val(*r);
                 resolve_value_call_named(val, arg_vals, named_vals, self.core)
             }
             CalleeTarget::DynGlobal(sym) => {
@@ -1273,8 +1492,15 @@ impl<'a> VmEngine<'a> {
     ) -> StepOutcome {
         match action {
             CallAction::Done(val) => {
-                frame.regs[dst.0 as usize] = val;
+                frame.set_val(dst, val);
                 StepOutcome::NextInst
+            }
+            CallAction::AwaitFuture(fut) => {
+                frame.pc += 1;
+                frame.resume_dst = Some(dst);
+                self.frames.push(CallFrame::Script(Box::new(frame.clone())));
+                self.pending_yield = Some(VmYield::AwaitFuture(fut));
+                StepOutcome::Yielded
             }
             CallAction::AmbientRandom {
                 label,
@@ -1292,7 +1518,7 @@ impl<'a> VmEngine<'a> {
                 } else {
                     match self.core.random_state.dispatch_op(label, &args) {
                         Ok(val) => {
-                            frame.regs[dst.0 as usize] = val;
+                            frame.set_val(dst, val);
                             StepOutcome::NextInst
                         }
                         Err(reason) => {
@@ -1317,7 +1543,15 @@ impl<'a> VmEngine<'a> {
     fn exec_inst(&mut self, frame: &mut ScriptFrame, inst: ControlInst) -> StepOutcome {
         match inst {
             ControlInst::Const(dst, c) => {
-                frame.regs[dst.0 as usize] = c.to_value();
+                // Zero-boxing inline constant materialization into 16B RegSlot.
+                let slot = match c {
+                    ControlConst::Nil => RegSlot::Nil,
+                    ControlConst::Bool(b) => RegSlot::Bool(b),
+                    ControlConst::Int(i) => RegSlot::Int(i),
+                    ControlConst::Float(f) => RegSlot::Float(f),
+                    other => RegSlot::from_value(other.to_value()),
+                };
+                frame.set_slot(dst, slot);
                 StepOutcome::NextInst
             }
             ControlInst::Copy(dst, src) => {
@@ -1325,14 +1559,39 @@ impl<'a> VmEngine<'a> {
                 StepOutcome::NextInst
             }
             ControlInst::Unary(dst, op, src) => {
-                let v = &frame.regs[src.0 as usize];
-                let out = match op {
-                    UnaryOp::Truthy => Value::Bool(is_truthy(v)),
-                    UnaryOp::Not => Value::Bool(!is_truthy(v)),
+                match op {
+                    UnaryOp::Truthy => {
+                        frame.set_slot(dst, RegSlot::Bool(frame.regs[src.0 as usize].is_truthy()));
+                        StepOutcome::NextInst
+                    }
+                    UnaryOp::Not => {
+                        frame.set_slot(dst, RegSlot::Bool(!frame.regs[src.0 as usize].is_truthy()));
+                        StepOutcome::NextInst
+                    }
                     UnaryOp::Neg => {
+                        // Zero-boxing inline fast paths for Int / Float negation.
+                        match &frame.regs[src.0 as usize] {
+                            RegSlot::Int(i) => match i.checked_neg() {
+                                Some(neg) => {
+                                    frame.set_slot(dst, RegSlot::Int(neg));
+                                    return StepOutcome::NextInst;
+                                }
+                                None => {
+                                    return StepOutcome::Err(MoraError::Runtime(format!(
+                                        "integer overflow negating {i}"
+                                    )));
+                                }
+                            },
+                            RegSlot::Float(f) => {
+                                frame.set_slot(dst, RegSlot::Float(-*f));
+                                return StepOutcome::NextInst;
+                            }
+                            _ => {}
+                        }
+                        let v = frame.get_val(src);
                         if let Some((func, all_args)) = super::builtins::resolve_operator_impl(
                             self.core,
-                            v,
+                            &v,
                             "Neg",
                             "neg",
                             Vec::new(),
@@ -1342,18 +1601,94 @@ impl<'a> VmEngine<'a> {
                                 Err(e) => StepOutcome::Err(e),
                             };
                         }
-                        match eval_unary_neg_tracked(v, Some(&mut self.core.autograd)) {
-                            Ok(negated) => negated,
-                            Err(e) => return StepOutcome::Err(e),
+                        match eval_unary_neg_tracked(&v, Some(&mut self.core.autograd)) {
+                            Ok(negated) => {
+                                frame.set_val(dst, negated);
+                                StepOutcome::NextInst
+                            }
+                            Err(e) => StepOutcome::Err(e),
                         }
                     }
-                };
-                frame.regs[dst.0 as usize] = out;
-                StepOutcome::NextInst
+                }
             }
             ControlInst::Binary(dst, lhs, op, rhs) => {
-                let l = frame.regs[lhs.0 as usize].clone();
-                let r = frame.regs[rhs.0 as usize].clone();
+                // P4-2: Zero-allocation inline unboxed fast paths for primitive Int / Float / Bool.
+                match (&frame.regs[lhs.0 as usize], &frame.regs[rhs.0 as usize]) {
+                    (&RegSlot::Int(a), &RegSlot::Int(b)) => {
+                        let fast = match op {
+                            BinaryOp::Add => crate::flow::numeric::int::arith(&BinaryOp::Add, a, b)
+                                .map(RegSlot::Int)
+                                .map(Some),
+                            BinaryOp::Sub => crate::flow::numeric::int::arith(&BinaryOp::Sub, a, b)
+                                .map(RegSlot::Int)
+                                .map(Some),
+                            BinaryOp::Mul => crate::flow::numeric::int::arith(&BinaryOp::Mul, a, b)
+                                .map(RegSlot::Int)
+                                .map(Some),
+                            BinaryOp::Div => crate::flow::numeric::int::arith(&BinaryOp::Div, a, b)
+                                .map(RegSlot::Int)
+                                .map(Some),
+                            BinaryOp::Mod => crate::flow::numeric::int::arith(&BinaryOp::Mod, a, b)
+                                .map(RegSlot::Int)
+                                .map(Some),
+                            BinaryOp::Equal => Ok(Some(RegSlot::Bool(a == b))),
+                            BinaryOp::NotEqual => Ok(Some(RegSlot::Bool(a != b))),
+                            BinaryOp::Less => Ok(Some(RegSlot::Bool(a < b))),
+                            BinaryOp::LessEqual => Ok(Some(RegSlot::Bool(a <= b))),
+                            BinaryOp::Greater => Ok(Some(RegSlot::Bool(a > b))),
+                            BinaryOp::GreaterEqual => Ok(Some(RegSlot::Bool(a >= b))),
+                            _ => Ok(None),
+                        };
+                        match fast {
+                            Ok(Some(slot)) => {
+                                frame.set_slot(dst, slot);
+                                return StepOutcome::NextInst;
+                            }
+                            Err(e) => return StepOutcome::Err(MoraError::Runtime(e.to_string())),
+                            Ok(None) => {}
+                        }
+                    }
+                    (&RegSlot::Float(a), &RegSlot::Float(b)) => {
+                        let fast = match op {
+                            BinaryOp::Add => Some(RegSlot::Float(a + b)),
+                            BinaryOp::Sub => Some(RegSlot::Float(a - b)),
+                            BinaryOp::Mul => Some(RegSlot::Float(a * b)),
+                            BinaryOp::Div => Some(RegSlot::Float(a / b)),
+                            BinaryOp::Mod => Some(RegSlot::Float(if b == 0.0 {
+                                f64::NAN
+                            } else {
+                                a - (a / b).trunc() * b
+                            })),
+                            BinaryOp::Pow => Some(RegSlot::Float(a.powf(b))),
+                            BinaryOp::Equal => Some(RegSlot::Bool(a == b)),
+                            BinaryOp::NotEqual => Some(RegSlot::Bool(a != b)),
+                            BinaryOp::Less => Some(RegSlot::Bool(a < b)),
+                            BinaryOp::LessEqual => Some(RegSlot::Bool(a <= b)),
+                            BinaryOp::Greater => Some(RegSlot::Bool(a > b)),
+                            BinaryOp::GreaterEqual => Some(RegSlot::Bool(a >= b)),
+                            _ => None,
+                        };
+                        if let Some(slot) = fast {
+                            frame.set_slot(dst, slot);
+                            return StepOutcome::NextInst;
+                        }
+                    }
+                    (&RegSlot::Bool(a), &RegSlot::Bool(b)) => {
+                        let fast = match op {
+                            BinaryOp::Equal => Some(RegSlot::Bool(a == b)),
+                            BinaryOp::NotEqual => Some(RegSlot::Bool(a != b)),
+                            _ => None,
+                        };
+                        if let Some(slot) = fast {
+                            frame.set_slot(dst, slot);
+                            return StepOutcome::NextInst;
+                        }
+                    }
+                    _ => {}
+                }
+
+                let l = frame.get_val(lhs);
+                let r = frame.get_val(rhs);
                 // P4-1A: Stackful trait-driven operator overloading on nominal types.
                 let trait_op = match op {
                     BinaryOp::Add => Some(("Add", "add", false)),
@@ -1392,32 +1727,30 @@ impl<'a> VmEngine<'a> {
                 }
                 match eval_binary_tracked(l, &op, r, Some(&mut self.core.autograd)) {
                     Ok(v) => {
-                        frame.regs[dst.0 as usize] = v;
+                        frame.set_val(dst, v);
                         StepOutcome::NextInst
                     }
                     Err(e) => StepOutcome::Err(MoraError::Runtime(e.to_string())),
                 }
             }
             ControlInst::ListLit(dst, items) => {
-                let list: crate::value::list::List = items
-                    .into_iter()
-                    .map(|r| frame.regs[r.0 as usize].clone())
-                    .collect();
-                frame.regs[dst.0 as usize] = Value::List(list);
+                let list: crate::value::list::List =
+                    items.into_iter().map(|r| frame.get_val(r)).collect();
+                frame.set_val(dst, Value::List(list));
                 StepOutcome::NextInst
             }
             ControlInst::DictLit(dst, pairs) => {
                 let mut map = HashMap::with_capacity(pairs.len());
                 for (sym, r) in pairs {
                     let key = frame.program.symbols.resolve(sym).to_string();
-                    map.insert(key, frame.regs[r.0 as usize].clone());
+                    map.insert(key, frame.get_val(r));
                 }
-                frame.regs[dst.0 as usize] = Value::Dict(map);
+                frame.set_val(dst, Value::Dict(map));
                 StepOutcome::NextInst
             }
             ControlInst::Quasiquote(dst, segs) => match eval_quasiquote(&segs, &frame.regs) {
                 Ok(v) => {
-                    frame.regs[dst.0 as usize] = v;
+                    frame.set_val(dst, v);
                     StepOutcome::NextInst
                 }
                 Err(e) => StepOutcome::Err(e),
@@ -1435,13 +1768,16 @@ impl<'a> VmEngine<'a> {
                     .iter()
                     .map(|s| frame.program.symbols.resolve(*s).to_string())
                     .collect();
-                frame.regs[dst.0 as usize] = Value::Closure {
-                    params,
-                    program: Arc::clone(&frame.program),
-                    fn_id,
-                    globals: Arc::clone(&frame.globals),
-                    upvalues: Arc::new(upvalues),
-                };
+                frame.set_val(
+                    dst,
+                    Value::Closure {
+                        params,
+                        program: Arc::clone(&frame.program),
+                        fn_id,
+                        globals: Arc::clone(&frame.globals),
+                        upvalues: Arc::new(upvalues),
+                    },
+                );
                 StepOutcome::NextInst
             }
             ControlInst::MakeDynTrait {
@@ -1451,41 +1787,44 @@ impl<'a> VmEngine<'a> {
                 generics,
             } => {
                 let tname = frame.program.symbols.resolve(trait_name).to_string();
-                let val = frame.regs[src.0 as usize].clone();
-                frame.regs[dst.0 as usize] = make_dyn_trait(val, &tname, &generics);
+                let val = frame.get_val(src);
+                frame.set_val(dst, make_dyn_trait(val, &tname, &generics));
                 StepOutcome::NextInst
             }
             ControlInst::LoadLocal(dst, slot) => {
-                frame.regs[dst.0 as usize] = frame.locals[slot.0 as usize].get();
+                // Zero-boxing unshared local load directly into 16B RegSlot!
+                frame.set_slot(dst, frame.locals[slot.0 as usize].get_slot());
                 StepOutcome::NextInst
             }
             ControlInst::StoreLocal(slot, src) => {
-                let val = frame.regs[src.0 as usize].clone();
-                frame.locals[slot.0 as usize].set(val);
+                // Zero-boxing unshared local store directly from 16B RegSlot!
+                let s = frame.regs[src.0 as usize].clone();
+                frame.locals[slot.0 as usize].set_slot(s);
                 StepOutcome::NextInst
             }
             ControlInst::IsMissingArg(dst, slot) => {
                 let missing = matches!(frame.locals[slot.0 as usize].get(), Value::MissingArg);
-                frame.regs[dst.0 as usize] = Value::Bool(missing);
+                frame.set_slot(dst, RegSlot::Bool(missing));
                 StepOutcome::NextInst
             }
             ControlInst::LoadUpvalue(dst, slot) => {
-                frame.regs[dst.0 as usize] = frame.upvalues[slot.0 as usize].get();
+                frame.set_val(dst, frame.upvalues[slot.0 as usize].get());
                 StepOutcome::NextInst
             }
             ControlInst::StoreUpvalue(slot, src) => {
-                let val = frame.regs[src.0 as usize].clone();
+                let val = frame.get_val(src);
                 match frame.upvalues[slot.0 as usize].set(val) {
                     Ok(()) => StepOutcome::NextInst,
                     Err(e) => StepOutcome::Err(e),
                 }
             }
             ControlInst::LoadGlobal(dst, slot) => {
-                frame.regs[dst.0 as usize] = frame.globals[slot.0 as usize].lock().0.clone();
+                let val = frame.globals[slot.0 as usize].lock().0.clone();
+                frame.set_val(dst, val);
                 StepOutcome::NextInst
             }
             ControlInst::StoreGlobal(slot, src) => {
-                let val = frame.regs[src.0 as usize].clone();
+                let val = frame.get_val(src);
                 frame.globals[slot.0 as usize].lock().0 = val;
                 StepOutcome::NextInst
             }
@@ -1497,18 +1836,18 @@ impl<'a> VmEngine<'a> {
                     .get(name)
                     .or_else(|| BuiltinKind::from_name(name).map(Value::Builtin))
                     .unwrap_or(Value::Nil);
-                frame.regs[dst.0 as usize] = val;
+                frame.set_val(dst, val);
                 StepOutcome::NextInst
             }
             ControlInst::DefineDyn(sym, src, exported) => {
                 let name = frame.program.symbols.resolve(sym).to_string();
-                let val = frame.regs[src.0 as usize].clone();
+                let val = frame.get_val(src);
                 self.core.environment.define(name, val, exported);
                 StepOutcome::NextInst
             }
             ControlInst::AssignDyn(sym, src) => {
                 let name = frame.program.symbols.resolve(sym);
-                let val = frame.regs[src.0 as usize].clone();
+                let val = frame.get_val(src);
                 let _ = self.core.environment.assign(name, val);
                 StepOutcome::NextInst
             }
@@ -1522,37 +1861,35 @@ impl<'a> VmEngine<'a> {
                 StepOutcome::NextInst
             }
             ControlInst::Index(dst, obj, idx) => {
-                match index_value_tracked(
-                    &frame.regs[obj.0 as usize],
-                    &frame.regs[idx.0 as usize],
-                    Some(&mut self.core.autograd),
-                ) {
+                let obj_val = frame.get_val(obj);
+                let idx_val = frame.get_val(idx);
+                match index_value_tracked(&obj_val, &idx_val, Some(&mut self.core.autograd)) {
                     Ok(v) => {
-                        frame.regs[dst.0 as usize] = v;
+                        frame.set_val(dst, v);
                         StepOutcome::NextInst
                     }
                     Err(e) => StepOutcome::Err(e),
                 }
             }
             ControlInst::IndexAssign(dst, obj, idx, val) => {
-                let mut container = frame.regs[obj.0 as usize].clone();
-                let idx_val = frame.regs[idx.0 as usize].clone();
-                let elem_val = frame.regs[val.0 as usize].clone();
+                let mut container = frame.get_val(obj);
+                let idx_val = frame.get_val(idx);
+                let elem_val = frame.get_val(val);
                 match index_assign_value(&mut container, &idx_val, &elem_val) {
                     Ok(()) => {
-                        frame.regs[dst.0 as usize] = container;
+                        frame.set_val(dst, container);
                         StepOutcome::NextInst
                     }
                     Err(e) => StepOutcome::Err(e),
                 }
             }
             ControlInst::TensorSlice { dst, target, axes } => {
-                let target_val = frame.regs[target.0 as usize].clone();
+                let target_val = frame.get_val(target);
                 let mut rt_axes = Vec::with_capacity(axes.len());
                 for ax in &axes {
                     match ax {
                         ControlSliceAxis::Index(r) => {
-                            let i = match value_to_slice_isize(&frame.regs[r.0 as usize]) {
+                            let i = match value_to_slice_isize(&frame.get_val(*r)) {
                                 Ok(v) => v,
                                 Err(e) => return StepOutcome::Err(e),
                             };
@@ -1560,21 +1897,21 @@ impl<'a> VmEngine<'a> {
                         }
                         ControlSliceAxis::Range { start, stop, step } => {
                             let s = match start {
-                                Some(r) => match value_to_slice_isize(&frame.regs[r.0 as usize]) {
+                                Some(r) => match value_to_slice_isize(&frame.get_val(*r)) {
                                     Ok(v) => Some(v),
                                     Err(e) => return StepOutcome::Err(e),
                                 },
                                 None => None,
                             };
                             let e = match stop {
-                                Some(r) => match value_to_slice_isize(&frame.regs[r.0 as usize]) {
+                                Some(r) => match value_to_slice_isize(&frame.get_val(*r)) {
                                     Ok(v) => Some(v),
                                     Err(e) => return StepOutcome::Err(e),
                                 },
                                 None => None,
                             };
                             let st = match step {
-                                Some(r) => match value_to_slice_isize(&frame.regs[r.0 as usize]) {
+                                Some(r) => match value_to_slice_isize(&frame.get_val(*r)) {
                                     Ok(v) => Some(v),
                                     Err(e) => return StepOutcome::Err(e),
                                 },
@@ -1596,7 +1933,7 @@ impl<'a> VmEngine<'a> {
                 };
                 match sliced {
                     Ok(v) => {
-                        frame.regs[dst.0 as usize] = v;
+                        frame.set_val(dst, v);
                         StepOutcome::NextInst
                     }
                     Err(e) => StepOutcome::Err(e),
@@ -1608,16 +1945,13 @@ impl<'a> VmEngine<'a> {
                 args,
                 named_args,
             } => {
-                let arg_vals: Vec<Value> = args
-                    .iter()
-                    .map(|r| frame.regs[r.0 as usize].clone())
-                    .collect();
+                let arg_vals: Vec<Value> = args.iter().map(|r| frame.get_val(*r)).collect();
                 let named_vals: Vec<(String, Value)> = named_args
                     .iter()
                     .map(|(sym, r)| {
                         (
                             frame.program.symbols.resolve(*sym).to_string(),
-                            frame.regs[r.0 as usize].clone(),
+                            frame.get_val(*r),
                         )
                     })
                     .collect();
@@ -1633,16 +1967,13 @@ impl<'a> VmEngine<'a> {
                 args,
                 named_args,
             } => {
-                let arg_vals: Vec<Value> = args
-                    .iter()
-                    .map(|r| frame.regs[r.0 as usize].clone())
-                    .collect();
+                let arg_vals: Vec<Value> = args.iter().map(|r| frame.get_val(*r)).collect();
                 let named_vals: Vec<(String, Value)> = named_args
                     .iter()
                     .map(|(sym, r)| {
                         (
                             frame.program.symbols.resolve(*sym).to_string(),
-                            frame.regs[r.0 as usize].clone(),
+                            frame.get_val(*r),
                         )
                     })
                     .collect();
@@ -1651,7 +1982,7 @@ impl<'a> VmEngine<'a> {
                     .map(|(sym, v)| (frame.program.symbols.resolve(*sym).to_string(), *v))
                     .collect();
                 let action = match &target {
-                    CalleeTarget::Value(r) => match frame.regs[r.0 as usize].clone() {
+                    CalleeTarget::Value(r) => match frame.get_val(*r) {
                         Value::StructType(def) => {
                             super::builtins::construct_struct_instance_with_consts(
                                 def, const_vals, arg_vals, named_vals,
@@ -1695,19 +2026,21 @@ impl<'a> VmEngine<'a> {
             }
             ControlInst::GetConstGeneric { dst, src, name } => {
                 let cname = frame.program.symbols.resolve(name);
-                match &frame.regs[src.0 as usize] {
-                    Value::StructInstance {
-                        type_name,
-                        const_args,
-                        ..
-                    }
-                    | Value::EnumVariant {
-                        enum_name: type_name,
-                        const_args,
-                        ..
-                    } => {
+                match frame.regs[src.0 as usize].as_boxed() {
+                    Some(
+                        Value::StructInstance {
+                            type_name,
+                            const_args,
+                            ..
+                        }
+                        | Value::EnumVariant {
+                            enum_name: type_name,
+                            const_args,
+                            ..
+                        },
+                    ) => {
                         if let Some((_, val)) = const_args.iter().find(|(k, _)| k == cname) {
-                            frame.regs[dst.0 as usize] = Value::Int(*val);
+                            frame.set_slot(dst, RegSlot::Int(*val));
                             StepOutcome::NextInst
                         } else {
                             StepOutcome::Err(MoraError::Runtime(format!(
@@ -1715,10 +2048,13 @@ impl<'a> VmEngine<'a> {
                             )))
                         }
                     }
-                    other => StepOutcome::Err(MoraError::Runtime(format!(
-                        "cannot read const generic '{cname}' from non-nominal receiver {}",
-                        crate::flow::type_name(other)
-                    ))),
+                    _ => {
+                        let other = frame.get_val(src);
+                        StepOutcome::Err(MoraError::Runtime(format!(
+                            "cannot read const generic '{cname}' from non-nominal receiver {}",
+                            crate::flow::type_name(&other)
+                        )))
+                    }
                 }
             }
             ControlInst::ModuleCall {
@@ -1729,16 +2065,13 @@ impl<'a> VmEngine<'a> {
                 named_args,
             } => {
                 let mname = frame.program.symbols.resolve(method).to_string();
-                let arg_vals: Vec<Value> = args
-                    .iter()
-                    .map(|r| frame.regs[r.0 as usize].clone())
-                    .collect();
+                let arg_vals: Vec<Value> = args.iter().map(|r| frame.get_val(*r)).collect();
                 let named_vals: Vec<(String, Value)> = named_args
                     .iter()
                     .map(|(sym, r)| {
                         (
                             frame.program.symbols.resolve(*sym).to_string(),
-                            frame.regs[r.0 as usize].clone(),
+                            frame.get_val(*r),
                         )
                     })
                     .collect();
@@ -1762,17 +2095,14 @@ impl<'a> VmEngine<'a> {
                 named_args,
             } => {
                 let mname = frame.program.symbols.resolve(method).to_string();
-                let recv = frame.regs[receiver.0 as usize].clone();
-                let arg_vals: Vec<Value> = args
-                    .iter()
-                    .map(|r| frame.regs[r.0 as usize].clone())
-                    .collect();
+                let recv = frame.get_val(receiver);
+                let arg_vals: Vec<Value> = args.iter().map(|r| frame.get_val(*r)).collect();
                 let named_vals: Vec<(String, Value)> = named_args
                     .iter()
                     .map(|(sym, r)| {
                         (
                             frame.program.symbols.resolve(*sym).to_string(),
-                            frame.regs[r.0 as usize].clone(),
+                            frame.get_val(*r),
                         )
                     })
                     .collect();
@@ -1789,8 +2119,8 @@ impl<'a> VmEngine<'a> {
                 }
             }
             ControlInst::Pipe { dst, lhs, rhs } => {
-                let l = frame.regs[lhs.0 as usize].clone();
-                let r = frame.regs[rhs.0 as usize].clone();
+                let l = frame.get_val(lhs);
+                let r = frame.get_val(rhs);
                 match resolve_value_call(r, vec![l], self.core) {
                     Ok(action) => self.suspend_and_dispatch(frame, dst, action),
                     Err(e) => StepOutcome::Err(e),
@@ -1801,8 +2131,8 @@ impl<'a> VmEngine<'a> {
                 val,
                 pattern,
             } => {
-                let scrutinee = &frame.regs[val.0 as usize];
-                if let Some(bindings) = match_pattern(scrutinee, &pattern) {
+                let scrutinee = frame.get_val(val);
+                if let Some(bindings) = match_pattern(&scrutinee, &pattern) {
                     for (target, bound_val) in bindings {
                         match target {
                             PatternTarget::Local(slot) => {
@@ -1818,9 +2148,9 @@ impl<'a> VmEngine<'a> {
                             PatternTarget::Discard => {}
                         }
                     }
-                    frame.regs[dst_ok.0 as usize] = Value::Bool(true);
+                    frame.set_slot(dst_ok, RegSlot::Bool(true));
                 } else {
-                    frame.regs[dst_ok.0 as usize] = Value::Bool(false);
+                    frame.set_slot(dst_ok, RegSlot::Bool(false));
                 }
                 StepOutcome::NextInst
             }
@@ -1935,7 +2265,7 @@ impl<'a> VmEngine<'a> {
                         self.frames.pop();
                         frame.pc -= 1;
                         frame.resume_dst = None;
-                        frame.regs[dst.0 as usize] = pf.last_val;
+                        frame.set_val(dst, pf.last_val);
                         StepOutcome::NextInst
                     }
                     Err(e) => StepOutcome::Err(e),
@@ -2043,11 +2373,8 @@ impl<'a> VmEngine<'a> {
                 tolerance,
                 replay_path: _,
             } => {
-                let given_val = frame.regs[given.0 as usize].clone();
-                let expect_vals: Vec<Value> = expects
-                    .iter()
-                    .map(|r| frame.regs[r.0 as usize].clone())
-                    .collect();
+                let given_val = frame.get_val(given);
+                let expect_vals: Vec<Value> = expects.iter().map(|r| frame.get_val(*r)).collect();
                 let name_str = frame.program.symbols.resolve(name);
                 match eval_assert(name_str, &given_val, &expect_vals, tolerance) {
                     Ok(()) => StepOutcome::NextInst,
@@ -2055,12 +2382,12 @@ impl<'a> VmEngine<'a> {
                 }
             }
             ControlInst::Assert(cond, msg) => {
-                if is_truthy(&frame.regs[cond.0 as usize]) {
+                if frame.regs[cond.0 as usize].is_truthy() {
                     StepOutcome::NextInst
                 } else {
                     StepOutcome::Err(MoraError::Runtime(format!(
                         "assertion failed: {}",
-                        frame.regs[msg.0 as usize]
+                        frame.get_val(msg)
                     )))
                 }
             }
@@ -2376,16 +2703,13 @@ impl<'a> VmEngine<'a> {
                 args,
                 named_args,
             } => {
-                let arg_vals: Vec<Value> = args
-                    .iter()
-                    .map(|r| frame.regs[r.0 as usize].clone())
-                    .collect();
+                let arg_vals: Vec<Value> = args.iter().map(|r| frame.get_val(*r)).collect();
                 let named_vals: Vec<(String, Value)> = named_args
                     .iter()
                     .map(|(sym, r)| {
                         (
                             frame.program.symbols.resolve(*sym).to_string(),
-                            frame.regs[r.0 as usize].clone(),
+                            frame.get_val(*r),
                         )
                     })
                     .collect();
@@ -2410,7 +2734,7 @@ impl<'a> VmEngine<'a> {
                             globals: Arc::clone(&frame.globals),
                         }
                     }
-                    CalleeTarget::Value(r) => frame.regs[r.0 as usize].clone(),
+                    CalleeTarget::Value(r) => frame.get_val(r),
                     CalleeTarget::DynGlobal(sym) => {
                         let name = frame.program.symbols.resolve(sym);
                         if let Some(id) = crate::mir::control::BuiltinFnId::from_name(name) {
@@ -2433,18 +2757,15 @@ impl<'a> VmEngine<'a> {
                 args,
                 named_args,
             } => {
-                let recv_val = frame.regs[receiver.0 as usize].clone();
+                let recv_val = frame.get_val(receiver);
                 let method_name = frame.program.symbols.resolve(method).to_string();
-                let arg_vals: Vec<Value> = args
-                    .iter()
-                    .map(|r| frame.regs[r.0 as usize].clone())
-                    .collect();
+                let arg_vals: Vec<Value> = args.iter().map(|r| frame.get_val(*r)).collect();
                 let named_vals: Vec<(String, Value)> = named_args
                     .iter()
                     .map(|(sym, r)| {
                         (
                             frame.program.symbols.resolve(*sym).to_string(),
-                            frame.regs[r.0 as usize].clone(),
+                            frame.get_val(*r),
                         )
                     })
                     .collect();
@@ -2458,11 +2779,11 @@ impl<'a> VmEngine<'a> {
                 )
             }
             ControlSpawnTarget::Callable(reg) => {
-                let callee_val = frame.regs[reg.0 as usize].clone();
+                let callee_val = frame.get_val(reg);
                 scheduler.spawn_mora_value(callee_val, Vec::new(), self.core, &base_ctx)
             }
         };
-        frame.regs[dst.0 as usize] = Value::TaskHandle(handle);
+        frame.set_val(dst, Value::TaskHandle(handle));
         StepOutcome::NextInst
     }
 
@@ -2480,32 +2801,34 @@ impl<'a> VmEngine<'a> {
         for arm in &arms {
             match arm {
                 ControlSelectArm::Recv { channel, .. } => {
-                    let Value::Channel(ch) = &frame.regs[channel.0 as usize] else {
+                    let Some(Value::Channel(ch)) = frame.regs[channel.0 as usize].as_boxed() else {
+                        let got = frame.get_val(*channel);
                         return StepOutcome::Err(MoraError::Runtime(format!(
                             "select recv arm requires a channel, got {}",
-                            crate::flow::type_name(&frame.regs[channel.0 as usize])
+                            crate::flow::type_name(&got)
                         )));
                     };
                     branches.push(SelectBranch::Recv(Arc::clone(ch)));
                 }
                 ControlSelectArm::Send { channel, value, .. } => {
-                    let Value::Channel(ch) = &frame.regs[channel.0 as usize] else {
+                    let Some(Value::Channel(ch)) = frame.regs[channel.0 as usize].as_boxed() else {
+                        let got = frame.get_val(*channel);
                         return StepOutcome::Err(MoraError::Runtime(format!(
                             "select send arm requires a channel, got {}",
-                            crate::flow::type_name(&frame.regs[channel.0 as usize])
+                            crate::flow::type_name(&got)
                         )));
                     };
-                    let val = frame.regs[value.0 as usize].clone();
+                    let val = frame.get_val(*value);
                     branches.push(SelectBranch::Send(Arc::clone(ch), val));
                 }
                 ControlSelectArm::Timeout { ms, .. } => {
-                    let dur = match crate::runtime::builtins::duration_from_ms(
-                        &frame.regs[ms.0 as usize],
-                        "select timeout",
-                    ) {
-                        Ok(d) => d,
-                        Err(e) => return StepOutcome::Err(e),
-                    };
+                    let ms_val = frame.get_val(*ms);
+                    let dur =
+                        match crate::runtime::builtins::duration_from_ms(&ms_val, "select timeout")
+                        {
+                            Ok(d) => d,
+                            Err(e) => return StepOutcome::Err(e),
+                        };
                     branches.push(SelectBranch::Timeout(dur));
                 }
                 ControlSelectArm::Default { .. } => branches.push(SelectBranch::Default),
@@ -2513,56 +2836,27 @@ impl<'a> VmEngine<'a> {
         }
 
         let start_hint = self.core.random_state.next_u64() as usize;
-        let scheduler = Arc::clone(self.core.scheduler());
-        let (arm_idx, received_val) = match scheduler.block_on(select_arms(
-            branches,
-            start_hint,
-            self.core.task_context.as_ref(),
-        )) {
-            Ok(winner) => winner,
-            Err(e) => return StepOutcome::Err(e),
-        };
-
-        let (body_fn, captures, arm_args) = match &arms[arm_idx] {
-            ControlSelectArm::Recv {
-                has_binding,
-                body_fn,
-                captures,
-                ..
-            } => (
-                *body_fn,
-                captures,
-                if *has_binding {
-                    vec![received_val]
-                } else {
-                    Vec::new()
-                },
-            ),
-            ControlSelectArm::Send {
-                body_fn, captures, ..
-            }
-            | ControlSelectArm::Timeout {
-                body_fn, captures, ..
-            }
-            | ControlSelectArm::Default { body_fn, captures } => (*body_fn, captures, Vec::new()),
-        };
-
-        let target_func = frame.program.func(body_fn);
-        let upvalues = resolve_captures(captures, &frame.locals, &frame.upvalues, target_func);
-        let body_frame = match materialize_frame(
-            Arc::clone(&frame.program),
-            body_fn,
-            Arc::clone(&frame.globals),
-            Arc::new(upvalues),
-            &arm_args,
-        ) {
-            Ok(f) => f,
-            Err(e) => return StepOutcome::Err(e),
+        let ctx = self.core.task_context.clone();
+        let select_state = SelectResumeState {
+            program: Arc::clone(&frame.program),
+            globals: Arc::clone(&frame.globals),
+            parent_locals: frame.locals.clone(),
+            parent_upvalues: Arc::clone(&frame.upvalues),
+            arms,
         };
         frame.pc += 1;
         frame.resume_dst = Some(dst);
         self.frames.push(CallFrame::Script(Box::new(frame.clone())));
-        self.frames.push(CallFrame::Script(Box::new(body_frame)));
+        self.frames
+            .push(CallFrame::Combinator(CombinatorFrame::SelectResume(
+                Box::new(select_state),
+            )));
+        self.pending_yield = Some(VmYield::AwaitFuture(Box::pin(async move {
+            let (arm_idx, received_val) = select_arms(branches, start_hint, ctx.as_ref()).await?;
+            Ok(Value::List(
+                vec![Value::Int(arm_idx as i64), received_val].into(),
+            ))
+        })));
         StepOutcome::Yielded
     }
 

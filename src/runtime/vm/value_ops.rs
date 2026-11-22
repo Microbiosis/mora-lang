@@ -172,21 +172,27 @@ pub fn value_to_string(v: &Value) -> String {
 }
 
 /// Render quasiquote template segments into a `Value::Code` source string.
-pub fn eval_quasiquote(segs: &[ControlQqSegment], regs: &[Value]) -> MoraResult<Value> {
+pub fn eval_quasiquote(
+    segs: &[ControlQqSegment],
+    regs: &[super::continuation::RegSlot],
+) -> MoraResult<Value> {
     let mut out = String::new();
     for seg in segs {
         match seg {
             ControlQqSegment::Quote(s) => out.push_str(s),
-            ControlQqSegment::Unquote(r) => out.push_str(&value_to_string(&regs[r.0 as usize])),
-            ControlQqSegment::UnquoteSplice(r) => match &regs[r.0 as usize] {
-                Value::List(items) => {
+            ControlQqSegment::Unquote(r) => {
+                out.push_str(&value_to_string(&regs[r.0 as usize].to_value()))
+            }
+            ControlQqSegment::UnquoteSplice(r) => match regs[r.0 as usize].as_boxed() {
+                Some(Value::List(items)) => {
                     let rendered: Vec<String> = items.iter().map(value_to_string).collect();
                     out.push_str(&rendered.join(", "));
                 }
-                other => {
+                _ => {
+                    let val = regs[r.0 as usize].to_value();
                     return Err(MoraError::Runtime(format!(
                         "quasiquote unquote-splicing (,,): expected List, got {}",
-                        type_name(other)
+                        type_name(&val)
                     )));
                 }
             },

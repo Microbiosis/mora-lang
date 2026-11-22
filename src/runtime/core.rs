@@ -44,6 +44,17 @@ impl EngineShared {
         }
     }
 
+    /// Construct a shared runtime backing bound to an explicit [`TaskScheduler`] (e.g. M:N worker-bound pool).
+    pub(crate) fn with_scheduler(scheduler: Arc<TaskScheduler>) -> Self {
+        let reactor = Arc::new(AsyncIoReactor::new(Arc::clone(&scheduler)));
+        let dag_cache = Arc::new(DagPlanCache::default());
+        Self {
+            scheduler,
+            reactor,
+            dag_cache,
+        }
+    }
+
     /// Borrow the shared multi-threaded [`TaskScheduler`].
     pub fn scheduler(&self) -> &Arc<TaskScheduler> {
         &self.scheduler
@@ -182,6 +193,12 @@ impl CoreRuntime {
     /// Borrow the shared [`AsyncIoReactor`].
     pub fn reactor(&self) -> &Arc<AsyncIoReactor> {
         self.shared.reactor()
+    }
+
+    /// Bind this runtime to a custom [`TaskScheduler`] (e.g. bounded M:N worker thread count).
+    pub fn with_scheduler(mut self, scheduler: Arc<TaskScheduler>) -> Self {
+        self.shared = Arc::new(EngineShared::with_scheduler(scheduler));
+        self
     }
 
     /// Attach a cooperative cancellation and deadline [`TaskContext`] to this runtime.

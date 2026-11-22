@@ -27,13 +27,14 @@ use crate::runtime::CoreRuntime;
 use crate::value::Value;
 
 pub use builtins::{
-    CallAction, resolve_dyn_call, resolve_dyn_call_named, resolve_method_call,
+    CallAction, VmFuture, resolve_dyn_call, resolve_dyn_call_named, resolve_method_call,
     resolve_method_call_named, resolve_value_call, resolve_value_call_named,
 };
 pub use continuation::{
-    CallFrame, CapturedContinuation, ModuleGlobals, UpvalueValue, init_globals, materialize_frame,
+    CallFrame, CapturedContinuation, CapturedFrames, ModuleGlobals, RegSlot, UpvalueValue,
+    init_globals, materialize_frame,
 };
-pub use engine::{VmEngine, collect_env_names};
+pub use engine::{VmEngine, VmOutcome, VmYield, collect_env_names};
 pub use value_ops::{index_assign_value, index_value};
 
 /// Execute a compiled [`ControlProgram`] entry function (`<main>`) and return `(result, globals)`.

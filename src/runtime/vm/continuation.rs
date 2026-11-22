@@ -18,10 +18,91 @@ use crate::common::sync::Mutex;
 
 use crate::error::{MoraError, MoraResult};
 use crate::mir::control::{
-    BlockId, CaptureSource, ControlFunction, ControlProgram, FnId, FunctionKind, LocalSlot,
-    ParallelSegment, UpvalueSlot, VReg,
+    BlockId, CaptureSource, ControlFunction, ControlProgram, ControlSelectArm, FnId, FunctionKind,
+    LocalSlot, ParallelSegment, UpvalueSlot, VReg,
 };
 use crate::value::{Environment, Value};
+
+/// P4-2: Compact 16-byte hybrid unboxed VM register slot replacing full `Value` in
+/// `ScriptFrame.regs` and unshared `LocalCell`s.
+///
+/// Primitives (`Nil`, `Bool`, `Int`, `Float`) live completely inline inside the 16-byte slot
+/// with zero heap allocations on hot numeric, comparison, and control-flow paths; heap-backed
+/// values (`String`, `List`, `Dict`, `Tensor`, `StructInstance`, closures, etc.) are stored
+/// behind an 8-byte `Box<Value>` pointer.
+#[derive(Debug, Clone)]
+pub enum RegSlot {
+    Nil,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Boxed(Box<Value>),
+}
+
+const _: () = assert!(std::mem::size_of::<RegSlot>() == 16);
+
+impl RegSlot {
+    /// Pack a full [`Value`] into a 16-byte [`RegSlot`], unboxing primitives inline.
+    #[inline]
+    pub fn from_value(val: Value) -> Self {
+        match val {
+            Value::Nil => Self::Nil,
+            Value::Bool(b) => Self::Bool(b),
+            Value::Int(i) => Self::Int(i),
+            Value::Float(f) => Self::Float(f),
+            other => Self::Boxed(Box::new(other)),
+        }
+    }
+
+    /// Clone out a full [`Value`] from this register slot.
+    #[inline]
+    pub fn to_value(&self) -> Value {
+        match self {
+            Self::Nil => Value::Nil,
+            Self::Bool(b) => Value::Bool(*b),
+            Self::Int(i) => Value::Int(*i),
+            Self::Float(f) => Value::Float(*f),
+            Self::Boxed(v) => (**v).clone(),
+        }
+    }
+
+    /// Consume this register slot into a full [`Value`].
+    #[inline]
+    pub(crate) fn take_value(self) -> Value {
+        match self {
+            Self::Nil => Value::Nil,
+            Self::Bool(b) => Value::Bool(b),
+            Self::Int(i) => Value::Int(i),
+            Self::Float(f) => Value::Float(f),
+            Self::Boxed(v) => *v,
+        }
+    }
+
+    /// Zero-allocation truthiness test matching [`crate::flow::is_truthy`].
+    #[inline]
+    pub(crate) fn is_truthy(&self) -> bool {
+        match self {
+            Self::Nil => false,
+            Self::Bool(b) => *b,
+            Self::Int(i) => *i != 0,
+            Self::Float(f) => *f != 0.0 && !f.is_nan(),
+            Self::Boxed(v) => crate::flow::is_truthy(v),
+        }
+    }
+
+    /// Borrow the inner [`Value`] when this slot is heap-boxed.
+    #[inline]
+    pub(crate) fn as_boxed(&self) -> Option<&Value> {
+        match self {
+            Self::Boxed(v) => Some(v),
+            _ => None,
+        }
+    }
+}
+
+/// Shared stack-frame slice captured by both multi-shot delimited continuations
+/// (`perform`/`handle`) and cooperative M:N VM fiber suspensions (`VmYield`).
+pub type CapturedFrames = Vec<CallFrame>;
 
 /// Shared cell holding a module-top static global binding `(value, is_exported)`.
 pub type GlobalCell = Arc<Mutex<(Value, bool)>>;
@@ -75,26 +156,46 @@ impl UpvalueValue {
 /// Per-frame local variable slot storage.
 #[derive(Debug, Clone)]
 pub enum LocalCell {
-    /// Direct frame-local slot; cloned independently across multi-shot continuations.
-    Val(Value),
+    /// Direct frame-local unboxed 16-byte register slot; cloned independently across multi-shot continuations.
+    Val(RegSlot),
     /// Boxed heap cell shared with inner closures capturing this local.
     Shared(UpvalueCell),
 }
 
 impl LocalCell {
-    /// Read the current value stored in this local slot.
+    /// Read the current value stored in this local slot as a [`Value`].
+    #[inline]
     pub fn get(&self) -> Value {
         match self {
-            Self::Val(v) => v.clone(),
+            Self::Val(s) => s.to_value(),
             Self::Shared(cell) => cell.lock().clone(),
         }
     }
 
-    /// Write a new value into this local slot, preserving shared cell identity.
+    /// Read this local directly into a 16-byte [`RegSlot`] without boxing primitives.
+    #[inline]
+    pub(crate) fn get_slot(&self) -> RegSlot {
+        match self {
+            Self::Val(s) => s.clone(),
+            Self::Shared(cell) => RegSlot::from_value(cell.lock().clone()),
+        }
+    }
+
+    /// Write a [`Value`] into this local slot, preserving shared cell identity.
+    #[inline]
     pub fn set(&mut self, val: Value) {
         match self {
-            Self::Val(v) => *v = val,
+            Self::Val(s) => *s = RegSlot::from_value(val),
             Self::Shared(cell) => *cell.lock() = val,
+        }
+    }
+
+    /// Write a 16-byte [`RegSlot`] into this local slot without boxing unshared primitives.
+    #[inline]
+    pub(crate) fn set_slot(&mut self, slot: RegSlot) {
+        match self {
+            Self::Val(s) => *s = slot,
+            Self::Shared(cell) => *cell.lock() = slot.take_value(),
         }
     }
 
@@ -103,8 +204,8 @@ impl LocalCell {
         match (self, shared) {
             (Self::Shared(cell), true) => UpvalueValue::Cell(Arc::clone(cell)),
             (Self::Shared(cell), false) => UpvalueValue::Const(cell.lock().clone()),
-            (Self::Val(v), false) => UpvalueValue::Const(v.clone()),
-            (Self::Val(v), true) => UpvalueValue::Cell(Arc::new(Mutex::new(v.clone()))),
+            (Self::Val(s), false) => UpvalueValue::Const(s.to_value()),
+            (Self::Val(s), true) => UpvalueValue::Cell(Arc::new(Mutex::new(s.to_value()))),
         }
     }
 }
@@ -117,7 +218,8 @@ pub struct ScriptFrame {
     pub globals: ModuleGlobals,
     pub upvalues: Arc<Vec<UpvalueValue>>,
     pub locals: Vec<LocalCell>,
-    pub regs: Vec<Value>,
+    /// P4-2: 16-byte hybrid unboxed register file.
+    pub regs: Vec<RegSlot>,
     pub block_id: BlockId,
     pub pc: usize,
     pub resume_dst: Option<VReg>,
@@ -130,17 +232,35 @@ impl ScriptFrame {
         self.program.func(self.func_id)
     }
 
+    /// Read a virtual register as a full [`Value`].
+    #[inline]
+    pub(crate) fn get_val(&self, r: VReg) -> Value {
+        self.regs[r.0 as usize].to_value()
+    }
+
+    /// Write a full [`Value`] into a virtual register (unboxing primitives inline).
+    #[inline]
+    pub(crate) fn set_val(&mut self, r: VReg, val: Value) {
+        self.regs[r.0 as usize] = RegSlot::from_value(val);
+    }
+
+    /// Write an already-unboxed [`RegSlot`] directly into a virtual register.
+    #[inline]
+    pub(crate) fn set_slot(&mut self, r: VReg, slot: RegSlot) {
+        self.regs[r.0 as usize] = slot;
+    }
+
     /// Deliver `reply` when control returns to this frame from a callee or resumed continuation.
     pub fn receive_reply(&mut self, reply: Value) {
         if let Some(dst) = self.resume_dst.take() {
-            self.regs[dst.0 as usize] = reply;
+            self.regs[dst.0 as usize] = RegSlot::from_value(reply);
             return;
         }
         let block = &self.func().blocks[self.block_id.0 as usize];
         if self.pc == 0
             && let Some(&param_reg) = block.params.first()
         {
-            self.regs[param_reg.0 as usize] = reply;
+            self.regs[param_reg.0 as usize] = RegSlot::from_value(reply);
         }
     }
 }
@@ -154,6 +274,16 @@ pub struct HandleBarrierState {
     pub handler_globals: ModuleGlobals,
     pub handler_upvalues: Arc<Vec<UpvalueValue>>,
     pub auto_resume: bool,
+}
+
+/// Boxed state for resuming the winning arm of a suspended `select` instruction.
+#[derive(Debug, Clone)]
+pub struct SelectResumeState {
+    pub program: Arc<ControlProgram>,
+    pub globals: ModuleGlobals,
+    pub parent_locals: Vec<LocalCell>,
+    pub parent_upvalues: Arc<Vec<UpvalueValue>>,
+    pub arms: Vec<ControlSelectArm>,
 }
 
 /// Boxed state for evaluating omitted `struct` field default initializers on the VM stack.
@@ -225,6 +355,8 @@ pub enum CombinatorFrame {
     StructInit(Box<StructInitState>),
     /// P4-1A: Negates boolean result returned from `Eq::eq` when evaluating `!=` on overloaded types.
     BoolNot,
+    /// P4-2: Resumes the winning arm body after an asynchronous `select` future resolves.
+    SelectResume(Box<SelectResumeState>),
     /// Dispatches rising-edge memory watermark callbacks outside allocator locks
     /// on the stackful VM frame stack before yielding `final_result`.
     WatermarkCallbacks {
@@ -292,7 +424,7 @@ pub struct CapturedContinuation {
     pub effect_name: String,
     pub barrier: HandleBarrierState,
     /// Captured frames ordered bottom-to-top above the barrier.
-    pub frames: Vec<CallFrame>,
+    pub frames: CapturedFrames,
 }
 
 /// Initialize module global cells from `prog.globals`.
@@ -519,7 +651,7 @@ pub fn materialize_frame_named(
             if func.shared_locals.get(slot_idx).copied().unwrap_or(false) {
                 locals.push(LocalCell::Shared(Arc::new(Mutex::new(Value::Nil))));
             } else {
-                locals.push(LocalCell::Val(Value::Nil));
+                locals.push(LocalCell::Val(RegSlot::Nil));
             }
         }
 
@@ -529,7 +661,7 @@ pub fn materialize_frame_named(
             }
         }
 
-        let regs = vec![Value::Nil; func.n_regs as usize];
+        let regs = vec![RegSlot::Nil; func.n_regs as usize];
         (locals, regs, func.entry)
     };
 

@@ -194,6 +194,12 @@ fn extract_module_symbols(
             WitnessKind::StructDef { .. }
             | WitnessKind::EnumDef { .. }
             | WitnessKind::TraitDef { .. } => {}
+            WitnessKind::KernelDef { name, params, .. } => {
+                if !syms.iter().any(|(n, _)| n == name) {
+                    let sig = params.iter().map(|p| p.ty).collect();
+                    syms.push((name.clone(), Type::GpuKernel(Some(sig))));
+                }
+            }
             WitnessKind::TypeAlias { name, target } => {
                 syms.push((name.clone(), target.to_type().clone()));
             }

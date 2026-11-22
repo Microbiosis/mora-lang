@@ -310,6 +310,18 @@ pub trait DeviceBackend: Send + Sync {
     ) -> MoraResult<Option<Arc<dyn DeviceVramBuffer>>> {
         Ok(None)
     }
+
+    /// P4-1B: Compile (cached) and launch a user-defined source-level GPU `kernel` directly on
+    /// persistent GPU VRAM buffers (`Ok(true)` = executed on GPU hardware; `Ok(false)` = fall back to CPU).
+    fn launch_custom_kernel(
+        &self,
+        _kernel: &crate::common::kernel_ir::KernelProgram,
+        _grid: u32,
+        _block: u32,
+        _args: &[crate::runtime::gpu::kernel_compiler::KernelLaunchArg],
+    ) -> MoraResult<bool> {
+        Ok(false)
+    }
 }
 
 /// Native host CPU backend executing multi-threaded cache-blocked SIMD fused kernels.

@@ -369,6 +369,7 @@ pub enum GlobalKind {
     Struct,
     Trait,
     TypeAlias,
+    Kernel,
 }
 
 /// Metadata entry for one module-level [`GlobalSlot`].
@@ -597,6 +598,20 @@ pub enum ControlInst {
         args: Vec<VReg>,
         named_args: Vec<(SymId, VReg)>,
     },
+    /// P4-1A: Nominal generic constructor/associated call with explicit const-generic integer args (`Linear<4, 3>(w, b)`).
+    CallGeneric {
+        dst: VReg,
+        target: CalleeTarget,
+        const_args: Vec<(SymId, i64)>,
+        args: Vec<VReg>,
+        named_args: Vec<(SymId, VReg)>,
+    },
+    /// P4-1A: Read a compile-time const-generic integer bound on a `StructInstance` receiver (`self`).
+    GetConstGeneric {
+        dst: VReg,
+        src: VReg,
+        name: SymId,
+    },
     ModuleCall {
         dst: VReg,
         module: BuiltinKind,
@@ -678,12 +693,16 @@ pub enum ControlInst {
     RegisterEnum {
         name: SymId,
         type_params: Vec<SymId>,
+        const_params: Vec<SymId>,
+        const_shape_bindings: Vec<(SymId, SymId, usize, usize)>,
         variants: Vec<(SymId, Vec<String>)>,
         dst: Option<GlobalSlot>,
     },
     RegisterStruct {
         name: SymId,
         type_params: Vec<SymId>,
+        const_params: Vec<SymId>,
+        const_shape_bindings: Vec<(SymId, usize, usize)>,
         fields: Vec<ControlStructField>,
         dst: Option<GlobalSlot>,
     },
@@ -713,6 +732,12 @@ pub enum ControlInst {
         fn_id: FnId,
         dst: Option<GlobalSlot>,
     },
+    /// P4-1B: Register a compiled first-class GPU `kernel` value in global/lexical scope.
+    RegisterKernel {
+        name: SymId,
+        program: Box<crate::common::kernel_ir::KernelProgram>,
+        dst: Option<GlobalSlot>,
+    },
     /// Optional statement expression marker keeping last statement value live.
     KeepAlive(VReg),
 }
@@ -739,6 +764,8 @@ impl ControlInst {
             | Self::IndexAssign(d, _, _, _)
             | Self::TensorSlice { dst: d, .. }
             | Self::Call { dst: d, .. }
+            | Self::CallGeneric { dst: d, .. }
+            | Self::GetConstGeneric { dst: d, .. }
             | Self::ModuleCall { dst: d, .. }
             | Self::MethodCall { dst: d, .. }
             | Self::Pipe { dst: d, .. }
@@ -768,6 +795,7 @@ impl ControlInst {
             | Self::RegisterImpl { .. }
             | Self::RegisterMacro { .. }
             | Self::RegisterTask { .. }
+            | Self::RegisterKernel { .. }
             | Self::KeepAlive(..) => None,
         }
     }
@@ -794,6 +822,7 @@ impl ControlInst {
             | Self::RegisterImpl { .. }
             | Self::RegisterMacro { .. }
             | Self::RegisterTask { .. }
+            | Self::RegisterKernel { .. }
             | Self::Handle { .. }
             | Self::Transaction { .. }
             | Self::Parallel { .. }
@@ -801,6 +830,7 @@ impl ControlInst {
             Self::Copy(_, s)
             | Self::Unary(_, _, s)
             | Self::MakeDynTrait { src: s, .. }
+            | Self::GetConstGeneric { src: s, .. }
             | Self::StoreLocal(_, s)
             | Self::StoreUpvalue(_, s)
             | Self::StoreGlobal(_, s)
@@ -844,6 +874,12 @@ impl ControlInst {
                 })
                 .collect(),
             Self::Call {
+                target,
+                args,
+                named_args,
+                ..
+            }
+            | Self::CallGeneric {
                 target,
                 args,
                 named_args,
@@ -945,7 +981,8 @@ impl ControlInst {
             Self::Copy(d, s)
             | Self::Unary(d, _, s)
             | Self::Assert(d, s)
-            | Self::MakeDynTrait { dst: d, src: s, .. } => {
+            | Self::MakeDynTrait { dst: d, src: s, .. }
+            | Self::GetConstGeneric { dst: d, src: s, .. } => {
                 *d = f(*d);
                 *s = f(*s);
             }
@@ -1031,6 +1068,13 @@ impl ControlInst {
                 target,
                 args,
                 named_args,
+            }
+            | Self::CallGeneric {
+                dst,
+                target,
+                args,
+                named_args,
+                ..
             } => {
                 *dst = f(*dst);
                 if let CalleeTarget::Value(v) = target {
@@ -1139,7 +1183,8 @@ impl ControlInst {
             | Self::RegisterTrait { .. }
             | Self::RegisterImpl { .. }
             | Self::RegisterMacro { .. }
-            | Self::RegisterTask { .. } => {}
+            | Self::RegisterTask { .. }
+            | Self::RegisterKernel { .. } => {}
         }
     }
 
@@ -1160,6 +1205,7 @@ impl ControlInst {
             Self::Index(..)
             | Self::IndexAssign(..)
             | Self::TensorSlice { .. }
+            | Self::GetConstGeneric { .. }
             | Self::Quasiquote(..)
             | Self::Assert(..) => Purity::Fallible,
             Self::MatchPattern { .. }
@@ -1197,6 +1243,8 @@ impl ControlInst {
             | Self::RegisterImpl { .. }
             | Self::RegisterMacro { .. }
             | Self::RegisterTask { .. }
+            | Self::RegisterKernel { .. }
+            | Self::CallGeneric { .. }
             | Self::KeepAlive(..) => Purity::Effectful,
         }
     }

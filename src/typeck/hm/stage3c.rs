@@ -119,11 +119,42 @@ fn subst_generics_inner(ty: &Type, map: &HashMap<&str, &Type>) -> Type {
             dtype,
             shape,
             device,
-        } => Type::Tensor {
-            dtype: Box::new(subst_generics_inner(dtype, map)),
-            shape: shape.clone(),
-            device: device.clone(),
-        },
+        } => {
+            let new_shape = match shape {
+                ShapeType::Ranked(dims) => ShapeType::Ranked(
+                    dims.iter()
+                        .map(|d| match d {
+                            DimExpr::Symbolic(sym) => match map.get(sym.as_str()) {
+                                Some(Type::ConstInt(n)) if *n >= 0 => DimExpr::Known(*n as usize),
+                                Some(Type::TypeVar(TypeVarId::Meta(id))) => DimExpr::Var(*id),
+                                Some(Type::TypeVar(TypeVarId::Rigid(r))) => {
+                                    DimExpr::Symbolic(r.clone())
+                                }
+                                _ => d.clone(),
+                            },
+                            other => other.clone(),
+                        })
+                        .collect(),
+                ),
+                ShapeType::Unranked(Some(TypeVarId::Rigid(r))) => match map.get(r.as_str()) {
+                    Some(Type::TypeVar(v)) => ShapeType::Unranked(Some(v.clone())),
+                    _ => shape.clone(),
+                },
+                other => other.clone(),
+            };
+            let new_device = match device {
+                crate::typeck::DeviceType::Var(TypeVarId::Rigid(r)) => match map.get(r.as_str()) {
+                    Some(Type::TypeVar(v)) => crate::typeck::DeviceType::Var(v.clone()),
+                    _ => device.clone(),
+                },
+                other => other.clone(),
+            };
+            Type::Tensor {
+                dtype: Box::new(subst_generics_inner(dtype, map)),
+                shape: new_shape,
+                device: new_device,
+            }
+        }
         other => other.clone(),
     }
 }
@@ -153,6 +184,7 @@ pub(super) fn canonical_target_name_of(ty: &Type) -> Option<String> {
         Type::ComputeDag => Some("compute_dag".to_string()),
         Type::KVAllocator => Some("kv_allocator".to_string()),
         Type::MemoryPool => Some("memory_pool".to_string()),
+        Type::GpuKernel(_) => Some("gpu_kernel".to_string()),
         _ => None,
     }
 }
@@ -262,6 +294,7 @@ impl HMInference {
         &mut self,
         name: &str,
         _type_params: &[String],
+        _const_params: &[String],
         fields: &[WitnessStructField],
         _span: Span,
     ) -> Result<(Type, EffectRow), Vec<TypeError>> {
@@ -334,6 +367,7 @@ impl HMInference {
         &mut self,
         name: &str,
         _type_params: &[String],
+        _const_params: &[String],
         variants: &[WitnessEnumVariant],
         _span: Span,
     ) -> Result<(Type, EffectRow), Vec<TypeError>> {
@@ -491,6 +525,7 @@ impl HMInference {
     pub(super) fn infer_impl_def(
         &mut self,
         _type_params: &[String],
+        const_params: &[String],
         trait_name: Option<&str>,
         _trait_generics: &[TypeHint],
         target_type: &str,
@@ -499,6 +534,30 @@ impl HMInference {
         span: Span,
     ) -> Result<(Type, EffectRow), Vec<TypeError>> {
         let self_ty = self.resolve_impl_target_type(target_type, target_generics);
+
+        // P4-1A: Collect const-generic parameter names in scope for all method bodies (bound as `int`).
+        let mut active_consts: Vec<String> = const_params.to_vec();
+        if let Some(sdef) = self.struct_defs.get(target_type) {
+            for (idx, tg) in target_generics.iter().enumerate() {
+                if let Some(tp_name) = sdef.type_params.get(idx)
+                    && sdef.const_params.contains(tp_name)
+                    && let Type::TypeVar(TypeVarId::Rigid(r)) = tg.to_type()
+                    && !active_consts.contains(r)
+                {
+                    active_consts.push(r.clone());
+                }
+            }
+        } else if let Some(edef) = self.enum_defs.get(target_type) {
+            for (idx, tg) in target_generics.iter().enumerate() {
+                if let Some(tp_name) = edef.type_params.get(idx)
+                    && edef.const_params.contains(tp_name)
+                    && let Type::TypeVar(TypeVarId::Rigid(r)) = tg.to_type()
+                    && !active_consts.contains(r)
+                {
+                    active_consts.push(r.clone());
+                }
+            }
+        }
 
         // 1. For `impl Trait for Target`, validate trait existence, required methods, and arities.
         if let Some(tr_name) = trait_name {
@@ -577,7 +636,16 @@ impl HMInference {
             }
         }
 
-        // 2. Type-check every method body inside `impl`.
+        // 2. Type-check every method body inside `impl` (with const-generic params bound as `int`).
+        let saved_env = if active_consts.is_empty() {
+            None
+        } else {
+            let prev = self.env.clone();
+            for cname in &active_consts {
+                self.env.add(cname.clone(), Type::Int);
+            }
+            Some(prev)
+        };
         for m in methods {
             let param_types: Vec<Type> = m
                 .params
@@ -657,6 +725,9 @@ impl HMInference {
                 }
                 Err(errs) => self.errors.extend(errs),
             }
+        }
+        if let Some(prev) = saved_env {
+            self.env = prev;
         }
         Ok((Type::Nil, EffectRow::Empty))
     }
@@ -742,14 +813,31 @@ impl HMInference {
         named_args: &[(String, MirWitness)],
         span: Span,
     ) -> Option<Result<(Type, EffectRow), Vec<TypeError>>> {
-        // Direct struct constructor call `Point(1, 2)` / `Point(x=1, y=2)`
+        self.try_infer_nominal_or_assoc_call_generic(name, &[], args, named_args, span)
+    }
+
+    pub(super) fn try_infer_nominal_or_assoc_call_generic(
+        &mut self,
+        name: &str,
+        explicit_type_args: &[Type],
+        args: &[MirWitness],
+        named_args: &[(String, MirWitness)],
+        span: Span,
+    ) -> Option<Result<(Type, EffectRow), Vec<TypeError>>> {
+        // Direct struct constructor call `Point(1, 2)` / `Linear<4, 3>(weight=w, bias=b)`
         if self.struct_defs.contains_key(name) {
-            return Some(self.infer_struct_constructor(name, args, named_args, span));
+            return Some(self.infer_struct_constructor_generic(
+                name,
+                explicit_type_args,
+                args,
+                named_args,
+                span,
+            ));
         }
 
         let (type_name, member) = name.split_once("::")?;
 
-        // Associated calls on nominal struct (`Point::new`, `Point::from_dict`, `Point::schema`, ...)
+        // Associated calls on nominal struct (`Point::new`, `Linear<4, 3>::new`, `Point::from_dict`, ...)
         if self.struct_defs.contains_key(type_name) {
             match member {
                 "new" => {
@@ -762,14 +850,20 @@ impl HMInference {
                     {
                         return Some(self.apply_impl_method_call(
                             &sig,
-                            &[],
+                            explicit_type_args,
                             args,
                             named_args,
                             EffectRow::Empty,
                             span,
                         ));
                     }
-                    return Some(self.infer_struct_constructor(type_name, args, named_args, span));
+                    return Some(self.infer_struct_constructor_generic(
+                        type_name,
+                        explicit_type_args,
+                        args,
+                        named_args,
+                        span,
+                    ));
                 }
                 "from_dict" => {
                     if !named_args.is_empty() || args.len() != 1 {
@@ -867,9 +961,48 @@ impl HMInference {
                         span,
                     }]));
                 }
-                let fresh_gens: Vec<Type> = (0..edef.type_params.len())
-                    .map(|_| self.fresh_type_var())
-                    .collect();
+                let fresh_gens: Vec<Type> = if explicit_type_args.is_empty() {
+                    (0..edef.type_params.len())
+                        .map(|_| self.fresh_type_var())
+                        .collect()
+                } else {
+                    if explicit_type_args.len() != edef.type_params.len() {
+                        return Some(Err(vec![TypeError::UnificationFailure {
+                            expected: format!(
+                                "{} generic argument(s) for enum '{type_name}'",
+                                edef.type_params.len()
+                            ),
+                            got: format!("{} generic argument(s)", explicit_type_args.len()),
+                            span: Some(span),
+                        }]));
+                    }
+                    for (tp, arg) in edef.type_params.iter().zip(explicit_type_args.iter()) {
+                        if edef.const_params.contains(tp) {
+                            let ok = matches!(
+                                arg,
+                                Type::ConstInt(_) | Type::TypeVar(_) | Type::Any | Type::Error
+                            );
+                            if !ok {
+                                return Some(Err(vec![TypeError::UnificationFailure {
+                                    expected: format!(
+                                        "compile-time integer const argument for '{type_name}::{tp}'"
+                                    ),
+                                    got: arg.name(),
+                                    span: Some(span),
+                                }]));
+                            }
+                        } else if matches!(arg, Type::ConstInt(_)) {
+                            return Some(Err(vec![TypeError::UnificationFailure {
+                                expected: format!(
+                                    "type argument (not integer constant) for '{type_name}::{tp}'"
+                                ),
+                                got: arg.name(),
+                                span: Some(span),
+                            }]));
+                        }
+                    }
+                    explicit_type_args.to_vec()
+                };
                 let mut acc_row = EffectRow::Empty;
                 for (arg_w, raw_pty) in args.iter().zip(payload_tys.iter()) {
                     let (arg_ty, arg_row) = self.infer_recover(arg_w);
@@ -934,6 +1067,17 @@ impl HMInference {
         named_args: &[(String, MirWitness)],
         span: Span,
     ) -> Result<(Type, EffectRow), Vec<TypeError>> {
+        self.infer_struct_constructor_generic(struct_name, &[], args, named_args, span)
+    }
+
+    pub(super) fn infer_struct_constructor_generic(
+        &mut self,
+        struct_name: &str,
+        explicit_type_args: &[Type],
+        args: &[MirWitness],
+        named_args: &[(String, MirWitness)],
+        span: Span,
+    ) -> Result<(Type, EffectRow), Vec<TypeError>> {
         let Some(def) = self.struct_defs.get(struct_name).cloned() else {
             return Err(vec![TypeError::UnboundVariable {
                 name: struct_name.to_string(),
@@ -947,9 +1091,48 @@ impl HMInference {
                 span,
             }]);
         }
-        let fresh_gens: Vec<Type> = (0..def.type_params.len())
-            .map(|_| self.fresh_type_var())
-            .collect();
+        let fresh_gens: Vec<Type> = if explicit_type_args.is_empty() {
+            (0..def.type_params.len())
+                .map(|_| self.fresh_type_var())
+                .collect()
+        } else {
+            if explicit_type_args.len() != def.type_params.len() {
+                return Err(vec![TypeError::UnificationFailure {
+                    expected: format!(
+                        "{} generic argument(s) for struct '{struct_name}'",
+                        def.type_params.len()
+                    ),
+                    got: format!("{} generic argument(s)", explicit_type_args.len()),
+                    span: Some(span),
+                }]);
+            }
+            for (tp, arg) in def.type_params.iter().zip(explicit_type_args.iter()) {
+                if def.const_params.contains(tp) {
+                    let ok = matches!(
+                        arg,
+                        Type::ConstInt(_) | Type::TypeVar(_) | Type::Any | Type::Error
+                    );
+                    if !ok {
+                        return Err(vec![TypeError::UnificationFailure {
+                            expected: format!(
+                                "compile-time integer const argument for '{struct_name}::{tp}'"
+                            ),
+                            got: arg.name(),
+                            span: Some(span),
+                        }]);
+                    }
+                } else if matches!(arg, Type::ConstInt(_)) {
+                    return Err(vec![TypeError::UnificationFailure {
+                        expected: format!(
+                            "type argument (not integer constant) for '{struct_name}::{tp}'"
+                        ),
+                        got: arg.name(),
+                        span: Some(span),
+                    }]);
+                }
+            }
+            explicit_type_args.to_vec()
+        };
         let mut slots: Vec<Option<&MirWitness>> = vec![None; def.fields.len()];
         for (i, arg) in args.iter().enumerate() {
             slots[i] = Some(arg);
@@ -2527,5 +2710,345 @@ impl HMInference {
             slots[pos] = Some(v);
         }
         Ok(slots)
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // 6. P4-1A: Trait-Driven Operator Overloading (`Add`/`Sub`/`Mul`/.../`Neg`/`Eq`)
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn try_infer_binary_op_overload(
+        &mut self,
+        op_trait: &str,
+        op_method: &str,
+        left_ty: &Type,
+        right_ty: &Type,
+        acc_row: EffectRow,
+        span: Span,
+    ) -> Option<Result<(Type, EffectRow), Vec<TypeError>>> {
+        let (target_name, recv_generics) = match left_ty {
+            Type::Concrete { name, generics, .. } => (name.clone(), generics.clone()),
+            Type::Trait { name, generics } => (name.clone(), generics.clone()),
+            Type::TraitObject {
+                trait_name,
+                generics,
+            } => {
+                if self
+                    .collect_trait_chain(trait_name)
+                    .iter()
+                    .any(|t| t == op_trait)
+                {
+                    let ret = if op_trait == "Eq" {
+                        Type::Bool
+                    } else {
+                        Type::Any
+                    };
+                    let _ = generics;
+                    return Some(Ok((ret, acc_row)));
+                }
+                return None;
+            }
+            _ => return None,
+        };
+
+        let sig = self
+            .trait_impl_methods
+            .iter()
+            .find(|((tr, tgt, m), s)| {
+                tr == op_trait
+                    && m == op_method
+                    && s.has_self
+                    && target_name_matches(tgt, &target_name)
+            })
+            .map(|(_, s)| s.clone())?;
+
+        if sig.params.len() != 1 {
+            return Some(Err(vec![TypeError::ArityMismatch {
+                expected: 1,
+                actual: sig.params.len(),
+                span,
+            }]));
+        }
+
+        let mut extra_tps: Vec<String> = Vec::new();
+        let mut extra_vars: Vec<Type> = Vec::new();
+        for tp in &sig.type_params {
+            if !sig.target_type_params.contains(tp) {
+                extra_tps.push(tp.clone());
+                extra_vars.push(self.fresh_type_var());
+            }
+        }
+        let subst_sig_ty = |t: &Type| -> Type {
+            let t1 = substitute_named_generics(t, &sig.target_type_params, &recv_generics);
+            substitute_named_generics(&t1, &extra_tps, &extra_vars)
+        };
+        let expected_rhs = subst_sig_ty(&sig.params[0].1);
+        if !matches!(right_ty, Type::Error) && !matches!(expected_rhs, Type::Any) {
+            let c = SpannedConstraint::new(
+                Constraint::Subtype {
+                    sub: Box::new(right_ty.clone()),
+                    sup: Box::new(expected_rhs),
+                },
+                span,
+            )
+            .with_hint(format!(
+                "right-hand operand for operator trait '{op_trait}::{op_method}' on '{target_name}'"
+            ));
+            match unify::solve_spanned(&c, &self.subst) {
+                Ok(s) => self.subst = s,
+                Err(e) => return Some(Err(vec![e])),
+            }
+        }
+        let out_row = self.merge_rows(acc_row, sig.effect_row.clone(), span);
+        let ret_ty = if op_trait == "Eq" {
+            Type::Bool
+        } else {
+            self.subst.apply(&subst_sig_ty(&sig.return_type))
+        };
+        Some(Ok((ret_ty, out_row)))
+    }
+
+    pub(super) fn try_infer_unary_op_overload(
+        &mut self,
+        recv_ty: &Type,
+        op_trait: &str,
+        op_method: &str,
+        acc_row: EffectRow,
+        span: Span,
+    ) -> Option<Result<(Type, EffectRow), Vec<TypeError>>> {
+        let (target_name, recv_generics) = match recv_ty {
+            Type::Concrete { name, generics, .. } => (name.clone(), generics.clone()),
+            Type::Trait { name, generics } => (name.clone(), generics.clone()),
+            Type::TraitObject { trait_name, .. } => {
+                if self
+                    .collect_trait_chain(trait_name)
+                    .iter()
+                    .any(|t| t == op_trait)
+                {
+                    return Some(Ok((Type::Any, acc_row)));
+                }
+                return None;
+            }
+            _ => return None,
+        };
+        let sig = self
+            .trait_impl_methods
+            .iter()
+            .find(|((tr, tgt, m), s)| {
+                tr == op_trait
+                    && m == op_method
+                    && s.has_self
+                    && target_name_matches(tgt, &target_name)
+            })
+            .map(|(_, s)| s.clone())?;
+        if !sig.params.is_empty() {
+            return Some(Err(vec![TypeError::ArityMismatch {
+                expected: 0,
+                actual: sig.params.len(),
+                span,
+            }]));
+        }
+        let out_row = self.merge_rows(acc_row, sig.effect_row.clone(), span);
+        let ret_ty = self.subst.apply(&substitute_named_generics(
+            &sig.return_type,
+            &sig.target_type_params,
+            &recv_generics,
+        ));
+        Some(Ok((ret_ty, out_row)))
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // 7. P4-1B: First-Class Source-Level GPU `kernel` Blocks & `.launch(...)`
+    // ════════════════════════════════════════════════════════════════════════
+
+    pub(super) fn infer_kernel_def(
+        &mut self,
+        name: &str,
+        params: &[crate::common::kernel_ir::KernelParam],
+        body: &[MirWitness],
+        span: Span,
+    ) -> Result<(Type, EffectRow), Vec<TypeError>> {
+        if let Err(msg) =
+            crate::runtime::gpu::kernel_compiler::lower_witness_kernel(name, params, body)
+        {
+            self.errors.push(TypeError::UnificationFailure {
+                expected: format!("valid GPU kernel definition '{name}'"),
+                got: msg,
+                span: Some(span),
+            });
+        }
+        let sig: Vec<crate::common::kernel_ir::KernelParamType> =
+            params.iter().map(|p| p.ty).collect();
+        let kty = Type::GpuKernel(Some(sig));
+        self.env.add(name.to_string(), kty.clone());
+        self.record_binding(span, name, &kty);
+        Ok((Type::Nil, EffectRow::Empty))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn infer_gpu_kernel_method(
+        &mut self,
+        sig: Option<&[crate::common::kernel_ir::KernelParamType]>,
+        method: &str,
+        args: &[MirWitness],
+        named_args: &[(String, MirWitness)],
+        mut acc_row: EffectRow,
+        span: Span,
+    ) -> Result<(Type, EffectRow), Vec<TypeError>> {
+        use crate::common::kernel_ir::KernelParamType;
+
+        if !named_args.is_empty() {
+            return Err(vec![TypeError::UnificationFailure {
+                expected: format!("positional arguments for gpu_kernel.{method}"),
+                got: "keyword arguments".to_string(),
+                span: Some(span),
+            }]);
+        }
+
+        match method {
+            "emit_ptx" | "emit_msl" | "name" => {
+                if !args.is_empty() {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: 0,
+                        actual: args.len(),
+                        span,
+                    }]);
+                }
+                Ok((Type::String, acc_row))
+            }
+            "params" => {
+                if !args.is_empty() {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: 0,
+                        actual: args.len(),
+                        span,
+                    }]);
+                }
+                Ok((Type::List(Box::new(Type::String)), acc_row))
+            }
+            "emit_spirv_words" => {
+                if args.len() > 1 {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: 1,
+                        actual: args.len(),
+                        span,
+                    }]);
+                }
+                if let Some(a) = args.first() {
+                    let (t, r) = self.infer_recover(a);
+                    acc_row = self.merge_rows(acc_row, r, a.span);
+                    if !matches!(t, Type::Error) {
+                        let c = SpannedConstraint::new(
+                            Constraint::Subtype {
+                                sub: Box::new(t),
+                                sup: Box::new(Type::Int),
+                            },
+                            a.span,
+                        );
+                        match unify::solve_spanned(&c, &self.subst) {
+                            Ok(s) => self.subst = s,
+                            Err(e) => self.errors.push(e),
+                        }
+                    }
+                }
+                Ok((Type::List(Box::new(Type::Int)), acc_row))
+            }
+            "launch" => {
+                if args.len() < 2 {
+                    return Err(vec![TypeError::ArityMismatch {
+                        expected: 2 + sig.map_or(0, |s| s.len()),
+                        actual: args.len(),
+                        span,
+                    }]);
+                }
+                // Check grid & block are `int`.
+                for (label, arg) in [("grid", &args[0]), ("block", &args[1])] {
+                    let (t, r) = self.infer_recover(arg);
+                    acc_row = self.merge_rows(acc_row, r, arg.span);
+                    if !matches!(t, Type::Error) {
+                        let c = SpannedConstraint::new(
+                            Constraint::Subtype {
+                                sub: Box::new(t),
+                                sup: Box::new(Type::Int),
+                            },
+                            arg.span,
+                        )
+                        .with_hint(format!("kernel.launch '{label}' dimension must be int"));
+                        match unify::solve_spanned(&c, &self.subst) {
+                            Ok(s) => self.subst = s,
+                            Err(e) => self.errors.push(e),
+                        }
+                    }
+                }
+                let kargs = &args[2..];
+                if let Some(param_tys) = sig {
+                    if kargs.len() != param_tys.len() {
+                        return Err(vec![TypeError::ArityMismatch {
+                            expected: 2 + param_tys.len(),
+                            actual: args.len(),
+                            span,
+                        }]);
+                    }
+                    // Static Device unification across ALL buffer tensor arguments in one launch!
+                    let unified_dev = crate::typeck::DeviceType::Var(self.fresh_type_var_id());
+                    for (idx, (pty, arg_w)) in param_tys.iter().zip(kargs.iter()).enumerate() {
+                        let (arg_ty, arg_row) = self.infer_recover(arg_w);
+                        acc_row = self.merge_rows(acc_row, arg_row, arg_w.span);
+                        if matches!(arg_ty, Type::Error) {
+                            continue;
+                        }
+                        let expected_ty = match pty {
+                            KernelParamType::BufF32 => Type::Tensor {
+                                dtype: Box::new(Type::Scalar(crate::common::DType::F32)),
+                                shape: ShapeType::Unranked(None),
+                                device: unified_dev.clone(),
+                            },
+                            KernelParamType::BufF64 => Type::Tensor {
+                                dtype: Box::new(Type::Float),
+                                shape: ShapeType::Unranked(None),
+                                device: unified_dev.clone(),
+                            },
+                            KernelParamType::F32 => Type::Union(vec![
+                                Type::Scalar(crate::common::DType::F32),
+                                Type::Float,
+                                Type::Int,
+                            ]),
+                            KernelParamType::F64 => Type::Union(vec![Type::Float, Type::Int]),
+                            KernelParamType::I32 => Type::Union(vec![
+                                Type::Int,
+                                Type::Scalar(crate::common::DType::I32),
+                            ]),
+                        };
+                        let c = SpannedConstraint::new(
+                            Constraint::Subtype {
+                                sub: Box::new(arg_ty),
+                                sup: Box::new(expected_ty),
+                            },
+                            arg_w.span,
+                        )
+                        .with_hint(format!(
+                            "kernel.launch argument #{} must match '{}' (all buffer tensors must share one device)",
+                            idx + 1,
+                            pty.canonical_name()
+                        ));
+                        match unify::solve_spanned(&c, &self.subst) {
+                            Ok(s) => self.subst = s,
+                            Err(e) => self.errors.push(e),
+                        }
+                    }
+                } else {
+                    for arg_w in kargs {
+                        let (_, arg_row) = self.infer_recover(arg_w);
+                        acc_row = self.merge_rows(acc_row, arg_row, arg_w.span);
+                    }
+                }
+                Ok((Type::Nil, acc_row))
+            }
+            other => Err(vec![TypeError::UnificationFailure {
+                expected: "gpu_kernel method ('launch', 'emit_ptx', 'emit_spirv_words', 'emit_msl', 'name', 'params')".to_string(),
+                got: format!("gpu_kernel.{other}"),
+                span: Some(span),
+            }]),
+        }
     }
 }

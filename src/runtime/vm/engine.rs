@@ -17,7 +17,7 @@ use std::sync::Arc;
 use crate::common::trait_info::{
     TraitInfo, TraitMethodSig, default_impl_method_key, impl_method_key,
 };
-use crate::common::{DType, ScalarValue, Span};
+use crate::common::{BinaryOp, DType, ScalarValue, Span};
 use crate::error::{MoraError, MoraResult};
 use crate::flow::{eval_binary_tracked, eval_unary_neg_tracked, is_truthy};
 use crate::mir::control::{
@@ -524,41 +524,39 @@ impl<'a> VmEngine<'a> {
                 )?;
                 Ok(Some(Value::ComputeDag(Arc::new(dag))))
             }
-            CombinatorFrame::StructInit {
-                def,
-                mut fields,
-                mut pending_defaults,
-                current_field,
-            } => {
-                fields.insert(current_field, reply);
-                if pending_defaults.is_empty() {
-                    let field_order = def.fields.iter().map(|f| f.name.clone()).collect();
+            CombinatorFrame::StructInit(mut st) => {
+                st.fields.insert(st.current_field, reply);
+                if st.pending_defaults.is_empty() {
+                    let final_consts = super::builtins::finalize_struct_const_args(
+                        &st.def,
+                        &st.const_args,
+                        &st.fields,
+                    )?;
+                    let field_order = st.def.fields.iter().map(|f| f.name.clone()).collect();
                     return Ok(Some(Value::StructInstance {
-                        type_name: def.name.clone(),
-                        fields,
+                        type_name: st.def.name.clone(),
+                        fields: st.fields,
                         field_order,
-                        def,
+                        const_args: final_consts,
+                        def: st.def,
                     }));
                 }
-                let (next_field, next_fn_id) = pending_defaults.remove(0);
+                let (next_field, next_fn_id) = st.pending_defaults.remove(0);
                 let thunk = Value::Task {
-                    name: format!("{}::<default>", def.name),
+                    name: format!("{}::<default>", st.def.name),
                     params: Vec::new(),
-                    program: Arc::clone(&def.program),
+                    program: Arc::clone(&st.def.program),
                     fn_id: next_fn_id,
-                    globals: Arc::clone(&def.globals),
+                    globals: Arc::clone(&st.def.globals),
                 };
+                st.current_field = next_field;
                 self.frames
-                    .push(CallFrame::Combinator(CombinatorFrame::StructInit {
-                        def,
-                        fields,
-                        pending_defaults,
-                        current_field: next_field,
-                    }));
+                    .push(CallFrame::Combinator(CombinatorFrame::StructInit(st)));
                 let action = resolve_value_call(thunk, Vec::new(), self.core)?;
                 self.apply_action_chained(action)?;
                 Ok(None)
             }
+            CombinatorFrame::BoolNot => Ok(Some(Value::Bool(!is_truthy(&reply)))),
             CombinatorFrame::WatermarkCallbacks {
                 final_result,
                 mut pending,
@@ -613,7 +611,7 @@ impl<'a> VmEngine<'a> {
                     callee,
                     args,
                 } => {
-                    self.frames.push(CallFrame::Combinator(combinator));
+                    self.frames.push(CallFrame::Combinator(*combinator));
                     action = resolve_value_call(callee, args, self.core)?;
                 }
                 CallAction::EvalSource { source } => {
@@ -677,7 +675,7 @@ impl<'a> VmEngine<'a> {
                     callee,
                     args,
                 } => {
-                    self.frames.push(CallFrame::Combinator(combinator));
+                    self.frames.push(CallFrame::Combinator(*combinator));
                     cur = resolve_value_call(callee, args, self.core)?;
                 }
                 CallAction::EvalSource { source } => {
@@ -1332,6 +1330,18 @@ impl<'a> VmEngine<'a> {
                     UnaryOp::Truthy => Value::Bool(is_truthy(v)),
                     UnaryOp::Not => Value::Bool(!is_truthy(v)),
                     UnaryOp::Neg => {
+                        if let Some((func, all_args)) = super::builtins::resolve_operator_impl(
+                            self.core,
+                            v,
+                            "Neg",
+                            "neg",
+                            Vec::new(),
+                        ) {
+                            return match resolve_value_call(func, all_args, self.core) {
+                                Ok(action) => self.suspend_and_dispatch(frame, dst, action),
+                                Err(e) => StepOutcome::Err(e),
+                            };
+                        }
                         match eval_unary_neg_tracked(v, Some(&mut self.core.autograd)) {
                             Ok(negated) => negated,
                             Err(e) => return StepOutcome::Err(e),
@@ -1344,6 +1354,42 @@ impl<'a> VmEngine<'a> {
             ControlInst::Binary(dst, lhs, op, rhs) => {
                 let l = frame.regs[lhs.0 as usize].clone();
                 let r = frame.regs[rhs.0 as usize].clone();
+                // P4-1A: Stackful trait-driven operator overloading on nominal types.
+                let trait_op = match op {
+                    BinaryOp::Add => Some(("Add", "add", false)),
+                    BinaryOp::Sub => Some(("Sub", "sub", false)),
+                    BinaryOp::Mul => Some(("Mul", "mul", false)),
+                    BinaryOp::Div => Some(("Div", "div", false)),
+                    BinaryOp::Mod => Some(("Mod", "rem", false)),
+                    BinaryOp::Pow => Some(("Pow", "pow", false)),
+                    BinaryOp::MatMul => Some(("MatMul", "matmul", false)),
+                    BinaryOp::Equal => Some(("Eq", "eq", false)),
+                    BinaryOp::NotEqual => Some(("Eq", "eq", true)),
+                    _ => None,
+                };
+                if let Some((tr_name, m_name, negate)) = trait_op
+                    && let Some((func, all_args)) = super::builtins::resolve_operator_impl(
+                        self.core,
+                        &l,
+                        tr_name,
+                        m_name,
+                        vec![r.clone()],
+                    )
+                {
+                    let action = if negate {
+                        Ok(CallAction::PushCombinator {
+                            combinator: Box::new(CombinatorFrame::BoolNot),
+                            callee: func,
+                            args: all_args,
+                        })
+                    } else {
+                        resolve_value_call(func, all_args, self.core)
+                    };
+                    return match action {
+                        Ok(a) => self.suspend_and_dispatch(frame, dst, a),
+                        Err(e) => StepOutcome::Err(e),
+                    };
+                }
                 match eval_binary_tracked(l, &op, r, Some(&mut self.core.autograd)) {
                     Ok(v) => {
                         frame.regs[dst.0 as usize] = v;
@@ -1578,6 +1624,101 @@ impl<'a> VmEngine<'a> {
                 match self.resolve_callee_named(frame, &target, arg_vals, named_vals) {
                     Ok(action) => self.suspend_and_dispatch(frame, dst, action),
                     Err(e) => StepOutcome::Err(e),
+                }
+            }
+            ControlInst::CallGeneric {
+                dst,
+                target,
+                const_args,
+                args,
+                named_args,
+            } => {
+                let arg_vals: Vec<Value> = args
+                    .iter()
+                    .map(|r| frame.regs[r.0 as usize].clone())
+                    .collect();
+                let named_vals: Vec<(String, Value)> = named_args
+                    .iter()
+                    .map(|(sym, r)| {
+                        (
+                            frame.program.symbols.resolve(*sym).to_string(),
+                            frame.regs[r.0 as usize].clone(),
+                        )
+                    })
+                    .collect();
+                let const_vals: Vec<(String, i64)> = const_args
+                    .iter()
+                    .map(|(sym, v)| (frame.program.symbols.resolve(*sym).to_string(), *v))
+                    .collect();
+                let action = match &target {
+                    CalleeTarget::Value(r) => match frame.regs[r.0 as usize].clone() {
+                        Value::StructType(def) => {
+                            super::builtins::construct_struct_instance_with_consts(
+                                def, const_vals, arg_vals, named_vals,
+                            )
+                        }
+                        other => resolve_value_call_named(other, arg_vals, named_vals, self.core),
+                    },
+                    CalleeTarget::DynGlobal(sym) => {
+                        let name = frame.program.symbols.resolve(*sym);
+                        if let Some((type_name, member)) = name.split_once("::") {
+                            if member == "new"
+                                && let Some(def) = self.core.struct_registry.get(type_name).cloned()
+                            {
+                                super::builtins::construct_struct_instance_with_consts(
+                                    def, const_vals, arg_vals, named_vals,
+                                )
+                            } else if let Some(edef) =
+                                self.core.enum_registry.get(type_name).cloned()
+                                && edef.variants.iter().any(|(v, _)| v == member)
+                            {
+                                super::builtins::construct_enum_variant_with_consts(
+                                    &edef, member, const_vals, arg_vals, named_vals,
+                                )
+                            } else {
+                                self.resolve_callee_named(frame, &target, arg_vals, named_vals)
+                            }
+                        } else if let Some(def) = self.core.struct_registry.get(name).cloned() {
+                            super::builtins::construct_struct_instance_with_consts(
+                                def, const_vals, arg_vals, named_vals,
+                            )
+                        } else {
+                            self.resolve_callee_named(frame, &target, arg_vals, named_vals)
+                        }
+                    }
+                    _ => self.resolve_callee_named(frame, &target, arg_vals, named_vals),
+                };
+                match action {
+                    Ok(a) => self.suspend_and_dispatch(frame, dst, a),
+                    Err(e) => StepOutcome::Err(e),
+                }
+            }
+            ControlInst::GetConstGeneric { dst, src, name } => {
+                let cname = frame.program.symbols.resolve(name);
+                match &frame.regs[src.0 as usize] {
+                    Value::StructInstance {
+                        type_name,
+                        const_args,
+                        ..
+                    }
+                    | Value::EnumVariant {
+                        enum_name: type_name,
+                        const_args,
+                        ..
+                    } => {
+                        if let Some((_, val)) = const_args.iter().find(|(k, _)| k == cname) {
+                            frame.regs[dst.0 as usize] = Value::Int(*val);
+                            StepOutcome::NextInst
+                        } else {
+                            StepOutcome::Err(MoraError::Runtime(format!(
+                                "const generic parameter '{cname}' is not bound on instance of '{type_name}'"
+                            )))
+                        }
+                    }
+                    other => StepOutcome::Err(MoraError::Runtime(format!(
+                        "cannot read const generic '{cname}' from non-nominal receiver {}",
+                        crate::flow::type_name(other)
+                    ))),
                 }
             }
             ControlInst::ModuleCall {
@@ -1936,6 +2077,8 @@ impl<'a> VmEngine<'a> {
             ControlInst::RegisterEnum {
                 name,
                 type_params,
+                const_params,
+                const_shape_bindings,
                 variants,
                 dst,
             } => {
@@ -1943,6 +2086,21 @@ impl<'a> VmEngine<'a> {
                 let tp_names: Vec<String> = type_params
                     .into_iter()
                     .map(|s| frame.program.symbols.resolve(s).to_string())
+                    .collect();
+                let cp_names: Vec<String> = const_params
+                    .into_iter()
+                    .map(|s| frame.program.symbols.resolve(s).to_string())
+                    .collect();
+                let csb: Vec<(String, String, usize, usize)> = const_shape_bindings
+                    .into_iter()
+                    .map(|(vs, cs, pidx, aidx)| {
+                        (
+                            frame.program.symbols.resolve(vs).to_string(),
+                            frame.program.symbols.resolve(cs).to_string(),
+                            pidx,
+                            aidx,
+                        )
+                    })
                     .collect();
                 let evs: Vec<(String, Vec<String>)> = variants
                     .into_iter()
@@ -1953,6 +2111,8 @@ impl<'a> VmEngine<'a> {
                 let def = Arc::new(EnumDefRuntime {
                     name: n.clone(),
                     type_params: tp_names,
+                    const_params: cp_names,
+                    const_shape_bindings: csb,
                     variants: evs,
                 });
                 self.core.register_enum_def(Arc::clone(&def));
@@ -1962,6 +2122,8 @@ impl<'a> VmEngine<'a> {
             ControlInst::RegisterStruct {
                 name,
                 type_params,
+                const_params,
+                const_shape_bindings,
                 fields,
                 dst,
             } => {
@@ -1969,6 +2131,14 @@ impl<'a> VmEngine<'a> {
                 let tp_names: Vec<String> = type_params
                     .into_iter()
                     .map(|s| frame.program.symbols.resolve(s).to_string())
+                    .collect();
+                let cp_names: Vec<String> = const_params
+                    .into_iter()
+                    .map(|s| frame.program.symbols.resolve(s).to_string())
+                    .collect();
+                let csb: Vec<(String, usize, usize)> = const_shape_bindings
+                    .into_iter()
+                    .map(|(s, fi, ai)| (frame.program.symbols.resolve(s).to_string(), fi, ai))
                     .collect();
                 let rt_fields: Vec<StructFieldRuntime> = fields
                     .into_iter()
@@ -1982,6 +2152,8 @@ impl<'a> VmEngine<'a> {
                 let def = Arc::new(StructDefRuntime {
                     name: n.clone(),
                     type_params: tp_names,
+                    const_params: cp_names,
+                    const_shape_bindings: csb,
                     fields: rt_fields,
                     program: Arc::clone(&frame.program),
                     globals: Arc::clone(&frame.globals),
@@ -2172,6 +2344,14 @@ impl<'a> VmEngine<'a> {
                 StepOutcome::NextInst
             }
             ControlInst::KeepAlive(_) => StepOutcome::NextInst,
+            ControlInst::RegisterKernel { name, program, dst } => {
+                let n = frame.program.symbols.resolve(name).to_string();
+                let compiled = Arc::new(
+                    crate::runtime::gpu::kernel_compiler::CompiledGpuKernel::from_program(*program),
+                );
+                self.store_registered_decl(frame, dst, n, Value::GpuKernel(compiled));
+                StepOutcome::NextInst
+            }
         }
     }
 

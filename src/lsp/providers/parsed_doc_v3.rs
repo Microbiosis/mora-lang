@@ -276,6 +276,11 @@ fn walk_witness_kind<F: FnMut(&MirWitness)>(kind: &WitnessKind, visit: &mut F) {
                 walk_witness(&m.body, visit);
             }
         }
+        WitnessKind::KernelDef { body, .. } => {
+            for s in body {
+                walk_witness(s, visit);
+            }
+        }
         WitnessKind::TypeAlias { .. }
         | WitnessKind::EnumDef { .. }
         | WitnessKind::Import(_)

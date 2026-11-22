@@ -174,7 +174,9 @@ fn token_of(e: &crate::mir::witness::MirWitness) -> Option<(String, f64)> {
             Some((format!("{}", n), IDX_FLOAT))
         }
         WitnessKind::Call { callee, .. } => match callee {
-            WitnessCallee::Name(n) | WitnessCallee::Var(n) => Some((n.clone(), IDX_FUNCTION)),
+            WitnessCallee::Name(n)
+            | WitnessCallee::GenericName { name: n, .. }
+            | WitnessCallee::Var(n) => Some((n.clone(), IDX_FUNCTION)),
             WitnessCallee::Method(_, m) => Some((m.clone(), IDX_FUNCTION)),
             _ => None,
         },

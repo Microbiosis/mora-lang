@@ -279,20 +279,74 @@ impl ParserV3 {
     /// 供形参/返回标注把裸名认作 `Type::TypeVar(TypeVarId::Rigid(name))`，
     /// 并返回完整参数名列表。重复名称报错。
     pub(super) fn parse_generic_clause(&mut self) -> Option<Vec<String>> {
+        self.parse_generic_clause_with_consts()
+            .map(|(names, _)| names)
+    }
+
+    /// P4-1A: Parse generic parameter clause `<T, const IN: int, const OUT: usize>`.
+    /// Returns `(all_param_names_in_order, const_param_names)`.
+    pub(super) fn parse_generic_clause_with_consts(
+        &mut self,
+    ) -> Option<(Vec<String>, Vec<String>)> {
         if !self.match_token(&[TokenType::Less]) {
-            return Some(Vec::new());
+            return Some((Vec::new(), Vec::new()));
         }
         let mut names: Vec<String> = Vec::new();
+        let mut consts: Vec<String> = Vec::new();
         loop {
-            let n = self.consume_identifier("Expected type parameter name")?;
-            if names.contains(&n) {
-                eprintln!(
-                    "Parse error: duplicate generic type parameter '{n}' at line {}",
-                    self.current_line()
-                );
-                return None;
+            let is_const = matches!(
+                self.peek().map(|t| &t.token_type),
+                Some(TokenType::Identifier(s)) if s == "const"
+            ) && matches!(
+                self.tokens.get(self.current + 1).map(|t| &t.token_type),
+                Some(TokenType::Identifier(_))
+            );
+            if is_const {
+                self.advance(); // consume 'const'
+                let cname = self.consume_identifier("Expected const generic parameter name")?;
+                self.consume(
+                    TokenType::Colon,
+                    "Expected ':' and integer type (int/usize) after const generic parameter name",
+                )?;
+                let ty_name = self.consume_identifier("Expected const generic type (int/usize)")?;
+                let lower = ty_name.to_lowercase();
+                if !matches!(lower.as_str(), "int" | "usize" | "i64" | "i32") {
+                    let msg = format!(
+                        "Parse error: const generic parameter '{}' must have integer type (int/usize), got '{}' at line {}",
+                        cname,
+                        ty_name,
+                        self.current_line()
+                    );
+                    eprintln!("{msg}");
+                    self.diag = Some(msg);
+                    return None;
+                }
+                if names.contains(&cname) {
+                    let msg = format!(
+                        "Parse error: duplicate generic parameter '{}' at line {}",
+                        cname,
+                        self.current_line()
+                    );
+                    eprintln!("{msg}");
+                    self.diag = Some(msg);
+                    return None;
+                }
+                names.push(cname.clone());
+                consts.push(cname);
+            } else {
+                let n = self.consume_identifier("Expected type parameter name")?;
+                if names.contains(&n) {
+                    let msg = format!(
+                        "Parse error: duplicate generic type parameter '{}' at line {}",
+                        n,
+                        self.current_line()
+                    );
+                    eprintln!("{msg}");
+                    self.diag = Some(msg);
+                    return None;
+                }
+                names.push(n);
             }
-            names.push(n);
             if self.match_token(&[TokenType::Comma]) {
                 continue;
             }
@@ -306,7 +360,7 @@ impl ParserV3 {
             return None;
         }
         self.generic_params = names.clone();
-        Some(names)
+        Some((names, consts))
     }
 
     pub(super) fn parse_type_annotation(&mut self) -> Option<crate::typeck::Type> {
@@ -390,6 +444,17 @@ impl ParserV3 {
                     name: "Self".to_string(),
                     generics: Vec::new(),
                 })
+            }
+            // P4-1A: Compile-time integer const-generic argument in type annotations (`Linear<4, 3>`).
+            TokenType::Int(n) => {
+                let val = *n;
+                self.advance();
+                Some(Type::ConstInt(val))
+            }
+            TokenType::TypedInt(n, _) => {
+                let val = *n;
+                self.advance();
+                Some(Type::ConstInt(val))
             }
             TokenType::Identifier(name) => {
                 let orig_name = name.clone();
@@ -480,6 +545,7 @@ impl ParserV3 {
                     "compute_dag" | "computedag" => Type::ComputeDag,
                     "kv_allocator" | "kvallocator" => Type::KVAllocator,
                     "memory_pool" | "memorypool" => Type::MemoryPool,
+                    "gpu_kernel" | "gpukernel" => Type::GpuKernel(None),
                     "channel" => Type::Channel(Box::new(Type::Any)),
                     "task_handle" | "taskhandle" => Type::TaskHandle(Box::new(Type::Any)),
                     "tensor" => Type::any_tensor(),

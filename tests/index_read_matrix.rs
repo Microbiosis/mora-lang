@@ -218,11 +218,10 @@ fn d361_index_assignment_has_no_reachable_syntax() {
     }
 }
 
-/// **源码层断言**：`IndexAssign` 在 MIR/typeck 层有定义，但 parser 侧零构造。
-///
-/// 脚本层只能证明「不可达」，**无法区分**「未接通」与「设计上不支持」。
-/// 源码判据给出关键证据：`WitnessKind::IndexAssign` 在 `witness.rs` 有
-/// 完整定义与 children 处理，却没有**任何** parser 侧的构造点。
+/// **源码层断言**：`IndexAssign` 在 MIR/typeck 层有定义，且在 v0.111.0（P4-1B）之后
+/// 仅在 `parser_v3` 的 GPU `kernel ... end` 体（`self.scope.in_kernel_body`）内构造 1 处
+/// 用于全局显存缓冲写入 `buf[idx] = expr`；常规 Mora 宿主代码中的 `list`/`dict` 下标赋值
+/// 仍不可达（由 `d361_index_assignment_has_no_reachable_syntax` 钉住）。
 #[test]
 fn d361_index_assign_defined_in_mir_but_never_built_by_parser() {
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
@@ -234,20 +233,28 @@ fn d361_index_assign_defined_in_mir_but_never_built_by_parser() {
         "`WitnessKind::IndexAssign` 应仍定义在 witness.rs"
     );
 
-    // parser 侧：零构造
+    // parser 侧：严格仅在 `in_kernel_body` 守卫下出现 1 处（GPU `kernel` 全局缓冲写入）
     let mut parser_hits = 0usize;
+    let mut kernel_guarded = false;
     for entry in std::fs::read_dir(format!("{root}/parser_v3")).expect("读 parser_v3") {
         let p = entry.expect("dir entry").path();
         if p.extension().and_then(|s| s.to_str()) != Some("rs") {
             continue;
         }
         let src = std::fs::read_to_string(&p).expect("读 rs");
-        parser_hits += src.matches("IndexAssign").count();
+        let hits = src.matches("IndexAssign").count();
+        parser_hits += hits;
+        if hits > 0 && src.contains("self.scope.in_kernel_body") {
+            kernel_guarded = true;
+        }
     }
     assert_eq!(
-        parser_hits, 0,
-        "parser_v3 里出现了 IndexAssign 构造 —— 索引赋值可能已接通，\
-         本文件「未接通」的结论需重新评估（parser 命中 {parser_hits} 处）"
+        parser_hits, 1,
+        "parser_v3 中 IndexAssign 应仅在 GPU kernel 体缓冲写入路径出现 1 处（实得 {parser_hits} 处）"
+    );
+    assert!(
+        kernel_guarded,
+        "parser_v3 的 IndexAssign 构造必须受 `self.scope.in_kernel_body` 严格守卫"
     );
 
     // 但控制 IR 管线确实在传递它（否则就不是「死代码」而是「没实现」）

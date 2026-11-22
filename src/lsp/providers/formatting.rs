@@ -482,6 +482,7 @@ fn is_spaced_before_paren(ident: &str) -> bool {
             | "handle"
             | "trait"
             | "impl"
+            | "kernel"
             | "export"
             | "assign"
     )
@@ -569,6 +570,7 @@ fn is_block_opener_ctx(
                     | "transaction"
                     | "trait"
                     | "impl"
+                    | "kernel"
                     | "select"
             ) =>
         {

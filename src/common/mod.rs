@@ -4,6 +4,7 @@
 
 pub mod dtype;
 pub(crate) mod dynlib;
+pub mod kernel_ir;
 pub mod lock;
 pub mod sync;
 pub mod sys;

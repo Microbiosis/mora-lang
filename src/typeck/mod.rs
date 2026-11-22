@@ -260,6 +260,10 @@ pub enum Type {
         shape: ShapeType,
         device: DeviceType,
     },
+    /// P4-1A: Compile-time integer const-generic argument (e.g., `4` in `Linear<4, 3>`).
+    ConstInt(i64),
+    /// P4-1B: First-class compiled GPU `kernel` block value with optional typed parameter signature.
+    GpuKernel(Option<Vec<crate::common::kernel_ir::KernelParamType>>),
 } // ← close pub enum Type
 
 impl Type {
@@ -432,6 +436,14 @@ impl Type {
             Type::ComputeDag => "compute_dag".to_string(),
             Type::KVAllocator => "kv_allocator".to_string(),
             Type::MemoryPool => "memory_pool".to_string(),
+            Type::ConstInt(n) => n.to_string(),
+            Type::GpuKernel(params) => match params {
+                Some(ps) => {
+                    let parts: Vec<&str> = ps.iter().map(|p| p.canonical_name()).collect();
+                    format!("gpu_kernel({})", parts.join(", "))
+                }
+                None => "gpu_kernel".to_string(),
+            },
             Type::Scalar(dt) => dt.canonical_type_name().to_string(),
             Type::Tensor {
                 dtype,
@@ -477,6 +489,7 @@ impl Type {
             "compute_dag" | "computedag" => Type::ComputeDag,
             "kv_allocator" | "kvallocator" => Type::KVAllocator,
             "memory_pool" | "memorypool" => Type::MemoryPool,
+            "gpu_kernel" | "gpukernel" | "kernel" => Type::GpuKernel(None),
             "tensor" | "Tensor" => Type::any_tensor(),
             "task" => Type::Task,
             "closure" => Type::Closure,
@@ -763,6 +776,12 @@ impl Type {
         if let (Type::TraitObject { .. }, Type::TraitObject { .. }) = (self, expected) {
             return true;
         }
+        if let (Type::GpuKernel(a), Type::GpuKernel(b)) = (self, expected) {
+            return match (a, b) {
+                (None, _) | (_, None) => true,
+                (Some(pa), Some(pb)) => pa == pb,
+            };
+        }
         self == expected
     }
 
@@ -932,6 +951,12 @@ impl Type {
         }
         if let (Type::Cons(h1, t1), Type::Cons(h2, t2)) = (self, super_ty) {
             return h1.subtype_of(h2) && t1.subtype_of(t2);
+        }
+        if let (Type::GpuKernel(a), Type::GpuKernel(b)) = (self, super_ty) {
+            return match (a, b) {
+                (_, None) | (None, _) => true,
+                (Some(pa), Some(pb)) => pa == pb,
+            };
         }
         self == super_ty
     }

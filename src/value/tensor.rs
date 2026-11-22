@@ -568,6 +568,14 @@ impl TensorStorage {
         }
     }
 
+    /// Mark host shadow buffer stale after an in-place GPU kernel wrote directly to VRAM.
+    #[inline]
+    pub(crate) fn mark_host_stale(&self) {
+        if self.vram.read().is_some() {
+            self.host_stale.store(true, Ordering::Release);
+        }
+    }
+
     /// Return `true` when this storage currently holds an active physical GPU [`DeviceVramBuffer`].
     #[inline]
     pub(crate) fn is_vram_resident(&self) -> bool {
@@ -817,6 +825,52 @@ impl Tensor {
         } else {
             None
         }
+    }
+
+    /// Mark this tensor's host copy stale after an in-place GPU kernel mutated its VRAM buffer.
+    #[inline]
+    pub(crate) fn mark_host_stale(&self) {
+        self.storage.mark_host_stale();
+    }
+
+    /// Overwrite a contiguous zero-offset `f32` tensor's storage from CPU kernel execution output.
+    pub(crate) fn overwrite_contiguous_f32(&self, vals: &[f32]) -> MoraResult<()> {
+        if self.dtype != DType::F32 || !self.is_contiguous() || self.offset != 0 {
+            return Err(MoraError::Runtime(
+                "overwrite_contiguous_f32 requires a contiguous zero-offset f32 Tensor".to_string(),
+            ));
+        }
+        let mut raw = Vec::with_capacity(vals.len() * 4);
+        for &v in vals {
+            raw.extend_from_slice(&v.to_le_bytes());
+        }
+        let next = AlignedByteBuffer::from_raw_bytes(&raw, vals.len(), DType::F32)?;
+        {
+            let mut guard = self.storage.write_host();
+            *guard = next;
+        }
+        self.storage.sync_host_to_vram();
+        Ok(())
+    }
+
+    /// Overwrite a contiguous zero-offset `f64` tensor's storage from CPU kernel execution output.
+    pub(crate) fn overwrite_contiguous_f64(&self, vals: &[f64]) -> MoraResult<()> {
+        if self.dtype != DType::F64 || !self.is_contiguous() || self.offset != 0 {
+            return Err(MoraError::Runtime(
+                "overwrite_contiguous_f64 requires a contiguous zero-offset f64 Tensor".to_string(),
+            ));
+        }
+        let mut raw = Vec::with_capacity(vals.len() * 8);
+        for &v in vals {
+            raw.extend_from_slice(&v.to_le_bytes());
+        }
+        let next = AlignedByteBuffer::from_raw_bytes(&raw, vals.len(), DType::F64)?;
+        {
+            let mut guard = self.storage.write_host();
+            *guard = next;
+        }
+        self.storage.sync_host_to_vram();
+        Ok(())
     }
 
     /// Construct a contiguous compact tensor losslessly from `Value`s.

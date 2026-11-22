@@ -315,6 +315,7 @@ fn match_pattern_inner(
                 enum_name: v_enum,
                 variant: v_name,
                 payload,
+                ..
             } = val
             else {
                 return false;

@@ -346,6 +346,23 @@ kernel void mora_fused_elementwise_f32(
 }
 "#;
 
+#[cfg(any(target_os = "macos", test))]
+fn pack_metal_custom_kernel_scalars(
+    args: &[crate::runtime::gpu::kernel_compiler::KernelLaunchArg],
+) -> Vec<u32> {
+    use crate::runtime::gpu::kernel_compiler::KernelLaunchArg;
+    let mut words = Vec::new();
+    for arg in args {
+        match arg {
+            KernelLaunchArg::VramBuffer { .. } => {}
+            KernelLaunchArg::F32(v) => words.push(v.to_bits()),
+            KernelLaunchArg::F64(v) => words.push((*v as f32).to_bits()),
+            KernelLaunchArg::I32(v) => words.push(*v as u32),
+        }
+    }
+    words
+}
+
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn probe_metal_backends() -> Vec<HardwareBackendEntry> {
     Vec::new()
@@ -353,10 +370,12 @@ pub(crate) fn probe_metal_backends() -> Vec<HardwareBackendEntry> {
 
 #[cfg(target_os = "macos")]
 mod macos_impl {
+    use std::collections::HashMap;
     use std::ffi::{CStr, c_char, c_void};
     use std::ptr;
     use std::sync::Arc;
 
+    use crate::common::kernel_ir::KernelProgram;
     use crate::common::sync::Mutex;
     use crate::common::{
         DType, Device, bf16_bits_to_f64, f16_bits_to_f64, f64_to_bf16_bits, f64_to_f16_bits,
@@ -365,10 +384,11 @@ mod macos_impl {
     use crate::runtime::compute_dag::{
         DeviceBackend, DeviceVramBuffer, FusedAct, FusedEwStep, VramTelemetry,
     };
+    use crate::runtime::gpu::kernel_compiler::{KernelLaunchArg, emit_msl};
     use crate::runtime::gpu::{DynLib, GpuDeviceInfo, HardwareBackendEntry, VramCounters};
     use crate::runtime::simd_kernels;
 
-    use super::MORA_METAL_MSL;
+    use super::{MORA_METAL_MSL, pack_metal_custom_kernel_scalars};
 
     type Id = *mut c_void;
     type Sel = *mut c_void;
@@ -497,6 +517,7 @@ mod macos_impl {
         pipe_flash_attn_f32: Id,
         pipe_fused_ew_f32: Id,
         dummy_buf: Id,
+        custom_pipes: HashMap<u64, Id>,
     }
 
     struct MetalDeviceInner {
@@ -513,7 +534,10 @@ mod macos_impl {
 
     impl Drop for MetalDeviceInner {
         fn drop(&mut self) {
-            let st = self.state.lock();
+            let mut st = self.state.lock();
+            for (_, pipe) in st.custom_pipes.drain() {
+                self.objc.release(pipe);
+            }
             self.objc.release(st.dummy_buf);
             self.objc.release(st.pipe_fused_ew_f32);
             self.objc.release(st.pipe_flash_attn_f32);
@@ -2184,6 +2208,107 @@ mod macos_impl {
             }
             Ok(())
         }
+
+        fn launch_custom_kernel(
+            &self,
+            kernel: &KernelProgram,
+            grid: [u32; 3],
+            block: [u32; 3],
+            args: &[KernelLaunchArg],
+        ) -> MoraResult<bool> {
+            // Metal Shading Language does not support 64-bit IEEE float compute buffers;
+            // fall back cleanly to the bounds-checked CPU executor for `f64` kernels.
+            if kernel.uses_f64() {
+                return Ok(false);
+            }
+            let hash = kernel.content_hash();
+            let mut st = self.inner.state.lock();
+            let pipeline = if let Some(&p) = st.custom_pipes.get(&hash) {
+                p
+            } else {
+                let msl_src = emit_msl(kernel);
+                // SAFETY: Compiles generated MSL source on `st.mtl_dev` via `newLibraryWithSource:options:error:`
+                // and extracts the named compute pipeline state, releasing temporary ObjC objects immediately.
+                let compiled = unsafe {
+                    let s_new_lib = (self.inner.objc.sel)(
+                        b"newLibraryWithSource:options:error:\0".as_ptr() as *const c_char,
+                    );
+                    let ns_src = self.inner.objc.make_nsstring(&msl_src);
+                    let mut err: Id = ptr::null_mut();
+                    let lib = (self.inner.objc.msg_new_lib)(
+                        st.mtl_dev,
+                        s_new_lib,
+                        ns_src,
+                        ptr::null_mut(),
+                        &raw mut err,
+                    );
+                    self.inner.objc.release(ns_src);
+                    if lib.is_null() {
+                        return Err(MoraError::Runtime(format!(
+                            "Metal MSL compilation failed for custom kernel '{}'",
+                            kernel.name
+                        )));
+                    }
+                    let pipe = build_pipeline(&self.inner.objc, st.mtl_dev, lib, &kernel.name);
+                    self.inner.objc.release(lib);
+                    pipe.ok_or_else(|| {
+                        MoraError::Runtime(format!(
+                            "Metal pipeline creation failed for custom kernel '{}'",
+                            kernel.name
+                        ))
+                    })?
+                };
+                st.custom_pipes.insert(hash, compiled);
+                compiled
+            };
+
+            let mut buffers: Vec<Id> = Vec::with_capacity(args.len() + 1);
+            for arg in args {
+                if let KernelLaunchArg::VramBuffer { handle, .. } = arg {
+                    let ptr_id = *handle as Id;
+                    if ptr_id.is_null() {
+                        return Ok(false);
+                    }
+                    buffers.push(ptr_id);
+                }
+            }
+            let scalar_words = pack_metal_custom_kernel_scalars(args);
+            let mut temps: Vec<Id> = Vec::new();
+            let run = (|| -> MoraResult<()> {
+                if !scalar_words.is_empty() {
+                    let h_scalars = Self::upload_temp_slice(
+                        &self.inner.objc,
+                        st.mtl_dev,
+                        &mut temps,
+                        &scalar_words,
+                    )?;
+                    buffers.push(h_scalars);
+                }
+                let total_grid = MtlSize {
+                    width: (grid[0].max(1) as usize).saturating_mul(block[0].max(1) as usize),
+                    height: (grid[1].max(1) as usize).saturating_mul(block[1].max(1) as usize),
+                    depth: (grid[2].max(1) as usize).saturating_mul(block[2].max(1) as usize),
+                };
+                let tg = MtlSize {
+                    width: block[0].max(1) as usize,
+                    height: block[1].max(1) as usize,
+                    depth: block[2].max(1) as usize,
+                };
+                Self::dispatch_compute(
+                    &self.inner.objc,
+                    st.queue,
+                    pipeline,
+                    &buffers,
+                    total_grid,
+                    tg,
+                )?;
+                self.inner.counters.on_vram_hit();
+                Ok(())
+            })();
+            Self::release_temps(&self.inner.objc, temps);
+            run?;
+            Ok(true)
+        }
     }
 
     fn build_pipeline(objc: &ObjC, mtl_dev: Id, lib: Id, fn_name: &str) -> Option<Id> {
@@ -2326,6 +2451,7 @@ mod macos_impl {
                     pipe_flash_attn_f32,
                     pipe_fused_ew_f32,
                     dummy_buf,
+                    custom_pipes: HashMap::new(),
                 }),
                 counters: VramCounters::default(),
             });
@@ -2345,7 +2471,9 @@ pub(crate) fn probe_metal_backends() -> Vec<HardwareBackendEntry> {
 
 #[cfg(test)]
 mod tests {
-    use super::MORA_METAL_MSL;
+    use super::{MORA_METAL_MSL, pack_metal_custom_kernel_scalars};
+    use crate::common::kernel_ir::{KernelParam, KernelParamType, KernelProgram};
+    use crate::runtime::gpu::kernel_compiler::{KernelLaunchArg, emit_msl};
 
     #[test]
     fn metal_msl_defines_all_six_kernels_and_balanced_braces() {
@@ -2365,5 +2493,42 @@ mod tests {
         let opens = MORA_METAL_MSL.matches('{').count();
         let closes = MORA_METAL_MSL.matches('}').count();
         assert_eq!(opens, closes, "unbalanced braces in Metal MSL source");
+    }
+
+    #[test]
+    fn metal_custom_kernel_scalar_packing_matches_msl_buffer_layout() {
+        let prog = KernelProgram {
+            name: "saxpy_msl".to_string(),
+            params: vec![
+                KernelParam {
+                    name: "x".to_string(),
+                    ty: KernelParamType::BufF32,
+                },
+                KernelParam {
+                    name: "y".to_string(),
+                    ty: KernelParamType::BufF32,
+                },
+                KernelParam {
+                    name: "alpha".to_string(),
+                    ty: KernelParamType::F32,
+                },
+                KernelParam {
+                    name: "n".to_string(),
+                    ty: KernelParamType::I32,
+                },
+            ],
+            body: Vec::new(),
+        };
+        let msl = emit_msl(&prog);
+        assert!(msl.contains("device float* x [[buffer(0)]]"));
+        assert!(msl.contains("device float* y [[buffer(1)]]"));
+        assert!(msl.contains("constant _MoraKernelParams& _kp [[buffer(2)]]"));
+        assert!(msl.contains("float alpha;"));
+        assert!(msl.contains("int n;"));
+        let words = pack_metal_custom_kernel_scalars(&[
+            KernelLaunchArg::F32(2.5),
+            KernelLaunchArg::I32(-7),
+        ]);
+        assert_eq!(words, vec![2.5f32.to_bits(), (-7i32) as u32]);
     }
 }

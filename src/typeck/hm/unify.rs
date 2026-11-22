@@ -95,10 +95,21 @@ impl Substitution {
     fn apply_with_bound(&self, ty: &Type, bound: &HashSet<TypeVarId>) -> Type {
         match ty {
             Type::TypeVar(id) => {
-                if !bound.contains(id)
-                    && let Some(resolved) = self.mapping.get(id)
-                {
-                    return self.apply_with_bound(resolved, bound);
+                if !bound.contains(id) {
+                    if let Some(resolved) = self.mapping.get(id) {
+                        return self.apply_with_bound(resolved, bound);
+                    }
+                    if let TypeVarId::Meta(dim_id) = id
+                        && let Some(resolved_dim) = self.dim_mapping.get(dim_id)
+                    {
+                        match self.apply_dim(resolved_dim) {
+                            DimExpr::Known(n) => return Type::ConstInt(n as i64),
+                            DimExpr::Symbolic(sym) => {
+                                return Type::TypeVar(TypeVarId::Rigid(sym));
+                            }
+                            DimExpr::Var(_) => {}
+                        }
+                    }
                 }
                 ty.clone()
             }
@@ -217,11 +228,17 @@ impl Substitution {
         }
 
         let mut new_mapping = self.mapping.clone();
+        let mut new_dims = self.dim_mapping.clone();
+        if let (TypeVarId::Meta(dim_id), Type::ConstInt(n)) = (&var, &ty)
+            && *n >= 0
+        {
+            new_dims.insert(*dim_id, DimExpr::Known(*n as usize));
+        }
         new_mapping.insert(var, ty);
         Ok(Self {
             mapping: new_mapping,
             row_mapping: self.row_mapping.clone(),
-            dim_mapping: self.dim_mapping.clone(),
+            dim_mapping: new_dims,
             shape_mapping: self.shape_mapping.clone(),
             device_mapping: self.device_mapping.clone(),
         })
@@ -574,6 +591,12 @@ fn unify_dim_at(
         (DimExpr::Var(id1), DimExpr::Var(id2)) if id1 == id2 => Ok(()),
         (DimExpr::Var(id), other) | (other, DimExpr::Var(id)) => {
             subst.dim_mapping.insert(*id, other.clone());
+            if let DimExpr::Known(n) = other {
+                subst
+                    .mapping
+                    .entry(TypeVarId::Meta(*id))
+                    .or_insert(Type::ConstInt(*n as i64));
+            }
             Ok(())
         }
         _ => Err(TypeError::UnificationFailure {
@@ -824,6 +847,15 @@ fn unify_at(
                 }))
             }
         }
+        (Type::GpuKernel(a), Type::GpuKernel(b)) => match (a, b) {
+            (None, _) | (_, None) => Ok(subst.clone()),
+            (Some(pa), Some(pb)) if pa == pb => Ok(subst.clone()),
+            _ => Err(TypeError::UnificationFailure {
+                expected: format_type(&t1),
+                got: format_type(&t2),
+                span,
+            }),
+        },
         _ if t1 == t2 => Ok(subst.clone()),
         _ => Err(TypeError::UnificationFailure {
             expected: format_type(&t1),
@@ -1039,6 +1071,15 @@ fn unify_subtype_at(
             }
             Ok(s)
         }
+        (Type::GpuKernel(a), Type::GpuKernel(b)) => match (a, b) {
+            (None, _) | (_, None) => Ok(subst.clone()),
+            (Some(pa), Some(pb)) if pa == pb => Ok(subst.clone()),
+            _ => Err(TypeError::UnificationFailure {
+                expected: format_type(&t_sup),
+                got: format_type(&t_sub),
+                span,
+            }),
+        },
         (Type::Arrow(i1, o1, r1), Type::Arrow(i2, o2, r2)) => {
             // Contravariant arg, covariant return, subsumed effect row.
             let s1 = unify_subtype_at(i2, i1, subst, span)?;

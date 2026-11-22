@@ -156,6 +156,16 @@ pub struct HandleBarrierState {
     pub auto_resume: bool,
 }
 
+/// Boxed state for evaluating omitted `struct` field default initializers on the VM stack.
+#[derive(Debug, Clone)]
+pub struct StructInitState {
+    pub def: Arc<crate::value::StructDefRuntime>,
+    pub fields: HashMap<String, Value>,
+    pub const_args: Vec<(String, i64)>,
+    pub pending_defaults: Vec<(String, FnId)>,
+    pub current_field: String,
+}
+
 /// Iterative state machine frames for higher-order builtins and collection methods.
 #[derive(Debug, Clone)]
 pub enum CombinatorFrame {
@@ -212,12 +222,9 @@ pub enum CombinatorFrame {
         leaf_nodes: Vec<usize>,
     },
     /// Evaluates omitted `struct` field default initializers on the VM stack.
-    StructInit {
-        def: Arc<crate::value::StructDefRuntime>,
-        fields: HashMap<String, Value>,
-        pending_defaults: Vec<(String, FnId)>,
-        current_field: String,
-    },
+    StructInit(Box<StructInitState>),
+    /// P4-1A: Negates boolean result returned from `Eq::eq` when evaluating `!=` on overloaded types.
+    BoolNot,
     /// Dispatches rising-edge memory watermark callbacks outside allocator locks
     /// on the stackful VM frame stack before yielding `final_result`.
     WatermarkCallbacks {

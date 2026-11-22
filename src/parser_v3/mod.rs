@@ -147,6 +147,9 @@ fn witness_depth(roots: &[MirWitness]) -> (usize, Span) {
 pub(super) struct ParserScope {
     pub(super) is_program_top: bool,
     pub(super) parse_loop_depth: usize,
+    /// P4-1B: True only while parsing statements inside a `kernel ... end` GPU body,
+    /// where imperative global-buffer stores `buf[idx] = expr` are legal.
+    pub(super) in_kernel_body: bool,
 }
 
 ///  ParserV3 —— witness-native 语法前端（零 AST 中间层）
@@ -189,17 +192,24 @@ pub struct ParserV3 {
 
 impl ParserV3 {
     pub fn new(tokens: Vec<Token>, source: &str) -> Self {
+        let mut declared_type_names = std::collections::HashSet::new();
+        for op_trait in [
+            "Add", "Sub", "Mul", "Div", "Mod", "Pow", "MatMul", "Eq", "Neg",
+        ] {
+            declared_type_names.insert(op_trait.to_string());
+        }
         Self {
             tokens,
             current: 0,
             diag: None,
             generic_params: Vec::new(),
-            declared_type_names: std::collections::HashSet::new(),
+            declared_type_names,
             in_struct_field_default: false,
             virtual_modules: None,
             scope: ParserScope {
                 is_program_top: true,
                 parse_loop_depth: 0,
+                in_kernel_body: false,
             },
             witnesses: Vec::new(),
             source: source.to_string(),
@@ -215,6 +225,7 @@ impl ParserV3 {
             ParserScope {
                 is_program_top: false,
                 parse_loop_depth: 0,
+                in_kernel_body: false,
             },
         );
         let result = f(self);

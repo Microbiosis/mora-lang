@@ -600,15 +600,18 @@ pub fn values_equal(a: &Value, b: &Value) -> bool {
                 enum_name: ea,
                 variant: va,
                 payload: pa,
+                const_args: ca,
             },
             Value::EnumVariant {
                 enum_name: eb,
                 variant: vb,
                 payload: pb,
+                const_args: cb,
             },
         ) => {
             ea == eb
                 && va == vb
+                && ca == cb
                 && pa.len() == pb.len()
                 && pa
                     .iter()
@@ -748,6 +751,7 @@ pub fn type_name(value: &Value) -> &'static str {
         Value::ComputeDag(_) => "compute_dag",
         Value::KVAllocator(_) => "kv_allocator",
         Value::MemoryPool(_) => "memory_pool",
+        Value::GpuKernel(_) => "gpu_kernel",
         Value::Tensor(_) => "tensor",
         Value::StructType(_) => "struct_type",
         Value::StructInstance { .. } => "struct",

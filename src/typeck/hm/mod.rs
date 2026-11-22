@@ -67,6 +67,7 @@ pub struct StructFieldTypeDef {
 pub struct StructTypeDef {
     pub name: String,
     pub type_params: Vec<String>,
+    pub const_params: Vec<String>,
     pub fields: Vec<StructFieldTypeDef>,
 }
 
@@ -75,6 +76,7 @@ pub struct StructTypeDef {
 pub struct EnumTypeDef {
     pub name: String,
     pub type_params: Vec<String>,
+    pub const_params: Vec<String>,
     pub variants: Vec<(String, Vec<Type>)>,
 }
 
@@ -820,6 +822,7 @@ impl HMInference {
             "compute_dag" | "computedag" => Type::ComputeDag,
             "kv_allocator" | "kvallocator" => Type::KVAllocator,
             "memory_pool" | "memorypool" => Type::MemoryPool,
+            "gpu_kernel" | "gpukernel" => Type::GpuKernel(None),
             "list" => Type::List(Box::new(gen_tys.into_iter().next().unwrap_or(Type::Any))),
             "dict" => {
                 let mut it = gen_tys.into_iter();
@@ -938,10 +941,56 @@ impl HMInference {
     }
 
     fn precompute_type_defs(&mut self, exprs: &[MirWitness]) {
+        // P4-1A: Pre-register built-in operator traits (`Add`/`Sub`/`Mul`/`Div`/`Mod`/`Pow`/`MatMul`/`Eq`/`Neg`)
+        // so `impl Add for Vec2` works out of the box while allowing explicit `trait Add` overrides.
+        let builtin_bin_ops = [
+            ("Add", "add", Type::Any),
+            ("Sub", "sub", Type::Any),
+            ("Mul", "mul", Type::Any),
+            ("Div", "div", Type::Any),
+            ("Mod", "rem", Type::Any),
+            ("Pow", "pow", Type::Any),
+            ("MatMul", "matmul", Type::Any),
+            ("Eq", "eq", Type::Bool),
+        ];
+        for (tr_name, m_name, ret_ty) in builtin_bin_ops {
+            self.trait_defs
+                .entry(tr_name.to_string())
+                .or_insert_with(|| TraitTypeDef {
+                    name: tr_name.to_string(),
+                    type_params: Vec::new(),
+                    parents: Vec::new(),
+                    methods: vec![TraitMethodTypeSig {
+                        name: m_name.to_string(),
+                        type_params: Vec::new(),
+                        params: vec![("rhs".to_string(), Type::Any, false)],
+                        return_type: ret_ty,
+                        has_self: true,
+                        has_default: false,
+                    }],
+                });
+        }
+        self.trait_defs
+            .entry("Neg".to_string())
+            .or_insert_with(|| TraitTypeDef {
+                name: "Neg".to_string(),
+                type_params: Vec::new(),
+                parents: Vec::new(),
+                methods: vec![TraitMethodTypeSig {
+                    name: "neg".to_string(),
+                    type_params: Vec::new(),
+                    params: Vec::new(),
+                    return_type: Type::Any,
+                    has_self: true,
+                    has_default: false,
+                }],
+            });
+
         MirWitness::visit_preorder(exprs, |w| match &w.kind {
             WitnessKind::StructDef {
                 name,
                 type_params,
+                const_params,
                 fields,
             } => {
                 let fs = fields
@@ -958,6 +1007,7 @@ impl HMInference {
                     StructTypeDef {
                         name: name.clone(),
                         type_params: type_params.clone(),
+                        const_params: const_params.clone(),
                         fields: fs,
                     },
                 );
@@ -965,6 +1015,7 @@ impl HMInference {
             WitnessKind::EnumDef {
                 name,
                 type_params,
+                const_params,
                 variants,
             } => {
                 let vs = variants
@@ -984,9 +1035,14 @@ impl HMInference {
                     EnumTypeDef {
                         name: name.clone(),
                         type_params: type_params.clone(),
+                        const_params: const_params.clone(),
                         variants: vs,
                     },
                 );
+            }
+            WitnessKind::KernelDef { name, params, .. } => {
+                let sig = params.iter().map(|p| p.ty).collect();
+                self.env.add(name.clone(), Type::GpuKernel(Some(sig)));
             }
             WitnessKind::TypeAlias { name, target } => {
                 self.type_aliases
@@ -1424,7 +1480,9 @@ impl HMInference {
                             stack.push(Task::Visit(a));
                         }
                         match callee {
-                            WitnessCallee::Var(n) | WitnessCallee::Name(n) => {
+                            WitnessCallee::Var(n)
+                            | WitnessCallee::Name(n)
+                            | WitnessCallee::GenericName { name: n, .. } => {
                                 if let Some(r) = table.get(n) {
                                     cur_row = Self::union_effect_rows(&cur_row, r);
                                 }
@@ -1599,7 +1657,10 @@ impl HMInference {
                         args,
                         named_args,
                     } => {
-                        if let WitnessCallee::Var(name) | WitnessCallee::Name(name) = callee {
+                        if let WitnessCallee::Var(name)
+                        | WitnessCallee::Name(name)
+                        | WitnessCallee::GenericName { name, .. } = callee
+                        {
                             stack.push(Task::CheckCall(w.span, name));
                         }
                         for (_, a) in named_args.iter().rev() {
@@ -1801,6 +1862,18 @@ impl HMInference {
                 ChainTask::ApplyUnaryNeg { span } => {
                     let (arg_ty, arg_row) = vals.pop().expect("unary neg arg present");
                     let resolved = self.subst.apply(&arg_ty);
+                    if let Some(res) = self.try_infer_unary_op_overload(
+                        &resolved,
+                        "Neg",
+                        "neg",
+                        arg_row.clone(),
+                        span,
+                    ) {
+                        let (out_ty, out_row) = res?;
+                        self.record_span_type(span, &out_ty);
+                        vals.push((out_ty, out_row));
+                        continue;
+                    }
                     let out_ty = match &resolved {
                         Type::Error => Type::Error,
                         Type::Int | Type::Float | Type::Any | Type::TypeVar(_) => resolved,
@@ -2187,13 +2260,15 @@ impl HMInference {
             WitnessKind::StructDef {
                 name,
                 type_params,
+                const_params,
                 fields,
-            } => self.infer_struct_def(name, type_params, fields, expr.span),
+            } => self.infer_struct_def(name, type_params, const_params, fields, expr.span),
             WitnessKind::EnumDef {
                 name,
                 type_params,
+                const_params,
                 variants,
-            } => self.infer_enum_def(name, type_params, variants, expr.span),
+            } => self.infer_enum_def(name, type_params, const_params, variants, expr.span),
             WitnessKind::TraitDef {
                 name,
                 type_params,
@@ -2202,6 +2277,7 @@ impl HMInference {
             } => self.infer_trait_def(name, type_params, parents, methods, expr.span),
             WitnessKind::ImplDef {
                 type_params,
+                const_params,
                 trait_name,
                 trait_generics,
                 target_type,
@@ -2209,6 +2285,7 @@ impl HMInference {
                 methods,
             } => self.infer_impl_def(
                 type_params,
+                const_params,
                 trait_name.as_deref(),
                 trait_generics,
                 target_type,
@@ -2216,6 +2293,9 @@ impl HMInference {
                 methods,
                 expr.span,
             ),
+            WitnessKind::KernelDef { name, params, body } => {
+                self.infer_kernel_def(name, params, body, expr.span)
+            }
             WitnessKind::MacroDef { name, params, body } => {
                 self.infer_macro_def(name, params, body.as_ref(), expr.span)
             }
@@ -2529,11 +2609,16 @@ pub(crate) fn witness_uses_ident(root: &MirWitness, target: &str) -> bool {
                     named_args,
                 } => {
                     match callee {
-                        WitnessCallee::Name(n) | WitnessCallee::Var(n) if n == target => {
+                        WitnessCallee::Name(n)
+                        | WitnessCallee::Var(n)
+                        | WitnessCallee::GenericName { name: n, .. }
+                            if n == target =>
+                        {
                             return true;
                         }
                         WitnessCallee::Evaluated(e) => stack.push(Task::Visit(e)),
                         WitnessCallee::Name(_)
+                        | WitnessCallee::GenericName { .. }
                         | WitnessCallee::Var(_)
                         | WitnessCallee::Builtin(_)
                         | WitnessCallee::Method(_, _) => {}

@@ -144,6 +144,8 @@ pub struct StructFieldRuntime {
 pub struct StructDefRuntime {
     pub name: String,
     pub type_params: Vec<String>,
+    pub const_params: Vec<String>,
+    pub const_shape_bindings: Vec<(String, usize, usize)>,
     pub fields: Vec<StructFieldRuntime>,
     pub program: std::sync::Arc<crate::mir::control::ControlProgram>,
     pub globals: crate::runtime::vm::ModuleGlobals,
@@ -201,11 +203,16 @@ impl StructDefRuntime {
     }
 }
 
-/// Wave 3 Stage 3C: Runtime metadata for a nominal `enum` definition.
+/// Wave 3 Stage 3C + P4-1A: Runtime metadata for a nominal `enum` definition.
 #[derive(Debug, Clone)]
 pub struct EnumDefRuntime {
     pub name: String,
     pub type_params: Vec<String>,
+    /// P4-1A: Subset of `type_params` that are compile-time integer const generics.
+    pub const_params: Vec<String>,
+    /// P4-1A: `(variant_name, const_name, payload_idx, tensor_axis_idx)` bindings enabling
+    /// runtime const inference from tensor payload shapes when explicit `<...>` args are omitted.
+    pub const_shape_bindings: Vec<(String, String, usize, usize)>,
     pub variants: Vec<(String, Vec<String>)>,
 }
 
@@ -298,22 +305,26 @@ pub enum Value {
     KVAllocator(Arc<crate::runtime::kv_cache::KVPageAllocator>),
     /// Wave 4 P1: General 64-byte aligned size-classed tensor memory pool (`memory_pool(...)`).
     MemoryPool(Arc<crate::runtime::memory_pool::MemoryPool>),
+    /// P4-1B: First-class compiled source-level GPU compute kernel (`kernel name(...) ... end`).
+    GpuKernel(Arc<crate::runtime::gpu::kernel_compiler::CompiledGpuKernel>),
     /// Wave 3 — Stage 3C: First-class nominal struct type constructor & metadata object.
     StructType(Arc<StructDefRuntime>),
-    /// Wave 3 — Stage 3C: First-class nominal struct instance preserving field order & `@tag` schema.
+    /// Wave 3 — Stage 3C: First-class nominal struct instance preserving field order, const args & `@tag` schema.
     StructInstance {
         type_name: String,
         fields: HashMap<String, Value>,
         field_order: Vec<String>,
+        const_args: Vec<(String, i64)>,
         def: Arc<StructDefRuntime>,
     },
     /// Wave 3 — Stage 3C: First-class nominal enum type descriptor.
     EnumType(Arc<EnumDefRuntime>),
-    /// Wave 3 — Stage 3C: First-class nominal enum variant value with optional payload values.
+    /// Wave 3 — Stage 3C + P4-1A: First-class nominal enum variant value with optional payload and const args.
     EnumVariant {
         enum_name: String,
         variant: String,
         payload: Vec<Value>,
+        const_args: Vec<(String, i64)>,
     },
     /// Wave 3 — Stage 3C: Differentiated callable produced by `grad(fn)` or `value_and_grad(fn)`.
     GradFn {
@@ -367,6 +378,7 @@ impl PartialEq for Value {
             (Value::ComputeDag(a), Value::ComputeDag(b)) => Arc::ptr_eq(a, b) || a == b,
             (Value::KVAllocator(a), Value::KVAllocator(b)) => Arc::ptr_eq(a, b),
             (Value::MemoryPool(a), Value::MemoryPool(b)) => Arc::ptr_eq(a, b),
+            (Value::GpuKernel(a), Value::GpuKernel(b)) => Arc::ptr_eq(a, b) || a.hash == b.hash,
             (Value::Tensor(a), Value::Tensor(b)) => Arc::ptr_eq(a, b) || a == b,
             (Value::StructType(a), Value::StructType(b)) => Arc::ptr_eq(a, b) || a.name == b.name,
             (
@@ -387,13 +399,15 @@ impl PartialEq for Value {
                     enum_name: ea,
                     variant: va,
                     payload: pa,
+                    const_args: ca,
                 },
                 Value::EnumVariant {
                     enum_name: eb,
                     variant: vb,
                     payload: pb,
+                    const_args: cb,
                 },
-            ) => ea == eb && va == vb && pa == pb,
+            ) => ea == eb && va == vb && ca == cb && pa == pb,
             _ => false,
         }
     }
@@ -634,6 +648,14 @@ impl Value {
                 "max_bytes",
                 "utilization",
                 "stats",
+            ],
+            Value::GpuKernel(_) => &[
+                "launch",
+                "emit_ptx",
+                "emit_spirv_words",
+                "emit_msl",
+                "name",
+                "params",
             ],
             Value::Tensor(_) => &[
                 "shape",

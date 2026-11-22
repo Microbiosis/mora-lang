@@ -74,6 +74,9 @@ impl ParserV3 {
             TokenType::Identifier(ref s) if s == "impl" && self.is_impl_form() => {
                 self.emit_impl_def_w()
             }
+            TokenType::Identifier(ref s) if s == "kernel" && self.is_kernel_form() => {
+                self.emit_kernel_def_w()
+            }
             TokenType::Identifier(ref s) if s == "no_grad" && self.is_no_grad_form() => {
                 self.emit_no_grad_w()
             }
@@ -169,7 +172,39 @@ impl ParserV3 {
             }
             self.current = ident_start;
         }
-        let w = self.emit_pratt_w()?;
+        let mut w = self.emit_pratt_w()?;
+        // P4-1B: Indexed buffer store `buf[idx] = value` is permitted strictly inside `kernel` bodies;
+        // regular Mora `list` containers remain immutable so `xs[i] = v` outside kernels stays a parse error.
+        if self.scope.in_kernel_body && self.match_token_exact(TokenType::Assign) {
+            if let WitnessKind::Call {
+                callee: crate::mir::witness::WitnessCallee::Name(ref n),
+                ref mut args,
+                ref named_args,
+            } = w.kind
+                && n == "[]"
+                && args.len() == 2
+                && named_args.is_empty()
+            {
+                let v_w = self.emit_expr_w()?;
+                let idx_w = args.pop().expect("index arg");
+                let obj_w = args.pop().expect("object arg");
+                return Some(MirWitness {
+                    kind: WitnessKind::IndexAssign {
+                        object: Box::new(obj_w),
+                        index: Box::new(idx_w),
+                        value: Box::new(v_w),
+                    },
+                    span: w.span,
+                });
+            }
+            let msg = format!(
+                "Parse error: invalid assignment target at line {}",
+                self.current_line()
+            );
+            eprintln!("{msg}");
+            self.diag = Some(msg);
+            return None;
+        }
         // v0.85: `as dyn Trait` coercion（§3.5 spec 承诺）— emit 路径中
         // 显式将 expression 包装为 Value::TraitObject。
         self.emit_dyn_coercion(w)
@@ -494,6 +529,74 @@ impl ParserV3 {
 
     /// 调用链（函数 / 方法 / 索引 / DynTrait）。
     fn emit_call_w(&mut self) -> Option<MirWitness> {
+        // P4-1A: Nominal generic constructor / associated call (`Linear<4, 3>(w, b)` or `Linear<4, 3>::new(w, b)`).
+        if let TokenType::Identifier(type_name) = self.peek()?.token_type.clone()
+            && self.declared_type_names.contains(type_name.as_str())
+            && matches!(
+                self.tokens.get(self.current + 1).map(|t| &t.token_type),
+                Some(TokenType::Less)
+            )
+        {
+            let save = self.current;
+            let save_diag = self.diag.clone();
+            let span = self.span_of_current();
+            self.advance(); // type_name
+            self.advance(); // '<'
+            let mut type_args = Vec::new();
+            let mut ok = true;
+            while !self.check(&TokenType::Greater) && !self.is_at_end() {
+                if let Some(ty) = self.parse_type_annotation() {
+                    type_args.push(crate::mir::hint::TypeHint::from_type(ty));
+                } else {
+                    ok = false;
+                    break;
+                }
+                if !self.match_token(&[TokenType::Comma]) {
+                    break;
+                }
+            }
+            if ok && !type_args.is_empty() && self.match_token(&[TokenType::Greater]) {
+                if self.match_token_exact(TokenType::ColonColon) {
+                    let assoc =
+                        self.consume_identifier("Expected associated function after '::'")?;
+                    let full = format!("{type_name}::{assoc}");
+                    let (arg_wits, named_args) = if self.match_token_exact(TokenType::LParen) {
+                        self.emit_arg_list_w()?
+                    } else {
+                        (Vec::new(), Vec::new())
+                    };
+                    let w = MirWitness {
+                        kind: WitnessKind::Call {
+                            callee: crate::mir::witness::WitnessCallee::GenericName {
+                                name: full,
+                                type_args,
+                            },
+                            args: arg_wits,
+                            named_args,
+                        },
+                        span,
+                    };
+                    return self.emit_call_tail_w(w);
+                }
+                if self.match_token_exact(TokenType::LParen) {
+                    let (arg_wits, named_args) = self.emit_arg_list_w()?;
+                    let w = MirWitness {
+                        kind: WitnessKind::Call {
+                            callee: crate::mir::witness::WitnessCallee::GenericName {
+                                name: type_name,
+                                type_args,
+                            },
+                            args: arg_wits,
+                            named_args,
+                        },
+                        span,
+                    };
+                    return self.emit_call_tail_w(w);
+                }
+            }
+            self.current = save;
+            self.diag = save_diag;
+        }
         // `Type::member(args)` 关联调用（例如 Enum::Variant / Trait::new），
         // 编译为按名调用 "Type::member"，由 `runtime::vm::builtins` 分发。
         if let TokenType::Identifier(type_name) = self.peek()?.token_type.clone() {
@@ -1770,6 +1873,9 @@ impl ParserV3 {
             TokenType::Identifier(ref s) if s == "no_grad" && self.is_no_grad_form() => {
                 self.emit_no_grad_w()
             }
+            TokenType::Identifier(ref s) if s == "kernel" && self.is_kernel_form() => {
+                self.emit_kernel_def_w()
+            }
             TokenType::Identifier(n) if n == "commit" => {
                 let span = self.span_of_current();
                 self.advance(); // 'commit'
@@ -2279,6 +2385,9 @@ impl ParserV3 {
             TokenType::Identifier(ref s) if s == "impl" && self.is_impl_form() => {
                 self.emit_impl_def_w()
             }
+            TokenType::Identifier(ref s) if s == "kernel" && self.is_kernel_form() => {
+                self.emit_kernel_def_w()
+            }
             _ => return None,
         }?;
         let names = Self::exported_names_of(&decl);
@@ -2302,7 +2411,8 @@ impl ParserV3 {
             | WitnessKind::EnumDef { name, .. }
             | WitnessKind::TraitDef { name, .. }
             | WitnessKind::TypeAlias { name, .. }
-            | WitnessKind::MacroDef { name, .. } => vec![name.clone()],
+            | WitnessKind::MacroDef { name, .. }
+            | WitnessKind::KernelDef { name, .. } => vec![name.clone()],
             // Sequence 可含多条声明（`export` 后跟块）—— 收集全部
             WitnessKind::Sequence(items) => {
                 items.iter().flat_map(Self::exported_names_of).collect()
@@ -2336,6 +2446,23 @@ impl ParserV3 {
         matches!(
             self.tokens.get(self.current + 1).map(|t| &t.token_type),
             Some(TokenType::Identifier(_) | TokenType::Less)
+        )
+    }
+
+    /// P4-1B: Contextual lookahead for `kernel name(params...) ... end` (preserves `let kernel = 1`).
+    fn is_kernel_form(&self) -> bool {
+        let Some(tok) = self.peek() else {
+            return false;
+        };
+        if !matches!(&tok.token_type, TokenType::Identifier(s) if s == "kernel") {
+            return false;
+        }
+        matches!(
+            self.tokens.get(self.current + 1).map(|t| &t.token_type),
+            Some(TokenType::Identifier(_))
+        ) && matches!(
+            self.tokens.get(self.current + 2).map(|t| &t.token_type),
+            Some(TokenType::LParen)
         )
     }
 

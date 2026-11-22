@@ -36,7 +36,7 @@ pub enum CallAction {
     },
     /// Push a [`CombinatorFrame`] and invoke its initial callback target + args.
     PushCombinator {
-        combinator: CombinatorFrame,
+        combinator: Box<CombinatorFrame>,
         callee: Value,
         args: Vec<Value>,
     },
@@ -443,9 +443,9 @@ pub fn resolve_builtin_call_named(
                 Value::Atom(arc) => {
                     let old = arc.lock().clone();
                     Ok(CallAction::PushCombinator {
-                        combinator: CombinatorFrame::Swap {
+                        combinator: Box::new(CombinatorFrame::Swap {
                             atom: Arc::clone(arc),
-                        },
+                        }),
                         callee: args[1].clone(),
                         args: vec![old],
                     })
@@ -470,12 +470,12 @@ pub fn resolve_builtin_call_named(
                     let items: Vec<Value> = list.iter().cloned().collect();
                     let first = items[0].clone();
                     Ok(CallAction::PushCombinator {
-                        combinator: CombinatorFrame::Into {
+                        combinator: Box::new(CombinatorFrame::Into {
                             transform: transform.clone(),
                             items,
                             idx: 0,
                             results: Vec::new(),
-                        },
+                        }),
                         callee: transform,
                         args: vec![first],
                     })
@@ -958,12 +958,12 @@ pub fn resolve_builtin_call_named(
             }
 
             Ok(CallAction::PushCombinator {
-                combinator: CombinatorFrame::JvpEval {
+                combinator: Box::new(CombinatorFrame::JvpEval {
                     tape_id,
                     leaf_nodes,
                     leaf_tangents,
                     scalar_out_dtype,
-                },
+                }),
                 callee: func,
                 args: tracked_args,
             })
@@ -1032,10 +1032,10 @@ pub fn resolve_builtin_call_named(
             }
 
             Ok(CallAction::PushCombinator {
-                combinator: CombinatorFrame::TraceDagEval {
+                combinator: Box::new(CombinatorFrame::TraceDagEval {
                     tape_id,
                     leaf_nodes,
-                },
+                }),
                 callee: func,
                 args: tracked_args,
             })
@@ -1150,6 +1150,17 @@ pub fn construct_struct_instance(
     args: Vec<Value>,
     named_args: Vec<(String, Value)>,
 ) -> MoraResult<CallAction> {
+    construct_struct_instance_with_consts(def, Vec::new(), args, named_args)
+}
+
+/// P4-1A: Construct a nominal `Value::StructInstance` with explicit and/or tensor-shape-inferred
+/// compile-time const-generic integer bindings (`Linear<4, 3>(weight=w, bias=b)`).
+pub(crate) fn construct_struct_instance_with_consts(
+    def: Arc<StructDefRuntime>,
+    explicit_const_args: Vec<(String, i64)>,
+    args: Vec<Value>,
+    named_args: Vec<(String, Value)>,
+) -> MoraResult<CallAction> {
     if args.len() > def.fields.len() {
         return Err(MoraError::Runtime(format!(
             "struct '{}' expects at most {} fields, got {} positional args",
@@ -1194,11 +1205,13 @@ pub fn construct_struct_instance(
     }
 
     if pending_defaults.is_empty() {
+        let const_args = finalize_struct_const_args(&def, &explicit_const_args, &fields)?;
         let field_order = def.fields.iter().map(|f| f.name.clone()).collect();
         return Ok(CallAction::Done(Value::StructInstance {
             type_name: def.name.clone(),
             fields,
             field_order,
+            const_args,
             def,
         }));
     }
@@ -1212,15 +1225,137 @@ pub fn construct_struct_instance(
         globals: Arc::clone(&def.globals),
     };
     Ok(CallAction::PushCombinator {
-        combinator: CombinatorFrame::StructInit {
-            def,
-            fields,
-            pending_defaults,
-            current_field: first_field,
-        },
+        combinator: Box::new(CombinatorFrame::StructInit(Box::new(
+            super::continuation::StructInitState {
+                def,
+                fields,
+                const_args: explicit_const_args,
+                pending_defaults,
+                current_field: first_field,
+            },
+        ))),
         callee: thunk,
         args: Vec::new(),
     })
+}
+
+/// P4-1A: Construct a nominal `Value::EnumVariant`, propagating explicit const-generic
+/// arguments and inferring any omitted const generics from tensor payload shapes.
+pub(crate) fn construct_enum_variant_with_consts(
+    def: &crate::value::EnumDefRuntime,
+    variant: &str,
+    explicit_const_args: Vec<(String, i64)>,
+    args: Vec<Value>,
+    named_args: Vec<(String, Value)>,
+) -> MoraResult<CallAction> {
+    let Some((vname, payload_tys)) = def.variants.iter().find(|(v, _)| v == variant) else {
+        return Err(MoraError::Runtime(format!(
+            "Enum '{}' has no variant '{}'",
+            def.name, variant
+        )));
+    };
+    if !named_args.is_empty() {
+        return Err(MoraError::Runtime(format!(
+            "{}::{} does not accept keyword arguments",
+            def.name, vname
+        )));
+    }
+    if args.len() != payload_tys.len() {
+        return Err(MoraError::Runtime(format!(
+            "{}::{} expects {} payload arg(s), got {}",
+            def.name,
+            vname,
+            payload_tys.len(),
+            args.len()
+        )));
+    }
+    let mut out = explicit_const_args;
+    for (bind_v, cname, pidx, axis_idx) in &def.const_shape_bindings {
+        if bind_v != vname {
+            continue;
+        }
+        if let Some(Value::Tensor(t)) = args.get(*pidx)
+            && let Some(&dim) = t.shape.get(*axis_idx)
+        {
+            let dim_i64 = dim as i64;
+            if let Some((_, existing)) = out.iter().find(|(k, _)| k == cname) {
+                if *existing != dim_i64 {
+                    return Err(MoraError::Runtime(format!(
+                        "{}::{}: const generic '{}' mismatch (expected {}, got tensor dim {})",
+                        def.name, vname, cname, existing, dim_i64
+                    )));
+                }
+            } else {
+                out.push((cname.clone(), dim_i64));
+            }
+        }
+    }
+    Ok(CallAction::Done(Value::EnumVariant {
+        enum_name: def.name.clone(),
+        variant: vname.clone(),
+        payload: args,
+        const_args: out,
+    }))
+}
+
+/// Populate missing const-generic values from tensor field shapes (and validate explicit consts).
+pub(crate) fn finalize_struct_const_args(
+    def: &StructDefRuntime,
+    explicit: &[(String, i64)],
+    fields: &std::collections::HashMap<String, Value>,
+) -> MoraResult<Vec<(String, i64)>> {
+    let mut out: Vec<(String, i64)> = explicit.to_vec();
+    for (cname, fidx, aidx) in &def.const_shape_bindings {
+        if let Some(fdef) = def.fields.get(*fidx)
+            && let Some(Value::Tensor(t)) = fields.get(&fdef.name)
+            && let Some(&actual_dim) = t.shape.get(*aidx)
+        {
+            let actual_i64 = actual_dim as i64;
+            if let Some((_, expected_i64)) = out.iter().find(|(n, _)| n == cname) {
+                if *expected_i64 != actual_i64 {
+                    return Err(MoraError::Runtime(format!(
+                        "struct '{}' const generic '{}' mismatch: expected {}, field '{}' axis {} has {}",
+                        def.name, cname, expected_i64, fdef.name, aidx, actual_i64
+                    )));
+                }
+            } else {
+                out.push((cname.clone(), actual_i64));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// P4-1A: Resolve a trait-driven overloaded operator (`Add::add`, `Sub::sub`, ..., `Eq::eq`, `Neg::neg`)
+/// on a nominal `StructInstance`, `EnumVariant`, or `TraitObject`.
+pub(crate) fn resolve_operator_impl(
+    core: &CoreRuntime,
+    receiver: &Value,
+    op_trait: &str,
+    op_method: &str,
+    mut rhs_args: Vec<Value>,
+) -> Option<(Value, Vec<Value>)> {
+    let target_name = match receiver {
+        Value::StructInstance { type_name, .. } => type_name.as_str(),
+        Value::EnumVariant { enum_name, .. } => enum_name.as_str(),
+        Value::TraitObject { for_type, .. } => for_type.as_str(),
+        _ => return None,
+    };
+    let (func, has_self) = core
+        .trait_impls
+        .iter()
+        .find(|((tr, tgt, m), (_, hs))| {
+            *hs && tr == op_trait
+                && m == op_method
+                && (tgt == target_name || tgt.eq_ignore_ascii_case(target_name))
+        })
+        .map(|(_, v)| v.clone())?;
+    let mut all_args = Vec::with_capacity(1 + rhs_args.len());
+    if has_self {
+        all_args.push(receiver.clone());
+    }
+    all_args.append(&mut rhs_args);
+    Some((func, all_args))
 }
 
 /// Resolve a method invocation `receiver.method(args..., kw=val...)` onto pure result or stackful action.
@@ -1349,21 +1484,14 @@ pub fn resolve_method_call_named(
                         .collect(),
                 )));
             }
-            if let Some((vname, payload_tys)) = def.variants.iter().find(|(v, _)| v == method) {
-                if args.len() != payload_tys.len() {
-                    return Err(MoraError::Runtime(format!(
-                        "{}::{} expects {} payload arg(s), got {}",
-                        def.name,
-                        vname,
-                        payload_tys.len(),
-                        args.len()
-                    )));
-                }
-                return Ok(CallAction::Done(Value::EnumVariant {
-                    enum_name: def.name.clone(),
-                    variant: vname.clone(),
-                    payload: args,
-                }));
+            if def.variants.iter().any(|(v, _)| v == method) {
+                return construct_enum_variant_with_consts(
+                    &def,
+                    method,
+                    Vec::new(),
+                    args,
+                    named_args,
+                );
             }
             return Err(MoraError::Runtime(format!(
                 "Enum '{}' has no variant or method '{}'",
@@ -1465,6 +1593,7 @@ pub fn resolve_method_call_named(
         Value::ComputeDag(dag) => resolve_compute_dag_method(&dag, method, args, core),
         Value::KVAllocator(kv) => resolve_kv_allocator_method(&kv, method, args),
         Value::MemoryPool(pool) => resolve_memory_pool_method(&pool, method, args),
+        Value::GpuKernel(kernel) => resolve_gpu_kernel_method(&kernel, method, args),
         Value::List(list) => match method {
             "map" => {
                 let mapper = args
@@ -1477,12 +1606,12 @@ pub fn resolve_method_call_named(
                 let items: Vec<Value> = list.iter().cloned().collect();
                 let first = items[0].clone();
                 Ok(CallAction::PushCombinator {
-                    combinator: CombinatorFrame::ListMap {
+                    combinator: Box::new(CombinatorFrame::ListMap {
                         func: mapper.clone(),
                         results: Vec::with_capacity(items.len()),
                         items,
                         idx: 0,
-                    },
+                    }),
                     callee: mapper,
                     args: vec![first],
                 })
@@ -1497,12 +1626,12 @@ pub fn resolve_method_call_named(
                 let items: Vec<Value> = list.iter().cloned().collect();
                 let first = items[0].clone();
                 Ok(CallAction::PushCombinator {
-                    combinator: CombinatorFrame::ListFilter {
+                    combinator: Box::new(CombinatorFrame::ListFilter {
                         pred: predicate.clone(),
                         items,
                         idx: 0,
                         results: Vec::new(),
-                    },
+                    }),
                     callee: predicate,
                     args: vec![first],
                 })
@@ -1522,11 +1651,11 @@ pub fn resolve_method_call_named(
                 let items: Vec<Value> = list.iter().cloned().collect();
                 let first = items[0].clone();
                 Ok(CallAction::PushCombinator {
-                    combinator: CombinatorFrame::ListReduce {
+                    combinator: Box::new(CombinatorFrame::ListReduce {
                         func: reducer.clone(),
                         items,
                         idx: 0,
-                    },
+                    }),
                     callee: reducer,
                     args: vec![init, first],
                 })
@@ -2469,6 +2598,83 @@ fn resolve_compute_dag_method(
     }
 }
 
+fn resolve_gpu_kernel_method(
+    kernel: &Arc<crate::runtime::gpu::kernel_compiler::CompiledGpuKernel>,
+    method: &str,
+    args: Vec<Value>,
+) -> MoraResult<CallAction> {
+    match method {
+        "name" => Ok(CallAction::Done(Value::String(kernel.name().to_string()))),
+        "params" => Ok(CallAction::Done(Value::List(
+            kernel
+                .params()
+                .iter()
+                .map(|p| Value::String(format!("{}: {}", p.name, p.ty.canonical_name())))
+                .collect(),
+        ))),
+        "emit_ptx" => Ok(CallAction::Done(Value::String(kernel.emit_ptx()))),
+        "emit_msl" => Ok(CallAction::Done(Value::String(kernel.emit_msl()))),
+        "emit_spirv_words" => {
+            let local_size_x = match args.first() {
+                None => 64u32,
+                Some(Value::Int(n)) if *n > 0 => *n as u32,
+                Some(other) => {
+                    return Err(MoraError::Runtime(format!(
+                        "gpu_kernel.emit_spirv_words: local_size_x must be positive int, got {other}"
+                    )));
+                }
+            };
+            let words = kernel
+                .emit_spirv_words(local_size_x)
+                .map_err(MoraError::Runtime)?;
+            Ok(CallAction::Done(Value::List(
+                words
+                    .into_iter()
+                    .map(|w| Value::Int(i64::from(w)))
+                    .collect(),
+            )))
+        }
+        "launch" => {
+            if args.len() < 2 {
+                return Err(MoraError::Runtime(format!(
+                    "gpu_kernel '{}'.launch(grid, block, args...) expects at least 2 arguments, got {}",
+                    kernel.name(),
+                    args.len()
+                )));
+            }
+            let grid = match &args[0] {
+                Value::Int(n) if *n > 0 => *n as u32,
+                other => {
+                    return Err(MoraError::Runtime(format!(
+                        "gpu_kernel '{}'.launch: grid must be a positive int, got {other}",
+                        kernel.name()
+                    )));
+                }
+            };
+            let block = match &args[1] {
+                Value::Int(n) if *n > 0 => *n as u32,
+                other => {
+                    return Err(MoraError::Runtime(format!(
+                        "gpu_kernel '{}'.launch: block must be a positive int, got {other}",
+                        kernel.name()
+                    )));
+                }
+            };
+            crate::runtime::gpu::kernel_compiler::launch_compiled_kernel(
+                kernel,
+                grid,
+                block,
+                &args[2..],
+            )?;
+            Ok(CallAction::Done(Value::Nil))
+        }
+        other => Err(MoraError::Runtime(format!(
+            "GpuKernel '{}' has no method '{other}'",
+            kernel.name()
+        ))),
+    }
+}
+
 fn is_callable_value(v: &Value) -> bool {
     matches!(
         v,
@@ -2492,10 +2698,10 @@ fn dispatch_with_watermarks(
     }
     let (first_cb, first_event) = fired.remove(0);
     CallAction::PushCombinator {
-        combinator: CombinatorFrame::WatermarkCallbacks {
+        combinator: Box::new(CombinatorFrame::WatermarkCallbacks {
             final_result,
             pending: fired,
-        },
+        }),
         callee: first_cb,
         args: vec![Value::Dict(first_event)],
     }
@@ -3090,12 +3296,12 @@ pub fn resolve_value_call_named(
                 }
 
                 return Ok(CallAction::PushCombinator {
-                    combinator: CombinatorFrame::AutogradEval {
+                    combinator: Box::new(CombinatorFrame::AutogradEval {
                         tape_id,
                         leaf_nodes,
                         scalar_flags,
                         return_value,
-                    },
+                    }),
                     callee: *func,
                     args: tracked_args,
                 });
@@ -3144,7 +3350,7 @@ pub fn resolve_value_call_named(
                 }
                 let first = funcs[0].clone();
                 return Ok(CallAction::PushCombinator {
-                    combinator: CombinatorFrame::Compose { funcs, next_idx: 1 },
+                    combinator: Box::new(CombinatorFrame::Compose { funcs, next_idx: 1 }),
                     callee: first,
                     args,
                 });
@@ -3252,24 +3458,14 @@ pub fn resolve_dyn_call_named(
                         .collect(),
                 )));
             }
-            if let Some((vname, payload_tys)) = edef.variants.iter().find(|(v, _)| v == member) {
-                if !named_args.is_empty() {
-                    return Err(MoraError::Runtime(format!(
-                        "{type_name}::{vname} does not accept keyword arguments"
-                    )));
-                }
-                if args.len() != payload_tys.len() {
-                    return Err(MoraError::Runtime(format!(
-                        "{type_name}::{vname} expects {} payload arg(s), got {}",
-                        payload_tys.len(),
-                        args.len()
-                    )));
-                }
-                return Ok(CallAction::Done(Value::EnumVariant {
-                    enum_name: edef.name.clone(),
-                    variant: vname.clone(),
-                    payload: args,
-                }));
+            if edef.variants.iter().any(|(v, _)| v == member) {
+                return construct_enum_variant_with_consts(
+                    &edef,
+                    member,
+                    Vec::new(),
+                    args,
+                    named_args,
+                );
             }
         }
         if let Some((func, has_self)) = core

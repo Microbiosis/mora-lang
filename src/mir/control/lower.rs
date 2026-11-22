@@ -57,6 +57,9 @@ struct ProgramLowerer {
     /// Stage 3C: Parameter signature `(name, has_default)` of pre-scanned top-level tasks
     /// for compile-time static keyword reordering and default argument slot filling.
     task_param_specs: HashMap<FnId, Vec<(String, bool)>>,
+    /// P4-1A: Nominal struct generic metadata `(type_params, const_params)` for lowering
+    /// explicit const-generic calls (`Linear<4, 3>(...)`) and `impl` const-param prologues.
+    struct_const_meta: HashMap<String, (Vec<String>, Vec<String>)>,
 }
 
 impl ProgramLowerer {
@@ -69,6 +72,7 @@ impl ProgramLowerer {
             dyn_names: dyn_names.iter().cloned().collect(),
             parent_edges: Vec::new(),
             task_param_specs: HashMap::new(),
+            struct_const_meta: HashMap::new(),
         }
     }
 
@@ -155,11 +159,28 @@ impl ProgramLowerer {
                 let fn_id = self.reserve_fn();
                 self.alloc_global(name, GlobalKind::Macro(fn_id));
             }
-            WitnessKind::EnumDef { name, .. } => {
+            WitnessKind::EnumDef {
+                name,
+                type_params,
+                const_params,
+                ..
+            } => {
+                self.struct_const_meta
+                    .insert(name.clone(), (type_params.clone(), const_params.clone()));
                 self.alloc_global(name, GlobalKind::Enum);
             }
-            WitnessKind::StructDef { name, .. } => {
+            WitnessKind::StructDef {
+                name,
+                type_params,
+                const_params,
+                ..
+            } => {
+                self.struct_const_meta
+                    .insert(name.clone(), (type_params.clone(), const_params.clone()));
                 self.alloc_global(name, GlobalKind::Struct);
+            }
+            WitnessKind::KernelDef { name, .. } => {
+                self.alloc_global(name, GlobalKind::Kernel);
             }
             WitnessKind::TraitDef { name, .. } => {
                 self.alloc_global(name, GlobalKind::Trait);
@@ -701,6 +722,34 @@ impl ScopeStack {
         handler_setup: Option<(&str, usize)>,
         capture_parent: bool,
     ) -> MoraResult<(FnId, Vec<CaptureSource>)> {
+        self.lower_child_fn_with_params_and_consts(
+            prog,
+            existing_fn_id,
+            kind,
+            name,
+            params,
+            &[],
+            false,
+            body,
+            handler_setup,
+            capture_parent,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_child_fn_with_params_and_consts(
+        &mut self,
+        prog: &mut ProgramLowerer,
+        existing_fn_id: Option<FnId>,
+        kind: FunctionKind,
+        name: Option<&str>,
+        params: &[WitnessParam],
+        const_params: &[String],
+        has_self: bool,
+        body: &MirWitness,
+        handler_setup: Option<(&str, usize)>,
+        capture_parent: bool,
+    ) -> MoraResult<(FnId, Vec<CaptureSource>)> {
         let fn_id = match existing_fn_id {
             Some(id) => id,
             None => prog.reserve_fn(),
@@ -729,6 +778,26 @@ impl ScopeStack {
         let emit_default_prologue = |stack: &mut ScopeStack,
                                      prog: &mut ProgramLowerer|
          -> MoraResult<bool> {
+            // P4-1A: Bind const-generic parameters from `self` (`LocalSlot(0)`) into real locals.
+            if has_self && !const_params.is_empty() {
+                let r_self = stack.current_mut().alloc_reg();
+                stack
+                    .current_mut()
+                    .emit(ControlInst::LoadLocal(r_self, LocalSlot(0)));
+                for cname in const_params {
+                    let cslot = stack.current_mut().bind_let_local(cname, prog);
+                    let r_val = stack.current_mut().alloc_reg();
+                    let csym = prog.intern(cname);
+                    stack.current_mut().emit(ControlInst::GetConstGeneric {
+                        dst: r_val,
+                        src: r_self,
+                        name: csym,
+                    });
+                    stack
+                        .current_mut()
+                        .emit(ControlInst::StoreLocal(cslot, r_val));
+                }
+            }
             for (idx, wp) in params.iter().enumerate() {
                 if let Some(default_w) = &wp.default {
                     let slot = LocalSlot(idx as u16);
@@ -897,7 +966,9 @@ fn uses_identifier(w: &MirWitness, target: &str) -> bool {
             named_args,
         } => {
             let hit = match callee {
-                WitnessCallee::Name(n) | WitnessCallee::Var(n) => n == target,
+                WitnessCallee::Name(n)
+                | WitnessCallee::GenericName { name: n, .. }
+                | WitnessCallee::Var(n) => n == target,
                 WitnessCallee::Method(obj, _) => obj == target,
                 WitnessCallee::Evaluated(e) => uses_identifier(e, target),
                 WitnessCallee::Builtin(_) => false,
@@ -1846,21 +1917,44 @@ fn lower_expr_single(
         WitnessKind::EnumDef {
             name,
             type_params,
+            const_params,
             variants,
         } => {
+            prog.struct_const_meta
+                .insert(name.clone(), (type_params.clone(), const_params.clone()));
             let sym = prog.intern(name);
             let tp_syms = type_params.iter().map(|t| prog.intern(t)).collect();
-            let vdescs = variants
-                .iter()
-                .map(|v| {
-                    let payload_names = v
-                        .payload_types
-                        .iter()
-                        .map(|h| h.to_type().name().to_string())
-                        .collect();
-                    (prog.intern(&v.name), payload_names)
-                })
-                .collect();
+            let cp_syms = const_params.iter().map(|c| prog.intern(c)).collect();
+            let mut const_shape_bindings = Vec::new();
+            let mut vdescs = Vec::with_capacity(variants.len());
+            for v in variants {
+                let vsym = prog.intern(&v.name);
+                let mut payload_names = Vec::with_capacity(v.payload_types.len());
+                for (pidx, h) in v.payload_types.iter().enumerate() {
+                    let ty = h.to_type();
+                    if !const_params.is_empty()
+                        && let crate::typeck::Type::Tensor {
+                            shape: crate::typeck::ShapeType::Ranked(dims),
+                            ..
+                        } = ty
+                    {
+                        for (aidx, dim) in dims.iter().enumerate() {
+                            if let crate::typeck::DimExpr::Symbolic(sym_name) = dim
+                                && const_params.contains(sym_name)
+                            {
+                                const_shape_bindings.push((
+                                    vsym,
+                                    prog.intern(sym_name),
+                                    pidx,
+                                    aidx,
+                                ));
+                            }
+                        }
+                    }
+                    payload_names.push(ty.name().to_string());
+                }
+                vdescs.push((vsym, payload_names));
+            }
             let slot = if stack.current_mut().kind == FunctionKind::Main {
                 Some(prog.alloc_global(name, GlobalKind::Enum))
             } else {
@@ -1869,6 +1963,8 @@ fn lower_expr_single(
             stack.current_mut().emit(ControlInst::RegisterEnum {
                 name: sym,
                 type_params: tp_syms,
+                const_params: cp_syms,
+                const_shape_bindings,
                 variants: vdescs,
                 dst: slot,
             });
@@ -1878,12 +1974,31 @@ fn lower_expr_single(
         WitnessKind::StructDef {
             name,
             type_params,
+            const_params,
             fields,
         } => {
+            prog.struct_const_meta
+                .insert(name.clone(), (type_params.clone(), const_params.clone()));
             let sym = prog.intern(name);
             let tp_syms = type_params.iter().map(|t| prog.intern(t)).collect();
+            let cp_syms = const_params.iter().map(|c| prog.intern(c)).collect();
+            let mut const_shape_bindings = Vec::new();
             let mut field_descs = Vec::with_capacity(fields.len());
-            for f in fields {
+            for (fidx, f) in fields.iter().enumerate() {
+                if !const_params.is_empty()
+                    && let crate::typeck::Type::Tensor {
+                        shape: crate::typeck::ShapeType::Ranked(dims),
+                        ..
+                    } = f.type_hint.to_type()
+                {
+                    for (aidx, d) in dims.iter().enumerate() {
+                        if let crate::typeck::DimExpr::Symbolic(sym_name) = d
+                            && const_params.contains(sym_name)
+                        {
+                            const_shape_bindings.push((prog.intern(sym_name), fidx, aidx));
+                        }
+                    }
+                }
                 let default_fn = if let Some(def_w) = &f.default {
                     let (df_id, _) = stack.lower_child_fn(
                         prog,
@@ -1914,6 +2029,8 @@ fn lower_expr_single(
             stack.current_mut().emit(ControlInst::RegisterStruct {
                 name: sym,
                 type_params: tp_syms,
+                const_params: cp_syms,
+                const_shape_bindings,
                 fields: field_descs,
                 dst: slot,
             });
@@ -1980,6 +2097,7 @@ fn lower_expr_single(
         }
 
         WitnessKind::ImplDef {
+            const_params,
             trait_name,
             trait_generics,
             target_type,
@@ -1992,18 +2110,33 @@ fn lower_expr_single(
             let t_gens: Vec<String> = trait_generics.iter().map(|g| g.to_type().name()).collect();
             let tgt_gens: Vec<String> =
                 target_generics.iter().map(|g| g.to_type().name()).collect();
+            let mut active_consts = const_params.clone();
+            if let Some((stp, scp)) = prog.struct_const_meta.get(target_type).cloned() {
+                for (idx, tg) in target_generics.iter().enumerate() {
+                    if let Some(tp_name) = stp.get(idx)
+                        && scp.contains(tp_name)
+                        && let crate::typeck::Type::TypeVar(crate::typeck::TypeVarId::Rigid(r)) =
+                            tg.to_type()
+                        && !active_consts.contains(r)
+                    {
+                        active_consts.push(r.clone());
+                    }
+                }
+            }
             let mut compiled_methods = Vec::with_capacity(methods.len());
             for m in methods {
                 let label = match trait_name {
                     Some(tr) => format!("impl<{tr} for {target_type}>::{}", m.name),
                     None => format!("impl<{target_type}>::{}", m.name),
                 };
-                let (fn_id, _) = stack.lower_child_fn_with_params(
+                let (fn_id, _) = stack.lower_child_fn_with_params_and_consts(
                     prog,
                     None,
                     FunctionKind::ImplMethod,
                     Some(&label),
                     &m.params,
+                    &active_consts,
+                    m.has_self,
                     &m.body,
                     None,
                     false,
@@ -2020,6 +2153,24 @@ fn lower_expr_single(
                 target_type: target_sym,
                 target_generics: tgt_gens,
                 methods: compiled_methods,
+            });
+            Ok(FlowState::Active(stack.current_mut().emit_nil()))
+        }
+
+        WitnessKind::KernelDef { name, params, body } => {
+            let kprog =
+                crate::runtime::gpu::kernel_compiler::lower_witness_kernel(name, params, body)
+                    .map_err(MoraError::Parse)?;
+            let sym = prog.intern(name);
+            let slot = if stack.current_mut().kind == FunctionKind::Main {
+                Some(prog.alloc_global(name, GlobalKind::Kernel))
+            } else {
+                None
+            };
+            stack.current_mut().emit(ControlInst::RegisterKernel {
+                name: sym,
+                program: Box::new(kprog),
+                dst: slot,
             });
             Ok(FlowState::Active(stack.current_mut().emit_nil()))
         }
@@ -2291,7 +2442,9 @@ fn resolve_callee_target(
             };
             Ok(Some(ResolvedCallee::Target(CalleeTarget::Value(creg))))
         }
-        WitnessCallee::Name(name) | WitnessCallee::Var(name) => {
+        WitnessCallee::Name(name)
+        | WitnessCallee::GenericName { name, .. }
+        | WitnessCallee::Var(name) => {
             if let Some(binding) = stack.resolve_binding(prog, name, false) {
                 match binding {
                     VarBinding::Global(g) => match prog.globals[g.0 as usize].kind {
@@ -2619,6 +2772,49 @@ fn lower_call(
             named_args: named_regs,
         });
         return Ok(FlowState::Active(dst));
+    }
+
+    // P4-1A: Explicit generic/const constructor call `Linear<4, 3>(w, b)` or `Linear<4, 3>::new(w, b)`.
+    if let WitnessCallee::GenericName { name, type_args } = callee {
+        let base_type = name.split_once("::").map_or(name.as_str(), |(t, _)| t);
+        let mut const_args: Vec<(SymId, i64)> = Vec::new();
+        if let Some((type_params, const_params)) = prog.struct_const_meta.get(base_type).cloned() {
+            for (tp, arg_hint) in type_params.iter().zip(type_args.iter()) {
+                if const_params.contains(tp)
+                    && let crate::typeck::Type::ConstInt(n) = arg_hint.to_type()
+                {
+                    const_args.push((prog.intern(tp), *n));
+                }
+            }
+        }
+        let Some(resolved) = resolve_callee_target(stack, prog, callee)? else {
+            return Ok(FlowState::Terminated);
+        };
+        let mut arg_regs = Vec::with_capacity(args.len());
+        for a in args {
+            match lower_expr(stack, prog, a, false)? {
+                FlowState::Active(r) => arg_regs.push(r),
+                FlowState::Terminated => return Ok(FlowState::Terminated),
+            }
+        }
+        let mut named_regs: Vec<(SymId, VReg)> = Vec::with_capacity(named_args.len());
+        for (k, v) in named_args {
+            match lower_expr(stack, prog, v, false)? {
+                FlowState::Active(r) => named_regs.push((prog.intern(k), r)),
+                FlowState::Terminated => return Ok(FlowState::Terminated),
+            }
+        }
+        if let ResolvedCallee::Target(target) = resolved {
+            let dst = stack.current_mut().alloc_reg();
+            stack.current_mut().emit(ControlInst::CallGeneric {
+                dst,
+                target,
+                const_args,
+                args: arg_regs,
+                named_args: named_regs,
+            });
+            return Ok(FlowState::Active(dst));
+        }
     }
 
     let Some(resolved) = resolve_callee_target(stack, prog, callee)? else {

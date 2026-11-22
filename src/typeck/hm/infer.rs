@@ -386,6 +386,27 @@ impl HMInference {
 
         match op {
             Add | Sub | Mul | Div | Mod | Pow => {
+                // P4-1A: Trait-driven operator overloading for nominal types (`impl Add/Sub/Mul/Div/Mod/Pow for T`).
+                let (op_trait, op_method) = match op {
+                    Add => ("Add", "add"),
+                    Sub => ("Sub", "sub"),
+                    Mul => ("Mul", "mul"),
+                    Div => ("Div", "div"),
+                    Mod => ("Mod", "rem"),
+                    Pow => ("Pow", "pow"),
+                    _ => unreachable!(),
+                };
+                if let Some(res) = self.try_infer_binary_op_overload(
+                    op_trait,
+                    op_method,
+                    &left_ty,
+                    &right_ty,
+                    merged_row.clone(),
+                    span,
+                ) {
+                    return res;
+                }
+
                 // Stage 3B: Tensor elementwise binary operations (DType + Shape broadcast + Device).
                 if matches!(left_ty, Type::Tensor { .. }) || matches!(right_ty, Type::Tensor { .. })
                 {
@@ -498,6 +519,18 @@ impl HMInference {
                 }
             }
             MatMul => {
+                // P4-1A: Trait-driven `@` matrix-multiply operator overloading (`impl MatMul for T`).
+                if let Some(res) = self.try_infer_binary_op_overload(
+                    "MatMul",
+                    "matmul",
+                    &left_ty,
+                    &right_ty,
+                    merged_row.clone(),
+                    span,
+                ) {
+                    return res;
+                }
+
                 // Stage 3B: First-class Tensor matrix/tensor contraction (@).
                 if matches!(left_ty, Type::Tensor { .. }) || matches!(right_ty, Type::Tensor { .. })
                 {
@@ -578,6 +611,17 @@ impl HMInference {
                 Ok((ret, merged_row))
             }
             Equal | NotEqual => {
+                // P4-1A: Trait-driven `==` / `!=` operator overloading (`impl Eq for T`).
+                if let Some(res) = self.try_infer_binary_op_overload(
+                    "Eq",
+                    "eq",
+                    &left_ty,
+                    &right_ty,
+                    merged_row.clone(),
+                    span,
+                ) {
+                    return res;
+                }
                 if matches!(left_ty, Type::Scalar(_)) || matches!(right_ty, Type::Scalar(_)) {
                     let _ = self.infer_scalar_binary_op(&left_ty, &right_ty, true, span)?;
                     return Ok((Type::Bool, merged_row));
@@ -1043,6 +1087,26 @@ impl HMInference {
             }
         }
 
+        if let WitnessCallee::GenericName { name, type_args } = callee {
+            let resolved_args: Vec<Type> = type_args
+                .iter()
+                .map(|h| self.resolve_type_aliases(h.to_type()))
+                .collect();
+            if let Some(res) = self.try_infer_nominal_or_assoc_call_generic(
+                name,
+                &resolved_args,
+                args,
+                named_args,
+                span,
+            ) {
+                return res;
+            }
+            return Err(vec![TypeError::UnboundVariable {
+                name: name.clone(),
+                span,
+            }]);
+        }
+
         if let WitnessCallee::Name(name) | WitnessCallee::Var(name) = callee
             && !self.env.contains(name)
         {
@@ -1144,9 +1208,9 @@ impl HMInference {
         }
 
         let (callee_ty, acc_row, builtin_sig) = match callee {
-            WitnessCallee::Name(name) | WitnessCallee::Var(name) => {
-                self.resolve_named_callee_header(name, span)?
-            }
+            WitnessCallee::Name(name)
+            | WitnessCallee::GenericName { name, .. }
+            | WitnessCallee::Var(name) => self.resolve_named_callee_header(name, span)?,
             WitnessCallee::Evaluated(expr) => {
                 let (t, r) = self.infer_expr(expr)?;
                 (t, r, None)
@@ -1198,9 +1262,9 @@ impl HMInference {
         }
 
         let param_spec: Option<(String, FnParamSpec)> = match callee {
-            WitnessCallee::Name(n) | WitnessCallee::Var(n) => {
-                self.fn_param_specs.get(n).cloned().map(|s| (n.clone(), s))
-            }
+            WitnessCallee::Name(n)
+            | WitnessCallee::GenericName { name: n, .. }
+            | WitnessCallee::Var(n) => self.fn_param_specs.get(n).cloned().map(|s| (n.clone(), s)),
             WitnessCallee::Evaluated(e) => {
                 if let Some(s) = self.closure_param_specs.get(&e.span).cloned() {
                     Some(("<closure>".to_string(), s))
@@ -1508,6 +1572,17 @@ impl HMInference {
                 return res;
             }
         }
+        if let Type::GpuKernel(ref sig) = resolved_recv {
+            return self.infer_gpu_kernel_method(
+                sig.as_deref(),
+                method,
+                args,
+                named_args,
+                recv_row,
+                span,
+            );
+        }
+
         if let Type::TraitObject {
             trait_name,
             generics,

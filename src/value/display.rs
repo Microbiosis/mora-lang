@@ -190,6 +190,14 @@ impl std::fmt::Display for Value {
                     pool.device
                 )
             }
+            Value::GpuKernel(k) => {
+                let pstr: Vec<String> = k
+                    .params()
+                    .iter()
+                    .map(|p| format!("{}: {}", p.name, p.ty.canonical_name()))
+                    .collect();
+                write!(f, "<gpu_kernel {}({})>", k.name(), pstr.join(", "))
+            }
             Value::Tensor(t) => write!(f, "{t}"),
             Value::StructType(def) => write!(f, "<struct {}>", def.name),
             Value::StructInstance {
@@ -217,6 +225,7 @@ impl std::fmt::Display for Value {
                 enum_name,
                 variant,
                 payload,
+                ..
             } => {
                 if payload.is_empty() {
                     write!(f, "{enum_name}::{variant}")

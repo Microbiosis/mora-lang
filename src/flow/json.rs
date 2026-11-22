@@ -628,6 +628,11 @@ pub fn value_to_json(value: &Value) -> String {
                 Value::ComputeDag(_) => out.push_str("\"<compute_dag>\""),
                 Value::KVAllocator(_) => out.push_str("\"<kv_allocator>\""),
                 Value::MemoryPool(_) => out.push_str("\"<memory_pool>\""),
+                Value::GpuKernel(k) => {
+                    out.push_str("\"<gpu_kernel:");
+                    out.push_str(k.name());
+                    out.push_str(">\"");
+                }
                 Value::External(obj) => match obj.to_json() {
                     Some(v) if atom_depth < MAX_JSON_DEPTH => {
                         stack.push(SerStep::Val(Cow::Owned(v), atom_depth + 1));

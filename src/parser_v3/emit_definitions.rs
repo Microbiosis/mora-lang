@@ -465,7 +465,7 @@ impl ParserV3 {
         let name = self.consume_identifier("Expected enum name")?;
         self.declared_type_names.insert(name.clone());
         let saved_generic = std::mem::take(&mut self.generic_params);
-        let type_params = match self.parse_generic_clause() {
+        let (type_params, const_params) = match self.parse_generic_clause_with_consts() {
             Some(tp) => tp,
             None => {
                 self.generic_params = saved_generic;
@@ -546,6 +546,7 @@ impl ParserV3 {
             kind: WitnessKind::EnumDef {
                 name,
                 type_params,
+                const_params,
                 variants,
             },
             span,
@@ -664,7 +665,7 @@ impl ParserV3 {
         let name = self.consume_identifier("Expected struct name")?;
         self.declared_type_names.insert(name.clone());
         let saved_generic = std::mem::take(&mut self.generic_params);
-        let type_params = match self.parse_generic_clause() {
+        let (type_params, const_params) = match self.parse_generic_clause_with_consts() {
             Some(tp) => tp,
             None => {
                 self.generic_params = saved_generic;
@@ -780,6 +781,7 @@ impl ParserV3 {
             kind: WitnessKind::StructDef {
                 name,
                 type_params,
+                const_params,
                 fields,
             },
             span,
@@ -951,11 +953,57 @@ impl ParserV3 {
     fn parse_impl_header_type(
         &mut self,
         collected_type_params: &mut Vec<String>,
+        collected_const_params: &mut Vec<String>,
     ) -> Option<(String, Vec<crate::mir::hint::TypeHint>)> {
         let name = self.consume_identifier("Expected type or trait name in 'impl'")?;
         let mut generics = Vec::new();
         if self.match_token(&[TokenType::Less]) {
             loop {
+                // P4-1A: Allow inline `const D: int` inside `impl Linear<const IN: int, const OUT: int>`.
+                let is_inline_const = matches!(
+                    self.peek().map(|t| &t.token_type),
+                    Some(TokenType::Identifier(s)) if s == "const"
+                ) && matches!(
+                    self.tokens.get(self.current + 1).map(|t| &t.token_type),
+                    Some(TokenType::Identifier(_))
+                );
+                if is_inline_const {
+                    self.advance(); // 'const'
+                    let cname = self.consume_identifier("Expected const generic name in impl")?;
+                    self.consume(TokenType::Colon, "Expected ':' after const generic name")?;
+                    let ty_name =
+                        self.consume_identifier("Expected const generic type (int/usize)")?;
+                    if !matches!(
+                        ty_name.to_lowercase().as_str(),
+                        "int" | "usize" | "i64" | "i32"
+                    ) {
+                        let msg = format!(
+                            "Parse error: const generic parameter '{}' must have integer type (int/usize), got '{}' at line {}",
+                            cname,
+                            ty_name,
+                            self.current_line()
+                        );
+                        eprintln!("{msg}");
+                        self.diag = Some(msg);
+                        return None;
+                    }
+                    if !self.generic_params.contains(&cname) {
+                        self.generic_params.push(cname.clone());
+                    }
+                    if !collected_type_params.contains(&cname) {
+                        collected_type_params.push(cname.clone());
+                    }
+                    if !collected_const_params.contains(&cname) {
+                        collected_const_params.push(cname.clone());
+                    }
+                    generics.push(crate::mir::hint::TypeHint::from_type(
+                        crate::typeck::Type::TypeVar(crate::typeck::TypeVarId::Rigid(cname)),
+                    ));
+                    if !self.match_token(&[TokenType::Comma]) {
+                        break;
+                    }
+                    continue;
+                }
                 // Allow introducing implicit single-identifier generic vars like `T` in `impl Container<T> for list<T>`.
                 if let Some(Token {
                     token_type: TokenType::Identifier(id),
@@ -1015,29 +1063,31 @@ impl ParserV3 {
         let span = self.span_of_current();
         self.advance(); // 'impl'
         let saved_generic = std::mem::take(&mut self.generic_params);
-        let mut type_params = match self.parse_generic_clause() {
+        let (mut type_params, mut const_params) = match self.parse_generic_clause_with_consts() {
             Some(tp) => tp,
             None => {
                 self.generic_params = saved_generic;
                 return None;
             }
         };
-        let (first_name, first_generics) = match self.parse_impl_header_type(&mut type_params) {
-            Some(v) => v,
-            None => {
-                self.generic_params = saved_generic;
-                return None;
-            }
-        };
+        let (first_name, first_generics) =
+            match self.parse_impl_header_type(&mut type_params, &mut const_params) {
+                Some(v) => v,
+                None => {
+                    self.generic_params = saved_generic;
+                    return None;
+                }
+            };
         let (trait_name, trait_generics, target_type, target_generics) =
             if self.match_token_exact(TokenType::For) {
-                let (tgt_name, tgt_gens) = match self.parse_impl_header_type(&mut type_params) {
-                    Some(v) => v,
-                    None => {
-                        self.generic_params = saved_generic;
-                        return None;
-                    }
-                };
+                let (tgt_name, tgt_gens) =
+                    match self.parse_impl_header_type(&mut type_params, &mut const_params) {
+                        Some(v) => v,
+                        None => {
+                            self.generic_params = saved_generic;
+                            return None;
+                        }
+                    };
                 (Some(first_name), first_generics, tgt_name, tgt_gens)
             } else {
                 (None, Vec::new(), first_name, first_generics)
@@ -1168,6 +1218,7 @@ impl ParserV3 {
         Some(MirWitness {
             kind: WitnessKind::ImplDef {
                 type_params,
+                const_params,
                 trait_name,
                 trait_generics,
                 target_type,
@@ -1176,6 +1227,148 @@ impl ParserV3 {
             },
             span,
         })
+    }
+
+    /// P4-1B: Parse source-level GPU compute kernel `kernel name(p: f32, x: buf<f32>, ...) ... end`.
+    pub(super) fn emit_kernel_def_w(&mut self) -> Option<MirWitness> {
+        use crate::common::kernel_ir::KernelParam;
+
+        let span = self.span_of_current();
+        self.advance(); // 'kernel'
+        let name = self.consume_plain_identifier("Expected kernel name after 'kernel'")?;
+        self.consume(TokenType::LParen, "Expected '(' after kernel name")?;
+
+        let mut params: Vec<KernelParam> = Vec::new();
+        while !self.check(&TokenType::RParen) && !self.is_at_end() {
+            let pname = self.consume_plain_identifier("Expected kernel parameter name")?;
+            if params.iter().any(|p| p.name == pname) {
+                let msg = format!(
+                    "Parse error: duplicate kernel parameter '{}' in kernel '{}' at line {}",
+                    pname,
+                    name,
+                    self.current_line()
+                );
+                eprintln!("{msg}");
+                self.diag = Some(msg);
+                return None;
+            }
+            self.consume(TokenType::Colon, "Expected ':' after kernel parameter name")?;
+            let pty = self.parse_kernel_param_type(&name, &pname)?;
+            params.push(KernelParam {
+                name: pname,
+                ty: pty,
+            });
+            if !self.match_token(&[TokenType::Comma]) {
+                break;
+            }
+        }
+        self.consume(TokenType::RParen, "Expected ')' after kernel parameters")?;
+
+        let body = self.in_nested_scope(|this| {
+            this.scope.in_kernel_body = true;
+            let mut stmts = Vec::new();
+            while this.match_token(&[TokenType::Newline]) {}
+            while !this.check(&TokenType::End) && !this.is_at_end() {
+                let stmt = this.emit_statement_expr_w()?;
+                stmts.push(stmt);
+                while this.match_token(&[TokenType::Newline]) {}
+            }
+            this.consume(TokenType::End, "Expected 'end' after kernel body")?;
+            Some(stmts)
+        })?;
+
+        Some(MirWitness {
+            kind: WitnessKind::KernelDef { name, params, body },
+            span,
+        })
+    }
+
+    fn parse_kernel_param_type(
+        &mut self,
+        kernel_name: &str,
+        param_name: &str,
+    ) -> Option<crate::common::kernel_ir::KernelParamType> {
+        use crate::common::kernel_ir::KernelParamType;
+        let ty_ident = self.consume_identifier("Expected kernel parameter type")?;
+        let lower = ty_ident.to_lowercase();
+        match lower.as_str() {
+            "f32" => Some(KernelParamType::F32),
+            "f64" | "float" => Some(KernelParamType::F64),
+            "i32" | "int" => Some(KernelParamType::I32),
+            "buf" | "buffer" => {
+                self.consume(TokenType::Less, "Expected '<' after 'buf' in kernel param")?;
+                let elem = self.consume_identifier("Expected buffer element dtype (f32/f64)")?;
+                self.consume(TokenType::Greater, "Expected '>' after buf<dtype>")?;
+                match elem.to_lowercase().as_str() {
+                    "f32" => Some(KernelParamType::BufF32),
+                    "f64" | "float" => Some(KernelParamType::BufF64),
+                    other => {
+                        let msg = format!(
+                            "Parse error: unsupported kernel buffer dtype '{}' for '{}.{}' (expected f32 or f64) at line {}",
+                            other,
+                            kernel_name,
+                            param_name,
+                            self.current_line()
+                        );
+                        eprintln!("{msg}");
+                        self.diag = Some(msg);
+                        None
+                    }
+                }
+            }
+            "tensor" => {
+                if self.match_token(&[TokenType::Less]) {
+                    let elem = self.consume_identifier("Expected Tensor dtype (f32/f64)")?;
+                    // Consume optional `, shape, device` until matching `>`.
+                    let mut depth = 1usize;
+                    while depth > 0 && !self.is_at_end() {
+                        match self.peek().map(|t| &t.token_type) {
+                            Some(TokenType::Less) => {
+                                depth += 1;
+                                self.advance();
+                            }
+                            Some(TokenType::Greater) => {
+                                depth -= 1;
+                                self.advance();
+                            }
+                            _ => {
+                                self.advance();
+                            }
+                        }
+                    }
+                    match elem.to_lowercase().as_str() {
+                        "f32" => Some(KernelParamType::BufF32),
+                        "f64" | "float" => Some(KernelParamType::BufF64),
+                        other => {
+                            let msg = format!(
+                                "Parse error: unsupported kernel Tensor dtype '{}' for '{}.{}' (expected f32 or f64) at line {}",
+                                other,
+                                kernel_name,
+                                param_name,
+                                self.current_line()
+                            );
+                            eprintln!("{msg}");
+                            self.diag = Some(msg);
+                            None
+                        }
+                    }
+                } else {
+                    Some(KernelParamType::BufF32)
+                }
+            }
+            other => {
+                let msg = format!(
+                    "Parse error: unsupported kernel parameter type '{}' for '{}.{}' (expected f32, f64, i32, buf<f32>, or buf<f64>) at line {}",
+                    other,
+                    kernel_name,
+                    param_name,
+                    self.current_line()
+                );
+                eprintln!("{msg}");
+                self.diag = Some(msg);
+                None
+            }
+        }
     }
 }
 

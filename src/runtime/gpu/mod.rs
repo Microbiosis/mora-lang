@@ -11,6 +11,7 @@
 //!   is set, cleanly falls back to `EmulatedDeviceBackend` without crashing.
 
 pub(crate) mod cuda;
+pub(crate) mod kernel_compiler;
 pub(crate) mod metal;
 pub(crate) mod vulkan;
 mod vulkan_spirv;

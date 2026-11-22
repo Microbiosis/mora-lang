@@ -111,11 +111,13 @@ pub enum WitnessKind {
     EnumDef {
         name: String,
         type_params: Vec<String>,
+        const_params: Vec<String>,
         variants: Vec<WitnessEnumVariant>,
     },
     StructDef {
         name: String,
         type_params: Vec<String>,
+        const_params: Vec<String>,
         fields: Vec<WitnessStructField>,
     },
     /// Wave 3 Stage 3C: Source-level trait definition (`trait Name<T>: Parent ... end`).
@@ -128,11 +130,18 @@ pub enum WitnessKind {
     /// Wave 3 Stage 3C: Source-level trait or inherent `impl` block (`impl Trait for Target ... end` / `impl Target ... end`).
     ImplDef {
         type_params: Vec<String>,
+        const_params: Vec<String>,
         trait_name: Option<String>,
         trait_generics: Vec<crate::mir::hint::TypeHint>,
         target_type: String,
         target_generics: Vec<crate::mir::hint::TypeHint>,
         methods: Vec<WitnessImplMethod>,
+    },
+    /// P4-1B: First-class source-level GPU compute `kernel name(params...) ... end` declaration.
+    KernelDef {
+        name: String,
+        params: Vec<crate::common::kernel_ir::KernelParam>,
+        body: Vec<MirWitness>,
     },
     /// Wave 3 Stage 3C: Multi-dimensional zero-copy tensor slicing (`t[0..4, :, -1]`, `t[..., None]`).
     TensorSlice {
@@ -346,6 +355,11 @@ pub enum WitnessSelectArm {
 #[derive(Debug, Clone, PartialEq)]
 pub enum WitnessCallee {
     Name(String),
+    /// P4-1A: Nominal constructor or associated call with explicit generic/const arguments (e.g. `Linear<4, 3>(w, b)`).
+    GenericName {
+        name: String,
+        type_args: Vec<crate::mir::hint::TypeHint>,
+    },
     Var(String),
     Method(String, String),
     Evaluated(Box<MirWitness>),
@@ -398,6 +412,7 @@ impl MirWitness {
                 }
                 out
             }
+            WitnessKind::KernelDef { body, .. } => body.iter().collect(),
             WitnessKind::TensorSlice { target, axes } => {
                 let mut out = vec![target.as_ref()];
                 for ax in axes {
@@ -624,6 +639,9 @@ fn push_owned_witness_children(kind: WitnessKind, out: &mut Vec<MirWitness>) {
                 }
                 out.push(m.body);
             }
+        }
+        WitnessKind::KernelDef { body, .. } => {
+            out.extend(body);
         }
         WitnessKind::TensorSlice { target, axes } => {
             out.push(*target);

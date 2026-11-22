@@ -1430,6 +1430,8 @@ fn write_inst(w: &mut ByteWriter, inst: &ControlInst) -> MoraResult<()> {
         ControlInst::RegisterEnum {
             name,
             type_params,
+            const_params,
+            const_shape_bindings,
             variants,
             dst,
         } => {
@@ -1438,6 +1440,17 @@ fn write_inst(w: &mut ByteWriter, inst: &ControlInst) -> MoraResult<()> {
             w.write_len(type_params.len())?;
             for &tp in type_params {
                 w.write_sym(tp);
+            }
+            w.write_len(const_params.len())?;
+            for &cp in const_params {
+                w.write_sym(cp);
+            }
+            w.write_len(const_shape_bindings.len())?;
+            for &(vsym, csym, pidx, aidx) in const_shape_bindings {
+                w.write_sym(vsym);
+                w.write_sym(csym);
+                w.write_var_u32(pidx as u32);
+                w.write_var_u32(aidx as u32);
             }
             w.write_len(variants.len())?;
             for (vname, payloads) in variants {
@@ -1452,6 +1465,8 @@ fn write_inst(w: &mut ByteWriter, inst: &ControlInst) -> MoraResult<()> {
         ControlInst::RegisterStruct {
             name,
             type_params,
+            const_params,
+            const_shape_bindings,
             fields,
             dst,
         } => {
@@ -1460,6 +1475,16 @@ fn write_inst(w: &mut ByteWriter, inst: &ControlInst) -> MoraResult<()> {
             w.write_len(type_params.len())?;
             for &tp in type_params {
                 w.write_sym(tp);
+            }
+            w.write_len(const_params.len())?;
+            for &cp in const_params {
+                w.write_sym(cp);
+            }
+            w.write_len(const_shape_bindings.len())?;
+            for &(csym, fidx, aidx) in const_shape_bindings {
+                w.write_sym(csym);
+                w.write_var_u32(fidx as u32);
+                w.write_var_u32(aidx as u32);
             }
             w.write_len(fields.len())?;
             for f in fields {
@@ -1569,6 +1594,42 @@ fn write_inst(w: &mut ByteWriter, inst: &ControlInst) -> MoraResult<()> {
         ControlInst::KeepAlive(r) => {
             w.write_u8(47);
             w.write_reg(*r);
+        }
+        ControlInst::CallGeneric {
+            dst,
+            target,
+            const_args,
+            args,
+            named_args,
+        } => {
+            w.write_u8(48);
+            w.write_reg(*dst);
+            write_callee(w, target);
+            w.write_len(const_args.len())?;
+            for &(sym, val) in const_args {
+                w.write_sym(sym);
+                w.write_i64(val);
+            }
+            w.write_regs(args)?;
+            w.write_len(named_args.len())?;
+            for &(sym, reg) in named_args {
+                w.write_sym(sym);
+                w.write_reg(reg);
+            }
+        }
+        ControlInst::GetConstGeneric { dst, src, name } => {
+            w.write_u8(49);
+            w.write_reg(*dst);
+            w.write_reg(*src);
+            w.write_sym(*name);
+        }
+        ControlInst::RegisterKernel { name, program, dst } => {
+            w.write_u8(50);
+            w.write_sym(*name);
+            let encoded = program.encode_bytes();
+            w.write_len(encoded.len())?;
+            w.buf.extend_from_slice(&encoded);
+            write_opt_global(w, *dst);
         }
     }
     Ok(())
@@ -1823,6 +1884,20 @@ fn read_inst(r: &mut ByteReader<'_>) -> MoraResult<ControlInst> {
             for _ in 0..n_tp {
                 type_params.push(r.read_sym()?);
             }
+            let n_cp = r.read_len(MAX_COLLECTION_LEN)?;
+            let mut const_params = Vec::with_capacity(n_cp);
+            for _ in 0..n_cp {
+                const_params.push(r.read_sym()?);
+            }
+            let n_csb = r.read_len(MAX_COLLECTION_LEN)?;
+            let mut const_shape_bindings = Vec::with_capacity(n_csb);
+            for _ in 0..n_csb {
+                let vsym = r.read_sym()?;
+                let csym = r.read_sym()?;
+                let pidx = r.read_var_u32()? as usize;
+                let aidx = r.read_var_u32()? as usize;
+                const_shape_bindings.push((vsym, csym, pidx, aidx));
+            }
             let n_var = r.read_len(MAX_COLLECTION_LEN)?;
             let mut variants = Vec::with_capacity(n_var);
             for _ in 0..n_var {
@@ -1837,6 +1912,8 @@ fn read_inst(r: &mut ByteReader<'_>) -> MoraResult<ControlInst> {
             ControlInst::RegisterEnum {
                 name,
                 type_params,
+                const_params,
+                const_shape_bindings,
                 variants,
                 dst: read_opt_global(r)?,
             }
@@ -1847,6 +1924,19 @@ fn read_inst(r: &mut ByteReader<'_>) -> MoraResult<ControlInst> {
             let mut type_params = Vec::with_capacity(n_tp);
             for _ in 0..n_tp {
                 type_params.push(r.read_sym()?);
+            }
+            let n_cp = r.read_len(MAX_COLLECTION_LEN)?;
+            let mut const_params = Vec::with_capacity(n_cp);
+            for _ in 0..n_cp {
+                const_params.push(r.read_sym()?);
+            }
+            let n_csb = r.read_len(MAX_COLLECTION_LEN)?;
+            let mut const_shape_bindings = Vec::with_capacity(n_csb);
+            for _ in 0..n_csb {
+                let csym = r.read_sym()?;
+                let fidx = r.read_var_u32()? as usize;
+                let aidx = r.read_var_u32()? as usize;
+                const_shape_bindings.push((csym, fidx, aidx));
             }
             let n_f = r.read_len(MAX_COLLECTION_LEN)?;
             let mut fields = Vec::with_capacity(n_f);
@@ -1869,6 +1959,8 @@ fn read_inst(r: &mut ByteReader<'_>) -> MoraResult<ControlInst> {
             ControlInst::RegisterStruct {
                 name,
                 type_params,
+                const_params,
+                const_shape_bindings,
                 fields,
                 dst: read_opt_global(r)?,
             }
@@ -1976,6 +2068,45 @@ fn read_inst(r: &mut ByteReader<'_>) -> MoraResult<ControlInst> {
             }
         }
         47 => ControlInst::KeepAlive(r.read_reg()?),
+        48 => {
+            let dst = r.read_reg()?;
+            let target = read_callee(r)?;
+            let n_ca = r.read_len(MAX_COLLECTION_LEN)?;
+            let mut const_args = Vec::with_capacity(n_ca);
+            for _ in 0..n_ca {
+                const_args.push((r.read_sym()?, r.read_i64()?));
+            }
+            let args = r.read_regs()?;
+            let n_na = r.read_len(MAX_COLLECTION_LEN)?;
+            let mut named_args = Vec::with_capacity(n_na);
+            for _ in 0..n_na {
+                named_args.push((r.read_sym()?, r.read_reg()?));
+            }
+            ControlInst::CallGeneric {
+                dst,
+                target,
+                const_args,
+                args,
+                named_args,
+            }
+        }
+        49 => ControlInst::GetConstGeneric {
+            dst: r.read_reg()?,
+            src: r.read_reg()?,
+            name: r.read_sym()?,
+        },
+        50 => {
+            let name = r.read_sym()?;
+            let len = r.read_len(MAX_COLLECTION_LEN)?;
+            let raw = r.read_bytes(len)?;
+            let program =
+                crate::common::kernel_ir::KernelProgram::decode_bytes(raw).map_err(corrupt)?;
+            ControlInst::RegisterKernel {
+                name,
+                program: Box::new(program),
+                dst: read_opt_global(r)?,
+            }
+        }
         other => return Err(corrupt(format!("invalid ControlInst opcode {other}"))),
     })
 }
@@ -2131,6 +2262,7 @@ fn write_program(w: &mut ByteWriter, prog: &ControlProgram) -> MoraResult<()> {
             GlobalKind::Struct => w.write_u8(4),
             GlobalKind::Trait => w.write_u8(5),
             GlobalKind::TypeAlias => w.write_u8(6),
+            GlobalKind::Kernel => w.write_u8(7),
         }
     }
 
@@ -2238,6 +2370,7 @@ fn read_program(r: &mut ByteReader<'_>) -> MoraResult<ControlProgram> {
             4 => GlobalKind::Struct,
             5 => GlobalKind::Trait,
             6 => GlobalKind::TypeAlias,
+            7 => GlobalKind::Kernel,
             other => return Err(corrupt(format!("invalid GlobalKind tag {other}"))),
         };
         globals.push(GlobalMeta {

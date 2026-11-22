@@ -14,7 +14,7 @@
 //! - Includes a per-device size-classed VRAM slab arena (`CudaVramArena`) recycling `CUdeviceptr`
 //!   allocations across repeated DAG invocations with deterministic `Drop` cleanup.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 use std::fmt;
 use std::ptr;
@@ -280,6 +280,8 @@ struct CudaContextState {
     ctx: CuContext,
     kernels: CudaKernels,
     arena: CudaVramArena,
+    /// P4-1B: Cached compiled user-defined GPU `kernel` modules keyed by `KernelProgram::content_hash()`.
+    custom_modules: HashMap<u64, (CuModule, CuFunction)>,
 }
 
 struct CudaDeviceInner {
@@ -305,6 +307,11 @@ impl Drop for CudaDeviceInner {
         unsafe {
             let _ = (self.api.cu_ctx_set_current)(st.ctx);
             st.arena.drain(&self.api);
+            for (_, (cmod, _)) in st.custom_modules.drain() {
+                if !cmod.is_null() {
+                    let _ = (self.api.cu_module_unload)(cmod);
+                }
+            }
             if !st.kernels.module.is_null() {
                 let _ = (self.api.cu_module_unload)(st.kernels.module);
                 st.kernels.module = ptr::null_mut();
@@ -4144,6 +4151,135 @@ impl DeviceBackend for CudaDeviceBackend {
         quantize_slice_in_place(out, dtype);
         Ok(())
     }
+
+    fn launch_custom_kernel(
+        &self,
+        kernel: &crate::common::kernel_ir::KernelProgram,
+        grid: u32,
+        block: u32,
+        args: &[crate::runtime::gpu::kernel_compiler::KernelLaunchArg],
+    ) -> MoraResult<bool> {
+        use crate::runtime::gpu::kernel_compiler::{KernelLaunchArg, emit_ptx};
+
+        let mut st = self.inner.state.lock();
+        // SAFETY: Bind retained primary CUDA context before compiling/launching custom kernel.
+        let rc_ctx = unsafe { (self.inner.api.cu_ctx_set_current)(st.ctx) };
+        cu_check(rc_ctx, "cuCtxSetCurrent(launch_custom_kernel)")?;
+
+        let hash = kernel.content_hash();
+        let func = if let Some(&(_, f)) = st.custom_modules.get(&hash) {
+            f
+        } else {
+            let ptx = emit_ptx(kernel);
+            let ptx_nul = CString::new(ptx).map_err(|e| {
+                MoraError::Runtime(format!("CUDA custom kernel PTX contains interior NUL: {e}"))
+            })?;
+            let mut module: CuModule = ptr::null_mut();
+            let rc = if let Some(load_ex) = self.inner.api.cu_module_load_data_ex {
+                let mut err_buf = vec![0u8; 16384];
+                let mut opts: [c_uint; 2] =
+                    [CU_JIT_ERROR_LOG_BUFFER, CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES];
+                let mut vals: [*mut c_void; 2] = [
+                    err_buf.as_mut_ptr() as *mut c_void,
+                    err_buf.len() as *mut c_void,
+                ];
+                // SAFETY: `ptx_nul` is NUL-terminated; `opts`/`vals` match CUDA JIT error log ABI.
+                let rc = unsafe {
+                    load_ex(
+                        &mut module,
+                        ptx_nul.as_ptr() as *const c_void,
+                        opts.len() as c_uint,
+                        opts.as_mut_ptr(),
+                        vals.as_mut_ptr(),
+                    )
+                };
+                if rc != CUDA_SUCCESS {
+                    let log_end = err_buf
+                        .iter()
+                        .position(|&b| b == 0)
+                        .unwrap_or(err_buf.len());
+                    let log = String::from_utf8_lossy(&err_buf[..log_end]);
+                    return Err(MoraError::Runtime(format!(
+                        "CUDA JIT failed for kernel '{}': CUresult({rc})\n{log}",
+                        kernel.name
+                    )));
+                }
+                rc
+            } else {
+                // SAFETY: `ptx_nul` is a valid NUL-terminated PTX source buffer.
+                unsafe {
+                    (self.inner.api.cu_module_load_data)(
+                        &mut module,
+                        ptx_nul.as_ptr() as *const c_void,
+                    )
+                }
+            };
+            cu_check(rc, "cuModuleLoadData(custom_kernel)")?;
+            let f = match load_kernel_fn(&self.inner.api, module, &kernel.name) {
+                Ok(f) => f,
+                Err(e) => {
+                    // SAFETY: Unload newly loaded module on symbol lookup failure.
+                    unsafe {
+                        let _ = (self.inner.api.cu_module_unload)(module);
+                    }
+                    return Err(e);
+                }
+            };
+            st.custom_modules.insert(hash, (module, f));
+            f
+        };
+
+        // Keep concrete storage slots pinned in a Vec while building raw `*mut c_void` param pointers.
+        enum ParamSlot {
+            Ptr(CuDevicePtr),
+            F32(f32),
+            F64(f64),
+            U32(u32),
+        }
+        let mut slots: Vec<ParamSlot> = Vec::with_capacity(args.len());
+        for a in args {
+            match *a {
+                KernelLaunchArg::VramBuffer { handle, .. } => slots.push(ParamSlot::Ptr(handle)),
+                KernelLaunchArg::F32(v) => slots.push(ParamSlot::F32(v)),
+                KernelLaunchArg::F64(v) => slots.push(ParamSlot::F64(v)),
+                KernelLaunchArg::I32(v) => slots.push(ParamSlot::U32(v as u32)),
+            }
+        }
+        let mut param_ptrs: Vec<*mut c_void> = Vec::with_capacity(slots.len());
+        for slot in &mut slots {
+            let p = match slot {
+                ParamSlot::Ptr(v) => &raw mut *v as *mut c_void,
+                ParamSlot::F32(v) => &raw mut *v as *mut c_void,
+                ParamSlot::F64(v) => &raw mut *v as *mut c_void,
+                ParamSlot::U32(v) => &raw mut *v as *mut c_void,
+            };
+            param_ptrs.push(p);
+        }
+
+        // SAFETY: `func` is a live `CUfunction` in the bound context and `param_ptrs` points to
+        // live `slots` matching the exact `.param` order emitted by `emit_ptx(kernel)`.
+        let rc_launch = unsafe {
+            (self.inner.api.cu_launch_kernel)(
+                func,
+                grid.max(1),
+                1,
+                1,
+                block.max(1),
+                1,
+                1,
+                0,
+                ptr::null_mut(),
+                param_ptrs.as_mut_ptr(),
+                ptr::null_mut(),
+            )
+        };
+        cu_check(rc_launch, "cuLaunchKernel(custom_kernel)")?;
+        // SAFETY: Synchronize default stream so subsequent VRAM reads/D2H observe completed writes.
+        let rc_sync = unsafe { (self.inner.api.cu_ctx_synchronize)() };
+        cu_check(rc_sync, "cuCtxSynchronize(custom_kernel)")?;
+        self.inner.counters.on_vram_hit();
+        Ok(true)
+    }
 }
 
 /// Dynamically probe all available NVIDIA CUDA GPUs on this machine via the CUDA Driver API.
@@ -4259,6 +4395,7 @@ pub(crate) fn probe_cuda_backends() -> Vec<HardwareBackendEntry> {
                 ctx,
                 kernels,
                 arena: CudaVramArena::new(),
+                custom_modules: HashMap::new(),
             }),
             counters: VramCounters::default(),
         });

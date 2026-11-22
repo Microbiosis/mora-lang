@@ -12,6 +12,7 @@
 //! - Owns persistent RAII [`VulkanVramBuffer`] (`VkBuffer` + `VkDeviceMemory`) handles enabling
 //!   zero-copy VRAM-to-VRAM chained compute graph execution.
 
+use std::collections::HashMap;
 use std::ffi::{CStr, c_char, c_void};
 use std::fmt;
 use std::ptr;
@@ -819,6 +820,8 @@ struct VulkanState {
     cmd_pool: VkCommandPool,
     cmd_buf: VkCommandBuffer,
     mem_props: VkPhysicalDeviceMemoryProperties,
+    /// P4-1B: Cached compiled custom SPIR-V 1.0 pipelines keyed by `(kernel_hash, local_size_x)`.
+    custom_pipes: HashMap<(u64, u32), VkComputePipe>,
 }
 
 struct VulkanDeviceInner {
@@ -836,7 +839,7 @@ unsafe impl Sync for VulkanDeviceInner {}
 
 impl Drop for VulkanDeviceInner {
     fn drop(&mut self) {
-        let st = self.state.lock();
+        let mut st = self.state.lock();
         // SAFETY: Handles are destroyed in strict reverse creation order after all
         // `VulkanVramBuffer`s holding `Arc<VulkanDeviceInner>` have already been dropped.
         unsafe {
@@ -844,6 +847,10 @@ impl Drop for VulkanDeviceInner {
             (self.api.destroy_command_pool)(st.vk_dev, st.cmd_pool, ptr::null());
             (self.api.destroy_buffer)(st.vk_dev, st.dummy_buf.buffer, ptr::null());
             (self.api.free_memory)(st.vk_dev, st.dummy_buf.memory, ptr::null());
+            let vk_dev = st.vk_dev;
+            for (_, pipe) in st.custom_pipes.drain() {
+                pipe.destroy(&self.api, vk_dev);
+            }
             st.pipe_fused_ew_f32.destroy(&self.api, st.vk_dev);
             st.pipe_flash_attn_f32.destroy(&self.api, st.vk_dev);
             st.pipe_rms_norm_f32.destroy(&self.api, st.vk_dev);
@@ -2670,6 +2677,91 @@ impl DeviceBackend for VulkanDeviceBackend {
         }
         Ok(())
     }
+
+    fn launch_custom_kernel(
+        &self,
+        kernel: &crate::common::kernel_ir::KernelProgram,
+        grid: u32,
+        block: u32,
+        args: &[crate::runtime::gpu::kernel_compiler::KernelLaunchArg],
+    ) -> MoraResult<bool> {
+        use crate::runtime::gpu::kernel_compiler::{
+            KernelLaunchArg, emit_spirv_words, vulkan_kernel_layout,
+        };
+
+        // Core Vulkan 1.0 logical device does not enable optional `shaderFloat64`;
+        // fall back cleanly to CPU executor for f64 kernels while accelerating all f32 kernels on GPU.
+        if kernel.uses_f64() {
+            return Ok(false);
+        }
+
+        let local_size_x = block.max(1);
+        let layout = vulkan_kernel_layout(kernel);
+        let cache_key = (kernel.content_hash(), local_size_x);
+
+        let mut st = self.inner.state.lock();
+        if !st.custom_pipes.contains_key(&cache_key) {
+            let words = emit_spirv_words(kernel, local_size_x).map_err(MoraError::Runtime)?;
+            let pipe =
+                VkComputePipe::create(&self.inner.api, st.vk_dev, &words, layout.total_bindings)
+                    .ok_or_else(|| {
+                        MoraError::Runtime(format!(
+                            "Vulkan failed to compile SPIR-V 1.0 compute pipeline for kernel '{}'",
+                            kernel.name
+                        ))
+                    })?;
+            st.custom_pipes.insert(cache_key, pipe);
+        }
+
+        let mut temps: Vec<VkBufferAlloc> = Vec::new();
+        let mut buffers: Vec<VkBuffer> = Vec::with_capacity(layout.total_bindings as usize);
+        let run = (|| -> MoraResult<()> {
+            for &(param_idx, _binding) in &layout.buf_bindings {
+                let KernelLaunchArg::VramBuffer { handle, .. } = args[param_idx] else {
+                    return Err(MoraError::Runtime(format!(
+                        "Vulkan custom kernel '{}': expected VRAM buffer for param #{param_idx}",
+                        kernel.name
+                    )));
+                };
+                buffers.push(handle);
+            }
+            if layout.total_scalar_words > 0 {
+                let mut scalar_words = vec![0u32; layout.total_scalar_words];
+                for (&param_idx, &word_off) in &layout.scalar_word_offsets {
+                    match args[param_idx] {
+                        KernelLaunchArg::F32(v) => {
+                            scalar_words[word_off as usize] = v.to_bits();
+                        }
+                        KernelLaunchArg::I32(v) => {
+                            scalar_words[word_off as usize] = v as u32;
+                        }
+                        KernelLaunchArg::F64(v) => {
+                            let bits = v.to_bits();
+                            scalar_words[word_off as usize] = (bits & 0xFFFF_FFFF) as u32;
+                            scalar_words[word_off as usize + 1] = (bits >> 32) as u32;
+                        }
+                        KernelLaunchArg::VramBuffer { .. } => {}
+                    }
+                }
+                let h_scalars =
+                    Self::upload_temp_slice(&self.inner.api, &st, &mut temps, &scalar_words)?;
+                buffers.push(h_scalars);
+            }
+            let pipe = st
+                .custom_pipes
+                .get(&cache_key)
+                .expect("custom pipeline cached");
+            Self::dispatch_pipe(&self.inner.api, &st, pipe, &buffers, grid.max(1), 1, 1)?;
+            Ok(())
+        })();
+
+        for alloc in temps {
+            Self::free_host_buffer(&self.inner.api, st.vk_dev, alloc);
+        }
+        run?;
+        self.inner.counters.on_vram_hit();
+        Ok(true)
+    }
 }
 
 fn init_vulkan_device(
@@ -2820,6 +2912,7 @@ fn init_vulkan_device(
         cmd_pool,
         cmd_buf,
         mem_props,
+        custom_pipes: HashMap::new(),
     })
 }
 

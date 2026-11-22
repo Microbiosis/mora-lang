@@ -1,6 +1,6 @@
 [package]
 name = "mora"
-version = "0.110.1"
+version = "0.111.0"
 edition = "2024"
 # build.rs 从 Cargo.toml 读取 CARGO_PKG_VERSION 并注入 MORAGIT_VERSION 环境变量
 build = "build.rs"
@@ -22,7 +22,7 @@ path = "src/main.rs"
 name = "mora-lsp"
 path = "src/bin/lsp.rs"
 
-# v0.110.0: 核心二进制 `mora` 与 `mora-lsp`；纯 Mora 标准库（`std/math/bigint.mora`、`std/testing.mora`、`std/net/http.mora`、`std/mcp.mora`）内嵌于 `mora::resolve_std_module`。
+# v0.111.0: 核心二进制 `mora` 与 `mora-lsp`；纯 Mora 标准库（`std/math/bigint.mora`、`std/testing.mora`、`std/nn/safetensors.mora`、`std/nn/gguf.mora`、`std/net/tls.mora`、`std/net/http.mora`、`std/mcp.mora`、`std/trace.mora`）内嵌于 `mora::resolve_std_module`。
 
 [dependencies]
 # v0.110.0: 生产环境零外部第三方依赖（OS FFI、Futex 同步原语、多线程 Future 调度器、最小堆定时器与非阻塞 TCP Reactor 均自研内建）。

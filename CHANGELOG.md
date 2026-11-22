@@ -2,6 +2,50 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [0.111.0] — Phase P4 全栈深水区里程碑：编译期 Const Generics 与源码级 GPU `kernel`、16B 未装箱 VM 与 M:N 协作式纤程、代价模型与严格 W^X 原生 JIT、分布式集合通信与纳秒级 `std/trace`
+
+在不引入任何外部 Cargo 依赖（保持 `Cargo.toml` / `Cargo.lock` 唯一 1 包、**0 生产依赖 / 0 测试依赖**）与严格 Rust stable 通道的前提下，完成 `v0.111.0`（Phase P4）全部四项核心架构里程碑。
+
+### P4-1：编译期 Const Generics、Trait 运算符重载与源码级 GPU `kernel` 块（`tests/p4_const_generics_ops_and_gpu_kernels.rs`）
+
+- **编译期 Const Generics（`struct` / `enum` / `impl` 全链路闭环）**：
+  - 前端 `parser_v3` 与 `MirWitness` 新增 `const NAME: int` / `const NAME: usize` 泛型参数及显式整数实参（如 `struct Linear<const IN: int, const OUT: int>`、`Linear<4, 3>(...)`、`enum FixedBuf<const N: int>`）
+  - 统一 HM 求解器新增 `Type::ConstInt(i64)` 并与 `Tensor<DType, [IN, OUT], dev>` 符号维度 `DimExpr::Symbolic` ↔ `DimExpr::Known` 双向统一，编译期直接拦截维度/常量不匹配
+  - `ControlProgram` SSA IR（`CallGeneric`/`GetConstGeneric`/`RegisterEnum`）、`MORABC02` 字节码与堆帧 VM 完整保留 `StructInstance` / `EnumVariant` 运行期 `const_args`（支持从张量形状反推）供 `impl` 方法直接读取
+- **9 个内置运算符 Trait 堆帧重载**：
+  - 预注册 `Add`/`Sub`/`Mul`/`Div`/`Mod`/`Pow`/`MatMul`/`Eq`/`Neg` 9 个运算符 trait，覆盖 `+ - * / % ** @ == != -x` 静态推断与堆帧 VM 零 Rust 递归分派（含 `CombinatorFrame::BoolNot` 与默认结构化 `Eq` 回退，完整保留代数效应与定界续延安全）
+- **一等源码级 GPU `kernel` 块（PTX / SPIR-V / Metal MSL / CPU 四后端零拷贝执行）**：
+  - 新增 `kernel name(x: buf<f32>, ...) ... end` 上下文语法（`buf[idx] = expr` 严格限定于 `ParserScope::in_kernel_body`，不破坏不可变列表语义）、类型化 SSA `KernelProgram` IR（`src/common/kernel_ir.rs`）、FNV-1a 内容哈希及 `ControlInst::RegisterKernel` `MORABC02` AOT 往返编解码、`mora fmt` 规范排版与 HM/LSP 静态校验
+  - 新增纯 Rust 四后端编译器 `src/runtime/gpu/kernel_compiler.rs`：CUDA PTX ISA 7.0（含 `f64` `exp`/`tanh`）+ `CudaDeviceBackend::launch_custom_kernel`、Vulkan SPIR-V 1.0 结构化 CFG 二进制流 + `VulkanDeviceBackend::launch_custom_kernel`、Metal MSL + `MetalDeviceBackend::launch_custom_kernel`（`newLibraryWithSource` + 标量打包），以及安全 CPU 并行执行器；RTX 5070 实机 `cuda:0` 与 `vulkan:0` 链式 3 核零 H2D/D2H 拷贝实测通过
+  - 将 `CallAction::PushCombinator.combinator` 装箱为 `Box<CombinatorFrame>`（`CallAction` 尺寸 344B → 136B）
+
+### P4-2：16 字节未装箱 `RegSlot` 寄存器文件与协作式 M:N 栈帧挂起（`tests/p4_unboxed_vm_and_fibers.rs`）
+
+- **16 字节混合未装箱 `RegSlot`（`src/runtime/vm/continuation.rs`）**：
+  - `ScriptFrame.regs` 与非共享 `LocalCell` 迁移至 16B `RegSlot`（`Nil | Bool | Int | Float | Boxed(Box<Value>)`，编译期断言 `size_of::<RegSlot>() == 16`），在 `VmEngine` 热路径实现 `Const`/`Copy`/`LoadLocal`/`StoreLocal`/`Unary`/`Binary`（`Int`/`Float`/`Bool`）/`Jump`/`Branch` 零装箱快路径
+- **统一 `CapturedFrames` M:N 协作式栈帧挂起（`VmOutcome::Suspended` + `VmYield`）**：
+  - 统一 `CapturedFrames = Vec<CallFrame>` 同时服务定界续延（`perform`/`handle`）与 `TaskScheduler` M:N 纤程调度；全部异步操作（`sleep`/`channel`/`select` via `CombinatorFrame::SelectResume`/`join`/`tcp_*`/`tls_*`）改为非阻塞 `CallAction::AwaitFuture(VmFuture)`
+  - 引入 3 状态无竞态 `ExecutorTask`（`FIBER_STEP_BUDGET = 2048` 与 `fiber_stats()` 遥测），实测 2 条 OS 线程无死锁复用 120 条并发纤程（CPU 抢占、通道、选择、多客户端 TCP 与取消）及 16 步抢占下的多发代数效应完全等价
+
+### P4-3：Roofline 代价模型优化器与零依赖严格 W^X x86-64 原生 JIT（`tests/p4_cost_model_and_native_jit.rs`）
+
+- **DType 安全代数/布局化简与 `DagCostModel`（`src/runtime/compute_dag.rs`）**：
+  - `TensorComputeDag::fuse()` 新增 Pass 0 代数与布局消除（`Transpose(Transpose(x)) -> x`、`Reshape(Reshape(x)) -> Reshape`、`x ** 2.0 -> x * x`、`x ** 1.0 -> x`、`-(-x) -> x`，以及严格受 `DType::is_int()` 保护的整数恒等式 `x + 0`/`x - 0`/`x * 1`/`x / 1`，绝不破坏 IEEE-754 浮点 `NaN`/`±Inf`/`-0.0` 语义）
+  - 新增 `DagCostModel`（逐节点与全图 FLOPs、读写字节、算术强度、Roofline 瓶颈分类与融合节省字节），暴露 `dag.cost_report()` 贯穿 `Value`/`typeck`/`vm::builtins`
+- **零依赖严格 W^X x86-64 原生机器码 Kernel 发射器（`src/runtime/native_jit.rs`）**：
+  - 面向 `FusedElementwise` 算子链（含标量广播）的纯 Rust x86-64 AVX2（256-bit `4×f64`）+ SSE2（`1×f64`）跨 ABI（Windows x64 + System V AMD64）机器码生成器
+  - 严格执行 `RW → RX` 权限切换（Windows `VirtualAlloc`/`VirtualProtect`、Unix `mmap`/`mprotect`，永不分配 `RWX`），内置 FNV-1a 内核缓存、`MORA_DISABLE_NATIVE_JIT=1` 开关与非 x86-64 优雅回退；长度 `0..257` 及 IEEE-754 边界值与 `simd_kernels` 逐比特一致
+
+### P4-4：分布式 `ProcessGroup` 集合通信与纳秒级 `TraceProfiler`（`std/trace`，`tests/p4_distributed_and_profiler.rs`）
+
+- **分布式张量集合通信 `ProcessGroup`（`src/runtime/distributed.rs`）**：
+  - 新增一等 `Value::ProcessGroup` / `Type::ProcessGroup` 与 `process_group(world_size)`（进程内多 rank 异步协调器，保留 GPU VRAM 常驻、重复 rank 快速报错防死锁并自动回收已完成分代桶）及 `tcp_process_group(rank, world_size, addrs)`（基于 `AsyncIoReactor` TCP Socket 的 `MPGR` 二进制环网、`join2` 全双工传输与 `Send` 安全异步锁）
+  - 实现 `all_reduce`（`sum`/`mean`/`max`/`min`）、`all_gather`、`broadcast`、`reduce_scatter`、`barrier`、`ranks`、`stats`，全部通过 `CallAction::AwaitFuture` 协作式调度（`world_size > worker_threads` 零阻塞）
+- **计算图与服务统一纳秒剖析器（`src/runtime/profiler.rs` + `std/trace.mora`）**：
+  - 新增全局纳秒单调 `TraceProfiler`（`profiler()`）与内嵌纯 Mora 标准库 `std/trace.mora`（含 `trace_start`/`trace_stop`/`trace_span`/`trace_service_span`/`trace_http_middleware`/`trace_summary`/`trace_chrome_json`）
+  - 贯通 `ComputeDag.run_profiled()`、GPU `kernel` 派发、`KVPageAllocator` 页分配、`ProcessGroup` 集合通信与实时 `std/net/http` `Router` 中间件 5 大类别，原生导出标准 Chrome Trace Event JSON（`chrome://tracing` / Perfetto）
+  - 同步接入 `BuiltinFnId` 标签 45/46/47（`MORABC02`）、HM 签名与 LSP 补全，全仓 5 项守卫套件 20/20 全绿
+
 ## [0.110.1] — P3 全栈闭环：GPU VRAM 常驻与原生 f16/bf16 全核、工具链 `mora fmt`/`mora test`、ML 权重标准库与零依赖原生 TLS/HTTPS
 
 在不引入任何外部 Cargo 依赖（保持 `Cargo.toml` / `Cargo.lock` **0 生产依赖 / 0 测试依赖**）的前提下，完成 P3 全部三个子里程碑（P3-A GPU 全栈闭环、P3-B 工具链 CLI 与可运行示例、P3-C ML 权重与原生异步 TLS/HTTPS）。

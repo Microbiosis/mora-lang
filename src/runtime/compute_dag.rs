@@ -451,6 +451,17 @@ impl DeviceBackend for CpuDeviceBackend {
         dtype: DType,
         out: &mut Vec<f64>,
     ) -> MoraResult<()> {
+        if crate::runtime::native_jit::try_run_fused_elementwise_into(
+            input_flats,
+            input_shapes,
+            steps,
+            out_shape,
+            out_numel,
+            dtype,
+            out,
+        )? {
+            return Ok(());
+        }
         simd_kernels::fused_elementwise_into(
             input_flats,
             input_shapes,
@@ -1195,7 +1206,316 @@ pub struct TensorComputeDag {
     pub nodes: Vec<DagNode>,
     pub output: usize,
     pub fused: bool,
+    /// P4-3: Number of DType-safe algebraic / layout simplifications applied during optimization.
+    pub(crate) algebraic_rewrites: usize,
     compiled_plan: Option<Arc<CompiledDagPlan>>,
+}
+
+/// P4-3: Per-node roofline cost analysis entry produced by [`DagCostModel`].
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DagNodeCost {
+    pub(crate) node_id: usize,
+    pub(crate) op: &'static str,
+    pub(crate) flops: u64,
+    pub(crate) bytes_read: u64,
+    pub(crate) bytes_written: u64,
+    pub(crate) arithmetic_intensity: f64,
+    pub(crate) bound: &'static str,
+}
+
+/// P4-3: Whole-DAG roofline cost, bandwidth savings, algebraic rewrite, and native JIT report.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DagCostReport {
+    pub(crate) node_costs: Vec<DagNodeCost>,
+    pub(crate) total_flops: u64,
+    pub(crate) total_bytes_read: u64,
+    pub(crate) total_bytes_written: u64,
+    pub(crate) total_memory_bytes: u64,
+    pub(crate) arithmetic_intensity: f64,
+    pub(crate) bottleneck: &'static str,
+    pub(crate) fusion_bytes_saved: u64,
+    pub(crate) fused_nodes: usize,
+    pub(crate) total_nodes: usize,
+    pub(crate) algebraic_rewrites: usize,
+    pub(crate) native_jit_eligible_nodes: usize,
+    pub(crate) native_jit_isa: &'static str,
+    pub(crate) native_jit_compiled: u64,
+    pub(crate) native_jit_cache_hits: u64,
+    pub(crate) native_jit_dispatches: u64,
+}
+
+/// P4-3: Analytical FLOPs, memory-traffic, and roofline cost model for [`TensorComputeDag`].
+pub(crate) struct DagCostModel;
+
+impl DagCostModel {
+    fn ew_step_flops(step: &FusedEwStep) -> u64 {
+        match step {
+            FusedEwStep::Add(_, _)
+            | FusedEwStep::Sub(_, _)
+            | FusedEwStep::Mul(_, _)
+            | FusedEwStep::Div(_, _)
+            | FusedEwStep::AddScalar(_, _)
+            | FusedEwStep::SubScalar(_, _, _)
+            | FusedEwStep::MulScalar(_, _)
+            | FusedEwStep::DivScalar(_, _, _)
+            | FusedEwStep::Neg(_)
+            | FusedEwStep::Relu(_)
+            | FusedEwStep::Abs(_) => 1,
+            FusedEwStep::Sqrt(_)
+            | FusedEwStep::Exp(_)
+            | FusedEwStep::Ln(_)
+            | FusedEwStep::Sin(_)
+            | FusedEwStep::Cos(_)
+            | FusedEwStep::Tanh(_) => 4,
+            FusedEwStep::Sigmoid(_) => 5,
+            FusedEwStep::Silu(_) => 6,
+            FusedEwStep::Gelu(_) | FusedEwStep::Pow(_, _) | FusedEwStep::PowScalar(_, _, _) => 8,
+        }
+    }
+
+    fn act_flops(act: FusedAct) -> u64 {
+        match act {
+            FusedAct::None => 0,
+            FusedAct::Relu => 1,
+            FusedAct::Tanh => 4,
+            FusedAct::Sigmoid => 5,
+            FusedAct::Silu => 6,
+            FusedAct::Gelu => 8,
+        }
+    }
+
+    fn classify(flops: u64, mem_bytes: u64, dev: &Device) -> (f64, &'static str) {
+        if flops == 0 && mem_bytes == 0 {
+            return (0.0, "zero-cost");
+        }
+        let ai = if mem_bytes > 0 {
+            flops as f64 / mem_bytes as f64
+        } else {
+            f64::INFINITY
+        };
+        let ridge = match dev {
+            Device::Cpu => 8.0,
+            Device::Cuda(_) | Device::Vulkan(_) | Device::Metal(_) => 32.0,
+        };
+        if ai >= ridge {
+            (ai, "compute-bound")
+        } else {
+            (ai, "memory-bound")
+        }
+    }
+
+    pub(crate) fn analyze(dag: &TensorComputeDag) -> DagCostReport {
+        let mut node_costs = Vec::with_capacity(dag.nodes.len());
+        let mut total_flops: u64 = 0;
+        let mut total_bytes_read: u64 = 0;
+        let mut total_bytes_written: u64 = 0;
+        let mut fusion_bytes_saved: u64 = 0;
+        let mut fused_nodes: usize = 0;
+        let mut native_jit_eligible_nodes: usize = 0;
+
+        let node_bytes = |idx: usize| -> u64 {
+            let n = &dag.nodes[idx];
+            let elems = checked_numel(&n.shape).unwrap_or(1);
+            n.dtype.storage_bytes(elems) as u64
+        };
+
+        for (idx, node) in dag.nodes.iter().enumerate() {
+            let out_elems = checked_numel(&node.shape).unwrap_or(1) as u64;
+            let out_bytes = node.dtype.storage_bytes(out_elems as usize) as u64;
+            if node.op.is_fused() {
+                fused_nodes += 1;
+            }
+            let (flops, read_b, write_b, saved_b) = match &node.op {
+                DagOp::Input(_)
+                | DagOp::ConstTensor(_)
+                | DagOp::Reshape(_, _)
+                | DagOp::Identity(_) => (0, 0, 0, 0),
+                DagOp::Transpose(a, _, _) | DagOp::Gather(a, _) | DagOp::ScatterAdd(a, _, _) => {
+                    (0, node_bytes(*a), out_bytes, 0)
+                }
+                DagOp::Add(a, b) | DagOp::Sub(a, b) | DagOp::Mul(a, b) | DagOp::Div(a, b) => {
+                    (out_elems, node_bytes(*a) + node_bytes(*b), out_bytes, 0)
+                }
+                DagOp::Pow(a, b) => (out_elems * 8, node_bytes(*a) + node_bytes(*b), out_bytes, 0),
+                DagOp::AddScalar(a, _)
+                | DagOp::SubScalar(a, _, _)
+                | DagOp::MulScalar(a, _)
+                | DagOp::DivScalar(a, _, _)
+                | DagOp::Neg(a)
+                | DagOp::Relu(a)
+                | DagOp::Abs(a) => (out_elems, node_bytes(*a), out_bytes, 0),
+                DagOp::PowScalar(a, _, _) | DagOp::Gelu(a) => {
+                    (out_elems * 8, node_bytes(*a), out_bytes, 0)
+                }
+                DagOp::Sqrt(a)
+                | DagOp::Exp(a)
+                | DagOp::Ln(a)
+                | DagOp::Sin(a)
+                | DagOp::Cos(a)
+                | DagOp::Tanh(a) => (out_elems * 4, node_bytes(*a), out_bytes, 0),
+                DagOp::Sigmoid(a) => (out_elems * 5, node_bytes(*a), out_bytes, 0),
+                DagOp::Silu(a) => (out_elems * 6, node_bytes(*a), out_bytes, 0),
+                DagOp::Sum(a) | DagOp::Mean(a) | DagOp::SumAxis(a, _, _) => {
+                    let in_elems = checked_numel(&dag.nodes[*a].shape).unwrap_or(1) as u64;
+                    (in_elems, node_bytes(*a), out_bytes, 0)
+                }
+                DagOp::Softmax(a) => (out_elems * 5, node_bytes(*a), out_bytes, 0),
+                DagOp::RmsNorm(a, _) => (out_elems * 6, node_bytes(*a), out_bytes, 0),
+                DagOp::LayerNorm(a, _) => (out_elems * 8, node_bytes(*a), out_bytes, 0),
+                DagOp::MatMul(a, b) => {
+                    let k = dag.nodes[*a].shape.last().copied().unwrap_or(1) as u64;
+                    let flops = out_elems.saturating_mul(2).saturating_mul(k);
+                    (flops, node_bytes(*a) + node_bytes(*b), out_bytes, 0)
+                }
+                DagOp::FusedLinearAct { x, w, bias, act } => {
+                    let k = dag.nodes[*x].shape.last().copied().unwrap_or(1) as u64;
+                    let mut flops = out_elems.saturating_mul(2).saturating_mul(k);
+                    let mut read_b = node_bytes(*x) + node_bytes(*w);
+                    let mut saved = 0u64;
+                    if let Some(b) = bias {
+                        flops = flops.saturating_add(out_elems);
+                        read_b += node_bytes(*b);
+                        saved += out_bytes * 2;
+                    }
+                    if *act != FusedAct::None {
+                        flops = flops.saturating_add(out_elems * Self::act_flops(*act));
+                        saved += out_bytes * 2;
+                    }
+                    (flops, read_b, out_bytes, saved)
+                }
+                DagOp::FusedRmsNormLinear {
+                    x,
+                    gamma,
+                    w,
+                    bias,
+                    act,
+                    ..
+                } => {
+                    let x_elems = checked_numel(&dag.nodes[*x].shape).unwrap_or(1) as u64;
+                    let x_bytes = node_bytes(*x);
+                    let k = dag.nodes[*x].shape.last().copied().unwrap_or(1) as u64;
+                    let mut flops = x_elems.saturating_mul(4);
+                    let mut read_b = x_bytes + node_bytes(*w);
+                    let mut saved = x_bytes * 2;
+                    if let Some(g) = gamma {
+                        flops = flops.saturating_add(x_elems);
+                        read_b += node_bytes(*g);
+                        saved += x_bytes * 2;
+                    }
+                    flops = flops.saturating_add(out_elems.saturating_mul(2).saturating_mul(k));
+                    if let Some(b) = bias {
+                        flops = flops.saturating_add(out_elems);
+                        read_b += node_bytes(*b);
+                        saved += out_bytes * 2;
+                    }
+                    if *act != FusedAct::None {
+                        flops = flops.saturating_add(out_elems * Self::act_flops(*act));
+                        saved += out_bytes * 2;
+                    }
+                    (flops, read_b, out_bytes, saved)
+                }
+                DagOp::FusedFlashAttention {
+                    q,
+                    k,
+                    v,
+                    mask,
+                    k_is_transposed,
+                    ..
+                } => {
+                    let q_sh = &dag.nodes[*q].shape;
+                    let k_sh = &dag.nodes[*k].shape;
+                    let v_sh = &dag.nodes[*v].shape;
+                    let qr = q_sh.len();
+                    let kr = k_sh.len();
+                    let vr = v_sh.len();
+                    let batches: u64 = q_sh[..qr.saturating_sub(2)]
+                        .iter()
+                        .map(|&d| d as u64)
+                        .product::<u64>()
+                        .max(1);
+                    let s_q = q_sh.get(qr.saturating_sub(2)).copied().unwrap_or(1) as u64;
+                    let d_k = q_sh.get(qr.saturating_sub(1)).copied().unwrap_or(1) as u64;
+                    let s_k = if *k_is_transposed {
+                        k_sh.get(kr.saturating_sub(1)).copied().unwrap_or(1) as u64
+                    } else {
+                        k_sh.get(kr.saturating_sub(2)).copied().unwrap_or(1) as u64
+                    };
+                    let d_v = v_sh.get(vr.saturating_sub(1)).copied().unwrap_or(1) as u64;
+                    let score_elems = batches.saturating_mul(s_q).saturating_mul(s_k);
+                    let qk_flops = score_elems.saturating_mul(2).saturating_mul(d_k);
+                    let sm_flops = score_elems.saturating_mul(5);
+                    let pv_flops = score_elems.saturating_mul(2).saturating_mul(d_v);
+                    let mut read_b = node_bytes(*q) + node_bytes(*k) + node_bytes(*v);
+                    if let Some(m) = mask {
+                        read_b += node_bytes(*m);
+                    }
+                    let score_bytes = node.dtype.storage_bytes(score_elems as usize) as u64;
+                    // Eliminates writing+reading Q@K^T score matrix and Softmax probs matrix!
+                    let saved = score_bytes.saturating_mul(4);
+                    (qk_flops + sm_flops + pv_flops, read_b, out_bytes, saved)
+                }
+                DagOp::FusedElementwise { inputs, steps } => {
+                    if node.device == Device::Cpu
+                        && crate::runtime::native_jit::is_chain_supported(inputs.len(), steps)
+                    {
+                        native_jit_eligible_nodes += 1;
+                    }
+                    let step_flops: u64 = steps.iter().map(Self::ew_step_flops).sum();
+                    let read_b: u64 = inputs.iter().map(|&i| node_bytes(i)).sum();
+                    let saved = (steps.len().saturating_sub(1) as u64)
+                        .saturating_mul(out_bytes)
+                        .saturating_mul(2);
+                    (
+                        out_elems.saturating_mul(step_flops),
+                        read_b,
+                        out_bytes,
+                        saved,
+                    )
+                }
+            };
+
+            let mem = read_b + write_b;
+            let (ai, bound) = Self::classify(flops, mem, &node.device);
+            total_flops = total_flops.saturating_add(flops);
+            total_bytes_read = total_bytes_read.saturating_add(read_b);
+            total_bytes_written = total_bytes_written.saturating_add(write_b);
+            fusion_bytes_saved = fusion_bytes_saved.saturating_add(saved_b);
+            node_costs.push(DagNodeCost {
+                node_id: idx,
+                op: node.op.name(),
+                flops,
+                bytes_read: read_b,
+                bytes_written: write_b,
+                arithmetic_intensity: ai,
+                bound,
+            });
+        }
+
+        let total_memory_bytes = total_bytes_read + total_bytes_written;
+        let out_dev = dag.output_device();
+        let (arithmetic_intensity, bottleneck) =
+            Self::classify(total_flops, total_memory_bytes, &out_dev);
+        let jit_stats = crate::runtime::native_jit::stats();
+
+        DagCostReport {
+            node_costs,
+            total_flops,
+            total_bytes_read,
+            total_bytes_written,
+            total_memory_bytes,
+            arithmetic_intensity,
+            bottleneck,
+            fusion_bytes_saved,
+            fused_nodes,
+            total_nodes: dag.nodes.len(),
+            algebraic_rewrites: dag.algebraic_rewrites,
+            native_jit_eligible_nodes,
+            native_jit_isa: jit_stats.isa,
+            native_jit_compiled: jit_stats.compiled_kernels,
+            native_jit_cache_hits: jit_stats.cache_hits,
+            native_jit_dispatches: jit_stats.native_dispatches,
+        }
+    }
 }
 
 impl PartialEq for TensorComputeDag {
@@ -1469,6 +1789,7 @@ impl TensorComputeDag {
             nodes,
             output: dag_out,
             fused: false,
+            algebraic_rewrites: 0,
             compiled_plan: None,
         })
     }
@@ -1564,6 +1885,11 @@ impl TensorComputeDag {
             .unwrap_or(Device::Cpu)
     }
 
+    /// Compute the roofline FLOPs, bandwidth, fusion-savings, and native JIT cost report.
+    pub(crate) fn cost_report(&self) -> DagCostReport {
+        DagCostModel::analyze(self)
+    }
+
     /// Compute the static buffer lifetime reuse plan for this DAG.
     pub fn memory_plan(&self) -> DagMemoryPlan {
         if let Some(plan) = &self.compiled_plan {
@@ -1611,11 +1937,111 @@ impl TensorComputeDag {
         out
     }
 
-    /// Apply all 4 operator-fusion passes (`FusedFlashAttention`, `FusedRmsNormLinear`,
-    /// `FusedLinearAct`, `FusedElementwise`) and dead-node elimination.
+    /// Apply Pass 0 DType-safe algebraic & layout simplification followed by all 4 operator-fusion
+    /// passes (`FusedFlashAttention`, `FusedRmsNormLinear`, `FusedLinearAct`, `FusedElementwise`)
+    /// and dead-node elimination.
     pub fn fuse(&self) -> Self {
         let mut nodes = self.nodes.clone();
         let mut out_id = self.output;
+        let mut algebraic_rewrites = self.algebraic_rewrites;
+
+        // ── Pass 0: DType-Safe Algebraic Simplification & Layout Cancellation ──
+        // Strictly guards integer identities (`x + 0`, `x - 0`, `x * 1`, `x / 1`) by
+        // `dtype.is_int()` so IEEE-754 floating-point semantics (`NaN`, `±Inf`, `-0.0 + 0.0`)
+        // are NEVER broken.
+        {
+            let mut changed = true;
+            let mut rounds = 0usize;
+            while changed && rounds < 4 {
+                changed = false;
+                rounds += 1;
+                for idx in 0..nodes.len() {
+                    let dt = nodes[idx].dtype;
+                    let new_op = match &nodes[idx].op {
+                        DagOp::Transpose(a, d0, d1) if d0 == d1 => Some(DagOp::Identity(*a)),
+                        DagOp::Transpose(a, d0, d1) => {
+                            if let DagOp::Transpose(orig, inner0, inner1) = nodes[*a].op
+                                && ((inner0 == *d0 && inner1 == *d1)
+                                    || (inner0 == *d1 && inner1 == *d0))
+                            {
+                                Some(DagOp::Identity(orig))
+                            } else {
+                                None
+                            }
+                        }
+                        DagOp::Reshape(a, target_sh) => {
+                            if nodes[*a].shape == *target_sh {
+                                Some(DagOp::Identity(*a))
+                            } else if let DagOp::Reshape(orig, _) = nodes[*a].op {
+                                if nodes[orig].shape == *target_sh {
+                                    Some(DagOp::Identity(orig))
+                                } else {
+                                    Some(DagOp::Reshape(orig, target_sh.clone()))
+                                }
+                            } else {
+                                None
+                            }
+                        }
+                        // `x ** 2.0 -> x * x` is 100% IEEE-754 bit-exact across all finite, ±0.0, ±Inf, and NaN!
+                        DagOp::PowScalar(a, c, false) if *c == 2.0 => Some(DagOp::Mul(*a, *a)),
+                        // `x ** 1.0 -> x` is IEEE-754 bit-exact.
+                        DagOp::PowScalar(a, c, false) if *c == 1.0 => Some(DagOp::Identity(*a)),
+                        // `-(-x) -> x` is IEEE-754 bit-exact across all finite, ±0.0, ±Inf, and NaN!
+                        DagOp::Neg(a) => {
+                            if let DagOp::Neg(orig) = nodes[*a].op {
+                                Some(DagOp::Identity(orig))
+                            } else {
+                                None
+                            }
+                        }
+                        // Exact integer algebraic identities — NEVER applied to floating-point DTypes!
+                        DagOp::AddScalar(a, c) if dt.is_int() && *c == 0.0 => {
+                            Some(DagOp::Identity(*a))
+                        }
+                        DagOp::SubScalar(a, c, false) if dt.is_int() && *c == 0.0 => {
+                            Some(DagOp::Identity(*a))
+                        }
+                        DagOp::MulScalar(a, c) if dt.is_int() && *c == 1.0 => {
+                            Some(DagOp::Identity(*a))
+                        }
+                        DagOp::DivScalar(a, c, false) if dt.is_int() && *c == 1.0 => {
+                            Some(DagOp::Identity(*a))
+                        }
+                        _ => None,
+                    };
+                    if let Some(op) = new_op {
+                        nodes[idx].op = op;
+                        algebraic_rewrites += 1;
+                        changed = true;
+                    }
+                }
+                // Forward all `DagOp::Identity` references directly to their root source!
+                let mut forward: Vec<usize> = (0..nodes.len()).collect();
+                for (idx, dst) in forward.iter_mut().enumerate() {
+                    let mut cur = idx;
+                    let mut hops = 0usize;
+                    while let DagOp::Identity(src) = nodes[cur].op {
+                        if hops >= nodes.len() {
+                            break;
+                        }
+                        cur = src;
+                        hops += 1;
+                    }
+                    *dst = cur;
+                }
+                if forward.iter().enumerate().any(|(i, &f)| i != f) {
+                    for node in &mut nodes {
+                        if !matches!(node.op, DagOp::Identity(_)) {
+                            node.op.remap_inputs(&forward);
+                        }
+                    }
+                    out_id = forward[out_id];
+                }
+            }
+            let (simplified_nodes, simplified_out) = compact_live_nodes(nodes, out_id);
+            nodes = simplified_nodes;
+            out_id = simplified_out;
+        }
 
         let count_uses = |ns: &[DagNode], out: usize| -> Vec<usize> {
             let mut uses = vec![0usize; ns.len()];
@@ -1978,6 +2404,7 @@ impl TensorComputeDag {
             nodes: final_nodes,
             output: final_out,
             fused: true,
+            algebraic_rewrites,
             compiled_plan: None,
         }
     }

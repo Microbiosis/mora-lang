@@ -20,6 +20,8 @@ pub(crate) mod gpu;
 // Wave 4: PagedAttention-style dynamic KV-cache resource allocator & general MemoryPool
 pub mod kv_cache;
 pub mod memory_pool;
+// P4-3: Zero-dependency strict W^X (`RW -> RX`) x86-64 SSE2/AVX2 native kernel emitter
+pub(crate) mod native_jit;
 // v0.99: ambient random —— PRNG 纯值 + ambient effect 操作分发
 pub mod random;
 // Wave 2 W2.4: Zero-dependency native async I/O reactor and structured task scheduler

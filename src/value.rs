@@ -605,6 +605,7 @@ impl Value {
                 "to_dot",
                 "is_fused",
                 "memory_plan",
+                "cost_report",
                 "cache_stats",
                 "cache_key",
                 "backend_info",

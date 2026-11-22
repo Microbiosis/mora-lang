@@ -2611,6 +2611,98 @@ fn resolve_compute_dag_method(
             );
             Ok(CallAction::Done(Value::Dict(m)))
         }
+        "cost_report" => {
+            if !args.is_empty() {
+                return Err(MoraError::Runtime(
+                    "ComputeDag.cost_report() expects 0 arguments".to_string(),
+                ));
+            }
+            let rep = dag.cost_report();
+            let mut m = std::collections::HashMap::new();
+            m.insert(
+                "total_flops".to_string(),
+                Value::Int(rep.total_flops as i64),
+            );
+            m.insert(
+                "total_bytes_read".to_string(),
+                Value::Int(rep.total_bytes_read as i64),
+            );
+            m.insert(
+                "total_bytes_written".to_string(),
+                Value::Int(rep.total_bytes_written as i64),
+            );
+            m.insert(
+                "total_memory_bytes".to_string(),
+                Value::Int(rep.total_memory_bytes as i64),
+            );
+            m.insert(
+                "arithmetic_intensity".to_string(),
+                Value::Float(rep.arithmetic_intensity),
+            );
+            m.insert(
+                "bottleneck".to_string(),
+                Value::String(rep.bottleneck.to_string()),
+            );
+            m.insert(
+                "fusion_bytes_saved".to_string(),
+                Value::Int(rep.fusion_bytes_saved as i64),
+            );
+            m.insert(
+                "fused_nodes".to_string(),
+                Value::Int(rep.fused_nodes as i64),
+            );
+            m.insert(
+                "total_nodes".to_string(),
+                Value::Int(rep.total_nodes as i64),
+            );
+            m.insert(
+                "algebraic_rewrites".to_string(),
+                Value::Int(rep.algebraic_rewrites as i64),
+            );
+            m.insert(
+                "native_jit_eligible_nodes".to_string(),
+                Value::Int(rep.native_jit_eligible_nodes as i64),
+            );
+            m.insert(
+                "native_jit_isa".to_string(),
+                Value::String(rep.native_jit_isa.to_string()),
+            );
+            m.insert(
+                "native_jit_compiled".to_string(),
+                Value::Int(rep.native_jit_compiled as i64),
+            );
+            m.insert(
+                "native_jit_cache_hits".to_string(),
+                Value::Int(rep.native_jit_cache_hits as i64),
+            );
+            m.insert(
+                "native_jit_dispatches".to_string(),
+                Value::Int(rep.native_jit_dispatches as i64),
+            );
+            let node_list: Vec<Value> = rep
+                .node_costs
+                .into_iter()
+                .map(|nc| {
+                    let mut nm = std::collections::HashMap::new();
+                    nm.insert("node_id".to_string(), Value::Int(nc.node_id as i64));
+                    nm.insert("op".to_string(), Value::String(nc.op.to_string()));
+                    nm.insert("flops".to_string(), Value::Int(nc.flops as i64));
+                    nm.insert("bytes_read".to_string(), Value::Int(nc.bytes_read as i64));
+                    nm.insert(
+                        "bytes_written".to_string(),
+                        Value::Int(nc.bytes_written as i64),
+                    );
+                    nm.insert(
+                        "arithmetic_intensity".to_string(),
+                        Value::Float(nc.arithmetic_intensity),
+                    );
+                    nm.insert("bound".to_string(), Value::String(nc.bound.to_string()));
+                    Value::Dict(nm)
+                })
+                .collect();
+            m.insert("nodes".to_string(), Value::List(node_list.into()));
+            Ok(CallAction::Done(Value::Dict(m)))
+        }
         "cache_stats" => {
             if !args.is_empty() {
                 return Err(MoraError::Runtime(

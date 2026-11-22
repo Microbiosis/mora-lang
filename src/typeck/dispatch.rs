@@ -1307,6 +1307,10 @@ fn method_signature_builtin(receiver: &Type, method: &str) -> Option<Signature> 
             vec![("self".to_string(), Type::ComputeDag)],
             Type::Dict(Box::new(Type::String), Box::new(Type::Int)),
         )),
+        (Type::ComputeDag, "cost_report") => Some(Signature::new(
+            vec![("self".to_string(), Type::ComputeDag)],
+            Type::Dict(Box::new(Type::String), Box::new(Type::Any)),
+        )),
         (Type::ComputeDag, "backend_info") => Some(Signature::new(
             vec![("self".to_string(), Type::ComputeDag)],
             Type::Dict(Box::new(Type::String), Box::new(Type::String)),

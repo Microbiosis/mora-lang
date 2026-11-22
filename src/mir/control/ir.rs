@@ -580,6 +580,9 @@ pub enum ControlInst {
     // Slot / global storage operations
     LoadLocal(VReg, LocalSlot),
     StoreLocal(LocalSlot, VReg),
+    /// P5-1A: Allocate a fresh `UpvalueCell` for `LocalSlot` if it is shared with closures,
+    /// enforcing Go-1.22-style per-iteration loop variable capture semantics.
+    FreshLocalCell(LocalSlot),
     /// Wave 3 Stage 3C: Sets `dst` to `Bool(true)` iff `local` holds `Value::MissingArg`.
     IsMissingArg(VReg, LocalSlot),
     LoadUpvalue(VReg, UpvalueSlot),
@@ -787,6 +790,7 @@ impl ControlInst {
             | Self::NoGrad { dst: d, .. }
             | Self::Assert(d, _) => Some(*d),
             Self::StoreLocal(..)
+            | Self::FreshLocalCell(..)
             | Self::StoreUpvalue(..)
             | Self::StoreGlobal(..)
             | Self::DefineDyn(..)
@@ -815,6 +819,7 @@ impl ControlInst {
             Self::Const(..)
             | Self::MakeClosure { .. }
             | Self::LoadLocal(..)
+            | Self::FreshLocalCell(..)
             | Self::IsMissingArg(..)
             | Self::LoadUpvalue(..)
             | Self::LoadGlobal(..)
@@ -1182,6 +1187,7 @@ impl ControlInst {
                 }
             }
             Self::ExportGlobal(..)
+            | Self::FreshLocalCell(..)
             | Self::ExportDyn(..)
             | Self::Import { .. }
             | Self::Commit
@@ -1220,6 +1226,7 @@ impl ControlInst {
             Self::MatchPattern { .. }
             | Self::MakeClosure { .. }
             | Self::LoadLocal(..)
+            | Self::FreshLocalCell(..)
             | Self::IsMissingArg(..)
             | Self::StoreLocal(..)
             | Self::LoadUpvalue(..)
@@ -1761,6 +1768,7 @@ fn verify_inst_slots(
 ) -> MoraResult<()> {
     match inst {
         ControlInst::LoadLocal(_, l)
+        | ControlInst::FreshLocalCell(l)
         | ControlInst::IsMissingArg(_, l)
         | ControlInst::StoreLocal(l, _) => {
             if l.0 >= func.n_locals {

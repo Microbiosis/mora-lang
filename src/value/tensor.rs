@@ -2208,7 +2208,7 @@ fn parse_optional_dtype(val: Option<&Value>, fn_name: &str) -> MoraResult<Option
 fn parse_optional_device(val: Option<&Value>, fn_name: &str) -> MoraResult<Device> {
     match val {
         None | Some(Value::Nil) => Ok(Device::Cpu),
-        Some(Value::String(s)) => Device::parse(s).map_err(MoraError::Runtime),
+        Some(Value::String(s)) => Device::parse(s),
         Some(other) => Err(MoraError::Runtime(format!(
             "{fn_name}: device must be a string ('cpu', 'cuda:0', 'metal:0'), got {}",
             crate::flow::type_name(other)
@@ -2898,7 +2898,7 @@ pub fn call_tensor_method_tracked(
                     "Tensor.to_device(device) requires a device string argument".to_string(),
                 ));
             };
-            let dev = Device::parse(s).map_err(MoraError::Runtime)?;
+            let dev = Device::parse(s)?;
             let out = t.to_device(dev)?;
             if let Some(ag) = autograd.as_deref_mut()
                 && is_tracked
@@ -2919,14 +2919,14 @@ pub fn call_tensor_method_tracked(
             if let Some(dt) = DType::from_name(first) {
                 cur = cur.to_dtype(dt)?;
             } else {
-                let dev = Device::parse(first).map_err(MoraError::Runtime)?;
+                let dev = Device::parse(first)?;
                 cur = cur.to_device(dev)?;
             }
             if let Some(Value::String(second)) = args.get(1) {
                 if let Some(dt) = DType::from_name(second) {
                     cur = cur.to_dtype(dt)?;
                 } else {
-                    let dev = Device::parse(second).map_err(MoraError::Runtime)?;
+                    let dev = Device::parse(second)?;
                     cur = cur.to_device(dev)?;
                 }
             }

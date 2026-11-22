@@ -808,6 +808,8 @@ pub struct Environment {
     /// 2. `ControlInst::ExportGlobal` / `ControlInst::ExportDyn` 指令
     ///    （`export <decl>` 的运行时落点，见 `mir::control::ir` 与 `runtime::vm::engine`）。
     pub exports: std::collections::HashSet<String>,
+    /// Per-key CRDT merge strategies configured via `merge_with(key, strategy)` for parallel worker merges.
+    pub(crate) merge_strategies: Option<HashMap<String, MergeStrategy>>,
 }
 
 impl Default for Environment {
@@ -822,6 +824,7 @@ impl Environment {
             values: HashMap::new(),
             parent: None,
             exports: std::collections::HashSet::new(),
+            merge_strategies: None,
         }
     }
 
@@ -830,7 +833,20 @@ impl Environment {
             values: HashMap::new(),
             parent: Some(parent),
             exports: std::collections::HashSet::new(),
+            merge_strategies: None,
         }
+    }
+
+    /// Record a per-key parallel worker merge strategy in this lexical environment.
+    pub(crate) fn set_merge_strategy(&mut self, key: String, strategy: MergeStrategy) {
+        self.merge_strategies
+            .get_or_insert_with(HashMap::new)
+            .insert(key, strategy);
+    }
+
+    /// Read configured per-key parallel worker merge strategies, if any.
+    pub(crate) fn merge_strategies(&self) -> Option<&HashMap<String, MergeStrategy>> {
+        self.merge_strategies.as_ref()
     }
 
     /// 捕获当前作用域与共享父链的独立快照。

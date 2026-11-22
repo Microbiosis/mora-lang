@@ -19,7 +19,7 @@ use crate::runtime::compute_dag::DagPlanCache;
 use crate::runtime::fs::FsContext;
 use crate::runtime::reactor::AsyncIoReactor;
 use crate::runtime::scheduler::{TaskContext, TaskScheduler};
-use crate::value::{EnumDefRuntime, Environment, MergeStrategy, StructDefRuntime, Value};
+use crate::value::{EnumDefRuntime, Environment, StructDefRuntime, Value};
 
 /// Shared immutable process-level services across tasks and spawned VM workers.
 pub struct EngineShared {
@@ -87,8 +87,6 @@ pub struct CoreRuntime {
     pub(crate) environment: Environment,
     /// trait 系统注册表（`trait_name` → `TraitInfo`）
     pub(crate) trait_registry: Arc<HashMap<String, TraitInfo>>,
-    /// v0.67: 当前 transaction/worker 的合并策略。
-    pub(crate) current_merge_strategies: Option<HashMap<String, MergeStrategy>>,
     /// v0.87: gensym 计数器。每次 gensym() 调用递增，保证符号名唯一。
     pub(crate) gensym_counter: usize,
     /// v0.99: ambient random 状态（纯值）。
@@ -156,7 +154,6 @@ impl Default for CoreRuntime {
         Self {
             environment: default_environment(),
             trait_registry: Arc::new(HashMap::new()),
-            current_merge_strategies: None,
             gensym_counter: 0,
             random_state: crate::runtime::random::Xoshiro256::from_time(),
             shared: Arc::new(EngineShared::new()),

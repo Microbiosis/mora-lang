@@ -14,8 +14,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use mora::error::{MoraError, MoraResult};
+use mora::flow::json::{JsonValue as LspJsonValue, parse as lsp_parse, to_string as lsp_to_string};
 use mora::flow::{MAX_JSON_DEPTH, json_to_value, type_name, value_to_json};
-use mora::lsp::json::{Value as LspJsonValue, parse as lsp_parse, to_string as lsp_to_string};
 use mora::lsp::transport::{
     MAX_CONTENT_LENGTH, MAX_HEADER_LINE_BYTES, MAX_HEADER_LINES, read_message,
 };

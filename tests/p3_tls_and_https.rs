@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use mora::lsp::json::Value as JsonVal;
+use mora::flow::json::JsonValue as JsonVal;
 use mora::lsp::providers::completion_v3;
 use mora::lsp::server::DocumentState;
 use mora::parser_v3::ParserV3;

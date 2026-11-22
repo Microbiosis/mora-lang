@@ -1,0 +1,97 @@
+-- Pure-Mora Standard Library: `std/json`
+-- High-level RFC 8259 JSON encoding, decoding, and compile-time `@tag(json=...)`
+-- schema-aware struct serialization over Mora's unified bounded `flow::json` core.
+
+export task json_parse(text: string): any
+  return json.parse(text)
+end
+
+export task json_stringify(val: any): string
+  return json.stringify(val)
+end
+
+export task json_decode_object(text: string): dict<string, any>
+  let parsed = json.parse(text)
+  return parsed
+end
+
+-- Encode a field-value dict using compile-time `Struct::tags()` `@tag(json=...)` metadata.
+-- Supports wire field renaming (`@tag(json="user_id")`), field skip (`@tag(json="-")`),
+-- and omit-empty (`@tag(json="bio,omitempty")`).
+export task json_encode_tagged(fields: dict<string, any>, tags: dict<string, dict<string, string>>): string
+  let wire: dict<string, any> = {}
+  let ks = fields.keys()
+  let i = 0
+  while i < ks.len()
+    let fname = ks[i]
+    let fval = fields.get(fname)
+    let out_name = fname
+    let skip = false
+    let omitempty = false
+    let ftags = tags.get(fname)
+    if ftags != nil then
+      let jtag = ftags.get("json")
+      if jtag != nil then
+        let parts = jtag.split(",")
+        let head = parts[0].trim()
+        if head == "-" then
+          assign skip = true
+        end
+        if head != "-" and head.len() > 0 then
+          assign out_name = head
+        end
+        let pi = 1
+        while pi < parts.len()
+          if parts[pi].trim() == "omitempty" then
+            assign omitempty = true
+          end
+          assign pi = pi + 1
+        end
+      end
+    end
+    if !skip then
+      let is_empty = (fval == nil) or (fval == "")
+      if !(omitempty and is_empty) then
+        assign wire = wire.set(out_name, fval)
+      end
+    end
+    assign i = i + 1
+  end
+  return json.stringify(wire)
+end
+
+-- Decode a JSON object string into logical struct field names using `Struct::tags()` `@tag(json=...)`.
+export task json_decode_tagged(text: string, tags: dict<string, dict<string, string>>): dict<string, any>
+  let raw: dict<string, any> = json.parse(text)
+  let out: dict<string, any> = {}
+  let reverse: dict<string, string> = {}
+  let field_names = tags.keys()
+  let fi = 0
+  while fi < field_names.len()
+    let fname = field_names[fi]
+    let ftags = tags.get(fname)
+    if ftags != nil then
+      let jtag = ftags.get("json")
+      if jtag != nil then
+        let head = jtag.split(",")[0].trim()
+        if head != "-" and head.len() > 0 then
+          assign reverse = reverse.set(head, fname)
+        end
+      end
+    end
+    assign fi = fi + 1
+  end
+  let rkeys = raw.keys()
+  let ri = 0
+  while ri < rkeys.len()
+    let rk = rkeys[ri]
+    let mapped = reverse.get(rk)
+    let target = rk
+    if mapped != nil then
+      assign target = str(mapped)
+    end
+    assign out = out.set(target, raw.get(rk))
+    assign ri = ri + 1
+  end
+  return out
+end

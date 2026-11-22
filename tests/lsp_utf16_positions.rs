@@ -75,7 +75,7 @@ impl Drop for WorkDir {
 }
 
 /// 发一批消息，返回 id=91 的 `result`（用**服务器自己的 JSON 解析器**读）。
-fn talk(tag: &str, msgs: &[String]) -> Option<mora::lsp::json::Value> {
+fn talk(tag: &str, msgs: &[String]) -> Option<mora::flow::json::JsonValue> {
     let dir = WorkDir::new(tag);
     let input = dir.0.join(format!("{tag}.bin"));
     let uri = format!("file:///tmp/{tag}.mora");
@@ -109,7 +109,7 @@ fn talk(tag: &str, msgs: &[String]) -> Option<mora::lsp::json::Value> {
         while cut > 0 && !body.is_char_boundary(cut) {
             cut -= 1;
         }
-        let v = mora::lsp::json::Parser::new(&body[..cut])
+        let v = mora::flow::json::JsonParser::new(&body[..cut])
             .parse_value()
             .ok()?;
         if v.get("id").and_then(|i| i.as_i64()) == Some(91) {
@@ -169,7 +169,7 @@ fn apply_edits_utf16(text: &str, edits: &[(usize, usize, usize, usize, String)])
 }
 
 /// 从 rename 的应答里抽出 `(startLine, startChar, endLine, endChar, newText)`。
-fn rename_edits(result: &mora::lsp::json::Value) -> Vec<(usize, usize, usize, usize, String)> {
+fn rename_edits(result: &mora::flow::json::JsonValue) -> Vec<(usize, usize, usize, usize, String)> {
     let mut out = Vec::new();
     let Some(changes) = result.get("changes") else {
         return out;
@@ -315,7 +315,7 @@ fn d211_outbound_ranges_are_utf16_offsets() {
     }
 }
 
-fn collect_ranges(v: &mora::lsp::json::Value) -> Vec<(usize, usize, usize, usize)> {
+fn collect_ranges(v: &mora::flow::json::JsonValue) -> Vec<(usize, usize, usize, usize)> {
     let mut out = Vec::new();
     if let Some(arr) = v.as_array() {
         for e in arr {
@@ -328,7 +328,7 @@ fn collect_ranges(v: &mora::lsp::json::Value) -> Vec<(usize, usize, usize, usize
     out
 }
 
-fn push_range(e: &mora::lsp::json::Value, out: &mut Vec<(usize, usize, usize, usize)>) {
+fn push_range(e: &mora::flow::json::JsonValue, out: &mut Vec<(usize, usize, usize, usize)>) {
     if let Some(r) = e.get("range") {
         push_range_from(r, out);
     }
@@ -337,7 +337,7 @@ fn push_range(e: &mora::lsp::json::Value, out: &mut Vec<(usize, usize, usize, us
     }
 }
 
-fn push_range_from(r: &mora::lsp::json::Value, out: &mut Vec<(usize, usize, usize, usize)>) {
+fn push_range_from(r: &mora::flow::json::JsonValue, out: &mut Vec<(usize, usize, usize, usize)>) {
     let g = |p: &str, k: &str| {
         r.get(p)
             .and_then(|x| x.get(k))

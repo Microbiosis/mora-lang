@@ -143,8 +143,14 @@ pub mod ambient {
     /// Stage 3B: Ambient effect label for in-place tensor storage mutation (`fill_`, `add_`, `mul_`).
     pub const TENSOR_MUTATE_LABEL: &str = "tensor_mutate";
 
-    /// Stage 3C: Ambient effect label for automatic differentiation (`grad`, `value_and_grad`).
+    /// Stage 3C: Ambient effect label for automatic differentiation (`grad`, `value_and_grad`, `jvp`).
     pub const AUTOGRAD_LABEL: &str = "autograd";
+
+    /// Ambient effect label for filesystem / process / network I/O (`file.*`, `exec.*`, `tcp_*`, `tls_*`).
+    pub const IO_LABEL: &str = "io";
+
+    /// Ambient effect label for cooperative concurrency & async suspension (`spawn`, `select`, `sleep`, `channel`, `join`, `process_group`).
+    pub const ASYNC_LABEL: &str = "async";
 
     /// `random.<method>(...)` 调用对应的 ambient effect 标签。
     /// 未知方法返回 None（调用方报 unknown method）。
@@ -162,7 +168,11 @@ pub mod ambient {
 
     /// 标签是否属于 ambient 集合（运行时根 handler 已兜底）。
     pub fn is_ambient_label(label: &str) -> bool {
-        RANDOM_LABELS.contains(&label) || label == TENSOR_MUTATE_LABEL || label == AUTOGRAD_LABEL
+        RANDOM_LABELS.contains(&label)
+            || label == TENSOR_MUTATE_LABEL
+            || label == AUTOGRAD_LABEL
+            || label == IO_LABEL
+            || label == ASYNC_LABEL
     }
 }
 

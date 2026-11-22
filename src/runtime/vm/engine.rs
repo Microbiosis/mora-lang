@@ -1213,7 +1213,7 @@ impl<'a> VmEngine<'a> {
         let scheduler = Arc::clone(self.core.scheduler());
         let results = scheduler.run_indexed_batch(jobs, self.core.task_context.as_ref())?;
 
-        let strategies = self.core.current_merge_strategies.clone();
+        let strategies = self.core.environment.merge_strategies().cloned();
         for (w_core, w_globals, w_cells) in results {
             match strategies.as_ref() {
                 Some(sg) => {
@@ -1800,6 +1800,18 @@ impl<'a> VmEngine<'a> {
                 // Zero-boxing unshared local store directly from 16B RegSlot!
                 let s = frame.regs[src.0 as usize].clone();
                 frame.locals[slot.0 as usize].set_slot(s);
+                StepOutcome::NextInst
+            }
+            ControlInst::FreshLocalCell(slot) => {
+                // P5-1A: Per-iteration loop closure scoping — re-box shared local cells so
+                // previously spawned closures keep their own iteration's independent UpvalueCell,
+                // while unshared 16B unboxed slots remain zero-allocation!
+                let cell = &mut frame.locals[slot.0 as usize];
+                if matches!(cell, crate::runtime::vm::continuation::LocalCell::Shared(_)) {
+                    *cell = crate::runtime::vm::continuation::LocalCell::Shared(Arc::new(
+                        crate::common::sync::Mutex::new(Value::Nil),
+                    ));
+                }
                 StepOutcome::NextInst
             }
             ControlInst::IsMissingArg(dst, slot) => {

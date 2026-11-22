@@ -131,9 +131,7 @@ pub(crate) fn call_builtin_merge_with_core(
             )));
         }
     };
-    let mut strategies = core.current_merge_strategies.clone().unwrap_or_default();
-    strategies.insert(key, ms);
-    core.current_merge_strategies = Some(strategies);
+    core.environment.set_merge_strategy(key, ms);
     Ok(Value::Nil)
 }
 

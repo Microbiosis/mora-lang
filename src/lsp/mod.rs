@@ -4,11 +4,9 @@
 //!
 //! 内部模块：
 //! - `transport` — JSON-RPC 帧解析（Content-Length 协议）
-//! - `json` — 手写 JSON Value + parser + serializer（零依赖）
-//! - `server` — 主循环 + 路由 + diagnostics
+//! - `server` — 主循环 + 路由 + diagnostics（JSON 统一复用 `crate::flow::json`）
 //! - `providers` — 各 LSP method 的实现
 
-pub mod json;
 pub mod providers;
 pub mod server;
 pub mod transport;

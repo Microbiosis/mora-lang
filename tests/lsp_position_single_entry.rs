@@ -33,7 +33,7 @@
 //! **全称量化**的 —— 「没有例外」，而不是「某处长什么样」，因此不会像
 //! D150 那条一样随正确重构而失效。
 
-use mora::lsp::json::{self, Value as J};
+use mora::flow::json::{self, JsonValue as J};
 use mora::lsp::providers::{references_v3, rename_v3};
 use mora::lsp::server::DocumentState;
 use std::collections::HashMap;

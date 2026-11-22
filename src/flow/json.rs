@@ -1,12 +1,15 @@
-//! v0.110.0: 统一 JSON 编解码内核（RFC 8259 迭代状态机，显式栈 + 深度边界）。
+//! v0.111.0: 全仓唯一统一 JSON 编解码内核（RFC 8259 迭代状态机，显式栈 + 深度边界）。
 //!
-//! 为运行时 `Value`（`json_to_value` / `value_to_json`）与 LSP `lsp::json::Value`
-//! 提供单一共享的词法/语法解析引擎、UTF-8/代理对解码与字符串转义实现。
+//! 同时服务：
+//! - 运行时 `Value`（`json_to_value` / `value_to_json`）与纯 Mora `std/json` 标准库
+//! - LSP JSON-RPC 2.0 线格式对象树（`JsonValue` / `parse` / `to_string` / `JsonParser`）
+//!
+//! 消除历史重复的 `lsp/json.rs`，共享单一词法/语法状态机、UTF-8 代理对解码与转义实现。
 
 use crate::error::{MoraError, MoraResult};
 use crate::value::Value;
-use std::collections::HashMap;
-use std::fmt::Write as _;
+use std::collections::{BTreeMap, HashMap};
+use std::fmt::{self, Write as _};
 
 /// JSON 容器最大允许嵌套深度，防止深层嵌套输入导致过度栈/内存消耗。
 pub const MAX_JSON_DEPTH: usize = 256;
@@ -797,9 +800,270 @@ fn is_json_empty_value(v: &Value) -> bool {
     }
 }
 
+// ─── Unified JSON-RPC / Document Value Tree (formerly duplicated in `lsp/json.rs`) ───
+
+/// Deterministic RFC 8259 JSON value tree used by `mora-lsp` JSON-RPC 2.0 wire framing
+/// and protocol tests, built directly on the shared explicit-stack [`parse_json_with`] engine.
+#[derive(Debug, Clone, PartialEq)]
+pub enum JsonValue {
+    Null,
+    Bool(bool),
+    Number(f64),
+    String_(String),
+    Array(Vec<JsonValue>),
+    Object(BTreeMap<String, JsonValue>),
+}
+
+impl JsonValue {
+    pub fn as_str(&self) -> Option<&str> {
+        if let Self::String_(s) = self {
+            Some(s.as_str())
+        } else {
+            None
+        }
+    }
+
+    pub fn as_i64(&self) -> Option<i64> {
+        if let Self::Number(n) = self {
+            Some(*n as i64)
+        } else {
+            None
+        }
+    }
+
+    pub fn as_object(&self) -> Option<&BTreeMap<String, JsonValue>> {
+        if let Self::Object(m) = self {
+            Some(m)
+        } else {
+            None
+        }
+    }
+
+    pub fn as_array(&self) -> Option<&Vec<JsonValue>> {
+        if let Self::Array(a) = self {
+            Some(a)
+        } else {
+            None
+        }
+    }
+
+    pub fn get(&self, key: &str) -> Option<&JsonValue> {
+        self.as_object()?.get(key)
+    }
+}
+
+impl fmt::Display for JsonValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&to_string(self))
+    }
+}
+
+/// Serialize a [`JsonValue`] deterministically via an explicit stack (zero OS-stack recursion).
+pub fn to_string(v: &JsonValue) -> String {
+    enum Step<'a> {
+        Val(&'a JsonValue),
+        Raw(&'static str),
+        Key(&'a str),
+    }
+
+    let mut out = String::new();
+    let mut stack = vec![Step::Val(v)];
+
+    while let Some(step) = stack.pop() {
+        match step {
+            Step::Raw(s) => out.push_str(s),
+            Step::Key(k) => {
+                out.push('"');
+                write_escaped_json_string(&mut out, k);
+                out.push_str("\":");
+            }
+            Step::Val(cur) => match cur {
+                JsonValue::Null => out.push_str("null"),
+                JsonValue::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+                JsonValue::Number(n) => {
+                    if n.is_finite() {
+                        if n.fract() == 0.0 && n.abs() < 1e15 {
+                            let _ = write!(out, "{}", *n as i64);
+                        } else {
+                            let _ = write!(out, "{}", n);
+                        }
+                    } else {
+                        out.push_str("null");
+                    }
+                }
+                JsonValue::String_(s) => {
+                    out.push('"');
+                    write_escaped_json_string(&mut out, s);
+                    out.push('"');
+                }
+                JsonValue::Array(items) => {
+                    out.push('[');
+                    stack.push(Step::Raw("]"));
+                    for (idx, it) in items.iter().enumerate().rev() {
+                        stack.push(Step::Val(it));
+                        if idx > 0 {
+                            stack.push(Step::Raw(","));
+                        }
+                    }
+                }
+                JsonValue::Object(map) => {
+                    out.push('{');
+                    stack.push(Step::Raw("}"));
+                    for (idx, (k, val)) in map.iter().enumerate().rev() {
+                        stack.push(Step::Val(val));
+                        stack.push(Step::Key(k.as_str()));
+                        if idx > 0 {
+                            stack.push(Step::Raw(","));
+                        }
+                    }
+                }
+            },
+        }
+    }
+
+    out
+}
+
+struct DocJsonBuilder;
+
+impl JsonBuilder for DocJsonBuilder {
+    type Output = JsonValue;
+    type ArrayAcc = Vec<JsonValue>;
+    type ObjectAcc = BTreeMap<String, JsonValue>;
+
+    fn null() -> Self::Output {
+        JsonValue::Null
+    }
+
+    fn bool(v: bool) -> Self::Output {
+        JsonValue::Bool(v)
+    }
+
+    fn number(raw: &str, _has_decimal_or_exp: bool) -> MoraResult<Self::Output> {
+        let num: f64 = raw
+            .parse()
+            .map_err(|_| MoraError::Serialization(format!("Invalid number: {}", raw)))?;
+        if !num.is_finite() {
+            return Err(MoraError::Serialization(format!(
+                "Number literal overflow: {}",
+                raw
+            )));
+        }
+        Ok(JsonValue::Number(num))
+    }
+
+    fn string(s: String) -> Self::Output {
+        JsonValue::String_(s)
+    }
+
+    fn begin_array() -> Self::ArrayAcc {
+        Vec::new()
+    }
+
+    fn push_array(arr: &mut Self::ArrayAcc, val: Self::Output) {
+        arr.push(val);
+    }
+
+    fn finish_array(arr: Self::ArrayAcc) -> Self::Output {
+        JsonValue::Array(arr)
+    }
+
+    fn begin_object() -> Self::ObjectAcc {
+        BTreeMap::new()
+    }
+
+    fn insert_object(obj: &mut Self::ObjectAcc, key: String, val: Self::Output) {
+        obj.insert(key, val);
+    }
+
+    fn finish_object(obj: Self::ObjectAcc) -> Self::Output {
+        JsonValue::Object(obj)
+    }
+}
+
+/// Zero-overhead JSON parser wrapper over [`parse`].
+pub struct JsonParser<'a> {
+    src: &'a str,
+}
+
+impl<'a> JsonParser<'a> {
+    pub fn new(s: &'a str) -> Self {
+        Self { src: s }
+    }
+
+    pub fn parse_value(&mut self) -> MoraResult<JsonValue> {
+        parse(self.src)
+    }
+}
+
+/// Parse an RFC 8259 JSON string into a deterministic [`JsonValue`] tree.
+pub fn parse(s: &str) -> MoraResult<JsonValue> {
+    parse_json_with::<DocJsonBuilder>(s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_value_parse_primitives() {
+        assert_eq!(
+            JsonParser::new("null").parse_value().unwrap(),
+            JsonValue::Null
+        );
+        assert_eq!(
+            JsonParser::new("true").parse_value().unwrap(),
+            JsonValue::Bool(true)
+        );
+        assert_eq!(
+            JsonParser::new("false").parse_value().unwrap(),
+            JsonValue::Bool(false)
+        );
+        assert_eq!(
+            JsonParser::new("42").parse_value().unwrap(),
+            JsonValue::Number(42.0)
+        );
+        assert_eq!(
+            JsonParser::new("1.5").parse_value().unwrap(),
+            JsonValue::Number(1.5)
+        );
+        assert_eq!(
+            JsonParser::new("-1").parse_value().unwrap(),
+            JsonValue::Number(-1.0)
+        );
+        assert_eq!(
+            JsonParser::new("\"hi\"").parse_value().unwrap(),
+            JsonValue::String_("hi".to_string())
+        );
+    }
+
+    #[test]
+    fn json_value_parse_array_object_nested_and_roundtrip() {
+        let arr = JsonParser::new("[1, 2, 3]").parse_value().unwrap();
+        assert_eq!(
+            arr,
+            JsonValue::Array(vec![
+                JsonValue::Number(1.0),
+                JsonValue::Number(2.0),
+                JsonValue::Number(3.0)
+            ])
+        );
+        let obj = JsonParser::new(r#"{"a": 1, "b": "x"}"#)
+            .parse_value()
+            .unwrap();
+        if let JsonValue::Object(m) = obj {
+            assert_eq!(m.get("a"), Some(&JsonValue::Number(1.0)));
+            assert_eq!(m.get("b"), Some(&JsonValue::String_("x".to_string())));
+        } else {
+            panic!();
+        }
+        let s = r#"{"jsonrpc":"2.0","id":1,"params":{"x":[1,2]}}"#;
+        let nested = JsonParser::new(s).parse_value().unwrap();
+        assert_eq!(nested.get("jsonrpc").and_then(|v| v.as_str()), Some("2.0"));
+        assert_eq!(nested.get("id").and_then(|v| v.as_i64()), Some(1));
+        let ser = nested.to_string();
+        assert_eq!(JsonParser::new(&ser).parse_value().unwrap(), nested);
+    }
 
     #[test]
     fn int_roundtrip_symmetry() {

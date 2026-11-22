@@ -59,7 +59,7 @@ fn d292_flow_serializer_keeps_the_decimal_point() {
 #[test]
 fn d292_lsp_serializer_drops_the_decimal_point() {
     assert_eq!(
-        mora::lsp::json::to_string(&mora::lsp::json::Value::Number(6.0)),
+        mora::flow::json::to_string(&mora::flow::json::JsonValue::Number(6.0)),
         "6",
         "现状：lsp::json 把整值 Float 写成无小数点形式。\
          统一之后本条会红 —— 请把 assert_eq! 改成 assert_ne! 并更新 CHANGELOG"
@@ -74,7 +74,7 @@ fn d292_lsp_serializer_drops_the_decimal_point() {
 fn d292_the_two_serializers_disagree_on_integral_float() {
     let v = Value::Float(6.0);
     let flow_side = value_to_json(&v);
-    let lsp_side = mora::lsp::json::to_string(&mora::lsp::json::Value::Number(6.0));
+    let lsp_side = mora::flow::json::to_string(&mora::flow::json::JsonValue::Number(6.0));
     assert_eq!(flow_side, "6.0", "flow 侧应给 6.0（D84）");
     assert_eq!(lsp_side, "6", "lsp 侧当前给 6 —— 读回即 Int，与 D84 冲突");
     assert_ne!(

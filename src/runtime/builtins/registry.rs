@@ -72,7 +72,7 @@ mod tests {
             &mut core,
         )
         .expect("merge_with should succeed");
-        let strategies = core.current_merge_strategies.expect("strategies set");
+        let strategies = core.environment.merge_strategies().expect("strategies set");
         assert_eq!(
             strategies.get("x"),
             Some(&crate::value::MergeStrategy::GrowOnlySet)
@@ -95,7 +95,7 @@ mod tests {
             )
             .expect("merge_with should succeed");
         }
-        let strategies = core.current_merge_strategies.expect("strategies set");
+        let strategies = core.environment.merge_strategies().expect("strategies set");
         assert_eq!(strategies.len(), 4, "多次调用应累积 per-key 策略");
         assert_eq!(
             strategies.get("a"),

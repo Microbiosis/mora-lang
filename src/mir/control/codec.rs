@@ -1637,6 +1637,10 @@ fn write_inst(w: &mut ByteWriter, inst: &ControlInst) -> MoraResult<()> {
             w.buf.extend_from_slice(&encoded);
             write_opt_global(w, *dst);
         }
+        ControlInst::FreshLocalCell(slot) => {
+            w.write_u8(51);
+            w.write_local(*slot);
+        }
     }
     Ok(())
 }
@@ -2105,14 +2109,14 @@ fn read_inst(r: &mut ByteReader<'_>) -> MoraResult<ControlInst> {
             let name = r.read_sym()?;
             let len = r.read_len(MAX_COLLECTION_LEN)?;
             let raw = r.read_bytes(len)?;
-            let program =
-                crate::common::kernel_ir::KernelProgram::decode_bytes(raw).map_err(corrupt)?;
+            let program = crate::common::kernel_ir::KernelProgram::decode_bytes(raw)?;
             ControlInst::RegisterKernel {
                 name,
                 program: Box::new(program),
                 dst: read_opt_global(r)?,
             }
         }
+        51 => ControlInst::FreshLocalCell(r.read_local()?),
         other => return Err(corrupt(format!("invalid ControlInst opcode {other}"))),
     })
 }

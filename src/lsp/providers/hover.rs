@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, HashMap};
 use super::parsed_doc_v3;
 use super::parsed_doc_v3::{format_hm_type, ident_with_col_at_offset, position_to_offset};
 use crate::common::Span;
-use crate::lsp::json::Value;
+use crate::flow::json::JsonValue as Value;
 use crate::lsp::server::DocumentState;
 use crate::mir::witness::{MirWitness, WitnessKind};
 

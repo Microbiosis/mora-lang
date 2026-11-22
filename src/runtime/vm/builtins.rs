@@ -1105,9 +1105,7 @@ pub fn resolve_builtin_call_named(
             };
             let device = match args.get(5) {
                 None | Some(Value::Nil) => crate::common::Device::Cpu,
-                Some(Value::String(s)) => {
-                    crate::common::Device::parse(s).map_err(MoraError::Runtime)?
-                }
+                Some(Value::String(s)) => crate::common::Device::parse(s)?,
                 Some(other) => {
                     return Err(MoraError::Runtime(format!(
                         "kv_allocator: device must be string, got {}",
@@ -1147,9 +1145,7 @@ pub fn resolve_builtin_call_named(
             };
             let device = match args.get(1) {
                 None | Some(Value::Nil) => crate::common::Device::Cpu,
-                Some(Value::String(s)) => {
-                    crate::common::Device::parse(s).map_err(MoraError::Runtime)?
-                }
+                Some(Value::String(s)) => crate::common::Device::parse(s)?,
                 Some(other) => {
                     return Err(MoraError::Runtime(format!(
                         "memory_pool: device must be string, got {}",
@@ -2916,9 +2912,7 @@ fn resolve_gpu_kernel_method(
                     )));
                 }
             };
-            let words = kernel
-                .emit_spirv_words(local_size_x)
-                .map_err(MoraError::Runtime)?;
+            let words = kernel.emit_spirv_words(local_size_x)?;
             Ok(CallAction::Done(Value::List(
                 words
                     .into_iter()

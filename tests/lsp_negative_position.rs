@@ -22,7 +22,7 @@
 //! 不是「无结果」，而是**静默返回错误内容 + 荒谬出站 range**。客户端照该
 //! range 应用 rename / format 就会**改坏用户文件**。
 
-use mora::lsp::json::{self, Value as J};
+use mora::flow::json::{self, JsonValue as J};
 use mora::lsp::providers::{definition_v3, hover_v3};
 use mora::lsp::server::DocumentState;
 use std::collections::HashMap;

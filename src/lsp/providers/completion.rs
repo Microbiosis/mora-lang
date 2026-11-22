@@ -14,7 +14,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use super::parsed_doc_v3;
 use super::parsed_doc_v3::{format_hm_type, make_completion};
-use crate::lsp::json::Value;
+use crate::flow::json::JsonValue as Value;
 use crate::lsp::server::DocumentState;
 
 const CANONICAL_KEYWORDS: &[&str] = &[

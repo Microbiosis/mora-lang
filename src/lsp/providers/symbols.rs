@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use super::parsed_doc_v3;
-use crate::lsp::json::Value;
+use crate::flow::json::JsonValue as Value;
 use crate::lsp::server::DocumentState;
 
 pub fn document_symbol_v3(docs: &HashMap<String, DocumentState>, params: &Value) -> Value {

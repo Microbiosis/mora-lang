@@ -147,17 +147,17 @@ struct OpenSslApi {
     err_error_string_n: ErrErrorStringNFn,
 }
 
-static OPENSSL_API: OnceLock<Result<OpenSslApi, String>> = OnceLock::new();
+static OPENSSL_API: OnceLock<MoraResult<OpenSslApi>> = OnceLock::new();
 
 fn api() -> MoraResult<&'static OpenSslApi> {
     let res = OPENSSL_API.get_or_init(load_openssl_api);
     match res {
         Ok(a) => Ok(a),
-        Err(msg) => Err(MoraError::Io(msg.clone())),
+        Err(err) => Err(err.clone()),
     }
 }
 
-fn load_openssl_api() -> Result<OpenSslApi, String> {
+fn load_openssl_api() -> MoraResult<OpenSslApi> {
     const SSL_CANDIDATES: &[&str] = &[
         "libssl.so.3",
         "libssl.so.1.1",
@@ -180,10 +180,16 @@ fn load_openssl_api() -> Result<OpenSslApi, String> {
     ];
 
     let libssl = DynLib::open_any(SSL_CANDIDATES).ok_or_else(|| {
-        "TLS (Unix): failed to dynamically load OpenSSL/LibreSSL (libssl.so.3 / libssl.so.1.1 / libssl.3.dylib)".to_string()
+        MoraError::Io(
+            "TLS (Unix): failed to dynamically load OpenSSL/LibreSSL (libssl.so.3 / libssl.so.1.1 / libssl.3.dylib)"
+                .to_string(),
+        )
     })?;
     let libcrypto = DynLib::open_any(CRYPTO_CANDIDATES).ok_or_else(|| {
-        "TLS (Unix): failed to dynamically load OpenSSL/LibreSSL (libcrypto.so.3 / libcrypto.so.1.1 / libcrypto.3.dylib)".to_string()
+        MoraError::Io(
+            "TLS (Unix): failed to dynamically load OpenSSL/LibreSSL (libcrypto.so.3 / libcrypto.so.1.1 / libcrypto.3.dylib)"
+                .to_string(),
+        )
     })?;
 
     macro_rules! sym {
@@ -193,10 +199,10 @@ fn load_openssl_api() -> Result<OpenSslApi, String> {
                 unsafe { $lib.get_symbol($name) }
             };
             resolved.ok_or_else(|| {
-                format!(
+                MoraError::Io(format!(
                     "TLS (OpenSSL): missing C symbol {:?}",
                     std::str::from_utf8($name).unwrap_or("?")
-                )
+                ))
             })?
         }};
     }

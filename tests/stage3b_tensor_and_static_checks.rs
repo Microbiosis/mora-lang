@@ -16,7 +16,7 @@ use mora::common::{
     fp8_e5m2_bits_to_f64, pack_i4_nibble, unpack_i4_nibble,
 };
 use mora::error::MoraError;
-use mora::lsp::json::Value as JsonVal;
+use mora::flow::json::JsonValue as JsonVal;
 use mora::lsp::providers::{completion_v3, hover_v3};
 use mora::lsp::server::DocumentState;
 use mora::parser_v3::ParserV3;

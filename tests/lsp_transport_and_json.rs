@@ -50,7 +50,7 @@
 
 use std::io::Cursor;
 
-use mora::lsp::json::{Value, parse};
+use mora::flow::json::{JsonValue as Value, parse};
 use mora::lsp::transport::{read_message, write_message};
 
 fn roundtrip(body: &str) -> (Option<String>, bool) {
@@ -252,11 +252,11 @@ fn d371_big_integers_lose_precision_because_number_is_f64() {
         "LSP 的 `Number` 是 f64 ⇒ 2^53 以上丢精度（已知限制，非缺陷）"
     );
     // 常规整数往返正常
-    assert_eq!(mora::lsp::json::to_string(&parse("42").unwrap()), "42");
-    assert_eq!(mora::lsp::json::to_string(&parse("3.14").unwrap()), "3.14");
+    assert_eq!(mora::flow::json::to_string(&parse("42").unwrap()), "42");
+    assert_eq!(mora::flow::json::to_string(&parse("3.14").unwrap()), "3.14");
     // object 的 key 排序是确定的（BTreeMap）
     assert_eq!(
-        mora::lsp::json::to_string(&parse(r#"{"b":1,"a":2}"#).unwrap()),
+        mora::flow::json::to_string(&parse(r#"{"b":1,"a":2}"#).unwrap()),
         r#"{"a":2,"b":1}"#,
         "Object 是 BTreeMap ⇒ 序列化按 key 排序（确定性）"
     );

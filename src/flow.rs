@@ -132,7 +132,7 @@ pub fn eval_unary_neg_tracked(
             MoraError::Runtime("integer overflow in unary negation of i64::MIN".to_string())
         }),
         Value::Float(f) => Ok(Value::Float(-*f)),
-        Value::Scalar(s) => s.neg().map(Value::Scalar).map_err(MoraError::Runtime),
+        Value::Scalar(s) => s.neg().map(Value::Scalar),
         Value::Tensor(t) => crate::value::tensor::eval_tensor_neg_tracked(t, autograd),
         other => Err(MoraError::Runtime(format!(
             "cannot negate value of type {}",
@@ -211,7 +211,7 @@ pub fn eval_binary_tracked(
                 return match crate::common::ScalarValue::eval_binary(op, *a, *b) {
                     Ok(crate::common::ScalarBinaryOut::Scalar(s)) => Ok(Value::Scalar(s)),
                     Ok(crate::common::ScalarBinaryOut::Bool(flag)) => Ok(Value::Bool(flag)),
-                    Err(msg) => Err(MoraError::Runtime(msg)),
+                    Err(err) => Err(err),
                 };
             }
             (_, BinaryOp::Equal, _) => return Ok(Value::Bool(values_equal(&left, &right))),
@@ -779,7 +779,7 @@ pub fn value_type_name(value: &Value) -> &'static str {
     type_name(value)
 }
 
-pub(crate) mod json; // v0.110.0: 统一 RFC 8259 迭代 JSON 解析/序列化内核
+pub mod json; // v0.111.0: 全仓唯一统一 RFC 8259 迭代 JSON 解析/序列化内核（原 lsp::json 已合入并物理删除）
 pub use json::{MAX_JSON_DEPTH, escape_json_string, json_to_value, value_to_json};
 
 #[cfg(test)]

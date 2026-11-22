@@ -190,47 +190,55 @@ fn parse_wget_error_status(stderr: &str) -> Option<u16> {
 /// - `Ok(Some(code))`：拿到真实 HTTP 状态码（由调用方判定是否 2xx）；
 /// - `Ok(None)`：传输成功但工具未报告状态码（wget 成功路径）；
 /// - `Err(msg)`：传输失败或 HTTP 错误。
-fn download_to(url: &str, dest: &str) -> Result<Option<u16>, String> {
+fn download_to(url: &str, dest: &str) -> crate::error::MoraResult<Option<u16>> {
     if command_exists("curl") {
         download_with_curl(url, dest)
     } else if command_exists("wget") {
         download_with_wget(url, dest)
     } else {
-        Err(
+        Err(crate::error::MoraError::Io(
             "neither curl nor wget found; install one of them, or download the package manually"
                 .to_string(),
-        )
+        ))
     }
 }
 
 /// curl 路径：`-L` 跟随重定向、`-f` 禁止错误响应体落盘、`-w` 输出真实状态码。
-fn download_with_curl(url: &str, dest: &str) -> Result<Option<u16>, String> {
+fn download_with_curl(url: &str, dest: &str) -> crate::error::MoraResult<Option<u16>> {
     let output = Command::new("curl")
         .args(["-L", "-sS", "-f", "-o", dest, "-w", "%{http_code}", url])
         .output()
-        .map_err(|e| format!("failed to run curl: {e}"))?;
+        .map_err(|e| crate::error::MoraError::Io(format!("failed to run curl: {e}")))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     match parse_http_status(&stdout) {
         Some(code) => Ok(Some(code)),
         None if output.status.success() => Ok(None),
-        None => Err(describe_failure("curl", &stderr, output.status.code())),
+        None => Err(crate::error::MoraError::Io(describe_failure(
+            "curl",
+            &stderr,
+            output.status.code(),
+        ))),
     }
 }
 
 /// wget 路径：HTTP 错误时退出码非 0，状态码从 stderr 解析。
-fn download_with_wget(url: &str, dest: &str) -> Result<Option<u16>, String> {
+fn download_with_wget(url: &str, dest: &str) -> crate::error::MoraResult<Option<u16>> {
     let output = Command::new("wget")
         .args(["-O", dest, url])
         .output()
-        .map_err(|e| format!("failed to run wget: {e}"))?;
+        .map_err(|e| crate::error::MoraError::Io(format!("failed to run wget: {e}")))?;
     if output.status.success() {
         return Ok(None);
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
     match parse_wget_error_status(&stderr) {
-        Some(code) => Err(format!("HTTP {code}")),
-        None => Err(describe_failure("wget", &stderr, output.status.code())),
+        Some(code) => Err(crate::error::MoraError::Io(format!("HTTP {code}"))),
+        None => Err(crate::error::MoraError::Io(describe_failure(
+            "wget",
+            &stderr,
+            output.status.code(),
+        ))),
     }
 }
 

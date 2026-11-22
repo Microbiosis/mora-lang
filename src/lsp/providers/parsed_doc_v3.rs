@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use crate::lsp::json::Value as JsonValue;
+use crate::flow::json::JsonValue;
 use crate::lsp::server::DocumentState;
 use crate::mir::witness::{MirWitness, WitnessKind};
 

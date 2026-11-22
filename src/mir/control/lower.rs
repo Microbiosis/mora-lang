@@ -125,11 +125,11 @@ impl ProgramLowerer {
     /// recursion, and cross-statement globals resolve to static `GlobalSlot`s.
     fn pre_scan_top_level(&mut self, witnesses: &[MirWitness]) {
         for w in witnesses {
-            self.pre_scan_stmt(w);
+            self.pre_scan_stmt(w, false);
         }
     }
 
-    fn pre_scan_stmt(&mut self, w: &MirWitness) {
+    fn pre_scan_stmt(&mut self, w: &MirWitness, in_loop: bool) {
         match &w.kind {
             WitnessKind::FnDef { name, params, .. } => {
                 if let Some(&existing) = self.global_by_name.get(name)
@@ -189,10 +189,14 @@ impl ProgramLowerer {
                 self.alloc_global(name, GlobalKind::TypeAlias);
             }
             WitnessKind::LetBinding { name, .. } => {
-                self.alloc_global(name, GlobalKind::Var);
+                // P5-1A: Loop-body `let` bindings stay lexically scoped to each iteration
+                // (`ControlInst::FreshLocalCell`) rather than hoisting to module globals.
+                if !in_loop {
+                    self.alloc_global(name, GlobalKind::Var);
+                }
             }
             WitnessKind::Export { names, decl } => {
-                self.pre_scan_stmt(decl);
+                self.pre_scan_stmt(decl, in_loop);
                 for name in names {
                     let slot = self.alloc_global(name, GlobalKind::Var);
                     self.globals[slot.0 as usize].exported = true;
@@ -200,22 +204,22 @@ impl ProgramLowerer {
             }
             WitnessKind::Sequence(items) => {
                 for item in items {
-                    self.pre_scan_stmt(item);
+                    self.pre_scan_stmt(item, in_loop);
                 }
             }
             WitnessKind::Parallel { body }
             | WitnessKind::Worker { body, .. }
             | WitnessKind::Transaction { body, .. } => {
-                self.pre_scan_stmt(body);
+                self.pre_scan_stmt(body, in_loop);
             }
             WitnessKind::If { then, r#else, .. } => {
-                self.pre_scan_stmt(then);
+                self.pre_scan_stmt(then, in_loop);
                 if let Some(e) = r#else {
-                    self.pre_scan_stmt(e);
+                    self.pre_scan_stmt(e, in_loop);
                 }
             }
             WitnessKind::While { body, .. } | WitnessKind::Loop { body, .. } => {
-                self.pre_scan_stmt(body);
+                self.pre_scan_stmt(body, true);
             }
             _ => {}
         }
@@ -308,9 +312,14 @@ struct FuncScope {
     /// a straight-line re-`let` creates a fresh shadowing slot without breaking
     /// the prior immutable capture.
     captured_local_slots: HashSet<LocalSlot>,
+    /// P5-1A: Tracks locals mutated via `assign` in this function so captured
+    /// mutable locals are promoted to shared `UpvalueCell`s on `finish()`.
+    mutated_local_slots: HashSet<LocalSlot>,
     upvalues: Vec<UpvalueDesc>,
     upvalue_by_name: HashMap<String, UpvalueSlot>,
     loop_stack: Vec<LoopTargets>,
+    /// P5-1A: Index of the lexical scope pushed on entry to each enclosing loop.
+    loop_scope_bases: Vec<usize>,
     loop_depth: usize,
     branch_depth: usize,
     handler_k_slot: Option<LocalSlot>,
@@ -343,9 +352,11 @@ impl FuncScope {
             local_names: Vec::new(),
             shared_locals: Vec::new(),
             captured_local_slots: HashSet::new(),
+            mutated_local_slots: HashSet::new(),
             upvalues: Vec::new(),
             upvalue_by_name: HashMap::new(),
             loop_stack: Vec::new(),
+            loop_scope_bases: Vec::new(),
             loop_depth: 0,
             branch_depth: 0,
             handler_k_slot: None,
@@ -462,7 +473,12 @@ impl FuncScope {
         self.emit_const(ControlConst::Nil)
     }
 
-    fn finish(self) -> ControlFunction {
+    fn finish(mut self) -> ControlFunction {
+        for slot in &self.mutated_local_slots {
+            if self.captured_local_slots.contains(slot) {
+                self.shared_locals[slot.0 as usize] = true;
+            }
+        }
         ControlFunction {
             id: self.fn_id,
             name: self.name_sym,
@@ -1717,7 +1733,38 @@ fn lower_expr_single(
                 FlowState::Active(r) => r,
                 FlowState::Terminated => return Ok(FlowState::Terminated),
             };
-            if stack.is_module_top_level() {
+            // P5-1A: Go-1.22-style per-iteration loop variable scoping.
+            // Any `let` binding newly declared inside a `while`/`for` loop body (not already
+            // defined outside the loop) gets a loop-scoped `LocalSlot` with `FreshLocalCell`,
+            // ensuring closures / `spawn fn()` created on each iteration capture an isolated cell.
+            let loop_local_slot =
+                if let Some(&loop_base) = stack.current_mut().loop_scope_bases.last() {
+                    let in_outer_local = stack.current_mut().local_scopes[..loop_base]
+                        .iter()
+                        .any(|m| m.contains_key(name));
+                    let in_outer_global =
+                        stack.is_module_top_level() && prog.global_by_name.contains_key(name);
+                    if !in_outer_local && !in_outer_global {
+                        let existing_in_loop = stack
+                            .current_mut()
+                            .local_scopes
+                            .last()
+                            .and_then(|m| m.get(name).copied());
+                        let slot = existing_in_loop
+                            .unwrap_or_else(|| stack.current_mut().bind_block_local(name, prog));
+                        Some(slot)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+            if let Some(slot) = loop_local_slot {
+                stack.current_mut().emit(ControlInst::FreshLocalCell(slot));
+                stack
+                    .current_mut()
+                    .emit(ControlInst::StoreLocal(slot, val_reg));
+            } else if stack.is_module_top_level() {
                 let g_slot = prog.alloc_global(name, GlobalKind::Var);
                 stack
                     .current_mut()
@@ -1741,6 +1788,9 @@ fn lower_expr_single(
                 FlowState::Terminated => return Ok(FlowState::Terminated),
             };
             if let Some(binding) = stack.resolve_binding(prog, target, true) {
+                if let VarBinding::Local(slot) = binding {
+                    stack.current_mut().mutated_local_slots.insert(slot);
+                }
                 emit_store_binding(stack.current_mut(), binding, val_reg);
             } else {
                 let sym = prog.intern(target);
@@ -2159,8 +2209,7 @@ fn lower_expr_single(
 
         WitnessKind::KernelDef { name, params, body } => {
             let kprog =
-                crate::runtime::gpu::kernel_compiler::lower_witness_kernel(name, params, body)
-                    .map_err(MoraError::Parse)?;
+                crate::runtime::gpu::kernel_compiler::lower_witness_kernel(name, params, body)?;
             let sym = prog.intern(name);
             let slot = if stack.current_mut().kind == FunctionKind::Main {
                 Some(prog.alloc_global(name, GlobalKind::Kernel))
@@ -3060,6 +3109,9 @@ fn lower_while(
     }
 
     stack.current_mut().switch_to(body_bb);
+    stack.current_mut().push_lexical_scope();
+    let while_scope_base = stack.current_mut().local_scopes.len() - 1;
+    stack.current_mut().loop_scope_bases.push(while_scope_base);
     stack.current_mut().loop_stack.push(LoopTargets {
         continue_bb: header_bb,
         break_bb: exit_bb,
@@ -3068,6 +3120,8 @@ fn lower_while(
     let body_res = lower_expr(stack, prog, body, false);
     stack.current_mut().loop_depth -= 1;
     stack.current_mut().loop_stack.pop();
+    stack.current_mut().loop_scope_bases.pop();
+    stack.current_mut().pop_lexical_scope();
 
     if let FlowState::Active(_) = body_res? {
         stack.current_mut().terminate(ControlTerminator::Jump {
@@ -3146,11 +3200,16 @@ fn lower_for_loop(
     // body: bind `var = iter[idx]` in lexical scope so outer variable with same name isn't clobbered.
     stack.current_mut().switch_to(body_bb);
     stack.current_mut().push_lexical_scope();
+    let for_scope_base = stack.current_mut().local_scopes.len() - 1;
+    stack.current_mut().loop_scope_bases.push(for_scope_base);
     let var_slot = stack.current_mut().bind_block_local(var, prog);
     let elem_reg = stack.current_mut().alloc_reg();
     stack
         .current_mut()
         .emit(ControlInst::Index(elem_reg, iter_reg, idx_reg));
+    stack
+        .current_mut()
+        .emit(ControlInst::FreshLocalCell(var_slot));
     stack
         .current_mut()
         .emit(ControlInst::StoreLocal(var_slot, elem_reg));
@@ -3163,6 +3222,7 @@ fn lower_for_loop(
     let body_res = lower_expr(stack, prog, body, false);
     stack.current_mut().loop_depth -= 1;
     stack.current_mut().loop_stack.pop();
+    stack.current_mut().loop_scope_bases.pop();
     stack.current_mut().pop_lexical_scope();
 
     if let FlowState::Active(_) = body_res? {

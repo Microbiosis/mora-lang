@@ -2701,7 +2701,7 @@ impl DeviceBackend for VulkanDeviceBackend {
 
         let mut st = self.inner.state.lock();
         if !st.custom_pipes.contains_key(&cache_key) {
-            let words = emit_spirv_words(kernel, local_size_x).map_err(MoraError::Runtime)?;
+            let words = emit_spirv_words(kernel, local_size_x)?;
             let pipe =
                 VkComputePipe::create(&self.inner.api, st.vk_dev, &words, layout.total_bindings)
                     .ok_or_else(|| {

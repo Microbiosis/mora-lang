@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use super::parsed_doc_v3;
 use super::parsed_doc_v3::{ident_at_offset, position_to_offset};
-use crate::lsp::json::Value;
+use crate::flow::json::JsonValue as Value;
 use crate::lsp::server::DocumentState;
 
 pub fn rename_v3(docs: &HashMap<String, DocumentState>, params: &Value) -> Value {

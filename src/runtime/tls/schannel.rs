@@ -425,23 +425,23 @@ struct WinTlsApi {
     ncrypt_free_object: NCryptFreeObjectFn,
 }
 
-static WIN_TLS_API: OnceLock<Result<WinTlsApi, String>> = OnceLock::new();
+static WIN_TLS_API: OnceLock<MoraResult<WinTlsApi>> = OnceLock::new();
 
 fn api() -> MoraResult<&'static WinTlsApi> {
     let res = WIN_TLS_API.get_or_init(load_win_tls_api);
     match res {
         Ok(a) => Ok(a),
-        Err(msg) => Err(MoraError::Io(msg.clone())),
+        Err(err) => Err(err.clone()),
     }
 }
 
-fn load_win_tls_api() -> Result<WinTlsApi, String> {
+fn load_win_tls_api() -> MoraResult<WinTlsApi> {
     let secur32 = DynLib::open("secur32.dll")
-        .ok_or_else(|| "TLS (Windows): failed to load secur32.dll".to_string())?;
+        .ok_or_else(|| MoraError::Io("TLS (Windows): failed to load secur32.dll".to_string()))?;
     let crypt32 = DynLib::open("crypt32.dll")
-        .ok_or_else(|| "TLS (Windows): failed to load crypt32.dll".to_string())?;
+        .ok_or_else(|| MoraError::Io("TLS (Windows): failed to load crypt32.dll".to_string()))?;
     let ncrypt = DynLib::open("ncrypt.dll")
-        .ok_or_else(|| "TLS (Windows): failed to load ncrypt.dll".to_string())?;
+        .ok_or_else(|| MoraError::Io("TLS (Windows): failed to load ncrypt.dll".to_string()))?;
 
     macro_rules! sym {
         ($lib:expr, $name:literal) => {{
@@ -450,10 +450,10 @@ fn load_win_tls_api() -> Result<WinTlsApi, String> {
                 unsafe { $lib.get_symbol($name) }
             };
             resolved.ok_or_else(|| {
-                format!(
+                MoraError::Io(format!(
                     "TLS (Windows): missing Win32 symbol {:?}",
                     std::str::from_utf8($name).unwrap_or("?")
-                )
+                ))
             })?
         }};
     }

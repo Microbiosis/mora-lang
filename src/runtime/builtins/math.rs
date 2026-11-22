@@ -272,9 +272,7 @@ fn unary_preserve(
                 ))
             } else if let Some(n) = s.as_i64() {
                 let res = int_fn(n);
-                crate::common::ScalarValue::from_i64_checked(res, s.dtype())
-                    .map(Value::Scalar)
-                    .map_err(MoraError::Runtime)
+                crate::common::ScalarValue::from_i64_checked(res, s.dtype()).map(Value::Scalar)
             } else {
                 Ok(Value::Scalar(*s))
             }

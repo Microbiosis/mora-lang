@@ -51,7 +51,7 @@ fn is_test_filename(path: &Path) -> bool {
     name.ends_with("_test.mora") || (name.starts_with("test_") && name.ends_with(".mora"))
 }
 
-fn discover_test_files(paths: &[String]) -> Result<Vec<PathBuf>, String> {
+fn discover_test_files(paths: &[String]) -> crate::error::MoraResult<Vec<PathBuf>> {
     let roots: Vec<PathBuf> = if paths.is_empty() {
         vec![PathBuf::from(".")]
     } else {
@@ -61,7 +61,10 @@ fn discover_test_files(paths: &[String]) -> Result<Vec<PathBuf>, String> {
     let mut out = Vec::new();
     for root in roots {
         if !root.exists() {
-            return Err(format!("path not found: {}", root.display()));
+            return Err(crate::error::MoraError::Io(format!(
+                "path not found: {}",
+                root.display()
+            )));
         }
         if root.is_file() {
             out.push(root);
@@ -74,9 +77,10 @@ fn discover_test_files(paths: &[String]) -> Result<Vec<PathBuf>, String> {
     Ok(out)
 }
 
-fn walk_test_dir(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
-    let entries = fs::read_dir(dir)
-        .map_err(|e| format!("failed to read directory {}: {e}", dir.display()))?;
+fn walk_test_dir(dir: &Path, out: &mut Vec<PathBuf>) -> crate::error::MoraResult<()> {
+    let entries = fs::read_dir(dir).map_err(|e| {
+        crate::error::MoraError::Io(format!("failed to read directory {}: {e}", dir.display()))
+    })?;
     let mut children: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
     children.sort();
     for p in children {

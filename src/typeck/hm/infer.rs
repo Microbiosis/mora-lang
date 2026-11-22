@@ -1385,7 +1385,16 @@ impl HMInference {
                         ),
                     })
                     .collect();
-                return Ok(self.apply_builtin_call_types(spec, arg_vals, span));
+                self.check_static_resource_builtin_named(
+                    bname,
+                    &fspec.names,
+                    args,
+                    named_args,
+                    span,
+                )?;
+                let (ret_ty, mut eff_row) = self.apply_builtin_call_types(spec, arg_vals, span);
+                self.attach_builtin_ambient_effects(bname, &mut eff_row, span);
+                return Ok((ret_ty, eff_row));
             }
             if matches!(
                 resolved_callee,
@@ -1447,7 +1456,18 @@ impl HMInference {
                 let (t, r) = self.infer_recover(arg);
                 arg_vals.push((t, r, arg.span));
             }
-            return Ok(self.apply_builtin_call_types(&spec, arg_vals, span));
+            let bname_opt = match callee {
+                WitnessCallee::Name(n) | WitnessCallee::Var(n) => Some(n.as_str()),
+                _ => None,
+            };
+            if let Some(bname) = bname_opt {
+                self.check_static_resource_builtin_positional(bname, args, span)?;
+            }
+            let (ret_ty, mut eff_row) = self.apply_builtin_call_types(&spec, arg_vals, span);
+            if let Some(bname) = bname_opt {
+                self.attach_builtin_ambient_effects(bname, &mut eff_row, span);
+            }
+            return Ok((ret_ty, eff_row));
         }
 
         let mut arg_vals = Vec::with_capacity(args.len());
@@ -1878,6 +1898,11 @@ impl HMInference {
             }
             return Ok((arg0.clone(), acc_row));
         }
+
+        if matches!(resolved_recv, Type::MemoryPool) {
+            self.check_memory_pool_method_quota(receiver_witness, method, args, span)?;
+        }
+        self.attach_method_ambient_effects(mod_name, &resolved_recv, method, &mut acc_row, span);
 
         let return_ty = module_return_ty
             .or(resolved_return_ty)
@@ -2381,6 +2406,14 @@ impl HMInference {
                 }
             }
         };
+        let spawned_row = self.merge_rows(
+            spawned_row,
+            crate::mir::effect::EffectRow::Cons(
+                crate::mir::effect::ambient::ASYNC_LABEL.to_string(),
+                Box::new(crate::mir::effect::EffectRow::Empty),
+            ),
+            span,
+        );
         Ok((Type::TaskHandle(Box::new(ret_ty)), spawned_row))
     }
 
@@ -2496,6 +2529,14 @@ impl HMInference {
                 }
             }
         }
+        let acc_row = self.merge_rows(
+            acc_row,
+            crate::mir::effect::EffectRow::Cons(
+                crate::mir::effect::ambient::ASYNC_LABEL.to_string(),
+                Box::new(crate::mir::effect::EffectRow::Empty),
+            ),
+            span,
+        );
         Ok((result_ty.unwrap_or(Type::Nil), acc_row))
     }
 
@@ -2845,6 +2886,319 @@ impl HMInference {
         {
             self.aliased_source_tensors.insert(src_var.clone());
             self.aliased_source_tensors.insert(name.to_string());
+        }
+        // Static Resource byte-quota tracking for `let pool = memory_pool(max_bytes, ...)`.
+        if let Some(quota) = Self::extract_memory_pool_quota(value) {
+            self.pool_byte_quotas.insert(name.to_string(), quota);
+        } else {
+            self.pool_byte_quotas.remove(name);
+        }
+    }
+
+    fn extract_memory_pool_quota(w: &MirWitness) -> Option<usize> {
+        let WitnessKind::Call {
+            callee: WitnessCallee::Name(n) | WitnessCallee::Var(n),
+            args,
+            named_args,
+        } = &w.kind
+        else {
+            return None;
+        };
+        if n != "memory_pool" {
+            return None;
+        }
+        let quota_w = args.first().or_else(|| {
+            named_args
+                .iter()
+                .find(|(k, _)| k == "max_bytes")
+                .map(|(_, v)| v)
+        })?;
+        let val = Self::extract_static_int_literal(quota_w)?;
+        (val > 0).then_some(val as usize)
+    }
+
+    fn extract_static_shape_numel(w: &MirWitness) -> Option<usize> {
+        let WitnessKind::List(elems) = &w.kind else {
+            return None;
+        };
+        let mut numel: usize = 1;
+        for el in elems {
+            let d = Self::extract_static_int_literal(el)?;
+            if d < 0 {
+                return None;
+            }
+            numel = numel.checked_mul(d as usize)?;
+        }
+        Some(numel)
+    }
+
+    fn check_static_resource_builtin_positional(
+        &mut self,
+        bname: &str,
+        args: &[MirWitness],
+        span: Span,
+    ) -> Result<(), Vec<TypeError>> {
+        let refs: Vec<Option<&MirWitness>> = args.iter().map(Some).collect();
+        self.check_static_resource_builtin_slots(bname, &refs, span)
+    }
+
+    fn check_static_resource_builtin_named(
+        &mut self,
+        bname: &str,
+        pnames: &[String],
+        args: &[MirWitness],
+        named_args: &[(String, MirWitness)],
+        span: Span,
+    ) -> Result<(), Vec<TypeError>> {
+        let mut slots: Vec<Option<&MirWitness>> = vec![None; pnames.len()];
+        for (i, a) in args.iter().enumerate() {
+            if i < slots.len() {
+                slots[i] = Some(a);
+            }
+        }
+        for (k, v) in named_args {
+            if let Some(pos) = pnames.iter().position(|p| p == k) {
+                slots[pos] = Some(v);
+            }
+        }
+        self.check_static_resource_builtin_slots(bname, &slots, span)
+    }
+
+    fn check_static_resource_builtin_slots(
+        &mut self,
+        bname: &str,
+        slots: &[Option<&MirWitness>],
+        span: Span,
+    ) -> Result<(), Vec<TypeError>> {
+        match bname {
+            "memory_pool" => {
+                if let Some(Some(max_w)) = slots.first()
+                    && let Some(max_b) = Self::extract_static_int_literal(max_w)
+                    && max_b <= 0
+                {
+                    return Err(vec![TypeError::UnificationFailure {
+                        expected: "positive static resource quota max_bytes (> 0) for memory_pool"
+                            .to_string(),
+                        got: format!("{max_b} bytes"),
+                        span: Some(max_w.span),
+                    }]);
+                }
+            }
+            "kv_allocator" => {
+                let names = ["total_pages", "page_tokens", "num_heads", "head_dim"];
+                let mut geom: [Option<usize>; 4] = [None; 4];
+                for i in 0..4 {
+                    if let Some(Some(w)) = slots.get(i)
+                        && let Some(v) = Self::extract_static_int_literal(w)
+                    {
+                        if v <= 0 {
+                            return Err(vec![TypeError::UnificationFailure {
+                                expected: format!(
+                                    "positive static KV geometry '{}' (> 0)",
+                                    names[i]
+                                ),
+                                got: format!("{v}"),
+                                span: Some(w.span),
+                            }]);
+                        }
+                        geom[i] = Some(v as usize);
+                    }
+                }
+                if let Some(Some(max_w)) = slots.get(6)
+                    && let Some(max_b) = Self::extract_static_int_literal(max_w)
+                {
+                    if max_b <= 0 {
+                        return Err(vec![TypeError::UnificationFailure {
+                            expected:
+                                "positive static resource quota max_bytes (> 0) for kv_allocator"
+                                    .to_string(),
+                            got: format!("{max_b} bytes"),
+                            span: Some(max_w.span),
+                        }]);
+                    }
+                    if let [Some(_tp), Some(pt), Some(nh), Some(hd)] = geom {
+                        let dt = match slots.get(4).copied().flatten() {
+                            Some(w) => Self::parse_static_dtype_witness(Some(w))?
+                                .and_then(|t| t.as_dtype())
+                                .unwrap_or(crate::common::DType::F64),
+                            None => crate::common::DType::F64,
+                        };
+                        let elems_per_page = pt.saturating_mul(nh).saturating_mul(hd);
+                        let one_kv_page_bytes = dt.storage_bytes(elems_per_page).saturating_mul(2);
+                        if (max_b as usize) < one_kv_page_bytes {
+                            return Err(vec![TypeError::UnificationFailure {
+                                expected: format!(
+                                    "static resource quota max_bytes >= 1 physical KV page ({one_kv_page_bytes} bytes)"
+                                ),
+                                got: format!("{max_b} bytes"),
+                                span: Some(span),
+                            }]);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn check_memory_pool_method_quota(
+        &mut self,
+        receiver_witness: Option<&MirWitness>,
+        method: &str,
+        args: &[MirWitness],
+        span: Span,
+    ) -> Result<(), Vec<TypeError>> {
+        let pool_name = receiver_witness.and_then(|w| match &w.kind {
+            WitnessKind::Variable(name) => Some(name.clone()),
+            _ => None,
+        });
+        match method {
+            "set_quota" => {
+                if let Some(arg0) = args.first() {
+                    if let Some(v) = Self::extract_static_int_literal(arg0) {
+                        if v <= 0 {
+                            return Err(vec![TypeError::UnificationFailure {
+                                expected:
+                                    "positive static resource quota max_bytes (> 0) for set_quota"
+                                        .to_string(),
+                                got: format!("{v} bytes"),
+                                span: Some(arg0.span),
+                            }]);
+                        }
+                        if let Some(pname) = pool_name {
+                            self.pool_byte_quotas.insert(pname, v as usize);
+                        }
+                    } else if let Some(pname) = pool_name {
+                        self.pool_byte_quotas.remove(&pname);
+                    }
+                }
+            }
+            "alloc" | "zeros" | "full" => {
+                let Some(pname) = pool_name else {
+                    return Ok(());
+                };
+                let Some(&quota) = self.pool_byte_quotas.get(&pname) else {
+                    return Ok(());
+                };
+                let Some(shape_w) = args.first() else {
+                    return Ok(());
+                };
+                let Some(numel) = Self::extract_static_shape_numel(shape_w) else {
+                    return Ok(());
+                };
+                let dtype_idx = if method == "full" { 2 } else { 1 };
+                let dt = match args.get(dtype_idx) {
+                    Some(dw) => Self::parse_static_dtype_witness(Some(dw))?
+                        .and_then(|t| t.as_dtype())
+                        .unwrap_or(crate::common::DType::F64),
+                    None => crate::common::DType::F64,
+                };
+                let raw_bytes = dt.storage_bytes(numel);
+                let aligned_bytes = if raw_bytes == 0 {
+                    0
+                } else {
+                    raw_bytes.div_ceil(64) * 64
+                };
+                if aligned_bytes > quota {
+                    return Err(vec![TypeError::UnificationFailure {
+                        expected: format!(
+                            "static resource allocation within memory_pool '{pname}' quota ({quota} bytes)"
+                        ),
+                        got: format!(
+                            "{aligned_bytes} bytes (64B-aligned {numel} elements of '{}')",
+                            dt.short_name()
+                        ),
+                        span: Some(span),
+                    }]);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn attach_builtin_ambient_effects(
+        &mut self,
+        bname: &str,
+        row: &mut crate::mir::effect::EffectRow,
+        span: Span,
+    ) {
+        use crate::mir::effect::{EffectRow, ambient};
+        let mut add = |label: &str| {
+            let prev = std::mem::take(row);
+            *row = self.merge_rows(
+                prev,
+                EffectRow::Cons(label.to_string(), Box::new(EffectRow::Empty)),
+                span,
+            );
+        };
+        match bname {
+            "tcp_listen" | "tls_listen" => add(ambient::IO_LABEL),
+            "tcp_connect" | "tls_connect" | "tcp_process_group" => {
+                add(ambient::IO_LABEL);
+                add(ambient::ASYNC_LABEL);
+            }
+            "sleep" => add(ambient::ASYNC_LABEL),
+            _ => {}
+        }
+    }
+
+    fn attach_method_ambient_effects(
+        &mut self,
+        mod_name: Option<&str>,
+        resolved_recv: &Type,
+        method: &str,
+        row: &mut crate::mir::effect::EffectRow,
+        span: Span,
+    ) {
+        use crate::mir::effect::{EffectRow, ambient};
+        let mut add = |label: &str| {
+            let prev = std::mem::take(row);
+            *row = self.merge_rows(
+                prev,
+                EffectRow::Cons(label.to_string(), Box::new(EffectRow::Empty)),
+                span,
+            );
+        };
+        if matches!(mod_name, Some("file" | "exec")) {
+            add(ambient::IO_LABEL);
+        }
+        match resolved_recv {
+            Type::TcpListener | Type::TcpStream | Type::TlsListener | Type::TlsStream => {
+                add(ambient::IO_LABEL);
+                if matches!(
+                    method,
+                    "accept"
+                        | "read"
+                        | "read_bytes"
+                        | "read_line"
+                        | "write"
+                        | "write_bytes"
+                        | "shutdown"
+                ) {
+                    add(ambient::ASYNC_LABEL);
+                }
+            }
+            Type::Channel(_) => {
+                if matches!(method, "send" | "recv" | "send_ctx" | "recv_ctx") {
+                    add(ambient::ASYNC_LABEL);
+                }
+            }
+            Type::TaskHandle(_) => {
+                if method == "join" {
+                    add(ambient::ASYNC_LABEL);
+                }
+            }
+            Type::ProcessGroup => {
+                if matches!(
+                    method,
+                    "all_reduce" | "all_gather" | "broadcast" | "reduce_scatter" | "barrier"
+                ) {
+                    add(ambient::ASYNC_LABEL);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -4912,6 +5266,14 @@ impl HMInference {
     ) -> Option<Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>>> {
         let resolved: Vec<Type> = arg_types.iter().map(|t| self.subst.apply(t)).collect();
         if module == "file" {
+            let io_row = self.merge_rows(
+                acc_row.clone(),
+                crate::mir::effect::EffectRow::Cons(
+                    crate::mir::effect::ambient::IO_LABEL.to_string(),
+                    Box::new(crate::mir::effect::EffectRow::Empty),
+                ),
+                span,
+            );
             match method {
                 "read_binary" => {
                     if args.len() != 1 {
@@ -4938,7 +5300,7 @@ impl HMInference {
                             ]),
                             device: crate::typeck::DeviceType::Concrete(crate::common::Device::Cpu),
                         },
-                        acc_row.clone(),
+                        io_row,
                     )));
                 }
                 "read_binary_range" => {
@@ -4975,7 +5337,7 @@ impl HMInference {
                             ]),
                             device: crate::typeck::DeviceType::Concrete(crate::common::Device::Cpu),
                         },
-                        acc_row.clone(),
+                        io_row,
                     )));
                 }
                 "write_binary" => {
@@ -5004,7 +5366,7 @@ impl HMInference {
                         },
                         args[1].span,
                     ));
-                    return Some(Ok((Type::Nil, acc_row.clone())));
+                    return Some(Ok((Type::Nil, io_row)));
                 }
                 _ => {}
             }

@@ -5,6 +5,7 @@
 //! Metal MSL, and parallel host CPU execution.
 
 use crate::common::DType;
+use crate::error::{MoraError, MoraResult};
 
 /// Parameter kind in a source-level `kernel name(params...) ... end` declaration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -58,14 +59,16 @@ impl KernelParamType {
         }
     }
 
-    fn from_tag(tag: u8) -> Result<Self, String> {
+    fn from_tag(tag: u8) -> MoraResult<Self> {
         match tag {
             1 => Ok(Self::F32),
             2 => Ok(Self::F64),
             3 => Ok(Self::I32),
             4 => Ok(Self::BufF32),
             5 => Ok(Self::BufF64),
-            other => Err(format!("invalid KernelParamType tag {other}")),
+            other => Err(MoraError::Serialization(format!(
+                "invalid KernelParamType tag {other}"
+            ))),
         }
     }
 }
@@ -102,13 +105,15 @@ impl KernelScalarType {
         }
     }
 
-    fn from_tag(tag: u8) -> Result<Self, String> {
+    fn from_tag(tag: u8) -> MoraResult<Self> {
         match tag {
             1 => Ok(Self::I32),
             2 => Ok(Self::F32),
             3 => Ok(Self::F64),
             4 => Ok(Self::Bool),
-            other => Err(format!("invalid KernelScalarType tag {other}")),
+            other => Err(MoraError::Serialization(format!(
+                "invalid KernelScalarType tag {other}"
+            ))),
         }
     }
 }
@@ -149,7 +154,7 @@ impl KernelUnaryOp {
         }
     }
 
-    fn from_tag(tag: u8) -> Result<Self, String> {
+    fn from_tag(tag: u8) -> MoraResult<Self> {
         match tag {
             1 => Ok(Self::Neg),
             2 => Ok(Self::Not),
@@ -160,7 +165,9 @@ impl KernelUnaryOp {
             7 => Ok(Self::ToF32),
             8 => Ok(Self::ToF64),
             9 => Ok(Self::ToI32),
-            other => Err(format!("invalid KernelUnaryOp tag {other}")),
+            other => Err(MoraError::Serialization(format!(
+                "invalid KernelUnaryOp tag {other}"
+            ))),
         }
     }
 }
@@ -206,7 +213,7 @@ impl KernelBinOp {
         }
     }
 
-    fn from_tag(tag: u8) -> Result<Self, String> {
+    fn from_tag(tag: u8) -> MoraResult<Self> {
         match tag {
             1 => Ok(Self::Add),
             2 => Ok(Self::Sub),
@@ -223,7 +230,9 @@ impl KernelBinOp {
             13 => Ok(Self::Ne),
             14 => Ok(Self::And),
             15 => Ok(Self::Or),
-            other => Err(format!("invalid KernelBinOp tag {other}")),
+            other => Err(MoraError::Serialization(format!(
+                "invalid KernelBinOp tag {other}"
+            ))),
         }
     }
 }
@@ -381,7 +390,7 @@ impl KernelProgram {
     }
 
     /// Decode a `KernelProgram` from bytes produced by [`Self::encode_bytes`].
-    pub fn decode_bytes(bytes: &[u8]) -> Result<Self, String> {
+    pub fn decode_bytes(bytes: &[u8]) -> MoraResult<Self> {
         let mut cursor = 0usize;
         let name = read_str(bytes, &mut cursor)?;
         let n_params = read_u32(bytes, &mut cursor)? as usize;
@@ -396,10 +405,10 @@ impl KernelProgram {
         }
         let body = decode_stmts(bytes, &mut cursor)?;
         if cursor != bytes.len() {
-            return Err(format!(
+            return Err(MoraError::Serialization(format!(
                 "trailing {} bytes in KernelProgram binary payload",
                 bytes.len() - cursor
-            ));
+            )));
         }
         Ok(Self { name, params, body })
     }
@@ -414,17 +423,19 @@ fn write_str(buf: &mut Vec<u8>, s: &str) {
     buf.extend_from_slice(s.as_bytes());
 }
 
-fn read_u8(bytes: &[u8], cursor: &mut usize) -> Result<u8, String> {
+fn read_u8(bytes: &[u8], cursor: &mut usize) -> MoraResult<u8> {
     let b = *bytes
         .get(*cursor)
-        .ok_or_else(|| "unexpected EOF in KernelProgram".to_string())?;
+        .ok_or_else(|| MoraError::Serialization("unexpected EOF in KernelProgram".to_string()))?;
     *cursor += 1;
     Ok(b)
 }
 
-fn read_u32(bytes: &[u8], cursor: &mut usize) -> Result<u32, String> {
+fn read_u32(bytes: &[u8], cursor: &mut usize) -> MoraResult<u32> {
     if *cursor + 4 > bytes.len() {
-        return Err("unexpected EOF reading u32 in KernelProgram".to_string());
+        return Err(MoraError::Serialization(
+            "unexpected EOF reading u32 in KernelProgram".to_string(),
+        ));
     }
     let arr: [u8; 4] = bytes[*cursor..*cursor + 4]
         .try_into()
@@ -433,13 +444,15 @@ fn read_u32(bytes: &[u8], cursor: &mut usize) -> Result<u32, String> {
     Ok(u32::from_le_bytes(arr))
 }
 
-fn read_str(bytes: &[u8], cursor: &mut usize) -> Result<String, String> {
+fn read_str(bytes: &[u8], cursor: &mut usize) -> MoraResult<String> {
     let len = read_u32(bytes, cursor)? as usize;
     if *cursor + len > bytes.len() {
-        return Err("unexpected EOF reading string in KernelProgram".to_string());
+        return Err(MoraError::Serialization(
+            "unexpected EOF reading string in KernelProgram".to_string(),
+        ));
     }
     let s = std::str::from_utf8(&bytes[*cursor..*cursor + len])
-        .map_err(|e| format!("invalid UTF-8 in KernelProgram: {e}"))?
+        .map_err(|e| MoraError::Serialization(format!("invalid UTF-8 in KernelProgram: {e}")))?
         .to_string();
     *cursor += len;
     Ok(s)
@@ -504,7 +517,7 @@ fn encode_expr(buf: &mut Vec<u8>, expr: &KernelExpr) {
     }
 }
 
-fn decode_expr(bytes: &[u8], cursor: &mut usize) -> Result<KernelExpr, String> {
+fn decode_expr(bytes: &[u8], cursor: &mut usize) -> MoraResult<KernelExpr> {
     let tag = read_u8(bytes, cursor)?;
     match tag {
         1 => {
@@ -517,7 +530,9 @@ fn decode_expr(bytes: &[u8], cursor: &mut usize) -> Result<KernelExpr, String> {
         }
         3 => {
             if *cursor + 8 > bytes.len() {
-                return Err("unexpected EOF reading f64 in KernelProgram".to_string());
+                return Err(MoraError::Serialization(
+                    "unexpected EOF reading f64 in KernelProgram".to_string(),
+                ));
             }
             let arr: [u8; 8] = bytes[*cursor..*cursor + 8]
                 .try_into()
@@ -566,7 +581,9 @@ fn decode_expr(bytes: &[u8], cursor: &mut usize) -> Result<KernelExpr, String> {
             let rhs = Box::new(decode_expr(bytes, cursor)?);
             Ok(KernelExpr::Binary { op, lhs, rhs, ty })
         }
-        other => Err(format!("invalid KernelExpr tag {other}")),
+        other => Err(MoraError::Serialization(format!(
+            "invalid KernelExpr tag {other}"
+        ))),
     }
 }
 
@@ -614,7 +631,7 @@ fn encode_stmts(buf: &mut Vec<u8>, stmts: &[KernelStmt]) {
     }
 }
 
-fn decode_stmts(bytes: &[u8], cursor: &mut usize) -> Result<Vec<KernelStmt>, String> {
+fn decode_stmts(bytes: &[u8], cursor: &mut usize) -> MoraResult<Vec<KernelStmt>> {
     let n = read_u32(bytes, cursor)? as usize;
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
@@ -656,7 +673,11 @@ fn decode_stmts(bytes: &[u8], cursor: &mut usize) -> Result<Vec<KernelStmt>, Str
                 let body = decode_stmts(bytes, cursor)?;
                 KernelStmt::While { cond, body }
             }
-            other => return Err(format!("invalid KernelStmt tag {other}")),
+            other => {
+                return Err(MoraError::Serialization(format!(
+                    "invalid KernelStmt tag {other}"
+                )));
+            }
         };
         out.push(stmt);
     }

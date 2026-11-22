@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 
 use super::parsed_doc_v3;
-use crate::lsp::json::Value;
+use crate::flow::json::JsonValue as Value;
 use crate::lsp::server::DocumentState;
 
 pub fn folding_range_v3(docs: &HashMap<String, DocumentState>, params: &Value) -> Value {

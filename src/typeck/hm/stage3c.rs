@@ -2870,12 +2870,12 @@ impl HMInference {
         body: &[MirWitness],
         span: Span,
     ) -> Result<(Type, EffectRow), Vec<TypeError>> {
-        if let Err(msg) =
+        if let Err(err) =
             crate::runtime::gpu::kernel_compiler::lower_witness_kernel(name, params, body)
         {
             self.errors.push(TypeError::UnificationFailure {
                 expected: format!("valid GPU kernel definition '{name}'"),
-                got: msg,
+                got: err.to_string(),
                 span: Some(span),
             });
         }

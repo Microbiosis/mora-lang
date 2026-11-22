@@ -54,7 +54,7 @@ impl CompiledGpuKernel {
         emit_ptx(&self.program)
     }
 
-    pub fn emit_spirv_words(&self, local_size_x: u32) -> Result<Vec<u32>, String> {
+    pub fn emit_spirv_words(&self, local_size_x: u32) -> MoraResult<Vec<u32>> {
         emit_spirv_words(&self.program, local_size_x)
     }
 
@@ -145,7 +145,7 @@ impl KernelLowerCtx {
         }
     }
 
-    fn lower_block(&mut self, witnesses: &[MirWitness]) -> Result<Vec<KernelStmt>, String> {
+    fn lower_block(&mut self, witnesses: &[MirWitness]) -> MoraResult<Vec<KernelStmt>> {
         let mut out = Vec::new();
         for w in witnesses {
             self.lower_stmt(w, &mut out)?;
@@ -153,7 +153,7 @@ impl KernelLowerCtx {
         Ok(out)
     }
 
-    fn lower_stmt(&mut self, w: &MirWitness, out: &mut Vec<KernelStmt>) -> Result<(), String> {
+    fn lower_stmt(&mut self, w: &MirWitness, out: &mut Vec<KernelStmt>) -> MoraResult<()> {
         match &w.kind {
             WitnessKind::Sequence(items) => {
                 for item in items {
@@ -177,13 +177,13 @@ impl KernelLowerCtx {
                 if let Some(exp) = expected
                     && exp != ty
                 {
-                    return Err(format!(
+                    return Err(MoraError::Parse(format!(
                         "kernel '{}': local '{}' annotated as {} but initialized with {}",
                         self.kernel_name,
                         name,
                         exp.canonical_name(),
                         ty.canonical_name()
-                    ));
+                    )));
                 }
                 self.locals.insert(name.clone(), ty);
                 out.push(KernelStmt::Let {
@@ -195,20 +195,20 @@ impl KernelLowerCtx {
             }
             WitnessKind::Assign { target, value } => {
                 let Some(&target_ty) = self.locals.get(target) else {
-                    return Err(format!(
+                    return Err(MoraError::Parse(format!(
                         "kernel '{}': cannot assign to undeclared local '{}' (parameters are read-only; declare with 'let')",
                         self.kernel_name, target
-                    ));
+                    )));
                 };
                 let expr = self.lower_expr(value, Some(target_ty))?;
                 if expr.ty() != target_ty {
-                    return Err(format!(
+                    return Err(MoraError::Parse(format!(
                         "kernel '{}': cannot assign {} to local '{}' of type {}",
                         self.kernel_name,
                         expr.ty().canonical_name(),
                         target,
                         target_ty.canonical_name()
-                    ));
+                    )));
                 }
                 out.push(KernelStmt::Assign {
                     name: target.clone(),
@@ -222,35 +222,35 @@ impl KernelLowerCtx {
                 value,
             } => {
                 let WitnessKind::Variable(buf_name) = &object.kind else {
-                    return Err(format!(
+                    return Err(MoraError::Parse(format!(
                         "kernel '{}': store target must be a buffer parameter name",
                         self.kernel_name
-                    ));
+                    )));
                 };
                 let Some(&(buf_param, elem_ty)) = self.buf_params.get(buf_name) else {
-                    return Err(format!(
+                    return Err(MoraError::Parse(format!(
                         "kernel '{}': '{}' is not a buffer parameter",
                         self.kernel_name, buf_name
-                    ));
+                    )));
                 };
                 let idx_expr = self.lower_expr(index, Some(KernelScalarType::I32))?;
                 if idx_expr.ty() != KernelScalarType::I32 {
-                    return Err(format!(
+                    return Err(MoraError::Parse(format!(
                         "kernel '{}': buffer index into '{}' must be i32, got {}",
                         self.kernel_name,
                         buf_name,
                         idx_expr.ty().canonical_name()
-                    ));
+                    )));
                 }
                 let val_expr = self.lower_expr(value, Some(elem_ty))?;
                 if val_expr.ty() != elem_ty {
-                    return Err(format!(
+                    return Err(MoraError::Parse(format!(
                         "kernel '{}': buffer '{}' expects {} elements, got {}",
                         self.kernel_name,
                         buf_name,
                         elem_ty.canonical_name(),
                         val_expr.ty().canonical_name()
-                    ));
+                    )));
                 }
                 out.push(KernelStmt::Store {
                     buf_param,
@@ -262,11 +262,11 @@ impl KernelLowerCtx {
             WitnessKind::If { cond, then, r#else } => {
                 let cond_expr = self.lower_expr(cond, Some(KernelScalarType::Bool))?;
                 if cond_expr.ty() != KernelScalarType::Bool {
-                    return Err(format!(
+                    return Err(MoraError::Parse(format!(
                         "kernel '{}': 'if' condition must be bool, got {}",
                         self.kernel_name,
                         cond_expr.ty().canonical_name()
-                    ));
+                    )));
                 }
                 let saved = self.locals.clone();
                 let mut then_body = Vec::new();
@@ -287,11 +287,11 @@ impl KernelLowerCtx {
             WitnessKind::While { cond, body } => {
                 let cond_expr = self.lower_expr(cond, Some(KernelScalarType::Bool))?;
                 if cond_expr.ty() != KernelScalarType::Bool {
-                    return Err(format!(
+                    return Err(MoraError::Parse(format!(
                         "kernel '{}': 'while' condition must be bool, got {}",
                         self.kernel_name,
                         cond_expr.ty().canonical_name()
-                    ));
+                    )));
                 }
                 let saved = self.locals.clone();
                 let mut loop_body = Vec::new();
@@ -331,19 +331,19 @@ impl KernelLowerCtx {
                         }
                     }
                     _ => {
-                        return Err(format!(
+                        return Err(MoraError::Parse(format!(
                             "kernel '{}': 'for' loops inside GPU kernels must iterate over range(stop) or range(start, stop)",
                             self.kernel_name
-                        ));
+                        )));
                     }
                 };
                 if start_expr.ty() != KernelScalarType::I32
                     || stop_expr.ty() != KernelScalarType::I32
                 {
-                    return Err(format!(
+                    return Err(MoraError::Parse(format!(
                         "kernel '{}': range bounds in 'for' loop must be i32",
                         self.kernel_name
-                    ));
+                    )));
                 }
                 let end_var = format!("__k_end_{var}");
                 out.push(KernelStmt::Let {
@@ -382,11 +382,11 @@ impl KernelLowerCtx {
                 });
                 Ok(())
             }
-            other => Err(format!(
+            other => Err(MoraError::Parse(format!(
                 "kernel '{}': unsupported statement form in GPU kernel body ({:?})",
                 self.kernel_name,
                 std::mem::discriminant(other)
-            )),
+            ))),
         }
     }
 
@@ -394,7 +394,7 @@ impl KernelLowerCtx {
         &self,
         w: &MirWitness,
         expected: Option<KernelScalarType>,
-    ) -> Result<KernelExpr, String> {
+    ) -> MoraResult<KernelExpr> {
         match &w.kind {
             WitnessKind::Literal(lit) => match lit {
                 Literal::Int(n, _) | Literal::TypedInt(n, _, _) => {
@@ -410,10 +410,10 @@ impl KernelLowerCtx {
                 Literal::TypedFloat(v, DType::F32, _) => Ok(KernelExpr::ConstF32(*v as f32)),
                 Literal::TypedFloat(v, _, _) => Ok(KernelExpr::ConstF64(*v)),
                 Literal::Bool(b, _) => Ok(KernelExpr::ConstBool(*b)),
-                other => Err(format!(
+                other => Err(MoraError::Parse(format!(
                     "kernel '{}': unsupported literal '{other:?}' in GPU kernel",
                     self.kernel_name
-                )),
+                ))),
             },
             WitnessKind::Variable(name) => {
                 if let Some(&ty) = self.locals.get(name) {
@@ -423,24 +423,24 @@ impl KernelLowerCtx {
                     return Ok(KernelExpr::Param(idx, ty));
                 }
                 if self.buf_params.contains_key(name) {
-                    return Err(format!(
+                    return Err(MoraError::Parse(format!(
                         "kernel '{}': buffer parameter '{}' must be indexed as '{}[idx]'",
                         self.kernel_name, name, name
-                    ));
+                    )));
                 }
-                Err(format!(
+                Err(MoraError::Parse(format!(
                     "kernel '{}': undefined variable '{}' in GPU kernel",
                     self.kernel_name, name
-                ))
+                )))
             }
             WitnessKind::Or { left, right } => {
                 let l = self.lower_expr(left, Some(KernelScalarType::Bool))?;
                 let r = self.lower_expr(right, Some(KernelScalarType::Bool))?;
                 if l.ty() != KernelScalarType::Bool || r.ty() != KernelScalarType::Bool {
-                    return Err(format!(
+                    return Err(MoraError::Parse(format!(
                         "kernel '{}': 'or' requires bool operands",
                         self.kernel_name
-                    ));
+                    )));
                 }
                 Ok(KernelExpr::Binary {
                     op: KernelBinOp::Or,
@@ -453,10 +453,10 @@ impl KernelLowerCtx {
                 let l = self.lower_expr(left, Some(KernelScalarType::Bool))?;
                 let r = self.lower_expr(right, Some(KernelScalarType::Bool))?;
                 if l.ty() != KernelScalarType::Bool || r.ty() != KernelScalarType::Bool {
-                    return Err(format!(
+                    return Err(MoraError::Parse(format!(
                         "kernel '{}': 'and' requires bool operands",
                         self.kernel_name
-                    ));
+                    )));
                 }
                 Ok(KernelExpr::Binary {
                     op: KernelBinOp::And,
@@ -474,20 +474,20 @@ impl KernelLowerCtx {
                 named_args,
             } => {
                 if !named_args.is_empty() {
-                    return Err(format!(
+                    return Err(MoraError::Parse(format!(
                         "kernel '{}': keyword arguments are not supported inside GPU kernels",
                         self.kernel_name
-                    ));
+                    )));
                 }
                 match callee {
                     WitnessCallee::Builtin(BuiltinOp::Neg) if args.len() == 1 => {
                         let inner = self.lower_expr(&args[0], expected)?;
                         let ty = inner.ty();
                         if ty == KernelScalarType::Bool {
-                            return Err(format!(
+                            return Err(MoraError::Parse(format!(
                                 "kernel '{}': unary '-' cannot negate bool",
                                 self.kernel_name
-                            ));
+                            )));
                         }
                         Ok(KernelExpr::Unary {
                             op: KernelUnaryOp::Neg,
@@ -498,10 +498,10 @@ impl KernelLowerCtx {
                     WitnessCallee::Builtin(BuiltinOp::Not) if args.len() == 1 => {
                         let inner = self.lower_expr(&args[0], Some(KernelScalarType::Bool))?;
                         if inner.ty() != KernelScalarType::Bool {
-                            return Err(format!(
+                            return Err(MoraError::Parse(format!(
                                 "kernel '{}': unary '!' / 'not' requires bool operand",
                                 self.kernel_name
-                            ));
+                            )));
                         }
                         Ok(KernelExpr::Unary {
                             op: KernelUnaryOp::Not,
@@ -511,31 +511,31 @@ impl KernelLowerCtx {
                     }
                     WitnessCallee::Name(n) | WitnessCallee::Var(n) if n == "[]" => {
                         if args.len() != 2 {
-                            return Err(format!(
+                            return Err(MoraError::Parse(format!(
                                 "kernel '{}': buffer load expects 1 index",
                                 self.kernel_name
-                            ));
+                            )));
                         }
                         let WitnessKind::Variable(buf_name) = &args[0].kind else {
-                            return Err(format!(
+                            return Err(MoraError::Parse(format!(
                                 "kernel '{}': index target must be a buffer parameter",
                                 self.kernel_name
-                            ));
+                            )));
                         };
                         let Some(&(buf_param, elem_ty)) = self.buf_params.get(buf_name) else {
-                            return Err(format!(
+                            return Err(MoraError::Parse(format!(
                                 "kernel '{}': '{}' is not a buffer parameter",
                                 self.kernel_name, buf_name
-                            ));
+                            )));
                         };
                         let idx_expr = self.lower_expr(&args[1], Some(KernelScalarType::I32))?;
                         if idx_expr.ty() != KernelScalarType::I32 {
-                            return Err(format!(
+                            return Err(MoraError::Parse(format!(
                                 "kernel '{}': buffer index into '{}' must be i32, got {}",
                                 self.kernel_name,
                                 buf_name,
                                 idx_expr.ty().canonical_name()
-                            ));
+                            )));
                         }
                         Ok(KernelExpr::Load {
                             buf_param,
@@ -546,10 +546,10 @@ impl KernelLowerCtx {
                     WitnessCallee::Name(n) | WitnessCallee::Var(n) => {
                         self.lower_intrinsic_call(n, args, expected)
                     }
-                    _ => Err(format!(
+                    _ => Err(MoraError::Parse(format!(
                         "kernel '{}': dynamic function calls are not allowed inside GPU kernels",
                         self.kernel_name
-                    )),
+                    ))),
                 }
             }
             WitnessKind::MethodCall {
@@ -559,24 +559,24 @@ impl KernelLowerCtx {
                 named_args,
             } => {
                 if !named_args.is_empty() {
-                    return Err(format!(
+                    return Err(MoraError::Parse(format!(
                         "kernel '{}': keyword arguments are not supported inside GPU kernels",
                         self.kernel_name
-                    ));
+                    )));
                 }
                 if matches!(&receiver.kind, WitnessKind::Variable(m) if m == "math") {
                     return self.lower_intrinsic_call(method, args, expected);
                 }
-                Err(format!(
+                Err(MoraError::Parse(format!(
                     "kernel '{}': unsupported method call '.{}' in GPU kernel",
                     self.kernel_name, method
-                ))
+                )))
             }
-            other => Err(format!(
+            other => Err(MoraError::Parse(format!(
                 "kernel '{}': unsupported expression in GPU kernel ({:?})",
                 self.kernel_name,
                 std::mem::discriminant(other)
-            )),
+            ))),
         }
     }
 
@@ -585,7 +585,7 @@ impl KernelLowerCtx {
         name: &str,
         args: &[MirWitness],
         expected: Option<KernelScalarType>,
-    ) -> Result<KernelExpr, String> {
+    ) -> MoraResult<KernelExpr> {
         match name {
             "global_id" if args.is_empty() => Ok(KernelExpr::GlobalId),
             "block_idx" if args.is_empty() => Ok(KernelExpr::BlockIdx),
@@ -595,11 +595,11 @@ impl KernelLowerCtx {
             "exp" | "sqrt" | "tanh" if args.len() == 1 => {
                 let inner = self.lower_expr(&args[0], expected)?;
                 if !inner.ty().is_float() {
-                    return Err(format!(
+                    return Err(MoraError::Parse(format!(
                         "kernel '{}': '{name}(x)' requires f32 or f64 argument, got {}",
                         self.kernel_name,
                         inner.ty().canonical_name()
-                    ));
+                    )));
                 }
                 let op = match name {
                     "exp" => KernelUnaryOp::Exp,
@@ -618,10 +618,10 @@ impl KernelLowerCtx {
                 let inner = self.lower_expr(&args[0], expected)?;
                 let ty = inner.ty();
                 if ty == KernelScalarType::Bool {
-                    return Err(format!(
+                    return Err(MoraError::Parse(format!(
                         "kernel '{}': 'abs(x)' requires numeric argument",
                         self.kernel_name
-                    ));
+                    )));
                 }
                 Ok(KernelExpr::Unary {
                     op: KernelUnaryOp::Abs,
@@ -634,10 +634,10 @@ impl KernelLowerCtx {
                 if inner.ty() == KernelScalarType::F32 {
                     Ok(inner)
                 } else if inner.ty() == KernelScalarType::Bool {
-                    Err(format!(
+                    Err(MoraError::Parse(format!(
                         "kernel '{}': cannot cast bool to f32",
                         self.kernel_name
-                    ))
+                    )))
                 } else {
                     Ok(KernelExpr::Unary {
                         op: KernelUnaryOp::ToF32,
@@ -651,10 +651,10 @@ impl KernelLowerCtx {
                 if inner.ty() == KernelScalarType::F64 {
                     Ok(inner)
                 } else if inner.ty() == KernelScalarType::Bool {
-                    Err(format!(
+                    Err(MoraError::Parse(format!(
                         "kernel '{}': cannot cast bool to f64",
                         self.kernel_name
-                    ))
+                    )))
                 } else {
                     Ok(KernelExpr::Unary {
                         op: KernelUnaryOp::ToF64,
@@ -668,10 +668,10 @@ impl KernelLowerCtx {
                 if inner.ty() == KernelScalarType::I32 {
                     Ok(inner)
                 } else if inner.ty() == KernelScalarType::Bool {
-                    Err(format!(
+                    Err(MoraError::Parse(format!(
                         "kernel '{}': cannot cast bool to i32",
                         self.kernel_name
-                    ))
+                    )))
                 } else {
                     Ok(KernelExpr::Unary {
                         op: KernelUnaryOp::ToI32,
@@ -683,10 +683,10 @@ impl KernelLowerCtx {
             "max" | "min" if args.len() == 2 => {
                 let (l, r) = self.lower_matched_pair(&args[0], &args[1], expected)?;
                 if l.ty() == KernelScalarType::Bool {
-                    return Err(format!(
+                    return Err(MoraError::Parse(format!(
                         "kernel '{}': '{name}' requires numeric operands",
                         self.kernel_name
-                    ));
+                    )));
                 }
                 let ty = l.ty();
                 Ok(KernelExpr::Binary {
@@ -700,11 +700,11 @@ impl KernelLowerCtx {
                     ty,
                 })
             }
-            other => Err(format!(
+            other => Err(MoraError::Parse(format!(
                 "kernel '{}': unknown GPU kernel intrinsic '{other}' (arity {})",
                 self.kernel_name,
                 args.len()
-            )),
+            ))),
         }
     }
 
@@ -713,7 +713,7 @@ impl KernelLowerCtx {
         left: &MirWitness,
         right: &MirWitness,
         expected: Option<KernelScalarType>,
-    ) -> Result<(KernelExpr, KernelExpr), String> {
+    ) -> MoraResult<(KernelExpr, KernelExpr)> {
         let left_is_untyped_float = matches!(left.kind, WitnessKind::Literal(Literal::Float(_, _)));
         let right_is_untyped_float =
             matches!(right.kind, WitnessKind::Literal(Literal::Float(_, _)));
@@ -722,12 +722,12 @@ impl KernelLowerCtx {
             let r = self.lower_expr(right, expected)?;
             let l = self.lower_expr(left, Some(r.ty()))?;
             if l.ty() != r.ty() {
-                return Err(format!(
+                return Err(MoraError::Parse(format!(
                     "kernel '{}': operand type mismatch ({} vs {})",
                     self.kernel_name,
                     l.ty().canonical_name(),
                     r.ty().canonical_name()
-                ));
+                )));
             }
             return Ok((l, r));
         }
@@ -739,12 +739,12 @@ impl KernelLowerCtx {
         };
         let r = self.lower_expr(right, r_expected)?;
         if l.ty() != r.ty() {
-            return Err(format!(
+            return Err(MoraError::Parse(format!(
                 "kernel '{}': operand type mismatch ({} vs {})",
                 self.kernel_name,
                 l.ty().canonical_name(),
                 r.ty().canonical_name()
-            ));
+            )));
         }
         Ok((l, r))
     }
@@ -755,7 +755,7 @@ impl KernelLowerCtx {
         op: BinaryOp,
         right: &MirWitness,
         expected: Option<KernelScalarType>,
-    ) -> Result<KernelExpr, String> {
+    ) -> MoraResult<KernelExpr> {
         let arith_hint = match op {
             BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
                 expected
@@ -771,11 +771,11 @@ impl KernelLowerCtx {
             BinaryOp::Div => (KernelBinOp::Div, operand_ty),
             BinaryOp::Mod => {
                 if operand_ty != KernelScalarType::I32 {
-                    return Err(format!(
+                    return Err(MoraError::Parse(format!(
                         "kernel '{}': '%' remainder requires i32 operands, got {}",
                         self.kernel_name,
                         operand_ty.canonical_name()
-                    ));
+                    )));
                 }
                 (KernelBinOp::Rem, KernelScalarType::I32)
             }
@@ -786,10 +786,10 @@ impl KernelLowerCtx {
             BinaryOp::Equal => (KernelBinOp::Eq, KernelScalarType::Bool),
             BinaryOp::NotEqual => (KernelBinOp::Ne, KernelScalarType::Bool),
             other => {
-                return Err(format!(
+                return Err(MoraError::Parse(format!(
                     "kernel '{}': operator '{other:?}' is not supported inside GPU kernels",
                     self.kernel_name
-                ));
+                )));
             }
         };
         if matches!(
@@ -804,10 +804,10 @@ impl KernelLowerCtx {
                 | KernelBinOp::Ge
         ) && operand_ty == KernelScalarType::Bool
         {
-            return Err(format!(
+            return Err(MoraError::Parse(format!(
                 "kernel '{}': operator '{op:?}' requires numeric operands",
                 self.kernel_name
-            ));
+            )));
         }
         Ok(KernelExpr::Binary {
             op: kop,
@@ -822,7 +822,7 @@ fn hint_to_kernel_scalar(
     ty: &crate::typeck::Type,
     kernel_name: &str,
     local_name: &str,
-) -> Result<KernelScalarType, String> {
+) -> MoraResult<KernelScalarType> {
     match ty {
         crate::typeck::Type::Int | crate::typeck::Type::Scalar(DType::I32) => {
             Ok(KernelScalarType::I32)
@@ -830,10 +830,10 @@ fn hint_to_kernel_scalar(
         crate::typeck::Type::Scalar(DType::F32) => Ok(KernelScalarType::F32),
         crate::typeck::Type::Float => Ok(KernelScalarType::F64),
         crate::typeck::Type::Bool => Ok(KernelScalarType::Bool),
-        other => Err(format!(
+        other => Err(MoraError::Parse(format!(
             "kernel '{kernel_name}': local '{local_name}' type '{}' is not supported in GPU kernels (expected i32, f32, f64, or bool)",
             other.name()
-        )),
+        ))),
     }
 }
 
@@ -842,7 +842,7 @@ pub(crate) fn lower_witness_kernel(
     name: &str,
     params: &[KernelParam],
     body: &[MirWitness],
-) -> Result<KernelProgram, String> {
+) -> MoraResult<KernelProgram> {
     let mut ctx = KernelLowerCtx::new(name, params);
     let stmts = ctx.lower_block(body)?;
     Ok(KernelProgram {
@@ -2218,10 +2218,7 @@ impl SpvEmitter {
 }
 
 /// Compile a typed [`KernelProgram`] into valid SPIR-V 1.0 `GLCompute` words.
-pub(crate) fn emit_spirv_words(
-    program: &KernelProgram,
-    local_size_x: u32,
-) -> Result<Vec<u32>, String> {
+pub(crate) fn emit_spirv_words(program: &KernelProgram, local_size_x: u32) -> MoraResult<Vec<u32>> {
     let local_size_x = local_size_x.max(1);
     let uses_f64 = program.uses_f64();
     let layout = vulkan_kernel_layout(program);

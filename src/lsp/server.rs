@@ -12,9 +12,9 @@ use std::collections::HashMap;
 use std::io::{self, BufReader};
 use std::sync::Mutex;
 
-use super::json::{Parser, Value};
 use super::transport;
 use crate::common::lock::lock_or_recover;
+use crate::flow::json::{JsonParser as Parser, JsonValue as Value};
 
 pub struct Server {
     stdin: BufReader<io::Stdin>,

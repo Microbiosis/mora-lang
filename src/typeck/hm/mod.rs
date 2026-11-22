@@ -179,6 +179,8 @@ pub struct HMInference {
     pub active_fn_mut_stack: Vec<(Vec<String>, HashSet<usize>)>,
     /// Stage 3C: Active `no_grad ... end` nesting depth.
     pub no_grad_depth: usize,
+    /// Static byte quotas tracked for `let pool = memory_pool(max_bytes, ...)` variables.
+    pub pool_byte_quotas: HashMap<String, usize>,
 }
 
 impl HMInference {
@@ -2348,12 +2350,21 @@ impl HMInference {
                     EffectRow::Cons(h, Box::new(self.merge_rows(*t, b, span)))
                 }
             }
-            (EffectRow::Var(v), b) => {
-                self.constraints.push(SpannedConstraint::new(
-                    Constraint::RowEq(EffectRow::Var(v), b.clone()),
-                    span,
-                ));
-                b
+            (a, EffectRow::Cons(h, t)) => {
+                if row_contains_concrete(&a, &h) {
+                    self.merge_rows(a, *t, span)
+                } else {
+                    EffectRow::Cons(h, Box::new(self.merge_rows(a, *t, span)))
+                }
+            }
+            (EffectRow::Var(v1), EffectRow::Var(v2)) => {
+                if v1 != v2 {
+                    self.constraints.push(SpannedConstraint::new(
+                        Constraint::RowEq(EffectRow::Var(v1), EffectRow::Var(v2.clone())),
+                        span,
+                    ));
+                }
+                EffectRow::Var(v2)
             }
         }
     }

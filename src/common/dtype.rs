@@ -15,6 +15,7 @@
 use std::fmt;
 
 use super::BinaryOp;
+use crate::error::{MoraError, MoraResult};
 
 /// Hardware numeric precision and quantization data type (Wave 3 — Stage 3B).
 ///
@@ -201,17 +202,17 @@ impl DType {
     }
 
     /// Check whether signed integer `v` falls within this integer `DType`'s exact range.
-    pub fn check_int_range(&self, v: i64) -> Result<(), String> {
+    pub fn check_int_range(&self, v: i64) -> MoraResult<()> {
         match self.int_bounds() {
             Some((lo, hi)) if v >= lo && v <= hi => Ok(()),
-            Some((lo, hi)) => Err(format!(
+            Some((lo, hi)) => Err(MoraError::Runtime(format!(
                 "Integer literal {v} out of range for dtype '{}' (valid range: {lo}..={hi})",
                 self.short_name()
-            )),
-            None => Err(format!(
+            ))),
+            None => Err(MoraError::Runtime(format!(
                 "DType '{}' does not support integer range check",
                 self.short_name()
-            )),
+            ))),
         }
     }
 
@@ -655,41 +656,41 @@ impl ScalarValue {
     }
 
     /// Construct a [`ScalarValue`] from an `i64` in `dtype`, returning an error on range overflow.
-    pub fn from_i64_checked(v: i64, dtype: DType) -> Result<Self, String> {
+    pub fn from_i64_checked(v: i64, dtype: DType) -> MoraResult<Self> {
         match dtype {
-            DType::I32 => i32::try_from(v)
-                .map(Self::I32)
-                .map_err(|_| format!("integer overflow: {v} out of range for i32")),
-            DType::I16 => i16::try_from(v)
-                .map(Self::I16)
-                .map_err(|_| format!("integer overflow: {v} out of range for i16")),
-            DType::I8 => i8::try_from(v)
-                .map(Self::I8)
-                .map_err(|_| format!("integer overflow: {v} out of range for i8")),
+            DType::I32 => i32::try_from(v).map(Self::I32).map_err(|_| {
+                MoraError::Runtime(format!("integer overflow: {v} out of range for i32"))
+            }),
+            DType::I16 => i16::try_from(v).map(Self::I16).map_err(|_| {
+                MoraError::Runtime(format!("integer overflow: {v} out of range for i16"))
+            }),
+            DType::I8 => i8::try_from(v).map(Self::I8).map_err(|_| {
+                MoraError::Runtime(format!("integer overflow: {v} out of range for i8"))
+            }),
             DType::I4 => {
                 if (-8..=7).contains(&v) {
                     Ok(Self::I4(v as i8))
                 } else {
-                    Err(format!(
+                    Err(MoraError::Runtime(format!(
                         "integer overflow: {v} out of range for i4 (-8..=7)"
-                    ))
+                    )))
                 }
             }
-            DType::U64 => u64::try_from(v)
-                .map(Self::U64)
-                .map_err(|_| format!("integer overflow: {v} out of range for u64")),
-            DType::U32 => u32::try_from(v)
-                .map(Self::U32)
-                .map_err(|_| format!("integer overflow: {v} out of range for u32")),
-            DType::U16 => u16::try_from(v)
-                .map(Self::U16)
-                .map_err(|_| format!("integer overflow: {v} out of range for u16")),
-            DType::U8 => u8::try_from(v)
-                .map(Self::U8)
-                .map_err(|_| format!("integer overflow: {v} out of range for u8")),
-            _ => Err(format!(
+            DType::U64 => u64::try_from(v).map(Self::U64).map_err(|_| {
+                MoraError::Runtime(format!("integer overflow: {v} out of range for u64"))
+            }),
+            DType::U32 => u32::try_from(v).map(Self::U32).map_err(|_| {
+                MoraError::Runtime(format!("integer overflow: {v} out of range for u32"))
+            }),
+            DType::U16 => u16::try_from(v).map(Self::U16).map_err(|_| {
+                MoraError::Runtime(format!("integer overflow: {v} out of range for u16"))
+            }),
+            DType::U8 => u8::try_from(v).map(Self::U8).map_err(|_| {
+                MoraError::Runtime(format!("integer overflow: {v} out of range for u8"))
+            }),
+            _ => Err(MoraError::Runtime(format!(
                 "cannot construct low-bitwidth integer ScalarValue for dtype '{dtype}'"
-            )),
+            ))),
         }
     }
 
@@ -810,48 +811,49 @@ impl ScalarValue {
     }
 
     /// Checked unary negation preserving exact hardware width.
-    pub fn neg(&self) -> Result<Self, String> {
+    pub fn neg(&self) -> MoraResult<Self> {
         match *self {
             Self::F32(x) => Ok(Self::F32(-x)),
             Self::F16(b) => Ok(Self::F16(b ^ 0x8000)),
             Self::BF16(b) => Ok(Self::BF16(b ^ 0x8000)),
             Self::FP8E4M3(b) => Ok(Self::FP8E4M3(b ^ 0x80)),
             Self::FP8E5M2(b) => Ok(Self::FP8E5M2(b ^ 0x80)),
-            Self::I32(n) => n
-                .checked_neg()
-                .map(Self::I32)
-                .ok_or_else(|| "integer overflow in unary negation of i32::MIN".to_string()),
-            Self::I16(n) => n
-                .checked_neg()
-                .map(Self::I16)
-                .ok_or_else(|| "integer overflow in unary negation of i16::MIN".to_string()),
-            Self::I8(n) => n
-                .checked_neg()
-                .map(Self::I8)
-                .ok_or_else(|| "integer overflow in unary negation of i8::MIN".to_string()),
+            Self::I32(n) => n.checked_neg().map(Self::I32).ok_or_else(|| {
+                MoraError::Runtime("integer overflow in unary negation of i32::MIN".to_string())
+            }),
+            Self::I16(n) => n.checked_neg().map(Self::I16).ok_or_else(|| {
+                MoraError::Runtime("integer overflow in unary negation of i16::MIN".to_string())
+            }),
+            Self::I8(n) => n.checked_neg().map(Self::I8).ok_or_else(|| {
+                MoraError::Runtime("integer overflow in unary negation of i8::MIN".to_string())
+            }),
             Self::I4(n) => {
                 if n <= -8 {
-                    Err("integer overflow in unary negation of -8i4".to_string())
+                    Err(MoraError::Runtime(
+                        "integer overflow in unary negation of -8i4".to_string(),
+                    ))
                 } else {
                     Ok(Self::I4(-n))
                 }
             }
-            Self::U64(_) | Self::U32(_) | Self::U16(_) | Self::U8(_) => Err(format!(
-                "cannot negate unsigned integer scalar of dtype '{}'",
-                self.dtype()
-            )),
+            Self::U64(_) | Self::U32(_) | Self::U16(_) | Self::U8(_) => {
+                Err(MoraError::Runtime(format!(
+                    "cannot negate unsigned integer scalar of dtype '{}'",
+                    self.dtype()
+                )))
+            }
         }
     }
 
     /// Evaluate a binary operator on two scalars of the **same** hardware `DType`.
-    pub fn eval_binary(op: &BinaryOp, lhs: Self, rhs: Self) -> Result<ScalarBinaryOut, String> {
+    pub fn eval_binary(op: &BinaryOp, lhs: Self, rhs: Self) -> MoraResult<ScalarBinaryOut> {
         if lhs.dtype() != rhs.dtype() {
-            return Err(format!(
+            return Err(MoraError::Runtime(format!(
                 "DType mismatch: cannot apply {:?} to '{}' and '{}' without explicit cast",
                 op,
                 lhs.dtype(),
                 rhs.dtype()
-            ));
+            )));
         }
         let dt = lhs.dtype();
 
@@ -891,19 +893,22 @@ impl ScalarValue {
                 }
                 BinaryOp::Mod => {
                     if b == 0.0 {
-                        return Err(format!("modulo by zero in '{dt}' arithmetic"));
+                        return Err(MoraError::Runtime(format!(
+                            "modulo by zero in '{dt}' arithmetic"
+                        )));
                     }
                     a % b
                 }
                 BinaryOp::Pow => a.powf(b),
                 BinaryOp::MatMul => {
-                    return Err(format!(
+                    return Err(MoraError::Runtime(format!(
                         "operator '@' is not defined for scalar dtype '{dt}'"
-                    ));
+                    )));
                 }
             };
-            let scalar = Self::from_f64_quantized(out, dt)
-                .ok_or_else(|| format!("cannot quantize scalar result to '{dt}'"))?;
+            let scalar = Self::from_f64_quantized(out, dt).ok_or_else(|| {
+                MoraError::Runtime(format!("cannot quantize scalar result to '{dt}'"))
+            })?;
             return Ok(ScalarBinaryOut::Scalar(scalar));
         }
 
@@ -912,12 +917,12 @@ impl ScalarValue {
             return eval_u64_binary(op, a, b);
         }
 
-        let a = lhs
-            .as_i64()
-            .ok_or_else(|| format!("internal error: non-integer scalar '{dt}'"))?;
-        let b = rhs
-            .as_i64()
-            .ok_or_else(|| format!("internal error: non-integer scalar '{dt}'"))?;
+        let a = lhs.as_i64().ok_or_else(|| {
+            MoraError::Runtime(format!("internal error: non-integer scalar '{dt}'"))
+        })?;
+        let b = rhs.as_i64().ok_or_else(|| {
+            MoraError::Runtime(format!("internal error: non-integer scalar '{dt}'"))
+        })?;
 
         match op {
             BinaryOp::Equal => return Ok(ScalarBinaryOut::Bool(a == b)),
@@ -927,9 +932,9 @@ impl ScalarValue {
             BinaryOp::GreaterEqual => return Ok(ScalarBinaryOut::Bool(a >= b)),
             BinaryOp::LessEqual => return Ok(ScalarBinaryOut::Bool(a <= b)),
             BinaryOp::MatMul => {
-                return Err(format!(
+                return Err(MoraError::Runtime(format!(
                     "operator '@' is not defined for scalar dtype '{dt}'"
-                ));
+                )));
             }
             _ => {}
         }
@@ -940,39 +945,47 @@ impl ScalarValue {
             BinaryOp::Mul => (a as i128) * (b as i128),
             BinaryOp::Div => {
                 if b == 0 {
-                    return Err(format!("division by zero in '{dt}' arithmetic"));
+                    return Err(MoraError::Runtime(format!(
+                        "division by zero in '{dt}' arithmetic"
+                    )));
                 }
                 (a as i128) / (b as i128)
             }
             BinaryOp::Mod => {
                 if b == 0 {
-                    return Err(format!("modulo by zero in '{dt}' arithmetic"));
+                    return Err(MoraError::Runtime(format!(
+                        "modulo by zero in '{dt}' arithmetic"
+                    )));
                 }
                 (a as i128) % (b as i128)
             }
             BinaryOp::Pow => {
                 if b < 0 {
-                    return Err(format!(
+                    return Err(MoraError::Runtime(format!(
                         "negative exponent {b} is not valid for integer dtype '{dt}'"
-                    ));
+                    )));
                 }
-                let exp =
-                    u32::try_from(b).map_err(|_| format!("exponent {b} overflows '{dt}' power"))?;
-                (a as i128)
-                    .checked_pow(exp)
-                    .ok_or_else(|| format!("integer overflow in '{dt}' power"))?
+                let exp = u32::try_from(b).map_err(|_| {
+                    MoraError::Runtime(format!("exponent {b} overflows '{dt}' power"))
+                })?;
+                (a as i128).checked_pow(exp).ok_or_else(|| {
+                    MoraError::Runtime(format!("integer overflow in '{dt}' power"))
+                })?
             }
             _ => unreachable!(),
         };
 
-        let res_i64 = i64::try_from(res_i128)
-            .map_err(|_| format!("integer overflow: result {res_i128} out of range for '{dt}'"))?;
+        let res_i64 = i64::try_from(res_i128).map_err(|_| {
+            MoraError::Runtime(format!(
+                "integer overflow: result {res_i128} out of range for '{dt}'"
+            ))
+        })?;
         let scalar = Self::from_i64_checked(res_i64, dt)?;
         Ok(ScalarBinaryOut::Scalar(scalar))
     }
 }
 
-fn eval_u64_binary(op: &BinaryOp, a: u64, b: u64) -> Result<ScalarBinaryOut, String> {
+fn eval_u64_binary(op: &BinaryOp, a: u64, b: u64) -> MoraResult<ScalarBinaryOut> {
     match op {
         BinaryOp::Equal => Ok(ScalarBinaryOut::Bool(a == b)),
         BinaryOp::NotEqual => Ok(ScalarBinaryOut::Bool(a != b)),
@@ -983,31 +996,33 @@ fn eval_u64_binary(op: &BinaryOp, a: u64, b: u64) -> Result<ScalarBinaryOut, Str
         BinaryOp::Add => a
             .checked_add(b)
             .map(|r| ScalarBinaryOut::Scalar(ScalarValue::U64(r)))
-            .ok_or_else(|| format!("u64 overflow: {a} + {b}")),
+            .ok_or_else(|| MoraError::Runtime(format!("u64 overflow: {a} + {b}"))),
         BinaryOp::Sub => a
             .checked_sub(b)
             .map(|r| ScalarBinaryOut::Scalar(ScalarValue::U64(r)))
-            .ok_or_else(|| format!("u64 underflow: {a} - {b}")),
+            .ok_or_else(|| MoraError::Runtime(format!("u64 underflow: {a} - {b}"))),
         BinaryOp::Mul => a
             .checked_mul(b)
             .map(|r| ScalarBinaryOut::Scalar(ScalarValue::U64(r)))
-            .ok_or_else(|| format!("u64 overflow: {a} * {b}")),
+            .ok_or_else(|| MoraError::Runtime(format!("u64 overflow: {a} * {b}"))),
         BinaryOp::Div => a
             .checked_div(b)
             .map(|r| ScalarBinaryOut::Scalar(ScalarValue::U64(r)))
-            .ok_or_else(|| "division by zero in 'u64' arithmetic".to_string()),
+            .ok_or_else(|| MoraError::Runtime("division by zero in 'u64' arithmetic".to_string())),
         BinaryOp::Mod => a
             .checked_rem(b)
             .map(|r| ScalarBinaryOut::Scalar(ScalarValue::U64(r)))
-            .ok_or_else(|| "modulo by zero in 'u64' arithmetic".to_string()),
+            .ok_or_else(|| MoraError::Runtime("modulo by zero in 'u64' arithmetic".to_string())),
         BinaryOp::Pow => {
-            let exp =
-                u32::try_from(b).map_err(|_| format!("exponent {b} overflows 'u64' power"))?;
+            let exp = u32::try_from(b)
+                .map_err(|_| MoraError::Runtime(format!("exponent {b} overflows 'u64' power")))?;
             a.checked_pow(exp)
                 .map(|r| ScalarBinaryOut::Scalar(ScalarValue::U64(r)))
-                .ok_or_else(|| format!("u64 overflow: {a} ** {b}"))
+                .ok_or_else(|| MoraError::Runtime(format!("u64 overflow: {a} ** {b}")))
         }
-        BinaryOp::MatMul => Err("operator '@' is not defined for scalar dtype 'u64'".to_string()),
+        BinaryOp::MatMul => Err(MoraError::Runtime(
+            "operator '@' is not defined for scalar dtype 'u64'".to_string(),
+        )),
     }
 }
 
@@ -1080,7 +1095,7 @@ pub enum Device {
 
 impl Device {
     /// Parse a device descriptor (`"cpu"`, `"cuda"`, `"cuda:0"`, `"metal"`, `"metal:0"`, `"vulkan"`, `"vulkan:0"`).
-    pub fn parse(raw: &str) -> Result<Self, String> {
+    pub fn parse(raw: &str) -> MoraResult<Self> {
         let s = raw.trim().to_ascii_lowercase();
         if s == "cpu" {
             return Ok(Self::Cpu);
@@ -1092,32 +1107,30 @@ impl Device {
             let idx = idx_str
                 .trim()
                 .parse::<u16>()
-                .map_err(|_| format!("Invalid CUDA device index in '{raw}'"))?;
+                .map_err(|_| MoraError::Runtime(format!("Invalid CUDA device index in '{raw}'")))?;
             return Ok(Self::Cuda(idx));
         }
         if s == "metal" {
             return Ok(Self::Metal(0));
         }
         if let Some(idx_str) = s.strip_prefix("metal:") {
-            let idx = idx_str
-                .trim()
-                .parse::<u16>()
-                .map_err(|_| format!("Invalid Metal device index in '{raw}'"))?;
+            let idx = idx_str.trim().parse::<u16>().map_err(|_| {
+                MoraError::Runtime(format!("Invalid Metal device index in '{raw}'"))
+            })?;
             return Ok(Self::Metal(idx));
         }
         if s == "vulkan" {
             return Ok(Self::Vulkan(0));
         }
         if let Some(idx_str) = s.strip_prefix("vulkan:") {
-            let idx = idx_str
-                .trim()
-                .parse::<u16>()
-                .map_err(|_| format!("Invalid Vulkan device index in '{raw}'"))?;
+            let idx = idx_str.trim().parse::<u16>().map_err(|_| {
+                MoraError::Runtime(format!("Invalid Vulkan device index in '{raw}'"))
+            })?;
             return Ok(Self::Vulkan(idx));
         }
-        Err(format!(
+        Err(MoraError::Runtime(format!(
             "Unknown device '{raw}' (expected 'cpu', 'cuda:N', 'metal:N', or 'vulkan:N')"
-        ))
+        )))
     }
 }
 

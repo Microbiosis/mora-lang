@@ -95,7 +95,7 @@ struct Edit {
     new_text: String,
 }
 
-fn num(v: &mora::lsp::json::Value, key: &str) -> usize {
+fn num(v: &mora::flow::json::JsonValue, key: &str) -> usize {
     v.get(key)
         .and_then(|n| n.as_i64())
         .unwrap_or_else(|| panic!("应答里没有数字字段 `{key}`"))
@@ -182,7 +182,7 @@ fn format_request(
         .unwrap_or_else(|| panic!("没拿到格式化应答:\n{raw}"));
 
     // 用**服务器自己的 JSON 解析器**读应答（而不是字符串手术）
-    let v = mora::lsp::json::Parser::new(&body)
+    let v = mora::flow::json::JsonParser::new(&body)
         .parse_value()
         .unwrap_or_else(|e| panic!("应答不是合法 JSON: {e}\n{body}"));
     let edits = v

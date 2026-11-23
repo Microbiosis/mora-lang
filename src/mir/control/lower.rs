@@ -3256,6 +3256,18 @@ fn lower_match(
     for arm in arms {
         stack.current_mut().push_lexical_scope();
         let compiled_pat = compile_pattern(stack, prog, &arm.pattern);
+        if !stack.current_mut().loop_scope_bases.is_empty() {
+            let mut pat_slots: Vec<LocalSlot> = stack
+                .current_mut()
+                .local_scopes
+                .last()
+                .map(|m| m.values().copied().collect())
+                .unwrap_or_default();
+            pat_slots.sort_unstable_by_key(|s| s.0);
+            for slot in pat_slots {
+                stack.current_mut().emit(ControlInst::FreshLocalCell(slot));
+            }
+        }
         let ok_reg = stack.current_mut().alloc_reg();
         stack.current_mut().emit(ControlInst::MatchPattern {
             dst_ok: ok_reg,

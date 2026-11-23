@@ -2695,4 +2695,80 @@ run_all(7)
         // 3. Truncated buffer rejected cleanly
         assert!(decode_package(&encoded[..10]).is_err());
     }
+
+    #[test]
+    fn fresh_local_cell_morabc02_opcode_51_roundtrip() {
+        let src = r#"
+task make_counters(): list<int>
+  let fns: list<any> = []
+  for base in [10, 20, 30]
+    let acc = base
+    let f = fn()
+      assign acc = acc + 1
+      return acc
+    end
+    assign fns = fns.push(f)
+  end
+  let out: list<int> = []
+  for f in fns
+    assign out = out.push(f())
+  end
+  for f in fns
+    assign out = out.push(f())
+  end
+  return out
+end
+make_counters()
+"#;
+        let (mut prog, _) = ParserV3::compile(src).expect("compile");
+        optimize_program(&mut prog, OptLevel::Aggressive);
+        let has_fresh = prog.functions.iter().any(|f| {
+            f.blocks.iter().any(|b| {
+                b.insts
+                    .iter()
+                    .any(|i| matches!(i, ControlInst::FreshLocalCell(_)))
+            })
+        });
+        assert!(
+            has_fresh,
+            "expected ControlInst::FreshLocalCell in lowered loop"
+        );
+
+        let pkg = CompiledPackage {
+            opt_level: 2,
+            entry: prog,
+            modules: BTreeMap::new(),
+        };
+        let encoded = encode_package(&pkg).expect("encode MORABC02 with opcode 51");
+        let decoded = decode_package(&encoded).expect("decode MORABC02 with opcode 51");
+        let decoded_has_fresh = decoded.entry.functions.iter().any(|f| {
+            f.blocks.iter().any(|b| {
+                b.insts
+                    .iter()
+                    .any(|i| matches!(i, ControlInst::FreshLocalCell(_)))
+            })
+        });
+        assert!(
+            decoded_has_fresh,
+            "decoded program must preserve FreshLocalCell"
+        );
+
+        let mut core = CoreRuntime::default();
+        let (val, _) =
+            execute_program(Arc::new(decoded.entry), &mut core).expect("execute decoded");
+        assert_eq!(
+            val,
+            Value::List(
+                vec![
+                    Value::Int(11),
+                    Value::Int(21),
+                    Value::Int(31),
+                    Value::Int(12),
+                    Value::Int(22),
+                    Value::Int(32),
+                ]
+                .into(),
+            )
+        );
+    }
 }

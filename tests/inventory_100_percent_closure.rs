@@ -302,3 +302,122 @@ true
     let val = eval_typechecked(src, 2).expect("per-iteration loop scoping must pass");
     assert_eq!(val, Value::Bool(true));
 }
+
+#[test]
+fn p5_1a_match_in_loop_nested_32_fibers_opt2_and_morabc02_roundtrip() {
+    use mora::mir::control::{OptLevel, optimize_program};
+
+    let src = r#"
+enum Boxed
+  Val(int)
+end
+
+-- 1. `match` pattern bindings inside a loop captured & mutated by closures
+task test_match_in_loop(): list<int>
+  let items = [Boxed::Val(100), Boxed::Val(200), Boxed::Val(300)]
+  let fns: list<any> = []
+  for it in items
+    let inc = match it with
+      Boxed::Val(v) => fn()
+        assign v = v + 1
+        return v
+      end
+    end
+    assign fns = fns.push(inc)
+  end
+  let out: list<int> = []
+  for f in fns
+    assign out = out.push(f())
+  end
+  for f in fns
+    assign out = out.push(f())
+  end
+  return out
+end
+
+assert_eq(test_match_in_loop(), [101, 201, 301, 102, 202, 302])
+
+-- 2. 32 concurrent fibers spawned from nested loops capturing outer + inner loop vars
+let handles: list<any> = []
+let i = 0
+while i < 4
+  let outer_i = i
+  for j in [0, 1, 2, 3, 4, 5, 6, 7]
+    let h = spawn fn()
+      return outer_i * 10 + j
+    end
+    assign handles = handles.push(h)
+  end
+  assign i = i + 1
+end
+
+let total = 0
+let k = 0
+while k < 32
+  let expected = (k / 8) * 10 + (k % 8)
+  let got = handles[k].join()
+  assert_eq(got, expected)
+  assign total = total + got
+  assign k = k + 1
+end
+total
+"#;
+
+    let witnesses = ParserV3::parse_witnesses(src).expect("parse");
+    let errs = check_program_witnesses(&witnesses);
+    assert!(errs.is_empty(), "typeck errs: {errs:?}");
+
+    let (mut prog, _) = ParserV3::compile(src).expect("compile");
+    // Verify FreshLocalCell survives OptLevel::Aggressive (Purity::Effectful, never DCE/LICM'd).
+    optimize_program(&mut prog, OptLevel::Aggressive);
+    let has_fresh_cell = prog.functions.iter().any(|f| {
+        f.blocks.iter().any(|b| {
+            b.insts
+                .iter()
+                .any(|inst| matches!(inst, mora::mir::control::ControlInst::FreshLocalCell(_)))
+        })
+    });
+    assert!(
+        has_fresh_cell,
+        "FreshLocalCell must remain present after OptLevel::Aggressive"
+    );
+
+    let sched = Arc::new(TaskScheduler::with_worker_threads(2).expect("scheduler"));
+    let mut rt = CoreRuntime::default().with_scheduler(sched);
+    let (val, _) = execute_program(Arc::new(prog), &mut rt).expect("exec optimized program");
+    // sum_{i=0..4} sum_{j=0..8} (i*10 + j) = 8*(0+10+20+30) + 4*(0+..+7) = 480 + 112 = 592
+    assert_eq!(val, Value::Int(592));
+
+    // Verify end-to-end MORABC02 `.morac` AOT compile & zero-source execution preserves opcode 51!
+    let tmp = mora::test_support::TempDir::new("p5_1a_morac");
+    let src_path = tmp.path().join("loop_cells.mora");
+    let bc_path = tmp.path().join("loop_cells.morac");
+    std::fs::write(&src_path, format!("{src}\nprint(total)\n")).expect("write src");
+
+    let build_out = std::process::Command::new(env!("CARGO_BIN_EXE_mora"))
+        .args(["build", "--emit-bc", "-o"])
+        .arg(&bc_path)
+        .arg(&src_path)
+        .output()
+        .expect("run mora build --emit-bc");
+    assert!(
+        build_out.status.success(),
+        "mora build --emit-bc failed: {}",
+        String::from_utf8_lossy(&build_out.stderr)
+    );
+
+    let run_out = std::process::Command::new(env!("CARGO_BIN_EXE_mora"))
+        .arg(&bc_path)
+        .output()
+        .expect("run .morac");
+    assert!(
+        run_out.status.success(),
+        "running .morac failed: {}",
+        String::from_utf8_lossy(&run_out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run_out.stdout).contains("592"),
+        "expected 592 from .morac stdout, got: {}",
+        String::from_utf8_lossy(&run_out.stdout)
+    );
+}

@@ -563,6 +563,16 @@ mod macos_impl {
     // SAFETY: All host copies and releases serialize on `self.inner.state.lock()`.
     unsafe impl Sync for MetalVramBuffer {}
 
+    impl std::fmt::Debug for MetalVramBuffer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("MetalVramBuffer")
+                .field("device", &self.inner.device)
+                .field("buf", &(self.buf as u64))
+                .field("byte_len", &self.byte_len)
+                .finish()
+        }
+    }
+
     impl Drop for MetalVramBuffer {
         fn drop(&mut self) {
             let _st = self.inner.state.lock();
@@ -584,7 +594,7 @@ mod macos_impl {
             self.buf as u64
         }
 
-        fn upload(&self, src: &[u8]) -> MoraResult<()> {
+        fn upload_bytes(&self, src: &[u8]) -> MoraResult<()> {
             if src.len() != self.byte_len {
                 return Err(MoraError::Runtime(format!(
                     "Metal VRAM upload byte-length mismatch: expected {}, got {}",
@@ -611,7 +621,7 @@ mod macos_impl {
             Ok(())
         }
 
-        fn download(&self, dst: &mut [u8]) -> MoraResult<()> {
+        fn download_bytes(&self, dst: &mut [u8]) -> MoraResult<()> {
             if dst.len() != self.byte_len {
                 return Err(MoraError::Runtime(format!(
                     "Metal VRAM download byte-length mismatch: expected {}, got {}",
@@ -1264,6 +1274,7 @@ mod macos_impl {
             m_total: usize,
             k: usize,
             n: usize,
+            _out_shape: &[usize],
             dtype: DType,
         ) -> MoraResult<Option<Arc<dyn DeviceVramBuffer>>> {
             if m_total * n == 0 || !matches!(dtype, DType::F32 | DType::F16 | DType::BF16) {
@@ -1314,6 +1325,8 @@ mod macos_impl {
             m_total: usize,
             k: usize,
             n: usize,
+            _x_shape: &[usize],
+            _out_shape: &[usize],
             dtype: DType,
         ) -> MoraResult<Option<Arc<dyn DeviceVramBuffer>>> {
             if dtype != DType::F32 || m_total == 0 || k == 0 || n == 0 {
@@ -2212,8 +2225,8 @@ mod macos_impl {
         fn launch_custom_kernel(
             &self,
             kernel: &KernelProgram,
-            grid: [u32; 3],
-            block: [u32; 3],
+            grid: u32,
+            block: u32,
             args: &[KernelLaunchArg],
         ) -> MoraResult<bool> {
             // Metal Shading Language does not support 64-bit IEEE float compute buffers;
@@ -2285,14 +2298,14 @@ mod macos_impl {
                     buffers.push(h_scalars);
                 }
                 let total_grid = MtlSize {
-                    width: (grid[0].max(1) as usize).saturating_mul(block[0].max(1) as usize),
-                    height: (grid[1].max(1) as usize).saturating_mul(block[1].max(1) as usize),
-                    depth: (grid[2].max(1) as usize).saturating_mul(block[2].max(1) as usize),
+                    width: (grid.max(1) as usize).saturating_mul(block.max(1) as usize),
+                    height: 1,
+                    depth: 1,
                 };
                 let tg = MtlSize {
-                    width: block[0].max(1) as usize,
-                    height: block[1].max(1) as usize,
-                    depth: block[2].max(1) as usize,
+                    width: block.max(1) as usize,
+                    height: 1,
+                    depth: 1,
                 };
                 Self::dispatch_compute(
                     &self.inner.objc,

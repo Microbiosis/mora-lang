@@ -589,7 +589,6 @@ pub(crate) fn build_server_context(
 
 enum CtxOwner {
     ClientOwned(*mut c_void),
-    #[allow(dead_code)]
     ServerShared(Arc<PlatformServerContext>),
 }
 
@@ -613,13 +612,18 @@ impl Drop for PlatformTlsSession {
                     (a.ssl_free)(self.ssl);
                 }
             }
-            if let CtxOwner::ClientOwned(ctx) = self.ctx_owner
-                && !ctx.is_null()
-            {
-                // SAFETY: Client `SSL_CTX` is uniquely owned and freed after `SSL_free`.
-                unsafe {
-                    (a.ssl_ctx_free)(ctx);
+            match &self.ctx_owner {
+                CtxOwner::ClientOwned(ctx) if !ctx.is_null() => {
+                    // SAFETY: Client `SSL_CTX` is uniquely owned and freed after `SSL_free`.
+                    unsafe {
+                        (a.ssl_ctx_free)(*ctx);
+                    }
                 }
+                CtxOwner::ServerShared(shared) => {
+                    // Keep shared `SSL_CTX` alive until after `SSL_free` above.
+                    let _ = shared.ssl_ctx;
+                }
+                CtxOwner::ClientOwned(_) => {}
             }
         }
     }

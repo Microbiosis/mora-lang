@@ -356,6 +356,7 @@ unsafe extern "C" fn server_alpn_select_cb(
 
 pub(crate) struct PlatformServerContext {
     ssl_ctx: *mut c_void,
+    #[allow(clippy::box_collection)]
     _alpn_wire: Option<Box<Vec<u8>>>,
 }
 
@@ -588,6 +589,7 @@ pub(crate) fn build_server_context(
 
 enum CtxOwner {
     ClientOwned(*mut c_void),
+    #[allow(dead_code)]
     ServerShared(Arc<PlatformServerContext>),
 }
 

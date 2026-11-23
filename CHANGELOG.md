@@ -2,6 +2,17 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [0.112.0] — Unreleased（Phase P5-1A：清单 100% 闭环、纯 Mora `std/json` 与 Go-1.22 式循环每轮独立闭包捕获）
+
+> 本版为 `v0.111.0`（Phase P4）之后的下一开发版本；`v0.111.0` 已严格拆出并仅包含 Phase P4 及跨平台发布修复。
+
+### P5-1A：模块清单 100% 闭环与循环每轮独立闭包变量捕获（`tests/inventory_100_percent_closure.rs`）
+
+- **全仓统一错误类型 `MoraResult<T>`**：消除 `src/**/*.rs` 中剩余 36 处 `Result<..., String>` 签名，统一收口至 `MoraResult<T>`。
+- **静态资源配额与统一环境 EffectRow**：为 `memory_pool` / `kv_allocator` / `set_quota` 补充编译期字节配额校验，在 I/O、网络与并发原语发射统一环境 `EffectRow` 标签（`io` / `async`），并修复 `HMInference::merge_rows` 行变量合并对称性。
+- **JSON 底座收口与纯 Mora `std/json.mora`**：将 `current_merge_strategies` 从 `CoreRuntime` 迁入 `Environment`，合并 `src/lsp/json.rs` 至 `src/flow/json.rs`，新增内嵌纯 Mora 标准库 `std/json.mora`（支持编译期 `@tag(json=...)` 编解码）。
+- **Go-1.22 式循环每轮独立闭包捕获**：新增 `ControlInst::FreshLocalCell(LocalSlot)`（`MORABC02` opcode 51），支持 `while` / `for` 循环体及循环内 `match` 分支模式绑定捕获变量的每轮独立单元分配，并验证 `--opt=2` 与 `.morac` 字节码往返执行。
+
 ## [0.111.0] — Phase P4 全栈深水区里程碑：编译期 Const Generics 与源码级 GPU `kernel`、16B 未装箱 VM 与 M:N 协作式纤程、代价模型与严格 W^X 原生 JIT、分布式集合通信与纳秒级 `std/trace`
 
 在不引入任何外部 Cargo 依赖（保持 `Cargo.toml` / `Cargo.lock` 唯一 1 包、**0 生产依赖 / 0 测试依赖**）与严格 Rust stable 通道的前提下，完成 `v0.111.0`（Phase P4）全部四项核心架构里程碑。

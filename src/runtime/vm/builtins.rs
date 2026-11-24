@@ -2912,6 +2912,10 @@ fn resolve_compute_dag_method(
                 Value::Int(rep.native_jit_f32_dispatches as i64),
             );
             m.insert(
+                "native_jit_gemm_dispatches".to_string(),
+                Value::Int(rep.native_jit_gemm_dispatches as i64),
+            );
+            m.insert(
                 "vram_scratch_allocs".to_string(),
                 Value::Int(rep.vram_scratch_allocs as i64),
             );
@@ -3354,6 +3358,41 @@ fn resolve_kv_allocator_method(
             let seq_id = as_u64(&args[0], "seq_id")?;
             Ok(CallAction::Done(Value::Bool(kv.is_swapped(seq_id))))
         }
+        "cache_prefix" => {
+            if args.len() != 2 {
+                return Err(MoraError::Runtime(
+                    "kv_allocator.cache_prefix(seq_id, token_ids) expects 2 arguments".to_string(),
+                ));
+            }
+            let seq_id = as_u64(&args[0], "seq_id")?;
+            let token_ids = parse_int_list(&args[1], "kv_allocator.cache_prefix token_ids")?;
+            Ok(CallAction::Done(Value::Int(
+                kv.cache_prefix(seq_id, &token_ids)? as i64,
+            )))
+        }
+        "match_prefix" => {
+            if args.len() != 1 {
+                return Err(MoraError::Runtime(
+                    "kv_allocator.match_prefix(token_ids) expects 1 argument".to_string(),
+                ));
+            }
+            let token_ids = parse_int_list(&args[0], "kv_allocator.match_prefix token_ids")?;
+            Ok(CallAction::Done(Value::Int(
+                kv.match_prefix(&token_ids) as i64
+            )))
+        }
+        "attach_prefix" => {
+            if args.len() != 2 {
+                return Err(MoraError::Runtime(
+                    "kv_allocator.attach_prefix(seq_id, token_ids) expects 2 arguments".to_string(),
+                ));
+            }
+            let seq_id = as_u64(&args[0], "seq_id")?;
+            let token_ids = parse_int_list(&args[1], "kv_allocator.attach_prefix token_ids")?;
+            Ok(CallAction::Done(Value::Int(
+                kv.attach_prefix(seq_id, &token_ids)? as i64,
+            )))
+        }
         "evict_lru" => {
             if !args.is_empty() {
                 return Err(MoraError::Runtime(
@@ -3424,6 +3463,28 @@ fn resolve_kv_allocator_method(
             "KVAllocator has no method: {method}"
         ))),
     }
+}
+
+fn parse_int_list(val: &Value, ctx: &str) -> MoraResult<Vec<i64>> {
+    let Value::List(items) = val else {
+        return Err(MoraError::Runtime(format!(
+            "{ctx}: expected list<int>, got {}",
+            crate::flow::type_name(val)
+        )));
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for (i, item) in items.iter().enumerate() {
+        match item {
+            Value::Int(n) => out.push(*n),
+            Value::Scalar(s) if s.dtype().is_int() => out.push(s.as_f64() as i64),
+            other => {
+                return Err(MoraError::Runtime(format!(
+                    "{ctx}[{i}]: expected int token ID, got {other}"
+                )));
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn resolve_memory_pool_method(

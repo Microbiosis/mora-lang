@@ -1488,6 +1488,29 @@ fn method_signature_builtin(receiver: &Type, method: &str) -> Option<Signature> 
             ],
             Type::Bool,
         )),
+        (Type::KVAllocator, "cache_prefix") => Some(Signature::new(
+            vec![
+                ("self".to_string(), Type::KVAllocator),
+                ("seq_id".to_string(), Type::Int),
+                ("token_ids".to_string(), Type::List(Box::new(Type::Int))),
+            ],
+            Type::Int,
+        )),
+        (Type::KVAllocator, "match_prefix") => Some(Signature::new(
+            vec![
+                ("self".to_string(), Type::KVAllocator),
+                ("token_ids".to_string(), Type::List(Box::new(Type::Int))),
+            ],
+            Type::Int,
+        )),
+        (Type::KVAllocator, "attach_prefix") => Some(Signature::new(
+            vec![
+                ("self".to_string(), Type::KVAllocator),
+                ("seq_id".to_string(), Type::Int),
+                ("token_ids".to_string(), Type::List(Box::new(Type::Int))),
+            ],
+            Type::Int,
+        )),
         (
             Type::KVAllocator,
             "evict_lru" | "free_pages" | "used_pages" | "total_pages" | "bytes_used"

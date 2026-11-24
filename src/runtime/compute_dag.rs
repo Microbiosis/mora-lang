@@ -389,6 +389,11 @@ impl DeviceBackend for CpuDeviceBackend {
         dtype: DType,
         out: &mut Vec<f64>,
     ) -> MoraResult<()> {
+        if crate::runtime::native_jit::try_run_fused_linear_act_into(
+            x, w, bias, act, m_total, k, n, dtype, out,
+        )? {
+            return Ok(());
+        }
         simd_kernels::fused_linear_act_into(x, w, bias, act, m_total, k, n, out_shape, dtype, out);
         Ok(())
     }
@@ -1301,6 +1306,7 @@ pub(crate) struct DagCostReport {
     pub(crate) native_jit_cache_hits: u64,
     pub(crate) native_jit_dispatches: u64,
     pub(crate) native_jit_f32_dispatches: u64,
+    pub(crate) native_jit_gemm_dispatches: u64,
     pub(crate) vram_scratch_allocs: u64,
     pub(crate) vram_buffer_reuses: u64,
 }
@@ -1431,6 +1437,14 @@ impl DagCostModel {
                     (flops, node_bytes(*a) + node_bytes(*b), out_bytes, 0)
                 }
                 DagOp::FusedLinearAct { x, w, bias, act } => {
+                    let n_cols = dag.nodes[*w].shape.get(1).copied().unwrap_or(0);
+                    let min_lanes = if node.dtype == DType::F32 { 8 } else { 4 };
+                    if node.device == Device::Cpu
+                        && matches!(node.dtype, DType::F32 | DType::F64)
+                        && n_cols >= min_lanes
+                    {
+                        native_jit_eligible_nodes += 1;
+                    }
                     let k = dag.nodes[*x].shape.last().copied().unwrap_or(1) as u64;
                     let mut flops = out_elems.saturating_mul(2).saturating_mul(k);
                     let mut read_b = node_bytes(*x) + node_bytes(*w);
@@ -1582,6 +1596,7 @@ impl DagCostModel {
             native_jit_cache_hits: jit_stats.cache_hits,
             native_jit_dispatches: jit_stats.native_dispatches,
             native_jit_f32_dispatches: jit_stats.f32_native_dispatches,
+            native_jit_gemm_dispatches: jit_stats.gemm_native_dispatches,
             vram_scratch_allocs,
             vram_buffer_reuses,
         }

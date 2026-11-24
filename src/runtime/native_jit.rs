@@ -20,9 +20,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::common::DType;
 use crate::error::MoraResult;
-use crate::runtime::compute_dag::FusedEwStep;
+use crate::runtime::compute_dag::{FusedAct, FusedEwStep};
 
-/// Live runtime telemetry for the native W^X x86-64 elementwise JIT backend.
+/// Live runtime telemetry for the native W^X x86-64 elementwise & GEMM JIT backend.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct NativeJitStats {
     pub(crate) isa: &'static str,
@@ -31,6 +31,7 @@ pub(crate) struct NativeJitStats {
     pub(crate) cache_hits: u64,
     pub(crate) native_dispatches: u64,
     pub(crate) f32_native_dispatches: u64,
+    pub(crate) gemm_native_dispatches: u64,
     pub(crate) fallback_dispatches: u64,
 }
 
@@ -38,6 +39,7 @@ static STAT_COMPILED_KERNELS: AtomicU64 = AtomicU64::new(0);
 static STAT_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 static STAT_NATIVE_DISPATCHES: AtomicU64 = AtomicU64::new(0);
 static STAT_F32_NATIVE_DISPATCHES: AtomicU64 = AtomicU64::new(0);
+static STAT_GEMM_NATIVE_DISPATCHES: AtomicU64 = AtomicU64::new(0);
 static STAT_FALLBACK_DISPATCHES: AtomicU64 = AtomicU64::new(0);
 
 /// Maximum total virtual slots (`n_inputs + steps.len()`) kept in the 32B-aligned stack scratchpad.
@@ -65,7 +67,13 @@ pub(crate) fn active_isa() -> &'static str {
         if !is_enabled() {
             return "disabled";
         }
-        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("avx")
+        if std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("avx")
+            && std::arch::is_x86_feature_detected!("fma")
+        {
+            "x86_64-avx2-fma"
+        } else if std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("avx")
         {
             "x86_64-avx2"
         } else {
@@ -87,6 +95,7 @@ pub(crate) fn stats() -> NativeJitStats {
         cache_hits: STAT_CACHE_HITS.load(Ordering::Relaxed),
         native_dispatches: STAT_NATIVE_DISPATCHES.load(Ordering::Relaxed),
         f32_native_dispatches: STAT_F32_NATIVE_DISPATCHES.load(Ordering::Relaxed),
+        gemm_native_dispatches: STAT_GEMM_NATIVE_DISPATCHES.load(Ordering::Relaxed),
         fallback_dispatches: STAT_FALLBACK_DISPATCHES.load(Ordering::Relaxed),
     }
 }
@@ -144,6 +153,34 @@ pub(crate) fn try_run_fused_elementwise_into(
     }
 }
 
+/// P5-2B: Attempt to execute `FusedLinearAct` (`Act(X @ W + bias)`) via strict W^X x86-64
+/// AVX2+FMA (`vfmadd231ps` / `vfmadd231pd`) register-blocked `4×8` (`f32`) / `4×4` (`f64`)
+/// microkernels. Returns `Ok(true)` if executed natively, or `Ok(false)` to fall back to `simd_kernels`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_run_fused_linear_act_into(
+    x_vals: &[f64],
+    w_vals: &[f64],
+    bias: Option<(&[f64], &[usize])>,
+    act: FusedAct,
+    m_total: usize,
+    k: usize,
+    n: usize,
+    dtype: DType,
+    out: &mut Vec<f64>,
+) -> MoraResult<bool> {
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (x_vals, w_vals, bias, act, m_total, k, n, dtype, out);
+        STAT_FALLBACK_DISPATCHES.fetch_add(1, Ordering::Relaxed);
+        Ok(false)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        x86_64_impl::try_run_fused_linear_act(x_vals, w_vals, bias, act, m_total, k, n, dtype, out)
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 mod x86_64_impl {
     use std::collections::HashMap;
@@ -154,12 +191,13 @@ mod x86_64_impl {
     use crate::common::DType;
     use crate::common::sync::RwLock;
     use crate::error::{MoraError, MoraResult};
-    use crate::runtime::compute_dag::FusedEwStep;
+    use crate::runtime::compute_dag::{FusedAct, FusedEwStep};
     use crate::value::tensor::quantize_for_dtype;
 
     use super::{
         Ordering, STAT_CACHE_HITS, STAT_COMPILED_KERNELS, STAT_F32_NATIVE_DISPATCHES,
-        STAT_FALLBACK_DISPATCHES, STAT_NATIVE_DISPATCHES, is_chain_supported, is_enabled,
+        STAT_FALLBACK_DISPATCHES, STAT_GEMM_NATIVE_DISPATCHES, STAT_NATIVE_DISPATCHES,
+        is_chain_supported, is_enabled,
     };
 
     /// Uniform C ABI entry signature shared by both Windows x64 and System V AMD64 `f64` kernels.
@@ -1430,6 +1468,658 @@ mod x86_64_impl {
         STAT_NATIVE_DISPATCHES.fetch_add(1, Ordering::Relaxed);
         Ok(true)
     }
+
+    // ── P5-2B: Strict W^X AVX2+FMA `4×8` (`f32`) / `4×4` (`f64`) FusedLinearAct Microkernel JIT ──
+
+    #[repr(C)]
+    struct GemmMicroArgs<T> {
+        a0: *const T,          // 0x00
+        a1: *const T,          // 0x08
+        a2: *const T,          // 0x10
+        a3: *const T,          // 0x18
+        b_col: *const T,       // 0x20
+        b_stride_bytes: usize, // 0x28
+        bias_col: *const T,    // 0x30
+        c0: *mut T,            // 0x38
+        c1: *mut T,            // 0x40
+        c2: *mut T,            // 0x48
+        c3: *mut T,            // 0x50
+        k: usize,              // 0x58
+    }
+
+    const _: () = {
+        assert!(std::mem::offset_of!(GemmMicroArgs<f32>, a0) == 0x00);
+        assert!(std::mem::offset_of!(GemmMicroArgs<f32>, a1) == 0x08);
+        assert!(std::mem::offset_of!(GemmMicroArgs<f32>, a2) == 0x10);
+        assert!(std::mem::offset_of!(GemmMicroArgs<f32>, a3) == 0x18);
+        assert!(std::mem::offset_of!(GemmMicroArgs<f32>, b_col) == 0x20);
+        assert!(std::mem::offset_of!(GemmMicroArgs<f32>, b_stride_bytes) == 0x28);
+        assert!(std::mem::offset_of!(GemmMicroArgs<f32>, bias_col) == 0x30);
+        assert!(std::mem::offset_of!(GemmMicroArgs<f32>, c0) == 0x38);
+        assert!(std::mem::offset_of!(GemmMicroArgs<f32>, c1) == 0x40);
+        assert!(std::mem::offset_of!(GemmMicroArgs<f32>, c2) == 0x48);
+        assert!(std::mem::offset_of!(GemmMicroArgs<f32>, c3) == 0x50);
+        assert!(std::mem::offset_of!(GemmMicroArgs<f32>, k) == 0x58);
+    };
+
+    type JitGemmMicroFn = unsafe extern "C" fn(args: *const c_void);
+
+    struct CompiledGemmMicroKernel {
+        code: os_mem::WxCodeBuffer,
+    }
+
+    impl CompiledGemmMicroKernel {
+        fn invoke<T>(&self, args: &GemmMicroArgs<T>) {
+            // SAFETY: `self.code` is an immutable `RX` x86-64 AVX2+FMA leaf microkernel
+            // honoring C ABI (`rcx` on Win64, `rdi` on SysV), preserving all callee-saved GP
+            // registers (`rbp`, `rbx`, `rsi`) and touching only volatile `ymm0..ymm5`, and
+            // `args` points to valid non-overlapping `A`, `B`, optional `bias`, and `C` slices
+            // of width >= 8 (`f32`) or >= 4 (`f64`).
+            unsafe {
+                let f: JitGemmMicroFn = std::mem::transmute(self.code.as_ptr());
+                f((args as *const GemmMicroArgs<T>) as *const c_void);
+            }
+        }
+    }
+
+    /// Emit strict W^X x86-64 AVX2+FMA register-blocked GEMM+Bias+ReLU microkernel:
+    /// - `is_f64 == false`: `4×8` (`rows_4 = true`) or `1×8` (`rows_4 = false`) `f32` via `vfmadd231ps`
+    /// - `is_f64 == true`:  `4×4` (`rows_4 = true`) or `1×4` (`rows_4 = false`) `f64` via `vfmadd231pd`
+    ///
+    /// Uses ONLY volatile `ymm0..ymm5` (zero XMM callee-save spills on Windows x64 and System V).
+    fn emit_gemm_microkernel_code(
+        is_f64: bool,
+        rows_4: bool,
+        has_bias: bool,
+        apply_relu: bool,
+    ) -> Vec<u8> {
+        let mut a = X64Asm::new();
+        let pp: u8 = if is_f64 { 0x05 } else { 0x04 }; // L=1, pp=1 (66) for f64, pp=0 for f32
+        let bcast_op: u8 = if is_f64 { 0x19 } else { 0x18 }; // vbroadcastsd / vbroadcastss
+        let fma_vex2: u8 = if is_f64 { 0xDD } else { 0x5D }; // W=1/0, ~vvvv=~4=0xB, L=1, pp=1 (66)
+        let elem_step: u8 = if is_f64 { 8 } else { 4 };
+
+        let mov_r64_r11_disp8 = |asm: &mut X64Asm, reg_code: u8, disp: u8| {
+            let rex = 0x49 | if reg_code >= 8 { 0x04 } else { 0x00 };
+            let modrm = 0x40 | ((reg_code & 7) << 3) | 3; // [r11 + disp8]
+            asm.emit(&[rex, 0x8B, modrm, disp]);
+        };
+        let vxor_zero = |asm: &mut X64Asm, reg: u8| {
+            let vex2 = 0x80 | ((!reg & 0x0F) << 3) | pp;
+            asm.emit(&[0xC5, vex2, 0x57, 0xC0 | (reg << 3) | reg]);
+        };
+        let vadd_ymm4 = |asm: &mut X64Asm, dst: u8| {
+            let vex2 = 0x80 | ((!dst & 0x0F) << 3) | pp;
+            asm.emit(&[0xC5, vex2, 0x58, 0xC0 | (dst << 3) | 4]);
+        };
+        let vmax_ymm5 = |asm: &mut X64Asm, dst: u8| {
+            let vex2 = 0x80 | ((!dst & 0x0F) << 3) | pp;
+            asm.emit(&[0xC5, vex2, 0x5F, 0xC0 | (dst << 3) | 5]);
+        };
+        let vmovu_store_rcx = |asm: &mut X64Asm, src: u8| {
+            let vex2 = if is_f64 { 0xFD } else { 0xFC };
+            asm.emit(&[0xC5, vex2, 0x11, (src << 3) | 1]);
+        };
+
+        // Prologue: preserve callee-saved `rbp`, `rbx`, `rsi` across Win64 & SysV.
+        a.emit(&[0x55]); // push rbp
+        a.emit(&[0x48, 0x89, 0xE5]); // mov rbp, rsp
+        a.emit(&[0x53]); // push rbx
+        a.emit(&[0x56]); // push rsi
+
+        // Move single pointer argument (`args`) into `r11`.
+        #[cfg(windows)]
+        {
+            a.emit(&[0x49, 0x89, 0xCB]); // mov r11, rcx
+        }
+        #[cfg(not(windows))]
+        {
+            a.emit(&[0x49, 0x89, 0xFB]); // mov r11, rdi
+        }
+
+        // Load hot loop registers from `GemmMicroArgs` at `[r11 + disp8]`.
+        mov_r64_r11_disp8(&mut a, 0, 0x00); // rax = a0
+        if rows_4 {
+            mov_r64_r11_disp8(&mut a, 2, 0x08); // rdx = a1
+            mov_r64_r11_disp8(&mut a, 8, 0x10); // r8  = a2
+            mov_r64_r11_disp8(&mut a, 9, 0x18); // r9  = a3
+        }
+        mov_r64_r11_disp8(&mut a, 10, 0x20); // r10 = b_col
+        mov_r64_r11_disp8(&mut a, 3, 0x28); // rbx = b_stride_bytes
+        mov_r64_r11_disp8(&mut a, 6, 0x58); // rsi = k
+
+        // Zero accumulators `ymm0` (and `ymm1..ymm3` for 4-row microkernel).
+        vxor_zero(&mut a, 0);
+        if rows_4 {
+            vxor_zero(&mut a, 1);
+            vxor_zero(&mut a, 2);
+            vxor_zero(&mut a, 3);
+        }
+
+        // Skip K-loop if k == 0.
+        a.emit(&[0x48, 0x85, 0xF6]); // test rsi, rsi
+        a.emit(&[0x0F, 0x84]); // jz epilogue
+        let skip_k_patch = a.pos();
+        a.emit_i32(0);
+
+        // K-loop body: 4×8 (f32) or 4×4 (f64) FMA3 rank-1 update reusing loaded `B` vector across 4 rows!
+        let k_loop = a.pos();
+        // vmovups/vmovupd ymm4, [r10]
+        a.emit(&[0xC4, 0xC1, if is_f64 { 0x7D } else { 0x7C }, 0x10, 0x22]);
+
+        // Row 0: vbroadcastss/sd ymm5, [rax]; vfmadd231ps/pd ymm0, ymm4, ymm5
+        a.emit(&[0xC4, 0xE2, 0x7D, bcast_op, 0x28]);
+        a.emit(&[0xC4, 0xE2, fma_vex2, 0xB8, 0xC5]);
+
+        if rows_4 {
+            // Row 1: vbroadcastss/sd ymm5, [rdx]; vfmadd231ps/pd ymm1, ymm4, ymm5
+            a.emit(&[0xC4, 0xE2, 0x7D, bcast_op, 0x2A]);
+            a.emit(&[0xC4, 0xE2, fma_vex2, 0xB8, 0xCD]);
+            // Row 2: vbroadcastss/sd ymm5, [r8]; vfmadd231ps/pd ymm2, ymm4, ymm5
+            a.emit(&[0xC4, 0xC2, 0x7D, bcast_op, 0x28]);
+            a.emit(&[0xC4, 0xE2, fma_vex2, 0xB8, 0xD5]);
+            // Row 3: vbroadcastss/sd ymm5, [r9]; vfmadd231ps/pd ymm3, ymm4, ymm5
+            a.emit(&[0xC4, 0xC2, 0x7D, bcast_op, 0x29]);
+            a.emit(&[0xC4, 0xE2, fma_vex2, 0xB8, 0xDD]);
+        }
+
+        // Advance `A` pointers by `elem_step` and `B` pointer by `b_stride_bytes` (`rbx`).
+        a.emit(&[0x48, 0x83, 0xC0, elem_step]); // add rax, elem_step
+        if rows_4 {
+            a.emit(&[0x48, 0x83, 0xC2, elem_step]); // add rdx, elem_step
+            a.emit(&[0x49, 0x83, 0xC0, elem_step]); // add r8, elem_step
+            a.emit(&[0x49, 0x83, 0xC1, elem_step]); // add r9, elem_step
+        }
+        a.emit(&[0x49, 0x01, 0xDA]); // add r10, rbx
+
+        a.emit(&[0x48, 0x83, 0xEE, 0x01]); // sub rsi, 1
+        a.emit(&[0x0F, 0x85]); // jnz k_loop
+        let k_back_patch = a.pos();
+        a.emit_i32(0);
+        a.patch_rel32(k_back_patch, k_loop);
+
+        let epilogue = a.pos();
+        a.patch_rel32(skip_k_patch, epilogue);
+
+        // Optional fused bias addition in registers.
+        if has_bias {
+            mov_r64_r11_disp8(&mut a, 1, 0x30); // rcx = bias_col
+            a.emit(&[0xC5, if is_f64 { 0xFD } else { 0xFC }, 0x10, 0x21]); // vmovups/pd ymm4, [rcx]
+            vadd_ymm4(&mut a, 0);
+            if rows_4 {
+                vadd_ymm4(&mut a, 1);
+                vadd_ymm4(&mut a, 2);
+                vadd_ymm4(&mut a, 3);
+            }
+        }
+
+        // Optional fused ReLU (`max(acc, +0.0)`) in registers.
+        if apply_relu {
+            vxor_zero(&mut a, 5);
+            vmax_ymm5(&mut a, 0);
+            if rows_4 {
+                vmax_ymm5(&mut a, 1);
+                vmax_ymm5(&mut a, 2);
+                vmax_ymm5(&mut a, 3);
+            }
+        }
+
+        // Store finished output tiles `c0` (and `c1..c3`).
+        mov_r64_r11_disp8(&mut a, 1, 0x38); // rcx = c0
+        vmovu_store_rcx(&mut a, 0);
+        if rows_4 {
+            mov_r64_r11_disp8(&mut a, 1, 0x40); // rcx = c1
+            vmovu_store_rcx(&mut a, 1);
+            mov_r64_r11_disp8(&mut a, 1, 0x48); // rcx = c2
+            vmovu_store_rcx(&mut a, 2);
+            mov_r64_r11_disp8(&mut a, 1, 0x50); // rcx = c3
+            vmovu_store_rcx(&mut a, 3);
+        }
+
+        a.emit(&[0xC5, 0xF8, 0x77]); // vzeroupper
+        a.emit(&[0x5E]); // pop rsi
+        a.emit(&[0x5B]); // pop rbx
+        a.emit(&[0x5D]); // pop rbp
+        a.emit(&[0xC3]); // ret
+        a.buf
+    }
+
+    static JIT_GEMM_CACHE: OnceLock<RwLock<HashMap<u64, Arc<CompiledGemmMicroKernel>>>> =
+        OnceLock::new();
+
+    fn get_or_compile_gemm_micro(
+        is_f64: bool,
+        rows_4: bool,
+        has_bias: bool,
+        apply_relu: bool,
+    ) -> MoraResult<Arc<CompiledGemmMicroKernel>> {
+        let key: u64 = 0x6E33_0000
+            | (u64::from(is_f64) << 3)
+            | (u64::from(rows_4) << 2)
+            | (u64::from(has_bias) << 1)
+            | u64::from(apply_relu);
+        let cache = JIT_GEMM_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+        if let Some(hit) = cache.read().get(&key).cloned() {
+            STAT_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+            return Ok(hit);
+        }
+        let code_bytes = emit_gemm_microkernel_code(is_f64, rows_4, has_bias, apply_relu);
+        let wx_buf = os_mem::WxCodeBuffer::from_code(&code_bytes)?;
+        let kernel = Arc::new(CompiledGemmMicroKernel { code: wx_buf });
+        let mut w = cache.write();
+        if let Some(existing) = w.get(&key).cloned() {
+            STAT_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+            return Ok(existing);
+        }
+        STAT_COMPILED_KERNELS.fetch_add(1, Ordering::Relaxed);
+        w.insert(key, Arc::clone(&kernel));
+        Ok(kernel)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_gemm_rows_f32(
+        x_f32: &[f32],
+        w_f32: &[f32],
+        bias_f32: Option<&[f32]>,
+        out_f32: &mut [f32],
+        rows_here: usize,
+        k: usize,
+        n: usize,
+        k4: &CompiledGemmMicroKernel,
+        k1: &CompiledGemmMicroKernel,
+        apply_relu: bool,
+        post_act: Option<FusedAct>,
+    ) {
+        let b_stride_bytes = n * std::mem::size_of::<f32>();
+        let has_bias = bias_f32.is_some();
+        let bias_base = bias_f32.map_or(ptr::null(), |b| b.as_ptr());
+        let n_vec = (n / 8) * 8;
+
+        let mut r = 0usize;
+        while r + 4 <= rows_here {
+            let a0 = &x_f32[r * k..];
+            let a1 = &x_f32[(r + 1) * k..];
+            let a2 = &x_f32[(r + 2) * k..];
+            let a3 = &x_f32[(r + 3) * k..];
+            let c_base = out_f32.as_mut_ptr();
+            let mut j = 0usize;
+            while j < n_vec {
+                // SAFETY: `r + 3 < rows_here`, `j + 8 <= n`, so all 4 row slices and B/bias/C
+                // panels are strictly in-bounds and non-overlapping.
+                let args = unsafe {
+                    GemmMicroArgs {
+                        a0: a0.as_ptr(),
+                        a1: a1.as_ptr(),
+                        a2: a2.as_ptr(),
+                        a3: a3.as_ptr(),
+                        b_col: w_f32.as_ptr().add(j),
+                        b_stride_bytes,
+                        bias_col: if has_bias {
+                            bias_base.add(j)
+                        } else {
+                            ptr::null()
+                        },
+                        c0: c_base.add(r * n + j),
+                        c1: c_base.add((r + 1) * n + j),
+                        c2: c_base.add((r + 2) * n + j),
+                        c3: c_base.add((r + 3) * n + j),
+                        k,
+                    }
+                };
+                k4.invoke(&args);
+                j += 8;
+            }
+            for rr in r..r + 4 {
+                let row_a = &x_f32[rr * k..(rr + 1) * k];
+                let row_c = &mut out_f32[rr * n..(rr + 1) * n];
+                for jj in n_vec..n {
+                    let mut acc = 0.0_f32;
+                    for (p, &av) in row_a.iter().enumerate() {
+                        acc = av.mul_add(w_f32[p * n + jj], acc);
+                    }
+                    if let Some(bv) = bias_f32 {
+                        acc += bv[jj];
+                    }
+                    if apply_relu && acc < 0.0 {
+                        acc = 0.0;
+                    }
+                    row_c[jj] = acc;
+                }
+            }
+            r += 4;
+        }
+
+        while r < rows_here {
+            let a0 = &x_f32[r * k..];
+            let c_base = out_f32.as_mut_ptr();
+            let mut j = 0usize;
+            while j < n_vec {
+                // SAFETY: `r < rows_here` and `j + 8 <= n`.
+                let args = unsafe {
+                    GemmMicroArgs {
+                        a0: a0.as_ptr(),
+                        a1: ptr::null(),
+                        a2: ptr::null(),
+                        a3: ptr::null(),
+                        b_col: w_f32.as_ptr().add(j),
+                        b_stride_bytes,
+                        bias_col: if has_bias {
+                            bias_base.add(j)
+                        } else {
+                            ptr::null()
+                        },
+                        c0: c_base.add(r * n + j),
+                        c1: ptr::null_mut(),
+                        c2: ptr::null_mut(),
+                        c3: ptr::null_mut(),
+                        k,
+                    }
+                };
+                k1.invoke(&args);
+                j += 8;
+            }
+            let row_a = &x_f32[r * k..(r + 1) * k];
+            let row_c = &mut out_f32[r * n..(r + 1) * n];
+            for jj in n_vec..n {
+                let mut acc = 0.0_f32;
+                for (p, &av) in row_a.iter().enumerate() {
+                    acc = av.mul_add(w_f32[p * n + jj], acc);
+                }
+                if let Some(bv) = bias_f32 {
+                    acc += bv[jj];
+                }
+                if apply_relu && acc < 0.0 {
+                    acc = 0.0;
+                }
+                row_c[jj] = acc;
+            }
+            r += 1;
+        }
+
+        if let Some(act) = post_act {
+            for v in out_f32.iter_mut() {
+                *v = act.eval(f64::from(*v)) as f32;
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_gemm_rows_f64(
+        x_f64: &[f64],
+        w_f64: &[f64],
+        bias_f64: Option<&[f64]>,
+        out_f64: &mut [f64],
+        rows_here: usize,
+        k: usize,
+        n: usize,
+        k4: &CompiledGemmMicroKernel,
+        k1: &CompiledGemmMicroKernel,
+        apply_relu: bool,
+        post_act: Option<FusedAct>,
+    ) {
+        let b_stride_bytes = n * std::mem::size_of::<f64>();
+        let has_bias = bias_f64.is_some();
+        let bias_base = bias_f64.map_or(ptr::null(), |b| b.as_ptr());
+        let n_vec = (n / 4) * 4;
+
+        let mut r = 0usize;
+        while r + 4 <= rows_here {
+            let a0 = &x_f64[r * k..];
+            let a1 = &x_f64[(r + 1) * k..];
+            let a2 = &x_f64[(r + 2) * k..];
+            let a3 = &x_f64[(r + 3) * k..];
+            let c_base = out_f64.as_mut_ptr();
+            let mut j = 0usize;
+            while j < n_vec {
+                // SAFETY: `r + 3 < rows_here`, `j + 4 <= n`, all slices strictly in-bounds.
+                let args = unsafe {
+                    GemmMicroArgs {
+                        a0: a0.as_ptr(),
+                        a1: a1.as_ptr(),
+                        a2: a2.as_ptr(),
+                        a3: a3.as_ptr(),
+                        b_col: w_f64.as_ptr().add(j),
+                        b_stride_bytes,
+                        bias_col: if has_bias {
+                            bias_base.add(j)
+                        } else {
+                            ptr::null()
+                        },
+                        c0: c_base.add(r * n + j),
+                        c1: c_base.add((r + 1) * n + j),
+                        c2: c_base.add((r + 2) * n + j),
+                        c3: c_base.add((r + 3) * n + j),
+                        k,
+                    }
+                };
+                k4.invoke(&args);
+                j += 4;
+            }
+            for rr in r..r + 4 {
+                let row_a = &x_f64[rr * k..(rr + 1) * k];
+                let row_c = &mut out_f64[rr * n..(rr + 1) * n];
+                for jj in n_vec..n {
+                    let mut acc = 0.0_f64;
+                    for (p, &av) in row_a.iter().enumerate() {
+                        acc = av.mul_add(w_f64[p * n + jj], acc);
+                    }
+                    if let Some(bv) = bias_f64 {
+                        acc += bv[jj];
+                    }
+                    if apply_relu && acc < 0.0 {
+                        acc = 0.0;
+                    }
+                    row_c[jj] = acc;
+                }
+            }
+            r += 4;
+        }
+
+        while r < rows_here {
+            let a0 = &x_f64[r * k..];
+            let c_base = out_f64.as_mut_ptr();
+            let mut j = 0usize;
+            while j < n_vec {
+                // SAFETY: `r < rows_here`, `j + 4 <= n`.
+                let args = unsafe {
+                    GemmMicroArgs {
+                        a0: a0.as_ptr(),
+                        a1: ptr::null(),
+                        a2: ptr::null(),
+                        a3: ptr::null(),
+                        b_col: w_f64.as_ptr().add(j),
+                        b_stride_bytes,
+                        bias_col: if has_bias {
+                            bias_base.add(j)
+                        } else {
+                            ptr::null()
+                        },
+                        c0: c_base.add(r * n + j),
+                        c1: ptr::null_mut(),
+                        c2: ptr::null_mut(),
+                        c3: ptr::null_mut(),
+                        k,
+                    }
+                };
+                k1.invoke(&args);
+                j += 4;
+            }
+            let row_a = &x_f64[r * k..(r + 1) * k];
+            let row_c = &mut out_f64[r * n..(r + 1) * n];
+            for jj in n_vec..n {
+                let mut acc = 0.0_f64;
+                for (p, &av) in row_a.iter().enumerate() {
+                    acc = av.mul_add(w_f64[p * n + jj], acc);
+                }
+                if let Some(bv) = bias_f64 {
+                    acc += bv[jj];
+                }
+                if apply_relu && acc < 0.0 {
+                    acc = 0.0;
+                }
+                row_c[jj] = acc;
+            }
+            r += 1;
+        }
+
+        if let Some(act) = post_act {
+            for v in out_f64.iter_mut() {
+                *v = act.eval(*v);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn try_run_fused_linear_act(
+        x_vals: &[f64],
+        w_vals: &[f64],
+        bias: Option<(&[f64], &[usize])>,
+        act: FusedAct,
+        m_total: usize,
+        k: usize,
+        n: usize,
+        dtype: DType,
+        out: &mut Vec<f64>,
+    ) -> MoraResult<bool> {
+        let has_avx2_fma = is_enabled()
+            && std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("avx")
+            && std::arch::is_x86_feature_detected!("fma");
+        if !has_avx2_fma || !matches!(dtype, DType::F32 | DType::F64) {
+            STAT_FALLBACK_DISPATCHES.fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
+        }
+        let min_lanes = if dtype == DType::F32 { 8 } else { 4 };
+        if m_total == 0 || n < min_lanes {
+            STAT_FALLBACK_DISPATCHES.fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
+        }
+        // Only direct 1D `[n]` or `[1, n]` biases (or no bias) enter the fast microkernel path.
+        let simple_bias: Option<&[f64]> = match bias {
+            None => None,
+            Some((bv, bs))
+                if (bs.len() == 1 && bs[0] == n) || (bs.len() == 2 && bs[0] == 1 && bs[1] == n) =>
+            {
+                Some(bv)
+            }
+            Some(_) => {
+                STAT_FALLBACK_DISPATCHES.fetch_add(1, Ordering::Relaxed);
+                return Ok(false);
+            }
+        };
+
+        let is_f64 = dtype == DType::F64;
+        let has_bias = simple_bias.is_some();
+        let (apply_relu, post_act) = match act {
+            FusedAct::None => (false, None),
+            FusedAct::Relu => (true, None),
+            other => (false, Some(other)),
+        };
+
+        let k4 = get_or_compile_gemm_micro(is_f64, true, has_bias, apply_relu)?;
+        let k1 = get_or_compile_gemm_micro(is_f64, false, has_bias, apply_relu)?;
+
+        let workers = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1);
+        let flops = m_total.saturating_mul(k).saturating_mul(n);
+
+        if is_f64 {
+            out.resize(m_total * n, 0.0);
+            if workers <= 1 || m_total < 4 || flops < 131_072 {
+                run_gemm_rows_f64(
+                    x_vals,
+                    w_vals,
+                    simple_bias,
+                    out,
+                    m_total,
+                    k,
+                    n,
+                    &k4,
+                    &k1,
+                    apply_relu,
+                    post_act,
+                );
+            } else {
+                let chunk_rows = m_total.div_ceil(workers).max(4);
+                std::thread::scope(|s| {
+                    for (ci, out_chunk) in out.chunks_mut(chunk_rows * n).enumerate() {
+                        let r0 = ci * chunk_rows;
+                        let rows_here = out_chunk.len() / n;
+                        let x_chunk = &x_vals[r0 * k..(r0 + rows_here) * k];
+                        let k4_ref = &k4;
+                        let k1_ref = &k1;
+                        s.spawn(move || {
+                            run_gemm_rows_f64(
+                                x_chunk,
+                                w_vals,
+                                simple_bias,
+                                out_chunk,
+                                rows_here,
+                                k,
+                                n,
+                                k4_ref,
+                                k1_ref,
+                                apply_relu,
+                                post_act,
+                            );
+                        });
+                    }
+                });
+            }
+            STAT_NATIVE_DISPATCHES.fetch_add(1, Ordering::Relaxed);
+            STAT_GEMM_NATIVE_DISPATCHES.fetch_add(1, Ordering::Relaxed);
+            Ok(true)
+        } else {
+            let x_f32: Vec<f32> = x_vals.iter().map(|&v| v as f32).collect();
+            let w_f32: Vec<f32> = w_vals.iter().map(|&v| v as f32).collect();
+            let bias_f32: Option<Vec<f32>> =
+                simple_bias.map(|b| b.iter().map(|&v| v as f32).collect());
+            let mut out_f32 = vec![0.0_f32; m_total * n];
+            let bias_slice = bias_f32.as_deref();
+            if workers <= 1 || m_total < 4 || flops < 131_072 {
+                run_gemm_rows_f32(
+                    &x_f32,
+                    &w_f32,
+                    bias_slice,
+                    &mut out_f32,
+                    m_total,
+                    k,
+                    n,
+                    &k4,
+                    &k1,
+                    apply_relu,
+                    post_act,
+                );
+            } else {
+                let chunk_rows = m_total.div_ceil(workers).max(4);
+                let x_ref = &x_f32;
+                let w_ref = &w_f32;
+                std::thread::scope(|s| {
+                    for (ci, out_chunk) in out_f32.chunks_mut(chunk_rows * n).enumerate() {
+                        let r0 = ci * chunk_rows;
+                        let rows_here = out_chunk.len() / n;
+                        let x_chunk = &x_ref[r0 * k..(r0 + rows_here) * k];
+                        let k4_ref = &k4;
+                        let k1_ref = &k1;
+                        s.spawn(move || {
+                            run_gemm_rows_f32(
+                                x_chunk, w_ref, bias_slice, out_chunk, rows_here, k, n, k4_ref,
+                                k1_ref, apply_relu, post_act,
+                            );
+                        });
+                    }
+                });
+            }
+            out.clear();
+            out.reserve(out_f32.len());
+            out.extend(out_f32.into_iter().map(f64::from));
+            STAT_NATIVE_DISPATCHES.fetch_add(1, Ordering::Relaxed);
+            STAT_F32_NATIVE_DISPATCHES.fetch_add(1, Ordering::Relaxed);
+            STAT_GEMM_NATIVE_DISPATCHES.fetch_add(1, Ordering::Relaxed);
+            Ok(true)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1697,6 +2387,90 @@ mod tests {
                     "expected f32_native_dispatches counter to increment"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn native_wx_jit_fused_linear_act_avx2_fma_matches_simd_across_shapes_and_acts() {
+        let before_gemm = stats().gemm_native_dispatches;
+        let shapes = [
+            (1usize, 1usize, 8usize),
+            (3, 5, 11),
+            (4, 7, 8),
+            (5, 13, 17),
+            (9, 16, 25),
+            (17, 33, 19),
+            (4, 0, 8),
+        ];
+        for dtype in [DType::F32, DType::F64] {
+            for act in [
+                FusedAct::None,
+                FusedAct::Relu,
+                FusedAct::Gelu,
+                FusedAct::Silu,
+            ] {
+                for use_bias in [false, true] {
+                    for &(m, k, n) in &shapes {
+                        let x: Vec<f64> = (0..m * k)
+                            .map(|i| (((i * 7 + 3) % 19) as f64 - 9.0) * 0.125)
+                            .collect();
+                        let w: Vec<f64> = (0..k * n)
+                            .map(|i| (((i * 5 + 1) % 17) as f64 - 8.0) * 0.125)
+                            .collect();
+                        let b: Vec<f64> = (0..n).map(|j| (j as f64) * 0.05 - 0.3).collect();
+                        let bias_opt = use_bias.then_some((b.as_slice(), std::slice::from_ref(&n)));
+
+                        let mut out_jit = Vec::new();
+                        let ran = try_run_fused_linear_act_into(
+                            &x,
+                            &w,
+                            bias_opt,
+                            act,
+                            m,
+                            k,
+                            n,
+                            dtype,
+                            &mut out_jit,
+                        )
+                        .expect("native GEMM JIT");
+
+                        let mut out_ref = Vec::new();
+                        simd_kernels::fused_linear_act_into(
+                            &x,
+                            &w,
+                            bias_opt,
+                            act,
+                            m,
+                            k,
+                            n,
+                            &[m, n],
+                            dtype,
+                            &mut out_ref,
+                        );
+
+                        if ran {
+                            assert_eq!(out_jit.len(), out_ref.len());
+                            let tol = if dtype == DType::F32 { 2e-4 } else { 1e-11 };
+                            for (i, (&j, &r)) in out_jit.iter().zip(out_ref.iter()).enumerate() {
+                                assert!(
+                                    (j - r).abs() <= tol,
+                                    "GEMM JIT mismatch dtype={dtype:?} act={act:?} bias={use_bias} shape=({m},{k},{n}) idx={i}: jit={j} vs ref={r}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        if is_enabled()
+            && std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("fma")
+        {
+            assert!(
+                stats().gemm_native_dispatches > before_gemm,
+                "expected gemm_native_dispatches to increment on AVX2+FMA CPU"
+            );
         }
     }
 }

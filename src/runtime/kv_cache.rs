@@ -52,10 +52,38 @@ struct SwappedSeqState {
     priority: i64,
 }
 
+/// P5-2A: Content-addressed RadixAttention prefix trie node mapping a full `page_tokens`-length
+/// token block along a causal prefix path to an immutable cached physical KV page ID.
+#[derive(Debug, Clone)]
+struct PrefixNode {
+    parent: Option<usize>,
+    block_tokens: Vec<i64>,
+    page_id: Option<usize>,
+    children: HashMap<Vec<i64>, usize>,
+    lru_tick: u64,
+}
+
+impl PrefixNode {
+    fn root() -> Self {
+        Self {
+            parent: None,
+            block_tokens: Vec::new(),
+            page_id: None,
+            children: HashMap::new(),
+            lru_tick: 0,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct KvPoolInner {
     free_pages: Vec<usize>,
     refcounts: Vec<usize>,
+    /// Number of RadixAttention prefix trie nodes currently pinning each physical page.
+    /// `active_seq_refs(pid) == refcounts[pid] - radix_refcounts[pid]`.
+    radix_refcounts: Vec<usize>,
+    radix_nodes: Vec<Option<PrefixNode>>,
+    radix_cached_pages: usize,
     k_pages: Vec<AlignedByteBuffer>,
     v_pages: Vec<AlignedByteBuffer>,
     /// Physical GPU VRAM buffers backing active allocated KV pages (1:1 with `refcounts[pid] > 0`
@@ -74,6 +102,8 @@ struct KvPoolInner {
     swap_ins: u64,
     swap_out_bytes: u64,
     swap_in_bytes: u64,
+    prefix_cache_hits: u64,
+    prefix_evictions: u64,
 }
 
 /// Paged KV-cache memory allocator with Copy-on-Write prefix sharing, hard byte quotas,
@@ -187,6 +217,9 @@ impl KVPageAllocator {
             inner: Mutex::new(KvPoolInner {
                 free_pages,
                 refcounts,
+                radix_refcounts: vec![0usize; total_pages],
+                radix_nodes: vec![Some(PrefixNode::root())],
+                radix_cached_pages: 0,
                 k_pages,
                 v_pages,
                 k_vram_pages: vec![None; total_pages],
@@ -203,6 +236,8 @@ impl KVPageAllocator {
                 swap_ins: 0,
                 swap_out_bytes: 0,
                 swap_in_bytes: 0,
+                prefix_cache_hits: 0,
+                prefix_evictions: 0,
             }),
         }))
     }
@@ -253,6 +288,66 @@ impl KVPageAllocator {
                 return Err(MoraError::Runtime(format!(
                     "KVPageAllocator quota exceeded: sequence {seq_id} needs {projected_bytes} bytes, exceeds hard quota {quota} bytes"
                 )));
+            }
+        }
+        Ok(())
+    }
+
+    /// P5-2A: Evict the single least-recently-used RadixAttention leaf node whose physical page
+    /// has zero active sequence owners (`refcounts[pid] == radix_refcounts[pid]`).
+    fn evict_one_lru_radix_leaf(inner: &mut KvPoolInner) -> bool {
+        let victim = inner
+            .radix_nodes
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter_map(|(idx, slot)| {
+                let node = slot.as_ref()?;
+                if !node.children.is_empty() {
+                    return None;
+                }
+                let pid = node.page_id?;
+                if inner.refcounts[pid] == inner.radix_refcounts[pid] {
+                    Some((idx, node.lru_tick))
+                } else {
+                    None
+                }
+            })
+            .min_by_key(|&(_, tick)| tick)
+            .map(|(idx, _)| idx);
+
+        let Some(vidx) = victim else {
+            return false;
+        };
+        let node = inner.radix_nodes[vidx].take().expect("radix victim exists");
+        if let Some(parent_idx) = node.parent
+            && let Some(parent) = inner.radix_nodes[parent_idx].as_mut()
+        {
+            parent.children.remove(&node.block_tokens);
+        }
+        if let Some(pid) = node.page_id {
+            inner.radix_refcounts[pid] = inner.radix_refcounts[pid].saturating_sub(1);
+            let _ = Self::release_physical_page(inner, pid);
+        }
+        inner.radix_cached_pages = inner.radix_cached_pages.saturating_sub(1);
+        inner.prefix_evictions += 1;
+        true
+    }
+
+    /// Ensure `extra_pages` can be allocated within capacity and hard `max_bytes` quota,
+    /// automatically reclaiming LRU inactive RadixAttention cached prefix pages before failing.
+    fn ensure_can_allocate_or_reclaim_radix(
+        &self,
+        inner: &mut KvPoolInner,
+        extra_pages: usize,
+        seq_id: u64,
+    ) -> MoraResult<()> {
+        while self
+            .ensure_can_allocate(inner, extra_pages, seq_id)
+            .is_err()
+        {
+            if !Self::evict_one_lru_radix_leaf(inner) {
+                return self.ensure_can_allocate(inner, extra_pages, seq_id);
             }
         }
         Ok(())
@@ -529,7 +624,7 @@ impl KVPageAllocator {
             new_tokens.div_ceil(self.page_tokens)
         };
         let extra = needed_pages.saturating_sub(cur_pages);
-        self.ensure_can_allocate(&inner, extra, seq_id)?;
+        self.ensure_can_allocate_or_reclaim_radix(&mut inner, extra, seq_id)?;
 
         let mut newly = Vec::with_capacity(extra);
         for _ in 0..extra {
@@ -668,7 +763,7 @@ impl KVPageAllocator {
         }
 
         let target_pid = if inner.refcounts[cur_pid] > 1 {
-            self.ensure_can_allocate(&inner, 1, seq_id)?;
+            self.ensure_can_allocate_or_reclaim_radix(&mut inner, 1, seq_id)?;
             let new_pid = self.alloc_physical_page(&mut inner)?;
             let cloned_k = inner.k_pages[cur_pid].clone();
             let cloned_v = inner.v_pages[cur_pid].clone();
@@ -871,7 +966,7 @@ impl KVPageAllocator {
             MoraError::Runtime(format!("kv_allocator: unknown sequence {seq_id}"))
         })?;
         let pages_needed = swapped.host_pages.len();
-        self.ensure_can_allocate(&inner, pages_needed, seq_id)?;
+        self.ensure_can_allocate_or_reclaim_radix(&mut inner, pages_needed, seq_id)?;
 
         let mut newly = Vec::with_capacity(pages_needed);
         for _ in 0..pages_needed {
@@ -949,6 +1044,185 @@ impl KVPageAllocator {
         Ok((page_table, fired))
     }
 
+    /// P5-2A: Register all complete `page_tokens`-aligned prefix blocks of active sequence `seq_id`
+    /// into the content-addressed RadixAttention prefix trie, returning the count of blocks newly cached.
+    ///
+    /// Increments physical `refcounts` so subsequent `write_kv` on `seq_id` triggers Copy-on-Write
+    /// without mutating the cached immutable prefix pages, and `free_seq(seq_id)` leaves the warm
+    /// physical pages (and GPU VRAM buffers) pinned in the radix cache for future zero-copy reuse.
+    pub(crate) fn cache_prefix(&self, seq_id: u64, token_ids: &[i64]) -> MoraResult<usize> {
+        let _trace = crate::runtime::profiler::TraceScope::enter(
+            "kv_cache",
+            "kv_cache_prefix",
+            vec![
+                ("seq_id".to_string(), seq_id.to_string()),
+                ("tokens".to_string(), token_ids.len().to_string()),
+            ],
+        );
+        let mut inner = self.inner.lock();
+        if inner.swapped_seqs.contains_key(&seq_id) {
+            return Err(MoraError::Runtime(format!(
+                "kv_allocator.cache_prefix: sequence {seq_id} is swapped out to host RAM; call swap_in({seq_id}) first"
+            )));
+        }
+        let (seq_tokens, seq_pages) = {
+            let seq = inner.seqs.get(&seq_id).ok_or_else(|| {
+                MoraError::Runtime(format!("kv_allocator: unknown sequence {seq_id}"))
+            })?;
+            (seq.num_tokens, seq.page_table.clone())
+        };
+        let usable = token_ids.len().min(seq_tokens);
+        let full_blocks = usable / self.page_tokens;
+        let tick = Self::next_tick(&mut inner);
+
+        let mut cur = 0usize;
+        let mut newly_cached = 0usize;
+        for (blk, &pid) in seq_pages.iter().take(full_blocks).enumerate() {
+            let start = blk * self.page_tokens;
+            let key = token_ids[start..start + self.page_tokens].to_vec();
+            let existing = inner.radix_nodes[cur]
+                .as_ref()
+                .and_then(|n| n.children.get(&key).copied());
+            if let Some(child_idx) = existing {
+                if let Some(child) = inner.radix_nodes[child_idx].as_mut() {
+                    child.lru_tick = tick;
+                }
+                cur = child_idx;
+            } else {
+                inner.refcounts[pid] += 1;
+                inner.radix_refcounts[pid] += 1;
+                let node = PrefixNode {
+                    parent: Some(cur),
+                    block_tokens: key.clone(),
+                    page_id: Some(pid),
+                    children: HashMap::new(),
+                    lru_tick: tick,
+                };
+                let new_idx = if let Some(slot_idx) = inner
+                    .radix_nodes
+                    .iter()
+                    .enumerate()
+                    .skip(1)
+                    .find_map(|(i, s)| s.is_none().then_some(i))
+                {
+                    inner.radix_nodes[slot_idx] = Some(node);
+                    slot_idx
+                } else {
+                    let idx = inner.radix_nodes.len();
+                    inner.radix_nodes.push(Some(node));
+                    idx
+                };
+                if let Some(parent) = inner.radix_nodes[cur].as_mut() {
+                    parent.children.insert(key, new_idx);
+                }
+                inner.radix_cached_pages += 1;
+                newly_cached += 1;
+                cur = new_idx;
+            }
+        }
+        if let Some(seq) = inner.seqs.get_mut(&seq_id) {
+            seq.last_access_tick = tick;
+        }
+        Ok(newly_cached)
+    }
+
+    /// P5-2A: Return the longest cached block-aligned prefix length (in tokens) matching `token_ids`.
+    pub(crate) fn match_prefix(&self, token_ids: &[i64]) -> usize {
+        let inner = self.inner.lock();
+        let full_blocks = token_ids.len() / self.page_tokens;
+        let mut cur = 0usize;
+        let mut matched_blocks = 0usize;
+        for blk in 0..full_blocks {
+            let start = blk * self.page_tokens;
+            let key = &token_ids[start..start + self.page_tokens];
+            let next = inner.radix_nodes[cur]
+                .as_ref()
+                .and_then(|n| n.children.get(key).copied());
+            match next {
+                Some(child_idx) => {
+                    cur = child_idx;
+                    matched_blocks += 1;
+                }
+                None => break,
+            }
+        }
+        matched_blocks * self.page_tokens
+    }
+
+    /// P5-2A: Zero-copy bind the longest cached prefix matching `token_ids` onto fresh empty
+    /// sequence `seq_id` (incrementing `refcounts`, preserving CoW safety on subsequent writes).
+    /// Returns the number of tokens attached.
+    pub(crate) fn attach_prefix(&self, seq_id: u64, token_ids: &[i64]) -> MoraResult<usize> {
+        let _trace = crate::runtime::profiler::TraceScope::enter(
+            "kv_cache",
+            "kv_attach_prefix",
+            vec![
+                ("seq_id".to_string(), seq_id.to_string()),
+                ("tokens".to_string(), token_ids.len().to_string()),
+            ],
+        );
+        let mut inner = self.inner.lock();
+        if inner.swapped_seqs.contains_key(&seq_id) {
+            return Err(MoraError::Runtime(format!(
+                "kv_allocator.attach_prefix: sequence {seq_id} is swapped out to host RAM; call swap_in({seq_id}) first"
+            )));
+        }
+        {
+            let seq = inner.seqs.get(&seq_id).ok_or_else(|| {
+                MoraError::Runtime(format!("kv_allocator: unknown sequence {seq_id}"))
+            })?;
+            if seq.num_tokens > 0 || !seq.page_table.is_empty() {
+                return Err(MoraError::Runtime(format!(
+                    "kv_allocator.attach_prefix: sequence {seq_id} already has {} tokens (attach_prefix requires a fresh empty sequence)",
+                    seq.num_tokens
+                )));
+            }
+        }
+
+        let full_blocks = token_ids.len() / self.page_tokens;
+        let mut cur = 0usize;
+        let mut matched: Vec<(usize, usize)> = Vec::new();
+        for blk in 0..full_blocks {
+            let start = blk * self.page_tokens;
+            let key = &token_ids[start..start + self.page_tokens];
+            let next = inner.radix_nodes[cur]
+                .as_ref()
+                .and_then(|n| n.children.get(key).copied());
+            let Some(child_idx) = next else {
+                break;
+            };
+            let Some(pid) = inner.radix_nodes[child_idx]
+                .as_ref()
+                .and_then(|n| n.page_id)
+            else {
+                break;
+            };
+            matched.push((child_idx, pid));
+            cur = child_idx;
+        }
+        if matched.is_empty() {
+            return Ok(0);
+        }
+
+        let tick = Self::next_tick(&mut inner);
+        let mut attached_pages = Vec::with_capacity(matched.len());
+        for (node_idx, pid) in matched {
+            if let Some(node) = inner.radix_nodes[node_idx].as_mut() {
+                node.lru_tick = tick;
+            }
+            inner.refcounts[pid] += 1;
+            attached_pages.push(pid);
+        }
+        let matched_tokens = attached_pages.len() * self.page_tokens;
+        if let Some(seq) = inner.seqs.get_mut(&seq_id) {
+            seq.page_table = attached_pages;
+            seq.num_tokens = matched_tokens;
+            seq.last_access_tick = tick;
+        }
+        inner.prefix_cache_hits += 1;
+        Ok(matched_tokens)
+    }
+
     /// Return true if `seq_id` is currently swapped out to host RAM.
     pub(crate) fn is_swapped(&self, seq_id: u64) -> bool {
         self.inner.lock().swapped_seqs.contains_key(&seq_id)
@@ -1004,6 +1278,9 @@ impl KVPageAllocator {
         let mut inner = self.inner.lock();
         let mut evicted = Vec::new();
         while self.ensure_can_allocate(&inner, pages_needed, 0).is_err() {
+            if Self::evict_one_lru_radix_leaf(&mut inner) {
+                continue;
+            }
             let victim = inner
                 .seqs
                 .iter()
@@ -1150,6 +1427,18 @@ impl KVPageAllocator {
         m.insert(
             "swap_in_bytes".to_string(),
             Value::Int(inner.swap_in_bytes as i64),
+        );
+        m.insert(
+            "prefix_cache_hits".to_string(),
+            Value::Int(inner.prefix_cache_hits as i64),
+        );
+        m.insert(
+            "prefix_cached_pages".to_string(),
+            Value::Int(inner.radix_cached_pages as i64),
+        );
+        m.insert(
+            "prefix_evictions".to_string(),
+            Value::Int(inner.prefix_evictions as i64),
         );
         m
     }

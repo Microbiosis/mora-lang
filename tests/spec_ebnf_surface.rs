@@ -129,6 +129,12 @@ const EXPR_CASES: &[(&str, &str, &str)] = &[
         "\"a b\" |> split(\" \")\n",
         "OK:List([String(\"a\"), String(\"b\")])",
     ),
+    // question = expr "?" (v0.112.0 G2: Result/Option/nullable postfix error propagation)
+    (
+        "question (v0.112.0 G2)",
+        "enum Boxed<T>\n  Ok(T)\n  Err(string)\nend\ntask unwrap_ok(): Boxed<int>\n  let v = Boxed::Ok(41)?\n  return Boxed::Ok(v + 1)\nend\nmatch unwrap_ok() with\n  Boxed::Ok(n) -> n\n  Boxed::Err(_) -> 0\nend\n",
+        "OK:Int(42)",
+    ),
     // literal = NUMBER | STRING | CHAR | BOOL | NIL | list | dict
     ("literal NUMBER", "42\n", "OK:Int(42)"),
     ("literal STRING", "\"a\"\n", "OK:String(\"a\")"),
@@ -188,23 +194,6 @@ fn pipe_into_named_function_works() {
         let alt = pipe("let double = fn(x) x * 2 end\nlet result = 5 |> double\nresult\n");
         assert_eq!(alt, "OK:Int(10)", "闭包形式的 `|>` 应得 10.0");
     }
-}
-
-/// `question = expr "?"`（spec :1278）在 EBNF 里列了，但 §13.3 的类型规则明写
-/// 「**待补充**: … T-Question …」—— 语义未定义，实现也就没做。
-///
-/// 这条**不是「文档化了却坏掉」的缺陷**，而是一处**规范缺口**：要实现它得先
-/// 定清语义（存在性检查？类型提问？惰性求值？），那是语言设计决定。
-///
-/// 本测试记录当前状态。若将来实现了 `?`，请把它挪进 `EXPR_CASES` 并删掉这里。
-#[test]
-fn question_operator_is_still_unimplemented() {
-    let got = pipe("[1,2]?\n");
-    assert!(
-        got.starts_with("COMPILE-ERR"),
-        "spec §14.2 列了 `question = expr \"?\"`，但 §13.3 把 T-Question 标为「待补充」。\
-         若已实现，请把 `expr question` 移进 EXPR_CASES 并删除本测试。实得：{got}"
-    );
 }
 
 /// v0.104.6 D41：spec §14.2 说**所有**块体都是 `{ statement }`，而

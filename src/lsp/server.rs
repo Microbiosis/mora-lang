@@ -9,7 +9,7 @@
 //! 不实现：cancel（v1 协议太复杂）、progress（用不上）、window/workDoneProgress。
 
 use std::collections::HashMap;
-use std::io::{self, BufReader};
+use std::io::{self, BufReader, Read, Write};
 use std::sync::Mutex;
 
 use super::transport;
@@ -17,7 +17,6 @@ use crate::common::lock::lock_or_recover;
 use crate::flow::json::{JsonParser as Parser, JsonValue as Value};
 
 pub struct Server {
-    stdin: BufReader<io::Stdin>,
     docs: Mutex<HashMap<String, DocumentState>>,
     shutdown: Mutex<bool>,
 }
@@ -51,16 +50,27 @@ impl Default for Server {
 impl Server {
     pub fn new() -> Self {
         Self {
-            stdin: BufReader::new(io::stdin()),
             docs: Mutex::new(HashMap::new()),
             shutdown: Mutex::new(false),
         }
     }
 
-    /// 主循环
+    /// 主循环（绑定进程标准输入输出）
     pub fn run(&mut self) -> io::Result<()> {
+        let mut reader = BufReader::new(io::stdin());
+        let stdout = io::stdout();
+        let mut writer = stdout.lock();
+        self.run_with_io(&mut reader, &mut writer)
+    }
+
+    /// 通用 JSON-RPC 2.0 主循环（支持任意 `Read` / `Write` 传输流，便于确定性测试与嵌入）
+    pub fn run_with_io<R: Read, W: Write>(
+        &mut self,
+        reader: &mut R,
+        writer: &mut W,
+    ) -> io::Result<()> {
         loop {
-            let raw = match transport::read_message(&mut self.stdin)? {
+            let raw = match transport::read_message(reader)? {
                 Some(s) => s,
                 None => return Ok(()), // EOF
             };
@@ -71,7 +81,7 @@ impl Server {
                     continue;
                 }
             };
-            self.handle_message(msg)?;
+            self.handle_message_to(msg, writer)?;
             if *lock_or_recover(&self.shutdown, "lsp_shutdown") {
                 break;
             }
@@ -79,7 +89,7 @@ impl Server {
         Ok(())
     }
 
-    fn handle_message(&mut self, msg: Value) -> io::Result<()> {
+    fn handle_message_to<W: Write>(&mut self, msg: Value, writer: &mut W) -> io::Result<()> {
         let method = msg
             .get("method")
             .and_then(|v| v.as_str())
@@ -90,20 +100,25 @@ impl Server {
 
         // notification：没有 id 的消息
         if id.is_none() {
-            return self.handle_notification(&method, params);
+            return self.handle_notification_to(&method, params, writer);
         }
 
         // request：必须回复（成功或错误）
         if let Some(id) = id {
             match self.handle_request(&method, params) {
-                Ok(result) => self.send_response(id, Some(result), None)?,
-                Err(err) => self.send_response(id, None, Some(&err))?,
+                Ok(result) => self.send_response_to(id, Some(result), None, writer)?,
+                Err(err) => self.send_response_to(id, None, Some(&err), writer)?,
             }
         }
         Ok(())
     }
 
-    fn handle_notification(&mut self, method: &str, params: Value) -> io::Result<()> {
+    fn handle_notification_to<W: Write>(
+        &mut self,
+        method: &str,
+        params: Value,
+        writer: &mut W,
+    ) -> io::Result<()> {
         match method {
             "initialized" => {
                 // 客户端握手完成标志；什么都不做
@@ -124,7 +139,7 @@ impl Server {
                         },
                     );
                     drop(docs);
-                    let _ = self.publish_diagnostics(&uri, &diags);
+                    let _ = self.publish_diagnostics_to(&uri, &diags, writer);
                 }
             }
             "textDocument/didChange" => {
@@ -149,7 +164,7 @@ impl Server {
                         },
                     );
                     drop(docs);
-                    let _ = self.publish_diagnostics(&uri, &diags);
+                    let _ = self.publish_diagnostics_to(&uri, &diags, writer);
                 }
             }
             "textDocument/didClose" => {
@@ -177,7 +192,7 @@ impl Server {
                             d.diagnostics = diags.clone();
                         }
                         drop(docs);
-                        let _ = self.publish_diagnostics(uri, &diags);
+                        let _ = self.publish_diagnostics_to(uri, &diags, writer);
                     }
                 }
             }
@@ -426,7 +441,12 @@ impl Server {
             .collect()
     }
 
-    fn publish_diagnostics(&self, uri: &str, diags: &[Diagnostic]) -> io::Result<()> {
+    fn publish_diagnostics_to<W: Write>(
+        &self,
+        uri: &str,
+        diags: &[Diagnostic],
+        writer: &mut W,
+    ) -> io::Result<()> {
         let mut params = std::collections::BTreeMap::new();
         params.insert("uri".to_string(), Value::String_(uri.to_string()));
         let arr: Vec<Value> = diags
@@ -477,16 +497,15 @@ impl Server {
         );
         notif.insert("params".to_string(), Value::Object(params));
         let body = Value::Object(notif).to_string();
-        let stdout = io::stdout();
-        let mut lock = stdout.lock();
-        transport::write_message(&mut lock, &body)
+        transport::write_message(writer, &body)
     }
 
-    fn send_response(
+    fn send_response_to<W: Write>(
         &self,
         id: Value,
         result: Option<Value>,
         err: Option<&crate::error::MoraError>,
+        writer: &mut W,
     ) -> io::Result<()> {
         let mut msg = std::collections::BTreeMap::new();
         msg.insert("jsonrpc".to_string(), Value::String_("2.0".to_string()));
@@ -509,9 +528,7 @@ impl Server {
             }
         }
         let body = Value::Object(msg).to_string();
-        let stdout = io::stdout();
-        let mut lock = stdout.lock();
-        transport::write_message(&mut lock, &body)
+        transport::write_message(writer, &body)
     }
 }
 
@@ -611,6 +628,7 @@ mod tests {
             m
         });
         // 不应 panic
-        server.handle_message(msg).unwrap();
+        let mut out = Vec::new();
+        server.handle_message_to(msg, &mut out).unwrap();
     }
 }

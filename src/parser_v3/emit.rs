@@ -213,7 +213,9 @@ impl ParserV3 {
         self.emit_dyn_coercion(w)
     }
 
-    /// W2.3: 迭代式 Pratt（Shunting-Yard）二元/管道表达式解析，消除深层逻辑/算术嵌套时的 C 栈帧累积。
+    /// W2.3 / G1: 迭代式 Pratt（Shunting-Yard）表达式解析，同时用显式堆栈迭代处理
+    /// 括号嵌套 `((...))`、一元前缀 (`-`/`!`/`not`)、右结合幂运算 `**` 与二元/管道链，
+    /// 彻底消除深层表达式在 1 MiB 线程栈（含 debug `mora-lsp`）上的 OS 栈溢出风险。
     fn emit_pratt_w(&mut self) -> Option<MirWitness> {
         #[derive(Clone, Copy)]
         enum InfixOp {
@@ -238,6 +240,25 @@ impl ParserV3 {
                     InfixOp::MulDivMod(_) => 7,
                 }
             }
+        }
+
+        #[derive(Clone, Copy)]
+        enum UnaryPrefix {
+            Not(Span),
+            Minus(Span),
+        }
+
+        struct PowPending {
+            lhs: MirWitness,
+            pow_span: Span,
+            outer_prefixes: Vec<UnaryPrefix>,
+        }
+
+        struct ParenFrame {
+            operands: Vec<(MirWitness, Span)>,
+            ops: Vec<InfixOp>,
+            prefixes: Vec<UnaryPrefix>,
+            pow_stack: Vec<PowPending>,
         }
 
         fn fold_infix(lhs: MirWitness, op: InfixOp, mut rhs: MirWitness, span: Span) -> MirWitness {
@@ -305,6 +326,111 @@ impl ParserV3 {
             }
         }
 
+        fn fold_all(
+            operands: &mut Vec<(MirWitness, Span)>,
+            ops: &mut Vec<InfixOp>,
+        ) -> Option<MirWitness> {
+            while let Some(top_op) = ops.pop() {
+                let (rhs, span) = operands.pop()?;
+                let (lhs, _) = operands.pop()?;
+                operands.push((fold_infix(lhs, top_op, rhs, span), span));
+            }
+            operands.pop().map(|(w, _)| w)
+        }
+
+        let apply_unary_prefixes = |this: &Self,
+                                    mut expr: MirWitness,
+                                    prefixes: Vec<UnaryPrefix>|
+         -> Option<MirWitness> {
+            for p in prefixes.into_iter().rev() {
+                expr = match p {
+                    UnaryPrefix::Not(span) => {
+                        this.check_unnegated_typed_int(&expr)?;
+                        MirWitness {
+                            kind: WitnessKind::Call {
+                                callee: crate::mir::witness::WitnessCallee::Builtin(
+                                    crate::mir::witness::BuiltinOp::Not,
+                                ),
+                                args: vec![expr],
+                                named_args: Vec::new(),
+                            },
+                            span,
+                        }
+                    }
+                    UnaryPrefix::Minus(span) => match &expr.kind {
+                        WitnessKind::Literal(Literal::TypedInt(n, dt, _)) => {
+                            let (n, dt) = (*n, *dt);
+                            let neg = match n.checked_neg() {
+                                Some(v) => v,
+                                None => {
+                                    eprintln!(
+                                        "Parse error: integer literal '-{}' out of range for '{}' at line {}, column {}",
+                                        n,
+                                        dt.short_name(),
+                                        span.line,
+                                        span.column
+                                    );
+                                    return None;
+                                }
+                            };
+                            if let Err(msg) = dt.check_int_range(neg) {
+                                eprintln!(
+                                    "Parse error: {} at line {}, column {}",
+                                    msg, span.line, span.column
+                                );
+                                return None;
+                            }
+                            MirWitness {
+                                kind: WitnessKind::Literal(Literal::TypedInt(neg, dt, span)),
+                                span,
+                            }
+                        }
+                        WitnessKind::Literal(Literal::TypedFloat(f, dt, _)) => {
+                            let (f, dt) = (*f, *dt);
+                            MirWitness {
+                                kind: WitnessKind::Literal(Literal::TypedFloat(
+                                    dt.quantize_f64(-f),
+                                    dt,
+                                    span,
+                                )),
+                                span,
+                            }
+                        }
+                        _ => MirWitness {
+                            kind: WitnessKind::Call {
+                                callee: crate::mir::witness::WitnessCallee::Builtin(
+                                    crate::mir::witness::BuiltinOp::Neg,
+                                ),
+                                args: vec![expr],
+                                named_args: Vec::new(),
+                            },
+                            span,
+                        },
+                    },
+                };
+            }
+            this.check_unnegated_typed_int(&expr)?;
+            Some(expr)
+        };
+
+        let is_iterative_paren_start = |this: &Self| -> bool {
+            if !this.check(&TokenType::LParen) {
+                return false;
+            }
+            let Some(next) = this.tokens.get(this.current + 1) else {
+                return false;
+            };
+            match &next.token_type {
+                TokenType::If => false,
+                TokenType::Identifier(s) if s == "handle" || s == "perform" => false,
+                TokenType::Identifier(_) => !matches!(
+                    this.tokens.get(this.current + 2).map(|t| &t.token_type),
+                    Some(TokenType::Assign)
+                ),
+                _ => true,
+            }
+        };
+
         let peek_consume_infix = |this: &mut Self| -> Option<InfixOp> {
             if this
                 .peek()
@@ -367,134 +493,113 @@ impl ParserV3 {
             None
         };
 
-        let first = self.emit_unary_w()?;
-        let mut operands: Vec<(MirWitness, Span)> = vec![(first, self.span_of_current())];
+        let mut paren_stack: Vec<ParenFrame> = Vec::new();
+        let mut operands: Vec<(MirWitness, Span)> = Vec::new();
         let mut ops: Vec<InfixOp> = Vec::new();
+        let mut prefixes: Vec<UnaryPrefix> = Vec::new();
+        let mut pow_stack: Vec<PowPending> = Vec::new();
 
-        while let Some(op) = peek_consume_infix(self) {
-            let prec = op.precedence();
-            while let Some(&top_op) = ops.last() {
-                if top_op.precedence() >= prec {
-                    let top_op = ops.pop().expect("ops non-empty");
-                    let (rhs, span) = operands.pop().expect("rhs operand present");
-                    let (lhs, _) = operands.pop().expect("lhs operand present");
-                    operands.push((fold_infix(lhs, top_op, rhs, span), span));
+        'expect_operand: loop {
+            // 1. Collect unary prefixes (`not`, `!`, `-`) iteratively
+            loop {
+                let span = self.span_of_current();
+                if self
+                    .peek()
+                    .map(|t| {
+                        matches!(&t.token_type, TokenType::Identifier(s) if s == "not")
+                            || t.token_type == TokenType::Bang
+                    })
+                    .unwrap_or(false)
+                {
+                    self.advance();
+                    prefixes.push(UnaryPrefix::Not(span));
+                } else if self.match_token(&[TokenType::Minus]) {
+                    prefixes.push(UnaryPrefix::Minus(span));
                 } else {
                     break;
                 }
             }
-            ops.push(op);
-            let rhs = self.emit_unary_w()?;
-            let span = self.span_of_current();
-            operands.push((rhs, span));
-        }
 
-        while let Some(top_op) = ops.pop() {
-            let (rhs, span) = operands.pop().expect("rhs operand present");
-            let (lhs, _) = operands.pop().expect("lhs operand present");
-            operands.push((fold_infix(lhs, top_op, rhs, span), span));
-        }
+            // 2. Open nested parenthesized Pratt sub-expression iteratively on heap stack
+            if is_iterative_paren_start(self) {
+                self.advance(); // consume '('
+                paren_stack.push(ParenFrame {
+                    operands: std::mem::take(&mut operands),
+                    ops: std::mem::take(&mut ops),
+                    prefixes: std::mem::take(&mut prefixes),
+                    pow_stack: std::mem::take(&mut pow_stack),
+                });
+                continue 'expect_operand;
+            }
 
-        operands.pop().map(|(w, _)| w)
-    }
+            // 3. Parse call/primary atom
+            let mut atom = self.emit_call_w()?;
 
-    fn emit_unary_w(&mut self) -> Option<MirWitness> {
-        #[derive(Clone, Copy)]
-        enum UnaryPrefix {
-            Not(Span),
-            Minus(Span),
-        }
+            'have_atom: loop {
+                // 4. Right-associative `**` binds tighter than unary `-` on LHS
+                if self.check(&TokenType::StarStar) {
+                    self.check_unnegated_typed_int(&atom)?;
+                    let pow_span = self.span_of_current();
+                    self.advance();
+                    pow_stack.push(PowPending {
+                        lhs: atom,
+                        pow_span,
+                        outer_prefixes: std::mem::take(&mut prefixes),
+                    });
+                    continue 'expect_operand;
+                }
 
-        let mut prefixes = Vec::new();
-        loop {
-            let span = self.span_of_current();
-            if self
-                .peek()
-                .map(|t| {
-                    matches!(&t.token_type, TokenType::Identifier(s) if s == "not")
-                        || t.token_type == TokenType::Bang
-                })
-                .unwrap_or(false)
-            {
-                self.advance();
-                prefixes.push(UnaryPrefix::Not(span));
-            } else if self.match_token(&[TokenType::Minus]) {
-                prefixes.push(UnaryPrefix::Minus(span));
-            } else {
-                break;
+                // 5. Apply current unary prefixes and unwind right-associative `**` chain
+                let mut expr = apply_unary_prefixes(self, atom, std::mem::take(&mut prefixes))?;
+                while let Some(pending) = pow_stack.pop() {
+                    let pow_expr = MirWitness {
+                        kind: WitnessKind::Binary {
+                            left: Box::new(pending.lhs),
+                            op: BinaryOp::Pow,
+                            right: Box::new(expr),
+                        },
+                        span: pending.pow_span,
+                    };
+                    expr = apply_unary_prefixes(self, pow_expr, pending.outer_prefixes)?;
+                }
+
+                let span = self.span_of_current();
+                operands.push((expr, span));
+
+                // 6. Check for infix operator at current paren level
+                if let Some(op) = peek_consume_infix(self) {
+                    let prec = op.precedence();
+                    while let Some(&top_op) = ops.last() {
+                        if top_op.precedence() >= prec {
+                            let top_op = ops.pop().expect("ops non-empty");
+                            let (rhs, rspan) = operands.pop().expect("rhs operand present");
+                            let (lhs, _) = operands.pop().expect("lhs operand present");
+                            operands.push((fold_infix(lhs, top_op, rhs, rspan), rspan));
+                        } else {
+                            break;
+                        }
+                    }
+                    ops.push(op);
+                    continue 'expect_operand;
+                }
+
+                // 7. No infix op: if inside an iterative `(`, close it and apply postfix tail!
+                if let Some(frame) = paren_stack.pop() {
+                    let inner = fold_all(&mut operands, &mut ops)?;
+                    let inner = self.emit_dyn_coercion(inner)?;
+                    self.consume(TokenType::RParen, "Expected ')'")?;
+                    atom = self.emit_call_tail_w(inner)?;
+                    operands = frame.operands;
+                    ops = frame.ops;
+                    prefixes = frame.prefixes;
+                    pow_stack = frame.pow_stack;
+                    continue 'have_atom;
+                }
+
+                // 8. Top-level completion
+                return fold_all(&mut operands, &mut ops);
             }
         }
-
-        let mut expr = self.emit_power_w()?;
-        for p in prefixes.into_iter().rev() {
-            expr = match p {
-                UnaryPrefix::Not(span) => {
-                    self.check_unnegated_typed_int(&expr)?;
-                    MirWitness {
-                        kind: WitnessKind::Call {
-                            callee: crate::mir::witness::WitnessCallee::Builtin(
-                                crate::mir::witness::BuiltinOp::Not,
-                            ),
-                            args: vec![expr],
-                            named_args: Vec::new(),
-                        },
-                        span,
-                    }
-                }
-                UnaryPrefix::Minus(span) => match &expr.kind {
-                    WitnessKind::Literal(Literal::TypedInt(n, dt, _)) => {
-                        let (n, dt) = (*n, *dt);
-                        let neg = match n.checked_neg() {
-                            Some(v) => v,
-                            None => {
-                                eprintln!(
-                                    "Parse error: integer literal '-{}' out of range for '{}' at line {}, column {}",
-                                    n,
-                                    dt.short_name(),
-                                    span.line,
-                                    span.column
-                                );
-                                return None;
-                            }
-                        };
-                        if let Err(msg) = dt.check_int_range(neg) {
-                            eprintln!(
-                                "Parse error: {} at line {}, column {}",
-                                msg, span.line, span.column
-                            );
-                            return None;
-                        }
-                        MirWitness {
-                            kind: WitnessKind::Literal(Literal::TypedInt(neg, dt, span)),
-                            span,
-                        }
-                    }
-                    WitnessKind::Literal(Literal::TypedFloat(f, dt, _)) => {
-                        let (f, dt) = (*f, *dt);
-                        MirWitness {
-                            kind: WitnessKind::Literal(Literal::TypedFloat(
-                                dt.quantize_f64(-f),
-                                dt,
-                                span,
-                            )),
-                            span,
-                        }
-                    }
-                    _ => MirWitness {
-                        kind: WitnessKind::Call {
-                            callee: crate::mir::witness::WitnessCallee::Builtin(
-                                crate::mir::witness::BuiltinOp::Neg,
-                            ),
-                            args: vec![expr],
-                            named_args: Vec::new(),
-                        },
-                        span,
-                    },
-                },
-            };
-        }
-        self.check_unnegated_typed_int(&expr)?;
-        Some(expr)
     }
 
     fn check_unnegated_typed_int(&self, w: &MirWitness) -> Option<()> {
@@ -508,26 +613,6 @@ impl ParserV3 {
             return None;
         }
         Some(())
-    }
-
-    /// Right-associative power operator `**` (binds tighter than unary `-` on LHS).
-    fn emit_power_w(&mut self) -> Option<MirWitness> {
-        let lhs = self.emit_call_w()?;
-        if self.check(&TokenType::StarStar) {
-            self.check_unnegated_typed_int(&lhs)?;
-            let span = self.span_of_current();
-            self.advance();
-            let rhs = self.emit_unary_w()?;
-            return Some(MirWitness {
-                kind: WitnessKind::Binary {
-                    left: Box::new(lhs),
-                    op: BinaryOp::Pow,
-                    right: Box::new(rhs),
-                },
-                span,
-            });
-        }
-        Some(lhs)
     }
 
     /// 调用链（函数 / 方法 / 索引 / DynTrait）。

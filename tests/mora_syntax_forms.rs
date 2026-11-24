@@ -197,8 +197,8 @@ const FORMS: &[(&str, &str, Form, &str)] = &[
     (
         "Result 传播 `?`",
         "let x = f(1)?\nprint(x)\n",
-        Form::Rejected,
-        "D124 实测：Result 传播**完全未实现**（spec 有 3 处示例 + 1 条产生式）",
+        Form::Ok,
+        "v0.112.0 G2 已完整实现：Result/Option/nullable 后缀 `?` 错误传播已接通 Parser → HM → Control SSA IR → MORABC02 → VM",
     ),
     // ── 异质集合 ─────────────────────────────────────────
     // ⚠ 注意这两条**解析通过但 typeck 拒绝**：`ParserV3::compile` 只解析、

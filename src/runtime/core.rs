@@ -70,7 +70,7 @@ impl EngineShared {
     }
 
     /// Borrow the shared [`DagPlanCache`].
-    pub fn dag_cache(&self) -> &Arc<DagPlanCache> {
+    pub(crate) fn dag_cache(&self) -> &Arc<DagPlanCache> {
         &self.dag_cache
     }
 }

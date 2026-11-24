@@ -731,7 +731,17 @@ impl Value {
                 "to_list",
             ],
             Value::StructType(_) => &["schema", "tags", "fields"],
-            Value::StructInstance { .. } => &["to_dict", "schema", "tags", "json"],
+            Value::StructInstance { .. } => &[
+                "to_dict",
+                "schema",
+                "tags",
+                "json",
+                "parameters",
+                "named_parameters",
+                "state_dict",
+                "load_state_dict",
+                "to_device",
+            ],
             Value::EnumType(_) => &["variants"],
             _ => &[],
         };

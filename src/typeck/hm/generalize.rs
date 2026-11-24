@@ -149,26 +149,35 @@ pub(crate) fn remap_type_vars(ty: &Type, mapping: &HashMap<TypeVarId, TypeVarId>
                 }
                 crate::typeck::ShapeType::Ranked(dims) => crate::typeck::ShapeType::Ranked(
                     dims.iter()
-                        .map(|d| match d {
-                            crate::typeck::DimExpr::Known(n) => crate::typeck::DimExpr::Known(*n),
-                            crate::typeck::DimExpr::Var(id) => {
-                                match mapping.get(&TypeVarId::Meta(*id)) {
-                                    Some(TypeVarId::Meta(nid)) => crate::typeck::DimExpr::Var(*nid),
-                                    Some(TypeVarId::Rigid(sym)) => {
-                                        crate::typeck::DimExpr::Symbolic(sym.clone())
-                                    }
-                                    None => crate::typeck::DimExpr::Var(*id),
+                        .map(|d| {
+                            d.map_leaves(&mut |leaf| match leaf {
+                                crate::typeck::DimExpr::Known(n) => {
+                                    crate::typeck::DimExpr::Known(*n)
                                 }
-                            }
-                            crate::typeck::DimExpr::Symbolic(sym) => {
-                                match mapping.get(&TypeVarId::Rigid(sym.clone())) {
-                                    Some(TypeVarId::Meta(nid)) => crate::typeck::DimExpr::Var(*nid),
-                                    Some(TypeVarId::Rigid(nsym)) => {
-                                        crate::typeck::DimExpr::Symbolic(nsym.clone())
+                                crate::typeck::DimExpr::Var(id) => {
+                                    match mapping.get(&TypeVarId::Meta(*id)) {
+                                        Some(TypeVarId::Meta(nid)) => {
+                                            crate::typeck::DimExpr::Var(*nid)
+                                        }
+                                        Some(TypeVarId::Rigid(sym)) => {
+                                            crate::typeck::DimExpr::Symbolic(sym.clone())
+                                        }
+                                        None => crate::typeck::DimExpr::Var(*id),
                                     }
-                                    None => crate::typeck::DimExpr::Symbolic(sym.clone()),
                                 }
-                            }
+                                crate::typeck::DimExpr::Symbolic(sym) => {
+                                    match mapping.get(&TypeVarId::Rigid(sym.clone())) {
+                                        Some(TypeVarId::Meta(nid)) => {
+                                            crate::typeck::DimExpr::Var(*nid)
+                                        }
+                                        Some(TypeVarId::Rigid(nsym)) => {
+                                            crate::typeck::DimExpr::Symbolic(nsym.clone())
+                                        }
+                                        None => crate::typeck::DimExpr::Symbolic(sym.clone()),
+                                    }
+                                }
+                                crate::typeck::DimExpr::BinOp(..) => leaf.clone(),
+                            })
                         })
                         .collect(),
                 ),
@@ -288,35 +297,46 @@ fn instantiate_ty(
                 }
                 crate::typeck::ShapeType::Ranked(dims) => crate::typeck::ShapeType::Ranked(
                     dims.iter()
-                        .map(|d| match d {
-                            crate::typeck::DimExpr::Known(n) => crate::typeck::DimExpr::Known(*n),
-                            crate::typeck::DimExpr::Var(id) => {
-                                match mapping.get(&TypeVarId::Meta(*id)) {
-                                    Some(TypeVarId::Meta(nid)) => crate::typeck::DimExpr::Var(*nid),
-                                    Some(TypeVarId::Rigid(sym)) => {
-                                        crate::typeck::DimExpr::Symbolic(sym.clone())
-                                    }
-                                    None => crate::typeck::DimExpr::Var(*id),
+                        .map(|d| {
+                            d.map_leaves(&mut |leaf| match leaf {
+                                crate::typeck::DimExpr::Known(n) => {
+                                    crate::typeck::DimExpr::Known(*n)
                                 }
-                            }
-                            crate::typeck::DimExpr::Symbolic(sym) => {
-                                if sym == "_" {
-                                    match fresh_id() {
-                                        TypeVarId::Meta(nid) => crate::typeck::DimExpr::Var(nid),
-                                        TypeVarId::Rigid(s) => crate::typeck::DimExpr::Symbolic(s),
-                                    }
-                                } else {
-                                    match mapping.get(&TypeVarId::Rigid(sym.clone())) {
+                                crate::typeck::DimExpr::Var(id) => {
+                                    match mapping.get(&TypeVarId::Meta(*id)) {
                                         Some(TypeVarId::Meta(nid)) => {
                                             crate::typeck::DimExpr::Var(*nid)
                                         }
-                                        Some(TypeVarId::Rigid(nsym)) => {
-                                            crate::typeck::DimExpr::Symbolic(nsym.clone())
+                                        Some(TypeVarId::Rigid(sym)) => {
+                                            crate::typeck::DimExpr::Symbolic(sym.clone())
                                         }
-                                        None => crate::typeck::DimExpr::Symbolic(sym.clone()),
+                                        None => crate::typeck::DimExpr::Var(*id),
                                     }
                                 }
-                            }
+                                crate::typeck::DimExpr::Symbolic(sym) => {
+                                    if sym == "_" {
+                                        match fresh_id() {
+                                            TypeVarId::Meta(nid) => {
+                                                crate::typeck::DimExpr::Var(nid)
+                                            }
+                                            TypeVarId::Rigid(s) => {
+                                                crate::typeck::DimExpr::Symbolic(s)
+                                            }
+                                        }
+                                    } else {
+                                        match mapping.get(&TypeVarId::Rigid(sym.clone())) {
+                                            Some(TypeVarId::Meta(nid)) => {
+                                                crate::typeck::DimExpr::Var(*nid)
+                                            }
+                                            Some(TypeVarId::Rigid(nsym)) => {
+                                                crate::typeck::DimExpr::Symbolic(nsym.clone())
+                                            }
+                                            None => crate::typeck::DimExpr::Symbolic(sym.clone()),
+                                        }
+                                    }
+                                }
+                                crate::typeck::DimExpr::BinOp(..) => leaf.clone(),
+                            })
                         })
                         .collect(),
                 ),

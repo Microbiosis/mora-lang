@@ -8,6 +8,7 @@
 //! Every stackful call is expressed as a [`CallAction`] descriptor rather than as a nested
 //! Rust call, so resolution itself never grows the C stack.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::common::Span;
@@ -1568,7 +1569,7 @@ pub fn resolve_method_call_named(
             {
                 return resolve_value_call_named(func, all_args, named_args, core);
             }
-            // 3. Built-in struct instance reflection / projection methods
+            // 3. Built-in struct instance reflection / projection & Layer parameter-state methods
             match method {
                 "to_dict" => return Ok(CallAction::Done(Value::Dict(fields.clone()))),
                 "schema" => return Ok(CallAction::Done(def.to_schema_value())),
@@ -1577,6 +1578,52 @@ pub fn resolve_method_call_named(
                     return Ok(CallAction::Done(Value::String(crate::flow::value_to_json(
                         &receiver,
                     ))));
+                }
+                "parameters" => {
+                    if !args.is_empty() || !named_args.is_empty() {
+                        return Err(MoraError::Runtime(format!(
+                            "{}.parameters() expects 0 arguments",
+                            type_name
+                        )));
+                    }
+                    let mut out = Vec::new();
+                    collect_struct_tensors(&receiver, "", false, &mut |_, t| {
+                        out.push(Value::Tensor(t));
+                    });
+                    return Ok(CallAction::Done(Value::List(out.into())));
+                }
+                "named_parameters" | "state_dict" => {
+                    let include_buffers = method == "state_dict";
+                    let prefix = extract_optional_prefix_arg(method, &args, &named_args)?;
+                    let mut out = HashMap::new();
+                    collect_struct_tensors(&receiver, &prefix, include_buffers, &mut |k, t| {
+                        out.insert(k, Value::Tensor(t));
+                    });
+                    return Ok(CallAction::Done(Value::Dict(out)));
+                }
+                "load_state_dict" => {
+                    let (state_map, strict) =
+                        extract_load_state_dict_args(type_name, &args, &named_args)?;
+                    let updated = load_struct_state_dict(&receiver, state_map, strict)?;
+                    return Ok(CallAction::Done(updated));
+                }
+                "to_device" => {
+                    if args.len() != 1 || !named_args.is_empty() {
+                        return Err(MoraError::Runtime(format!(
+                            "{}.to_device(device) expects 1 string argument",
+                            type_name
+                        )));
+                    }
+                    let Value::String(dev_str) = &args[0] else {
+                        return Err(MoraError::Runtime(format!(
+                            "{}.to_device(device) expects a device string, got {}",
+                            type_name,
+                            crate::flow::type_name(&args[0])
+                        )));
+                    };
+                    let dev = crate::common::Device::parse(dev_str)?;
+                    let moved = move_struct_to_device(&receiver, &dev)?;
+                    return Ok(CallAction::Done(moved));
                 }
                 _ => {}
             }
@@ -4175,5 +4222,354 @@ fn dispatch_named_callable(
                 Err(MoraError::Runtime(format!("'{name}' is not callable")))
             }
         }
+    }
+}
+
+/// G2: Field role classification derived from compile-time `@tag(...)` metadata on a `struct` field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LayerFieldRole {
+    /// Trainable parameter or container traversed for both `parameters()` and `state_dict()`.
+    Param,
+    /// Persistent non-trainable buffer (`@tag(buffer="true")`): excluded from `parameters()`, included in `state_dict()`.
+    Buffer,
+    /// Ephemeral scratch (`@tag(transient="true")`): excluded from both `parameters()` and `state_dict()`.
+    Transient,
+    /// Explicitly non-parameter (`@tag(param="false")` without `buffer="true"`): excluded from `parameters()`, included in `state_dict()` if persistent tensor.
+    NonParam,
+}
+
+fn classify_layer_field(def: &StructDefRuntime, field_name: &str) -> LayerFieldRole {
+    let Some(fmeta) = def.fields.iter().find(|f| f.name == field_name) else {
+        return LayerFieldRole::Param;
+    };
+    let tag_true = |key: &str| {
+        fmeta
+            .tags
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case(key) && v.eq_ignore_ascii_case("true"))
+    };
+    let tag_false = |key: &str| {
+        fmeta
+            .tags
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case(key) && v.eq_ignore_ascii_case("false"))
+    };
+    if tag_true("transient") {
+        LayerFieldRole::Transient
+    } else if tag_true("buffer") {
+        LayerFieldRole::Buffer
+    } else if tag_false("param") {
+        LayerFieldRole::NonParam
+    } else {
+        LayerFieldRole::Param
+    }
+}
+
+fn join_state_key(prefix: &str, segment: &str) -> String {
+    if prefix.is_empty() {
+        segment.to_string()
+    } else {
+        format!("{prefix}.{segment}")
+    }
+}
+
+fn collect_struct_tensors(
+    val: &Value,
+    prefix: &str,
+    include_buffers: bool,
+    visit: &mut impl FnMut(String, Arc<crate::value::tensor::Tensor>),
+) {
+    match val {
+        Value::Tensor(t) => {
+            visit(prefix.to_string(), Arc::clone(t));
+        }
+        Value::StructInstance {
+            fields,
+            field_order,
+            def,
+            ..
+        } => {
+            for fname in field_order {
+                let Some(fval) = fields.get(fname) else {
+                    continue;
+                };
+                let role = classify_layer_field(def, fname);
+                match role {
+                    LayerFieldRole::Transient => continue,
+                    LayerFieldRole::Buffer | LayerFieldRole::NonParam if !include_buffers => {
+                        continue;
+                    }
+                    _ => {}
+                }
+                let child_key = join_state_key(prefix, fname);
+                collect_struct_tensors(fval, &child_key, include_buffers, visit);
+            }
+        }
+        Value::List(items) => {
+            for (idx, item) in items.iter().enumerate() {
+                let child_key = join_state_key(prefix, &idx.to_string());
+                collect_struct_tensors(item, &child_key, include_buffers, visit);
+            }
+        }
+        Value::Dict(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            for k in keys {
+                let child_key = join_state_key(prefix, k);
+                if let Some(v) = map.get(k) {
+                    collect_struct_tensors(v, &child_key, include_buffers, visit);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn extract_optional_prefix_arg(
+    method: &str,
+    args: &[Value],
+    named_args: &[(String, Value)],
+) -> MoraResult<String> {
+    if args.len() + named_args.len() > 1 {
+        return Err(MoraError::Runtime(format!(
+            "{method}(prefix?) expects at most 1 argument"
+        )));
+    }
+    let val = if let Some(v) = args.first() {
+        Some(v)
+    } else if let Some((k, v)) = named_args.first() {
+        if k != "prefix" {
+            return Err(MoraError::Runtime(format!(
+                "{method}() got unexpected keyword argument '{k}'"
+            )));
+        }
+        Some(v)
+    } else {
+        None
+    };
+    match val {
+        None | Some(Value::Nil) => Ok(String::new()),
+        Some(Value::String(s)) => Ok(s.clone()),
+        Some(other) => Err(MoraError::Runtime(format!(
+            "{method}(prefix) expects a string prefix, got {}",
+            crate::flow::type_name(other)
+        ))),
+    }
+}
+
+fn extract_load_state_dict_args<'a>(
+    type_name: &str,
+    args: &'a [Value],
+    named_args: &'a [(String, Value)],
+) -> MoraResult<(&'a HashMap<String, Value>, bool)> {
+    let mut state_val: Option<&Value> = args.first();
+    let mut strict_val: Option<&Value> = args.get(1);
+    if args.len() > 2 {
+        return Err(MoraError::Runtime(format!(
+            "{type_name}.load_state_dict(state, strict?) expects 1 or 2 arguments"
+        )));
+    }
+    for (k, v) in named_args {
+        match k.as_str() {
+            "state" | "state_dict" => {
+                if state_val.is_some() {
+                    return Err(MoraError::Runtime(format!(
+                        "{type_name}.load_state_dict() received multiple values for 'state'"
+                    )));
+                }
+                state_val = Some(v);
+            }
+            "strict" => {
+                if strict_val.is_some() {
+                    return Err(MoraError::Runtime(format!(
+                        "{type_name}.load_state_dict() received multiple values for 'strict'"
+                    )));
+                }
+                strict_val = Some(v);
+            }
+            _ => {
+                return Err(MoraError::Runtime(format!(
+                    "{type_name}.load_state_dict() got unexpected keyword argument '{k}'"
+                )));
+            }
+        }
+    }
+    let Some(Value::Dict(map)) = state_val else {
+        return Err(MoraError::Runtime(format!(
+            "{type_name}.load_state_dict(state, strict?) expects a dict as first argument"
+        )));
+    };
+    let strict = match strict_val {
+        None | Some(Value::Nil) => true,
+        Some(Value::Bool(b)) => *b,
+        Some(other) => {
+            return Err(MoraError::Runtime(format!(
+                "{type_name}.load_state_dict() expects bool for 'strict', got {}",
+                crate::flow::type_name(other)
+            )));
+        }
+    };
+    Ok((map, strict))
+}
+
+fn load_struct_state_dict(
+    root: &Value,
+    state: &HashMap<String, Value>,
+    strict: bool,
+) -> MoraResult<Value> {
+    let mut matched_keys = std::collections::HashSet::<String>::new();
+    let mut missing_keys = Vec::<String>::new();
+    let updated = rebuild_with_state_dict(root, "", state, &mut matched_keys, &mut missing_keys)?;
+    if strict {
+        let mut unexpected: Vec<String> = state
+            .keys()
+            .filter(|k| !matched_keys.contains(*k))
+            .cloned()
+            .collect();
+        unexpected.sort();
+        if !missing_keys.is_empty() || !unexpected.is_empty() {
+            let mut parts = Vec::new();
+            if !missing_keys.is_empty() {
+                parts.push(format!("missing keys: [{}]", missing_keys.join(", ")));
+            }
+            if !unexpected.is_empty() {
+                parts.push(format!("unexpected keys: [{}]", unexpected.join(", ")));
+            }
+            return Err(MoraError::Runtime(format!(
+                "load_state_dict(strict=true) mismatch: {}",
+                parts.join("; ")
+            )));
+        }
+    }
+    Ok(updated)
+}
+
+fn rebuild_with_state_dict(
+    val: &Value,
+    prefix: &str,
+    state: &HashMap<String, Value>,
+    matched_keys: &mut std::collections::HashSet<String>,
+    missing_keys: &mut Vec<String>,
+) -> MoraResult<Value> {
+    match val {
+        Value::Tensor(existing) => {
+            if let Some(new_val) = state.get(prefix) {
+                let Value::Tensor(new_t) = new_val else {
+                    return Err(MoraError::Runtime(format!(
+                        "load_state_dict: key '{prefix}' expected Tensor, got {}",
+                        crate::flow::type_name(new_val)
+                    )));
+                };
+                if new_t.shape != existing.shape {
+                    return Err(MoraError::Runtime(format!(
+                        "load_state_dict: shape mismatch for key '{prefix}': expected {:?}, got {:?}",
+                        existing.shape, new_t.shape
+                    )));
+                }
+                matched_keys.insert(prefix.to_string());
+                Ok(Value::Tensor(Arc::clone(new_t)))
+            } else {
+                missing_keys.push(prefix.to_string());
+                Ok(Value::Tensor(Arc::clone(existing)))
+            }
+        }
+        Value::StructInstance {
+            type_name,
+            fields,
+            field_order,
+            const_args,
+            def,
+        } => {
+            let mut new_fields = fields.clone();
+            for fname in field_order {
+                let Some(fval) = fields.get(fname) else {
+                    continue;
+                };
+                if classify_layer_field(def, fname) == LayerFieldRole::Transient {
+                    continue;
+                }
+                let child_key = join_state_key(prefix, fname);
+                let updated =
+                    rebuild_with_state_dict(fval, &child_key, state, matched_keys, missing_keys)?;
+                new_fields.insert(fname.clone(), updated);
+            }
+            Ok(Value::StructInstance {
+                type_name: type_name.clone(),
+                fields: new_fields,
+                field_order: field_order.clone(),
+                const_args: const_args.clone(),
+                def: Arc::clone(def),
+            })
+        }
+        Value::List(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for (idx, item) in items.iter().enumerate() {
+                let child_key = join_state_key(prefix, &idx.to_string());
+                out.push(rebuild_with_state_dict(
+                    item,
+                    &child_key,
+                    state,
+                    matched_keys,
+                    missing_keys,
+                )?);
+            }
+            Ok(Value::List(out.into()))
+        }
+        Value::Dict(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let mut out = HashMap::with_capacity(map.len());
+            for k in keys {
+                let child_key = join_state_key(prefix, k);
+                if let Some(v) = map.get(k) {
+                    out.insert(
+                        k.clone(),
+                        rebuild_with_state_dict(v, &child_key, state, matched_keys, missing_keys)?,
+                    );
+                }
+            }
+            Ok(Value::Dict(out))
+        }
+        other => Ok(other.clone()),
+    }
+}
+
+fn move_struct_to_device(val: &Value, dev: &crate::common::Device) -> MoraResult<Value> {
+    match val {
+        Value::Tensor(t) => Ok(Value::Tensor(t.to_device(dev.clone())?)),
+        Value::StructInstance {
+            type_name,
+            fields,
+            field_order,
+            const_args,
+            def,
+        } => {
+            let mut new_fields = HashMap::with_capacity(fields.len());
+            for (k, v) in fields {
+                new_fields.insert(k.clone(), move_struct_to_device(v, dev)?);
+            }
+            Ok(Value::StructInstance {
+                type_name: type_name.clone(),
+                fields: new_fields,
+                field_order: field_order.clone(),
+                const_args: const_args.clone(),
+                def: Arc::clone(def),
+            })
+        }
+        Value::List(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items.iter() {
+                out.push(move_struct_to_device(item, dev)?);
+            }
+            Ok(Value::List(out.into()))
+        }
+        Value::Dict(map) => {
+            let mut out = HashMap::with_capacity(map.len());
+            for (k, v) in map {
+                out.insert(k.clone(), move_struct_to_device(v, dev)?);
+            }
+            Ok(Value::Dict(out))
+        }
+        other => Ok(other.clone()),
     }
 }

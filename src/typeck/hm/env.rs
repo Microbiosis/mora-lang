@@ -132,13 +132,7 @@ pub(crate) fn collect_type_vars(ty: &Type) -> Vec<TypeVarId> {
                 crate::typeck::ShapeType::Unranked(None) => {}
                 crate::typeck::ShapeType::Ranked(dims) => {
                     for d in dims {
-                        match d {
-                            crate::typeck::DimExpr::Var(id) => vars.push(TypeVarId::Meta(*id)),
-                            crate::typeck::DimExpr::Symbolic(sym) if sym != "_" => {
-                                vars.push(TypeVarId::Rigid(sym.clone()))
-                            }
-                            _ => {}
-                        }
+                        d.collect_vars(&mut vars);
                     }
                 }
             }

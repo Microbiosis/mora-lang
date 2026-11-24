@@ -625,33 +625,80 @@ impl ParserV3 {
         })
     }
 
+    fn parse_dim_expr(&mut self) -> Option<crate::typeck::DimExpr> {
+        use crate::typeck::{DimExpr, DimOp};
+        let mut lhs = self.parse_dim_term()?;
+        loop {
+            let op = if self.match_token_exact(TokenType::Plus) {
+                DimOp::Add
+            } else if self.match_token_exact(TokenType::Minus) {
+                DimOp::Sub
+            } else {
+                break;
+            };
+            let rhs = self.parse_dim_term()?;
+            lhs = DimExpr::BinOp(op, Box::new(lhs), Box::new(rhs)).simplify();
+        }
+        Some(lhs)
+    }
+
+    fn parse_dim_term(&mut self) -> Option<crate::typeck::DimExpr> {
+        use crate::typeck::{DimExpr, DimOp};
+        let mut lhs = self.parse_dim_atom()?;
+        loop {
+            let op = if self.match_token_exact(TokenType::Star) {
+                DimOp::Mul
+            } else if self.match_token_exact(TokenType::Slash) {
+                DimOp::Div
+            } else {
+                break;
+            };
+            let rhs = self.parse_dim_atom()?;
+            lhs = DimExpr::BinOp(op, Box::new(lhs), Box::new(rhs)).simplify();
+        }
+        Some(lhs)
+    }
+
+    fn parse_dim_atom(&mut self) -> Option<crate::typeck::DimExpr> {
+        use crate::typeck::DimExpr;
+        if self.match_token_exact(TokenType::LParen) {
+            let inner = self.parse_dim_expr()?;
+            self.consume(
+                TokenType::RParen,
+                "Expected ')' in tensor dimension expression",
+            )?;
+            return Some(inner);
+        }
+        let tok = self.peek()?.token_type.clone();
+        match tok {
+            TokenType::Int(n) if n >= 0 => {
+                self.advance();
+                Some(DimExpr::Known(n as usize))
+            }
+            TokenType::TypedInt(n, _) if n >= 0 => {
+                self.advance();
+                Some(DimExpr::Known(n as usize))
+            }
+            TokenType::Identifier(sym) => {
+                self.advance();
+                Some(DimExpr::Symbolic(sym))
+            }
+            _ => {
+                eprintln!(
+                    "Parse error: expected dimension size, symbolic name, or expression in tensor shape at line {}",
+                    self.current_line()
+                );
+                None
+            }
+        }
+    }
+
     fn parse_tensor_shape_annotation(&mut self) -> Option<crate::typeck::ShapeType> {
-        use crate::typeck::{DimExpr, ShapeType, TypeVarId};
+        use crate::typeck::{ShapeType, TypeVarId};
         if self.match_token_exact(TokenType::LBracket) {
             let mut dims = Vec::new();
             while !self.check(&TokenType::RBracket) && !self.is_at_end() {
-                let tok = self.peek()?.token_type.clone();
-                match tok {
-                    TokenType::Int(n) if n >= 0 => {
-                        self.advance();
-                        dims.push(DimExpr::Known(n as usize));
-                    }
-                    TokenType::TypedInt(n, _) if n >= 0 => {
-                        self.advance();
-                        dims.push(DimExpr::Known(n as usize));
-                    }
-                    TokenType::Identifier(sym) => {
-                        self.advance();
-                        dims.push(DimExpr::Symbolic(sym));
-                    }
-                    _ => {
-                        eprintln!(
-                            "Parse error: expected dimension size or symbolic name in tensor shape at line {}",
-                            self.current_line()
-                        );
-                        return None;
-                    }
-                }
+                dims.push(self.parse_dim_expr()?);
                 if !self.match_token(&[TokenType::Comma]) {
                     break;
                 }

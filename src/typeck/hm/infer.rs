@@ -27,6 +27,35 @@ fn promote_list_elem(a: &Type, b: &Type) -> Type {
         (Type::TypeVar(TypeVarId::Meta(_)), other) | (other, Type::TypeVar(TypeVarId::Meta(_))) => {
             other.clone()
         }
+        (
+            Type::Tensor {
+                dtype: d1,
+                shape: s1,
+                device: dev1,
+            },
+            Type::Tensor {
+                dtype: d2,
+                shape: s2,
+                device: dev2,
+            },
+        ) => {
+            let dtype = if d1 == d2 { (**d1).clone() } else { Type::Any };
+            let shape = if s1 == s2 {
+                s1.clone()
+            } else {
+                crate::typeck::ShapeType::Unranked(None)
+            };
+            let device = if dev1 == dev2 {
+                dev1.clone()
+            } else {
+                crate::typeck::DeviceType::Any
+            };
+            Type::Tensor {
+                dtype: Box::new(dtype),
+                shape,
+                device,
+            }
+        }
         _ if is_numeric(a) && is_numeric(b) => promote_numeric(a, b),
         _ => a.clone(),
     }
@@ -2128,15 +2157,17 @@ impl HMInference {
                 default: None,
             })
             .collect();
-        self.infer_fn_def(Some(name), &[], &params, None, body, span)
+        self.infer_fn_def(Some(name), &[], &params, None, None, body, span)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn infer_fn_def(
         &mut self,
         name: Option<&str>,
         type_params: &[String],
         params: &[WitnessParam],
         return_type: Option<&Type>,
+        effect_annotation: Option<&crate::mir::effect::EffectRow>,
         body: &MirWitness,
         span: Span,
     ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
@@ -2222,7 +2253,16 @@ impl HMInference {
             ret_placeholder.clone()
         };
 
-        let arrow = Type::curried_arrow(&param_types, effective_ret, &body_row);
+        let effective_row = if let Some(declared) = effect_annotation {
+            let ctx_label = name
+                .map(|n| format!("fn '{n}'"))
+                .unwrap_or_else(|| "function".to_string());
+            self.check_declared_effect_row(declared, &body_row, &ctx_label, span)
+        } else {
+            body_row
+        };
+
+        let arrow = Type::curried_arrow(&param_types, effective_ret, &effective_row);
         let mut rigids: Vec<TypeVarId> = type_params
             .iter()
             .map(|p| TypeVarId::Rigid(p.clone()))
@@ -2256,14 +2296,347 @@ impl HMInference {
             self.record_binding(span, n, &final_ty);
             self.env.add(n.to_string(), final_ty.clone());
             self.fn_arities.entry(n.to_string()).or_insert(params.len());
-            let merged = match self.fn_effect_rows.get(n) {
-                Some(prev) => Self::union_effect_rows(prev, &body_row),
-                None => body_row.clone(),
+            let merged = if effect_annotation.is_some() {
+                effective_row.clone()
+            } else {
+                match self.fn_effect_rows.get(n) {
+                    Some(prev) => Self::union_effect_rows(prev, &effective_row),
+                    None => effective_row.clone(),
+                }
             };
             self.fn_effect_rows.insert(n.to_string(), merged);
         }
-        self.closure_rows.insert(span, body_row);
+        self.closure_rows.insert(span, effective_row);
         Ok((final_ty, crate::mir::effect::EffectRow::Empty))
+    }
+
+    /// G2: Static inference for `defer expr` / `defer do ... end`.
+    /// Validates the deferred cleanup body and propagates its effects into the enclosing scope.
+    pub(super) fn infer_defer(
+        &mut self,
+        body: &MirWitness,
+        _span: Span,
+    ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
+        let (_, body_row) = self.infer_recover(body);
+        Ok((Type::Nil, body_row))
+    }
+
+    /// G2: Static inference for postfix `expr?` error/optional propagation.
+    /// Supports:
+    /// 1. `Type::Result_(T, E)` -> unwraps `T` and constrains enclosing return type to `Result<_, E>`.
+    /// 2. Nominal Result-like `enum` (`Ok`/`Err` variants) -> unwraps `Ok` payload and constrains enclosing return type's `Err` payload.
+    /// 3. Nominal Option-like `enum` (`Some`/`None` variants) -> unwraps `Some` payload and constrains enclosing return type to Option-like enum.
+    /// 4. Nullable union `T | nil` (or `nil`) -> strips `nil` to yield `T` and constrains enclosing return type to accept `nil`.
+    pub(super) fn infer_try(
+        &mut self,
+        inner: &MirWitness,
+        span: Span,
+    ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
+        let (raw_ty, row) = self.infer_recover(inner);
+        let applied = self.subst.apply(&raw_ty);
+        let inner_ty = self.resolve_type_aliases(&applied);
+        if matches!(inner_ty, Type::Error) {
+            return Ok((Type::Error, row));
+        }
+
+        // 1. Built-in `Type::Result_(T, E)`.
+        if let Type::Result_(ok_ty, err_ty) = inner_ty {
+            if let Some(ret_target) = self.return_targets.last().cloned() {
+                let ret_applied = self.subst.apply(&ret_target);
+                match ret_applied {
+                    Type::Result_(_, ret_err_ty) => {
+                        self.constraints.push(
+                            SpannedConstraint::new(
+                                Constraint::Subtype {
+                                    sub: err_ty,
+                                    sup: ret_err_ty,
+                                },
+                                span,
+                            )
+                            .with_hint(
+                                "`?` error type must match enclosing function return error type",
+                            ),
+                        );
+                    }
+                    Type::TypeVar(_) => {
+                        let ret_ok = self.fresh_type_var();
+                        self.constraints.push(
+                            SpannedConstraint::new(
+                                Constraint::Eq(
+                                    Box::new(ret_target),
+                                    Box::new(Type::Result_(Box::new(ret_ok), err_ty)),
+                                ),
+                                span,
+                            )
+                            .with_hint("`?` constrains enclosing function to return Result"),
+                        );
+                    }
+                    Type::Any | Type::Error => {}
+                    other => {
+                        self.errors.push(TypeError::UnificationFailure {
+                            expected: "Result<_, _> return type for `?` operator".to_string(),
+                            got: other.name(),
+                            span: Some(span),
+                        });
+                    }
+                }
+            }
+            return Ok((*ok_ty, row));
+        }
+
+        // 2. Nominal Result-like (`Ok`/`Err`) or Option-like (`Some`/`None`) enum.
+        let nominal_enum = match &inner_ty {
+            Type::Concrete { name, generics, .. } | Type::Trait { name, generics } => self
+                .enum_defs
+                .get(name)
+                .cloned()
+                .map(|def| (name.clone(), generics.clone(), def)),
+            _ => None,
+        };
+        if let Some((ename, generics, edef)) = nominal_enum {
+            let ok_var = edef.variants.iter().find(|(v, _)| v == "Ok");
+            let err_var = edef.variants.iter().find(|(v, _)| v == "Err");
+            let some_var = edef.variants.iter().find(|(v, _)| v == "Some");
+            let none_var = edef.variants.iter().find(|(v, _)| v == "None");
+
+            if let (Some((_, ok_ps)), Some((_, err_ps))) = (ok_var, err_var) {
+                let ok_ty = Self::enum_payload_type(&edef.type_params, &generics, ok_ps);
+                let err_ty = Self::enum_payload_type(&edef.type_params, &generics, err_ps);
+                if let Some(ret_target) = self.return_targets.last().cloned() {
+                    let ret_applied = self.resolve_type_aliases(&self.subst.apply(&ret_target));
+                    match ret_applied {
+                        Type::Concrete {
+                            name: rname,
+                            generics: rgen,
+                            ..
+                        }
+                        | Type::Trait {
+                            name: rname,
+                            generics: rgen,
+                        } => {
+                            if let Some(rdef) = self.enum_defs.get(&rname).cloned()
+                                && let Some((_, rerr_ps)) =
+                                    rdef.variants.iter().find(|(v, _)| v == "Err")
+                            {
+                                let rerr_ty =
+                                    Self::enum_payload_type(&rdef.type_params, &rgen, rerr_ps);
+                                self.constraints.push(
+                                    SpannedConstraint::new(
+                                        Constraint::Subtype {
+                                            sub: Box::new(err_ty),
+                                            sup: Box::new(rerr_ty),
+                                        },
+                                        span,
+                                    )
+                                    .with_hint(
+                                        "`?` error payload must match enclosing function's Err variant type",
+                                    ),
+                                );
+                            } else {
+                                self.errors.push(TypeError::UnificationFailure {
+                                    expected: format!(
+                                        "Result-compatible enum return type (like `{ename}`) for `?`"
+                                    ),
+                                    got: rname,
+                                    span: Some(span),
+                                });
+                            }
+                        }
+                        Type::TypeVar(_) => {
+                            let err_rigid_vars: HashSet<String> = err_ps
+                                .iter()
+                                .flat_map(env::collect_type_vars)
+                                .filter_map(|v| match v {
+                                    TypeVarId::Rigid(s) => Some(s),
+                                    _ => None,
+                                })
+                                .collect();
+                            let ret_generics: Vec<Type> = edef
+                                .type_params
+                                .iter()
+                                .enumerate()
+                                .map(|(idx, tp)| {
+                                    if err_rigid_vars.contains(tp) {
+                                        generics
+                                            .get(idx)
+                                            .cloned()
+                                            .unwrap_or_else(|| self.fresh_type_var())
+                                    } else {
+                                        self.fresh_type_var()
+                                    }
+                                })
+                                .collect();
+                            let expected_ret = Type::Concrete {
+                                name: ename.clone(),
+                                generics: ret_generics,
+                                traits: Vec::new(),
+                            };
+                            self.constraints.push(
+                                SpannedConstraint::new(
+                                    Constraint::Eq(Box::new(ret_target), Box::new(expected_ret)),
+                                    span,
+                                )
+                                .with_hint("`?` constrains enclosing function return type"),
+                            );
+                        }
+                        Type::Any | Type::Error => {}
+                        other => {
+                            self.errors.push(TypeError::UnificationFailure {
+                                expected: format!(
+                                    "Result-compatible enum return type (like `{ename}`) for `?`"
+                                ),
+                                got: other.name(),
+                                span: Some(span),
+                            });
+                        }
+                    }
+                }
+                return Ok((ok_ty, row));
+            }
+
+            if let (Some((_, some_ps)), Some(_)) = (some_var, none_var) {
+                let some_ty = Self::enum_payload_type(&edef.type_params, &generics, some_ps);
+                if let Some(ret_target) = self.return_targets.last().cloned() {
+                    let ret_applied = self.resolve_type_aliases(&self.subst.apply(&ret_target));
+                    match ret_applied {
+                        Type::Concrete { name: rname, .. } | Type::Trait { name: rname, .. } => {
+                            let is_option_like = self
+                                .enum_defs
+                                .get(&rname)
+                                .is_some_and(|d| d.variants.iter().any(|(v, _)| v == "None"));
+                            if !is_option_like {
+                                self.errors.push(TypeError::UnificationFailure {
+                                    expected: format!(
+                                        "Option-compatible enum return type (like `{ename}`) for `?`"
+                                    ),
+                                    got: rname,
+                                    span: Some(span),
+                                });
+                            }
+                        }
+                        Type::TypeVar(_) => {
+                            let ret_generics: Vec<Type> = edef
+                                .type_params
+                                .iter()
+                                .map(|_| self.fresh_type_var())
+                                .collect();
+                            let expected_ret = Type::Concrete {
+                                name: ename.clone(),
+                                generics: ret_generics,
+                                traits: Vec::new(),
+                            };
+                            self.constraints.push(
+                                SpannedConstraint::new(
+                                    Constraint::Eq(Box::new(ret_target), Box::new(expected_ret)),
+                                    span,
+                                )
+                                .with_hint("`?` constrains enclosing function return type"),
+                            );
+                        }
+                        Type::Any | Type::Error => {}
+                        other => {
+                            self.errors.push(TypeError::UnificationFailure {
+                                expected: format!(
+                                    "Option-compatible enum return type (like `{ename}`) for `?`"
+                                ),
+                                got: other.name(),
+                                span: Some(span),
+                            });
+                        }
+                    }
+                }
+                return Ok((some_ty, row));
+            }
+
+            self.errors.push(TypeError::UnificationFailure {
+                expected:
+                    "Result (Ok/Err), Option (Some/None), or nullable (T | nil) for `?` operator"
+                        .to_string(),
+                got: format!("enum {ename}"),
+                span: Some(span),
+            });
+            return Ok((Type::Error, row));
+        }
+
+        // 3. Nullable union `T | nil` or literal `nil`.
+        let nullable_unwrapped = match &inner_ty {
+            Type::Nil => Some(Type::Nil),
+            Type::Union(members) if members.iter().any(|m| matches!(m, Type::Nil)) => {
+                let non_nil: Vec<Type> = members
+                    .iter()
+                    .filter(|m| !matches!(m, Type::Nil))
+                    .cloned()
+                    .collect();
+                let unwrapped = match non_nil.len() {
+                    0 => Type::Nil,
+                    1 => non_nil.into_iter().next().expect("length 1"),
+                    _ => Type::Union(non_nil),
+                };
+                Some(unwrapped)
+            }
+            _ => None,
+        };
+        if let Some(unwrapped) = nullable_unwrapped {
+            if let Some(ret_target) = self.return_targets.last().cloned() {
+                let ret_applied = self.resolve_type_aliases(&self.subst.apply(&ret_target));
+                match ret_applied {
+                    Type::TypeVar(_) => {
+                        let ok_v = self.fresh_type_var();
+                        // Put `Type::Nil` first so `Nil <: Nil | ok_v` matches `Nil` without
+                        // prematurely binding `ok_v := Nil`, while non-nil returns bind `ok_v`.
+                        let nullable_ret = Type::Union(vec![Type::Nil, ok_v]);
+                        self.constraints.push(
+                            SpannedConstraint::new(
+                                Constraint::Eq(Box::new(ret_target), Box::new(nullable_ret)),
+                                span,
+                            )
+                            .with_hint(
+                                "`?` on nullable value requires enclosing function to allow `nil`",
+                            ),
+                        );
+                    }
+                    Type::Any | Type::Error | Type::Nil => {}
+                    other => {
+                        self.constraints.push(
+                            SpannedConstraint::new(
+                                Constraint::Subtype {
+                                    sub: Box::new(Type::Nil),
+                                    sup: Box::new(other),
+                                },
+                                span,
+                            )
+                            .with_hint("`?` on nullable value requires enclosing function return type to allow `nil`"),
+                        );
+                    }
+                }
+            }
+            return Ok((unwrapped, row));
+        }
+
+        // 4. Polymorphic/dynamic fallback.
+        if matches!(inner_ty, Type::TypeVar(_)) {
+            return Ok((self.fresh_type_var(), row));
+        }
+        if matches!(inner_ty, Type::Any) {
+            return Ok((Type::Any, row));
+        }
+
+        // 5. Reject non-fallible concrete types statically.
+        self.errors.push(TypeError::UnificationFailure {
+            expected: "Result (Ok/Err), Option (Some/None), or nullable (T | nil) for `?` operator"
+                .to_string(),
+            got: inner_ty.name(),
+            span: Some(span),
+        });
+        Ok((Type::Error, row))
+    }
+
+    fn enum_payload_type(type_params: &[String], generics: &[Type], payload_tys: &[Type]) -> Type {
+        match payload_tys.len() {
+            0 => Type::Nil,
+            1 => super::stage3c::substitute_named_generics(&payload_tys[0], type_params, generics),
+            _ => Type::List(Box::new(Type::Any)),
+        }
     }
 
     pub(super) fn infer_match(
@@ -2791,6 +3164,7 @@ impl HMInference {
             }
             if let Some(prev) = &first_ty
                 && !ty.compatible_with(prev)
+                && !(matches!(prev, Type::Tensor { .. }) && matches!(ty, Type::Tensor { .. }))
             {
                 self.errors.push(TypeError::ListElementTypeMismatch {
                     index: idx,
@@ -2831,6 +3205,7 @@ impl HMInference {
             }
             if let Some(prev) = &first_v
                 && !ty.compatible_with(prev)
+                && !(matches!(prev, Type::Tensor { .. }) && matches!(ty, Type::Tensor { .. }))
             {
                 self.errors.push(TypeError::DictValueTypeMismatch {
                     key: key.clone(),
@@ -3483,17 +3858,16 @@ impl HMInference {
                     };
                     let merged = match (&da, &db) {
                         (DimExpr::Known(1), other) | (other, DimExpr::Known(1)) => other.clone(),
-                        (DimExpr::Known(x), DimExpr::Known(y)) if x == y => DimExpr::Known(*x),
-                        (DimExpr::Symbolic(sa), DimExpr::Symbolic(sb)) if sa == sb => {
-                            DimExpr::Symbolic(sa.clone())
-                        }
+                        (x, y) if x == y => x.clone(),
                         (DimExpr::Symbolic(s), other) | (other, DimExpr::Symbolic(s))
                             if s == "_" =>
                         {
                             other.clone()
                         }
-                        (DimExpr::Var(id1), DimExpr::Var(id2)) if id1 == id2 => DimExpr::Var(*id1),
-                        (DimExpr::Var(_), _) | (_, DimExpr::Var(_)) => {
+                        (DimExpr::Var(_), _)
+                        | (_, DimExpr::Var(_))
+                        | (DimExpr::BinOp(..), _)
+                        | (_, DimExpr::BinOp(..)) => {
                             let d1_ty = Type::Tensor {
                                 dtype: Box::new(Type::Any),
                                 shape: ShapeType::Ranked(vec![da.clone()]),
@@ -3504,15 +3878,15 @@ impl HMInference {
                                 shape: ShapeType::Ranked(vec![db.clone()]),
                                 device: crate::typeck::DeviceType::Any,
                             };
-                            if let Ok(new_s) = unify::solve_spanned(
+                            let new_s = unify::solve_spanned(
                                 &SpannedConstraint::new(
                                     Constraint::Eq(Box::new(d1_ty), Box::new(d2_ty)),
                                     span,
                                 ),
                                 &self.subst,
-                            ) {
-                                self.subst = new_s;
-                            }
+                            )
+                            .map_err(|e| vec![e])?;
+                            self.subst = new_s;
                             self.subst.apply_dim(&da)
                         }
                         _ => {

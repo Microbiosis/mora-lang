@@ -51,6 +51,8 @@ pub enum WitnessKind {
         type_params: Vec<String>,
         params: Vec<WitnessParam>,
         return_type: Option<crate::mir::hint::TypeHint>,
+        /// Optional explicit effect row constraint (`! pure` / `! io, async`).
+        effect_annotation: Option<crate::mir::effect::EffectRow>,
         body: Box<MirWitness>,
     },
     Match {
@@ -150,6 +152,14 @@ pub enum WitnessKind {
     },
     /// Wave 3 Stage 3C: Autograd tape suppression block (`no_grad ... end`).
     NoGrad {
+        body: Box<MirWitness>,
+    },
+    /// G2: Postfix error propagation operator (`expr?`) for `Result` / `Option` / nullable values.
+    Try {
+        expr: Box<MirWitness>,
+    },
+    /// G2: LIFO scope-exit explicit resource cleanup (`defer expr` / `defer do ... end` / `defer { ... }`).
+    Defer {
         body: Box<MirWitness>,
     },
     Import(String),
@@ -299,6 +309,7 @@ pub struct WitnessTraitMethod {
     pub type_params: Vec<String>,
     pub params: Vec<WitnessParam>,
     pub return_type: Option<crate::mir::hint::TypeHint>,
+    pub effect_annotation: Option<crate::mir::effect::EffectRow>,
     pub default_body: Option<MirWitness>,
     pub has_self: bool,
     pub span: Span,
@@ -311,6 +322,7 @@ pub struct WitnessImplMethod {
     pub type_params: Vec<String>,
     pub params: Vec<WitnessParam>,
     pub return_type: Option<crate::mir::hint::TypeHint>,
+    pub effect_annotation: Option<crate::mir::effect::EffectRow>,
     pub body: MirWitness,
     pub has_self: bool,
     pub span: Span,
@@ -434,7 +446,8 @@ impl MirWitness {
                 }
                 out
             }
-            WitnessKind::NoGrad { body } => vec![body.as_ref()],
+            WitnessKind::NoGrad { body } | WitnessKind::Defer { body } => vec![body.as_ref()],
+            WitnessKind::Try { expr } => vec![expr.as_ref()],
             WitnessKind::Binary { left, right, .. } => vec![left.as_ref(), right.as_ref()],
             WitnessKind::Call {
                 callee,
@@ -663,7 +676,8 @@ fn push_owned_witness_children(kind: WitnessKind, out: &mut Vec<MirWitness>) {
                 }
             }
         }
-        WitnessKind::NoGrad { body } => out.push(*body),
+        WitnessKind::NoGrad { body } | WitnessKind::Defer { body } => out.push(*body),
+        WitnessKind::Try { expr } => out.push(*expr),
         WitnessKind::Binary { left, right, .. }
         | WitnessKind::Or { left, right }
         | WitnessKind::And { left, right }

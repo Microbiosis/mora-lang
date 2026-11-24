@@ -246,7 +246,8 @@ fn walk_witness_kind<F: FnMut(&MirWitness)>(kind: &WitnessKind, visit: &mut F) {
                 }
             }
         }
-        WitnessKind::NoGrad { body } => walk_witness(body, visit),
+        WitnessKind::NoGrad { body } | WitnessKind::Defer { body } => walk_witness(body, visit),
+        WitnessKind::Try { expr } => walk_witness(expr, visit),
         WitnessKind::StructDef { fields, .. } => {
             for f in fields {
                 if let Some(d) = &f.default {

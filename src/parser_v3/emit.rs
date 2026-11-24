@@ -80,6 +80,9 @@ impl ParserV3 {
             TokenType::Identifier(ref s) if s == "no_grad" && self.is_no_grad_form() => {
                 self.emit_no_grad_w()
             }
+            TokenType::Identifier(ref s) if s == "defer" && self.is_defer_form() => {
+                self.emit_defer_w()
+            }
             // v0.75.81: 事务家族 + eval 断言（顶层同嵌套分发）
             // v0.104: `assign` 并入本组 —— 它是 spec §14.2 的一等语句
             //（assign_stmt），需在顶层与嵌套上下文都走同一分派。
@@ -685,6 +688,15 @@ impl ParserV3 {
                         callee: crate::mir::witness::WitnessCallee::Evaluated(Box::new(callee_w)),
                         args: arg_wits,
                         named_args,
+                    },
+                    span,
+                };
+            } else if self.match_token_exact(TokenType::Question) {
+                self.check_unnegated_typed_int(&callee_w)?;
+                let span = self.span_of_current();
+                callee_w = MirWitness {
+                    kind: WitnessKind::Try {
+                        expr: Box::new(callee_w),
                     },
                     span,
                 };
@@ -1873,6 +1885,9 @@ impl ParserV3 {
             TokenType::Identifier(ref s) if s == "no_grad" && self.is_no_grad_form() => {
                 self.emit_no_grad_w()
             }
+            TokenType::Identifier(ref s) if s == "defer" && self.is_defer_form() => {
+                self.emit_defer_w()
+            }
             TokenType::Identifier(ref s) if s == "kernel" && self.is_kernel_form() => {
                 self.emit_kernel_def_w()
             }
@@ -2494,6 +2509,69 @@ impl ParserV3 {
         };
         Some(MirWitness {
             kind: WitnessKind::NoGrad {
+                body: Box::new(body),
+            },
+            span,
+        })
+    }
+
+    /// G2: Contextual lookahead for `defer <stmt/expr>` / `defer do ... end` / `defer { ... }`.
+    fn is_defer_form(&self) -> bool {
+        let Some(tok) = self.peek() else {
+            return false;
+        };
+        if !matches!(&tok.token_type, TokenType::Identifier(s) if s == "defer") {
+            return false;
+        }
+        let Some(next) = self.tokens.get(self.current + 1) else {
+            return false;
+        };
+        !matches!(
+            next.token_type,
+            TokenType::Assign
+                | TokenType::LParen
+                | TokenType::RParen
+                | TokenType::RBracket
+                | TokenType::RBrace
+                | TokenType::Comma
+                | TokenType::Dot
+                | TokenType::Colon
+                | TokenType::Newline
+                | TokenType::End
+                | TokenType::Plus
+                | TokenType::Minus
+                | TokenType::Star
+                | TokenType::StarStar
+                | TokenType::Slash
+                | TokenType::Percent
+                | TokenType::At
+                | TokenType::Equal
+                | TokenType::NotEqual
+                | TokenType::Less
+                | TokenType::LessEqual
+                | TokenType::Greater
+                | TokenType::GreaterEqual
+                | TokenType::Pipe
+                | TokenType::Question
+                | TokenType::EOF
+        )
+    }
+
+    /// G2: Parse `defer do ... end`, `defer { ... }`, or `defer <statement/expr>`.
+    fn emit_defer_w(&mut self) -> Option<MirWitness> {
+        let span = self.span_of_current();
+        self.advance(); // consume 'defer'
+        let body = if self.check(&TokenType::LBrace) {
+            self.in_nested_scope(|this| this.emit_block_w())?
+        } else if self.match_token_exact(TokenType::Do) {
+            while self.match_token(&[TokenType::Newline]) {}
+            let stmts = self.emit_end_delimited_body_w("defer")?;
+            Self::block_witness(stmts, span)
+        } else {
+            self.emit_statement_expr_w()?
+        };
+        Some(MirWitness {
+            kind: WitnessKind::Defer {
                 body: Box::new(body),
             },
             span,

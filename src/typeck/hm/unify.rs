@@ -52,6 +52,12 @@ impl Substitution {
                 }
                 dim.clone()
             }
+            DimExpr::BinOp(op, lhs, rhs) => DimExpr::BinOp(
+                *op,
+                Box::new(self.apply_dim(lhs)),
+                Box::new(self.apply_dim(rhs)),
+            )
+            .simplify(),
             other => other.clone(),
         }
     }
@@ -107,7 +113,7 @@ impl Substitution {
                             DimExpr::Symbolic(sym) => {
                                 return Type::TypeVar(TypeVarId::Rigid(sym));
                             }
-                            DimExpr::Var(_) => {}
+                            DimExpr::Var(_) | DimExpr::BinOp(..) => {}
                         }
                     }
                 }
@@ -580,8 +586,12 @@ fn unify_dim_at(
     full_t2: &Type,
     span: Option<Span>,
 ) -> Result<(), TypeError> {
-    let a = subst.apply_dim(d1);
-    let b = subst.apply_dim(d2);
+    use crate::typeck::DimOp;
+    let a = subst.apply_dim(d1).simplify();
+    let b = subst.apply_dim(d2).simplify();
+    if a == b {
+        return Ok(());
+    }
     match (&a, &b) {
         (DimExpr::Known(x), DimExpr::Known(y)) if x == y => Ok(()),
         (DimExpr::Symbolic(s1), DimExpr::Symbolic(s2)) if s1 == s2 || s1 == "_" || s2 == "_" => {
@@ -590,6 +600,13 @@ fn unify_dim_at(
         (DimExpr::Symbolic(s), _) | (_, DimExpr::Symbolic(s)) if s == "_" => Ok(()),
         (DimExpr::Var(id1), DimExpr::Var(id2)) if id1 == id2 => Ok(()),
         (DimExpr::Var(id), other) | (other, DimExpr::Var(id)) => {
+            if other.contains_var(*id) {
+                return Err(TypeError::UnificationFailure {
+                    expected: format_type(&subst.apply(full_t1)),
+                    got: format_type(&subst.apply(full_t2)),
+                    span,
+                });
+            }
             subst.dim_mapping.insert(*id, other.clone());
             if let DimExpr::Known(n) = other {
                 subst
@@ -598,6 +615,42 @@ fn unify_dim_at(
                     .or_insert(Type::ConstInt(*n as i64));
             }
             Ok(())
+        }
+        // Linear dimension constraint solver: solve `expr op Known(c) == Known(k)`.
+        (DimExpr::BinOp(op, lhs, rhs), DimExpr::Known(k))
+        | (DimExpr::Known(k), DimExpr::BinOp(op, lhs, rhs)) => {
+            if let DimExpr::Known(c) = rhs.as_ref() {
+                let solved = match op {
+                    DimOp::Add if *k >= *c => Some(DimExpr::Known(*k - *c)),
+                    DimOp::Sub => Some(DimExpr::Known(k.saturating_add(*c))),
+                    DimOp::Mul if *c > 0 && *k % *c == 0 => Some(DimExpr::Known(*k / *c)),
+                    DimOp::Div if *c > 0 => Some(DimExpr::Known(k.saturating_mul(*c))),
+                    _ => None,
+                };
+                if let Some(target) = solved {
+                    return unify_dim_at(lhs, &target, subst, full_t1, full_t2, span);
+                }
+            } else if let DimExpr::Known(c) = lhs.as_ref() {
+                let solved = match op {
+                    DimOp::Add if *k >= *c => Some(DimExpr::Known(*k - *c)),
+                    DimOp::Sub if *c >= *k => Some(DimExpr::Known(*c - *k)),
+                    DimOp::Mul if *c > 0 && *k % *c == 0 => Some(DimExpr::Known(*k / *c)),
+                    DimOp::Div if *k > 0 && *c % *k == 0 => Some(DimExpr::Known(*c / *k)),
+                    _ => None,
+                };
+                if let Some(target) = solved {
+                    return unify_dim_at(rhs, &target, subst, full_t1, full_t2, span);
+                }
+            }
+            Err(TypeError::UnificationFailure {
+                expected: format_type(&subst.apply(full_t1)),
+                got: format_type(&subst.apply(full_t2)),
+                span,
+            })
+        }
+        (DimExpr::BinOp(op1, l1, r1), DimExpr::BinOp(op2, l2, r2)) if op1 == op2 => {
+            unify_dim_at(l1, l2, subst, full_t1, full_t2, span)?;
+            unify_dim_at(r1, r2, subst, full_t1, full_t2, span)
         }
         _ => Err(TypeError::UnificationFailure {
             expected: format_type(&subst.apply(full_t1)),

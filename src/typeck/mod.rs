@@ -44,7 +44,27 @@ impl std::fmt::Display for TypeVarId {
     }
 }
 
-/// Stage 3B: Static tensor dimension expression in `ShapeType::Ranked`.
+/// Linear arithmetic operator inside a static tensor dimension expression (`DimExpr::BinOp`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DimOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+impl std::fmt::Display for DimOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DimOp::Add => write!(f, "+"),
+            DimOp::Sub => write!(f, "-"),
+            DimOp::Mul => write!(f, "*"),
+            DimOp::Div => write!(f, "/"),
+        }
+    }
+}
+
+/// Stage 3B / G7: Static tensor dimension expression in `ShapeType::Ranked`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum DimExpr {
     /// Statically known concrete dimension extent (e.g., `128`).
@@ -53,15 +73,145 @@ pub enum DimExpr {
     Symbolic(String),
     /// Unification meta-variable for dimension inference.
     Var(u32),
+    /// Linear arithmetic expression over dimensions (e.g., `S + 1`, `D * 4`, `H / 2`).
+    BinOp(DimOp, Box<DimExpr>, Box<DimExpr>),
 }
 
 impl DimExpr {
+    /// Algebraically normalize and constant-fold linear dimension expressions.
+    pub(crate) fn simplify(&self) -> DimExpr {
+        match self {
+            DimExpr::Known(_) | DimExpr::Symbolic(_) | DimExpr::Var(_) => self.clone(),
+            DimExpr::BinOp(op, lhs, rhs) => {
+                let l = lhs.simplify();
+                let r = rhs.simplify();
+                match (*op, l, r) {
+                    // Constant folding
+                    (DimOp::Add, DimExpr::Known(a), DimExpr::Known(b)) => {
+                        DimExpr::Known(a.saturating_add(b))
+                    }
+                    (DimOp::Sub, DimExpr::Known(a), DimExpr::Known(b)) if a >= b => {
+                        DimExpr::Known(a - b)
+                    }
+                    (DimOp::Mul, DimExpr::Known(a), DimExpr::Known(b)) => {
+                        DimExpr::Known(a.saturating_mul(b))
+                    }
+                    (DimOp::Div, DimExpr::Known(a), DimExpr::Known(b)) if b > 0 && a % b == 0 => {
+                        DimExpr::Known(a / b)
+                    }
+                    // Algebraic identities & canonical ordering (Known on right for commutative ops)
+                    (DimOp::Add, x, DimExpr::Known(0)) | (DimOp::Add, DimExpr::Known(0), x) => x,
+                    (DimOp::Sub, x, DimExpr::Known(0)) => x,
+                    (DimOp::Mul, x, DimExpr::Known(1)) | (DimOp::Mul, DimExpr::Known(1), x) => x,
+                    (DimOp::Mul, _, DimExpr::Known(0)) | (DimOp::Mul, DimExpr::Known(0), _) => {
+                        DimExpr::Known(0)
+                    }
+                    (DimOp::Div, x, DimExpr::Known(1)) => x,
+                    (DimOp::Add, DimExpr::Known(k), x) => {
+                        DimExpr::BinOp(DimOp::Add, Box::new(x), Box::new(DimExpr::Known(k)))
+                            .simplify()
+                    }
+                    (DimOp::Mul, DimExpr::Known(k), x) => {
+                        DimExpr::BinOp(DimOp::Mul, Box::new(x), Box::new(DimExpr::Known(k)))
+                            .simplify()
+                    }
+                    // Associativity & inverse cancellation
+                    (DimOp::Add, DimExpr::BinOp(DimOp::Add, inner, c1), DimExpr::Known(b)) => {
+                        if let DimExpr::Known(a) = *c1 {
+                            DimExpr::BinOp(
+                                DimOp::Add,
+                                inner,
+                                Box::new(DimExpr::Known(a.saturating_add(b))),
+                            )
+                            .simplify()
+                        } else {
+                            DimExpr::BinOp(
+                                DimOp::Add,
+                                Box::new(DimExpr::BinOp(DimOp::Add, inner, c1)),
+                                Box::new(DimExpr::Known(b)),
+                            )
+                        }
+                    }
+                    (DimOp::Sub, DimExpr::BinOp(DimOp::Add, inner, c1), DimExpr::Known(b)) if matches!(*c1, DimExpr::Known(a) if a == b) => {
+                        *inner
+                    }
+                    (DimOp::Add, DimExpr::BinOp(DimOp::Sub, inner, c1), DimExpr::Known(b)) if matches!(*c1, DimExpr::Known(a) if a == b) => {
+                        *inner
+                    }
+                    (DimOp::Mul, DimExpr::BinOp(DimOp::Mul, inner, c1), DimExpr::Known(b)) => {
+                        if let DimExpr::Known(a) = *c1 {
+                            DimExpr::BinOp(
+                                DimOp::Mul,
+                                inner,
+                                Box::new(DimExpr::Known(a.saturating_mul(b))),
+                            )
+                            .simplify()
+                        } else {
+                            DimExpr::BinOp(
+                                DimOp::Mul,
+                                Box::new(DimExpr::BinOp(DimOp::Mul, inner, c1)),
+                                Box::new(DimExpr::Known(b)),
+                            )
+                        }
+                    }
+                    (DimOp::Div, DimExpr::BinOp(DimOp::Mul, inner, c1), DimExpr::Known(b))
+                        if b > 0 && matches!(*c1, DimExpr::Known(a) if a == b) =>
+                    {
+                        *inner
+                    }
+                    (op, l, r) => DimExpr::BinOp(op, Box::new(l), Box::new(r)),
+                }
+            }
+        }
+    }
+
+    /// Recursively transform every leaf (`Known` / `Symbolic` / `Var`) and simplify.
+    pub(crate) fn map_leaves(&self, f: &mut impl FnMut(&DimExpr) -> DimExpr) -> DimExpr {
+        match self {
+            DimExpr::Known(_) | DimExpr::Symbolic(_) | DimExpr::Var(_) => f(self),
+            DimExpr::BinOp(op, lhs, rhs) => DimExpr::BinOp(
+                *op,
+                Box::new(lhs.map_leaves(f)),
+                Box::new(rhs.map_leaves(f)),
+            )
+            .simplify(),
+        }
+    }
+
+    /// Collect all meta/symbolic dimension variables referenced inside this expression.
+    pub(crate) fn collect_vars(&self, out: &mut Vec<TypeVarId>) {
+        match self {
+            DimExpr::Known(_) => {}
+            DimExpr::Var(id) => out.push(TypeVarId::Meta(*id)),
+            DimExpr::Symbolic(sym) if sym != "_" => out.push(TypeVarId::Rigid(sym.clone())),
+            DimExpr::Symbolic(_) => {}
+            DimExpr::BinOp(_, lhs, rhs) => {
+                lhs.collect_vars(out);
+                rhs.collect_vars(out);
+            }
+        }
+    }
+
+    /// Return true if meta variable `id` occurs anywhere inside this expression.
+    pub(crate) fn contains_var(&self, id: u32) -> bool {
+        match self {
+            DimExpr::Var(v) => *v == id,
+            DimExpr::Known(_) | DimExpr::Symbolic(_) => false,
+            DimExpr::BinOp(_, l, r) => l.contains_var(id) || r.contains_var(id),
+        }
+    }
+
     pub fn compatible_with(&self, other: &DimExpr) -> bool {
-        match (self, other) {
-            (DimExpr::Known(a), DimExpr::Known(b)) => a == b,
+        let a = self.simplify();
+        let b = other.simplify();
+        match (&a, &b) {
+            (DimExpr::Known(x), DimExpr::Known(y)) => x == y,
             (DimExpr::Var(_), _) | (_, DimExpr::Var(_)) => true,
             (DimExpr::Symbolic(s), _) | (_, DimExpr::Symbolic(s)) if s == "_" => true,
-            (DimExpr::Symbolic(a), DimExpr::Symbolic(b)) => a == b,
+            (DimExpr::Symbolic(x), DimExpr::Symbolic(y)) => x == y,
+            (DimExpr::BinOp(op1, l1, r1), DimExpr::BinOp(op2, l2, r2)) => {
+                op1 == op2 && l1.compatible_with(l2) && r1.compatible_with(r2)
+            }
             _ => false,
         }
     }
@@ -73,6 +223,7 @@ impl std::fmt::Display for DimExpr {
             DimExpr::Known(n) => write!(f, "{n}"),
             DimExpr::Symbolic(s) => write!(f, "{s}"),
             DimExpr::Var(id) => write!(f, "_d{id}"),
+            DimExpr::BinOp(op, l, r) => write!(f, "({l} {op} {r})"),
         }
     }
 }

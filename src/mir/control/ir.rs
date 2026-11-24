@@ -684,6 +684,16 @@ pub enum ControlInst {
         body_fn: FnId,
         body_captures: Vec<CaptureSource>,
     },
+    /// G2: Probe whether `src` is an ok/present value (`Result::Ok`, `Option::Some`, or non-nil)
+    /// vs an early-return propagation value (`Result::Err`, `Option::None`, or `Nil`).
+    TryProbe(VReg, VReg),
+    /// G2: Unwrap payload from `Ok(v)` / `Some(v)` or pass through a verified non-nil value.
+    TryUnwrap(VReg, VReg),
+    /// G2: Register a zero-arg closure on the active frame's LIFO defer stack.
+    PushDefer {
+        fn_id: FnId,
+        captures: Vec<CaptureSource>,
+    },
     Import {
         path: String,
     },
@@ -788,9 +798,12 @@ impl ControlInst {
             | Self::Spawn { dst: d, .. }
             | Self::Select { dst: d, .. }
             | Self::NoGrad { dst: d, .. }
+            | Self::TryProbe(d, _)
+            | Self::TryUnwrap(d, _)
             | Self::Assert(d, _) => Some(*d),
             Self::StoreLocal(..)
             | Self::FreshLocalCell(..)
+            | Self::PushDefer { .. }
             | Self::StoreUpvalue(..)
             | Self::StoreGlobal(..)
             | Self::DefineDyn(..)
@@ -840,9 +853,12 @@ impl ControlInst {
             | Self::Handle { .. }
             | Self::Transaction { .. }
             | Self::Parallel { .. }
-            | Self::NoGrad { .. } => Vec::new(),
+            | Self::NoGrad { .. }
+            | Self::PushDefer { .. } => Vec::new(),
             Self::Copy(_, s)
             | Self::Unary(_, _, s)
+            | Self::TryProbe(_, s)
+            | Self::TryUnwrap(_, s)
             | Self::MakeDynTrait { src: s, .. }
             | Self::GetConstGeneric { src: s, .. }
             | Self::StoreLocal(_, s)
@@ -1077,6 +1093,10 @@ impl ControlInst {
                 *dst_ok = f(*dst_ok);
                 *val = f(*val);
             }
+            Self::TryProbe(d, s) | Self::TryUnwrap(d, s) => {
+                *d = f(*d);
+                *s = f(*s);
+            }
             Self::Call {
                 dst,
                 target,
@@ -1188,6 +1208,7 @@ impl ControlInst {
             }
             Self::ExportGlobal(..)
             | Self::FreshLocalCell(..)
+            | Self::PushDefer { .. }
             | Self::ExportDyn(..)
             | Self::Import { .. }
             | Self::Commit
@@ -1222,6 +1243,8 @@ impl ControlInst {
             | Self::TensorSlice { .. }
             | Self::GetConstGeneric { .. }
             | Self::Quasiquote(..)
+            | Self::TryProbe(..)
+            | Self::TryUnwrap(..)
             | Self::Assert(..) => Purity::Fallible,
             Self::MatchPattern { .. }
             | Self::MakeClosure { .. }
@@ -1248,6 +1271,7 @@ impl ControlInst {
             | Self::Spawn { .. }
             | Self::Select { .. }
             | Self::NoGrad { .. }
+            | Self::PushDefer { .. }
             | Self::Import { .. }
             | Self::EvalAssert { .. }
             | Self::Commit
@@ -1839,6 +1863,14 @@ fn verify_inst_slots(
                 return Err(MoraError::Parse(format!(
                     "fn {:?}: no_grad body fn {:?} OOB",
                     func.id, body_fn
+                )));
+            }
+        }
+        ControlInst::PushDefer { fn_id, .. } => {
+            if (fn_id.0 as usize) >= n_funcs {
+                return Err(MoraError::Parse(format!(
+                    "fn {:?}: defer fn {:?} OOB",
+                    func.id, fn_id
                 )));
             }
         }

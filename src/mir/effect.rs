@@ -68,6 +68,15 @@ impl EffectRow {
         matches!(self, EffectRow::Empty)
     }
 
+    /// True if this effect row ends in a polymorphic row variable (`..r`).
+    pub(crate) fn is_open(&self) -> bool {
+        match self {
+            EffectRow::Empty => false,
+            EffectRow::Var(_) => true,
+            EffectRow::Cons(_, t) => t.is_open(),
+        }
+    }
+
     /// 迭代所有具名 effect label（不含 Var — Var 是多态占位符）。
     pub fn labels(&self) -> Vec<&str> {
         let mut out = Vec::new();

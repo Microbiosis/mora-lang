@@ -255,6 +255,67 @@ impl ParserV3 {
         Some((params, has_self))
     }
 
+    /// G7: Parse an optional explicit effect row annotation after a function/method signature:
+    /// `! pure`, `! {}`, `! io, async`, `! {io, async, ..r}`.
+    /// Returns `Some(None)` if no `!` is present, `Some(Some(row))` on success, `None` on syntax error.
+    fn parse_effect_row_annotation(&mut self) -> Option<Option<crate::mir::effect::EffectRow>> {
+        use crate::mir::effect::EffectRow;
+        if !self.match_token_exact(TokenType::Bang) {
+            return Some(None);
+        }
+        let braced = self.match_token_exact(TokenType::LBrace);
+        let mut labels: Vec<String> = Vec::new();
+        let mut tail_var: Option<String> = None;
+
+        if braced && self.match_token_exact(TokenType::RBrace) {
+            return Some(Some(EffectRow::Empty));
+        }
+
+        loop {
+            if self.match_token_exact(TokenType::DotDot) {
+                let var = self.consume_identifier("Expected effect row variable after '..'")?;
+                tail_var = Some(var);
+                break;
+            }
+            let lbl = self.consume_identifier("Expected effect label or 'pure' after '!'")?;
+            if lbl == "pure" {
+                if !labels.is_empty() {
+                    let msg = format!(
+                        "Parse error: 'pure' cannot be combined with other effects at line {}",
+                        self.current_line()
+                    );
+                    eprintln!("{msg}");
+                    self.diag = Some(msg);
+                    return None;
+                }
+                if braced {
+                    self.consume(TokenType::RBrace, "Expected '}' after effect row")?;
+                }
+                return Some(Some(EffectRow::Empty));
+            }
+            if !labels.contains(&lbl) {
+                labels.push(lbl);
+            }
+            if !self.match_token_exact(TokenType::Comma) {
+                break;
+            }
+            if braced && self.check(&TokenType::RBrace) {
+                break;
+            }
+        }
+        if braced {
+            self.consume(TokenType::RBrace, "Expected '}' after effect row")?;
+        }
+        let mut row = match tail_var {
+            Some(v) => EffectRow::Var(v),
+            None => EffectRow::Empty,
+        };
+        for lbl in labels.into_iter().rev() {
+            row = EffectRow::Cons(lbl, Box::new(row));
+        }
+        Some(Some(row))
+    }
+
     pub(super) fn emit_fn_def_w(&mut self) -> Option<MirWitness> {
         let span = self.span_of_current();
         self.advance(); // 'task'
@@ -299,6 +360,13 @@ impl ParserV3 {
         } else {
             None
         };
+        let effect_annotation = match self.parse_effect_row_annotation() {
+            Some(ea) => ea,
+            None => {
+                self.generic_params = saved_generic;
+                return None;
+            }
+        };
         let body_res = self.in_nested_scope(|this| {
             let body_w = if this.match_token_exact(TokenType::Newline) {
                 let mut stmt_wits = Vec::new();
@@ -328,6 +396,7 @@ impl ParserV3 {
                 type_params,
                 params: w_params,
                 return_type,
+                effect_annotation,
                 body: Box::new(body_w),
             },
             span,
@@ -892,6 +961,13 @@ impl ParserV3 {
             } else {
                 None
             };
+            let effect_annotation = match self.parse_effect_row_annotation() {
+                Some(ea) => ea,
+                None => {
+                    self.generic_params = saved_generic;
+                    return None;
+                }
+            };
             while self.match_token(&[TokenType::Newline]) {}
             let default_body = if self.check(&TokenType::Fn)
                 || self.check(&TokenType::Task)
@@ -926,6 +1002,7 @@ impl ParserV3 {
                 type_params: method_type_params,
                 params,
                 return_type,
+                effect_annotation,
                 default_body,
                 has_self,
                 span: mspan,
@@ -1167,6 +1244,13 @@ impl ParserV3 {
             } else {
                 None
             };
+            let effect_annotation = match self.parse_effect_row_annotation() {
+                Some(ea) => ea,
+                None => {
+                    self.generic_params = saved_generic;
+                    return None;
+                }
+            };
             let body_res = self.in_nested_scope(|this| {
                 let body_w = if this.match_token_exact(TokenType::Newline) {
                     let mut stmts = Vec::new();
@@ -1204,6 +1288,7 @@ impl ParserV3 {
                 type_params: method_type_params,
                 params,
                 return_type,
+                effect_annotation,
                 body,
                 has_self,
                 span: mspan,

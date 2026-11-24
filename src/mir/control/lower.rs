@@ -2301,6 +2301,53 @@ fn lower_expr_single(
             Ok(FlowState::Active(dst))
         }
 
+        WitnessKind::Try { expr } => {
+            let src_reg = match lower_expr(stack, prog, expr, false)? {
+                FlowState::Active(r) => r,
+                FlowState::Terminated => return Ok(FlowState::Terminated),
+            };
+            let is_ok = stack.current_mut().alloc_reg();
+            stack
+                .current_mut()
+                .emit(ControlInst::TryProbe(is_ok, src_reg));
+            let (ok_bb, _) = stack.current_mut().new_block(0);
+            let (err_bb, _) = stack.current_mut().new_block(0);
+            stack.current_mut().terminate(ControlTerminator::Branch {
+                cond: is_ok,
+                then_bb: ok_bb,
+                then_args: Vec::new(),
+                else_bb: err_bb,
+                else_args: Vec::new(),
+            });
+            stack.current_mut().switch_to(err_bb);
+            stack
+                .current_mut()
+                .terminate(ControlTerminator::Return(Some(src_reg)));
+            stack.current_mut().switch_to(ok_bb);
+            let val_reg = stack.current_mut().alloc_reg();
+            stack
+                .current_mut()
+                .emit(ControlInst::TryUnwrap(val_reg, src_reg));
+            Ok(FlowState::Active(val_reg))
+        }
+
+        WitnessKind::Defer { body } => {
+            let (fn_id, captures) = stack.lower_child_fn(
+                prog,
+                None,
+                FunctionKind::Closure,
+                None,
+                &[],
+                body,
+                None,
+                true,
+            )?;
+            stack
+                .current_mut()
+                .emit(ControlInst::PushDefer { fn_id, captures });
+            Ok(FlowState::Active(stack.current_mut().emit_nil()))
+        }
+
         WitnessKind::MacroDef { name, params, body } => {
             let is_top_level =
                 stack.frames.len() == 1 && stack.current_mut().kind == FunctionKind::Main;

@@ -89,6 +89,8 @@ pub struct TraitMethodTypeSig {
     pub return_type: Type,
     pub has_self: bool,
     pub has_default: bool,
+    /// Optional explicit effect row constraint (`! pure` / `! io, async`).
+    pub effect_row: Option<crate::mir::effect::EffectRow>,
 }
 
 /// Wave 3 Stage 3C: Source-level trait declaration descriptor.
@@ -426,7 +428,7 @@ impl HMInference {
                     crate::typeck::ShapeType::Ranked(dims) => {
                         let mut new_dims = Vec::with_capacity(dims.len());
                         for d in dims {
-                            let nd = match d {
+                            let nd = d.map_leaves(&mut |leaf| match leaf {
                                 crate::typeck::DimExpr::Known(n) => {
                                     crate::typeck::DimExpr::Known(*n)
                                 }
@@ -487,7 +489,8 @@ impl HMInference {
                                         }
                                     }
                                 }
-                            };
+                                crate::typeck::DimExpr::BinOp(..) => leaf.clone(),
+                            });
                             new_dims.push(nd);
                         }
                         crate::typeck::ShapeType::Ranked(new_dims)
@@ -971,6 +974,7 @@ impl HMInference {
                         return_type: ret_ty,
                         has_self: true,
                         has_default: false,
+                        effect_row: None,
                     }],
                 });
         }
@@ -987,6 +991,7 @@ impl HMInference {
                     return_type: Type::Any,
                     has_self: true,
                     has_default: false,
+                    effect_row: None,
                 }],
             });
 
@@ -1087,6 +1092,7 @@ impl HMInference {
                             return_type: ret,
                             has_self: m.has_self,
                             has_default: m.default_body.is_some(),
+                            effect_row: m.effect_annotation.clone(),
                         }
                     })
                     .collect();
@@ -1190,8 +1196,13 @@ impl HMInference {
                         .unwrap_or_else(|| self.fresh_type_var());
                     let ret = Self::substitute_self_type(&ret_raw, &self_ty);
                     let mut ambient = HashSet::new();
-                    let effect_row =
+                    let body_tree_row =
                         Self::tree_effect_row(&m.body, &mut ambient, &self.fn_effect_rows);
+                    let effect_row = match &m.effect_annotation {
+                        Some(decl) if !decl.is_open() => decl.clone(),
+                        Some(decl) => Self::union_effect_rows(decl, &body_tree_row),
+                        None => body_tree_row,
+                    };
                     let mut all_tps = type_params.clone();
                     for tp in &m.type_params {
                         if !all_tps.contains(tp) {
@@ -1293,6 +1304,7 @@ impl HMInference {
                     type_params,
                     params,
                     return_type,
+                    effect_annotation,
                     ..
                 } => {
                     if self.env.contains(name) {
@@ -1311,10 +1323,9 @@ impl HMInference {
                         .as_ref()
                         .map(|h| self.resolve_type_aliases(h.to_type()))
                         .unwrap_or_else(|| self.fresh_type_var());
-                    let eff_row = self
-                        .fn_effect_rows
-                        .get(name)
-                        .cloned()
+                    let eff_row = effect_annotation
+                        .clone()
+                        .or_else(|| self.fn_effect_rows.get(name).cloned())
                         .unwrap_or(crate::mir::effect::EffectRow::Empty);
                     self.fn_placeholders
                         .insert(name.clone(), (param_types.clone(), ret.clone()));
@@ -1380,9 +1391,20 @@ impl HMInference {
         for round in 0..64u32 {
             let mut changed = false;
             for def in &defs {
-                if let WitnessKind::FnDef { name, body, .. } = &def.kind {
+                if let WitnessKind::FnDef {
+                    name,
+                    body,
+                    effect_annotation,
+                    ..
+                } = &def.kind
+                {
                     let mut ambient = std::collections::HashSet::new();
-                    let row = Self::tree_effect_row(body, &mut ambient, &table);
+                    let body_row = Self::tree_effect_row(body, &mut ambient, &table);
+                    let row = match effect_annotation {
+                        Some(decl) if !decl.is_open() => decl.clone(),
+                        Some(decl) => Self::union_effect_rows(decl, &body_row),
+                        None => body_row,
+                    };
                     let merged = match table.get(name) {
                         Some(prev) => Self::union_effect_rows(prev, &row),
                         None => row,
@@ -2118,12 +2140,14 @@ impl HMInference {
                 type_params,
                 params,
                 return_type,
+                effect_annotation,
                 body,
             } => self.infer_fn_def(
                 Some(name.as_str()),
                 type_params,
                 params,
                 return_type.as_ref().map(|h| h.to_type()),
+                effect_annotation.as_ref(),
                 body.as_ref(),
                 expr.span,
             ),
@@ -2328,8 +2352,43 @@ impl HMInference {
             }
             // v0.98: effect 签名声明 —— 纯类型层，无类型/效果贡献。
             //（签名本身已在 infer_program 预扫描注册进 effect_signatures。）
+            WitnessKind::Try { expr: inner } => self.infer_try(inner.as_ref(), expr.span),
+            WitnessKind::Defer { body } => self.infer_defer(body.as_ref(), expr.span),
             WitnessKind::EffectSig { .. } => Ok((Type::Nil, crate::mir::effect::EffectRow::Empty)),
         }
+    }
+
+    /// G7: Validate that `inferred` effect row is permitted by an explicit function/method
+    /// effect annotation (`! pure`, `! io, async`, `! {io, ..r}`), returning the signature row
+    /// exposed to callers.
+    pub(super) fn check_declared_effect_row(
+        &mut self,
+        declared: &crate::mir::effect::EffectRow,
+        inferred: &crate::mir::effect::EffectRow,
+        context: &str,
+        span: Span,
+    ) -> crate::mir::effect::EffectRow {
+        let inferred_applied = row::apply_row(inferred, &self.subst);
+        if declared.is_open() {
+            return Self::union_effect_rows(declared, &inferred_applied);
+        }
+        let allowed = declared.labels();
+        let forbidden: Vec<&str> = inferred_applied
+            .labels()
+            .into_iter()
+            .filter(|lbl| !allowed.contains(lbl))
+            .collect();
+        if !forbidden.is_empty() {
+            self.errors.push(TypeError::EffectRowMismatch {
+                expected: format!("{context} declared effect row `! {declared}`"),
+                got: format!(
+                    "body performs forbidden effect(s): {}",
+                    forbidden.join(", ")
+                ),
+                span: Some(span),
+            });
+        }
+        declared.clone()
     }
 
     /// Merge two effect rows, emitting a spanned `RowEq` constraint when open.
@@ -2754,6 +2813,7 @@ mod tests {
                 type_params: vec![],
                 params: vec![],
                 return_type: None,
+                effect_annotation: None,
                 body: Box::new(body),
             },
             span: Span::default(),

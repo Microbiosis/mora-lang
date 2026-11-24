@@ -453,9 +453,9 @@ fn needs_space(
         | TokenType::DotDot
         | TokenType::DotDotDot
         | TokenType::ColonColon
-        | TokenType::Bang
         | TokenType::Backtick
         | TokenType::Amp => return false,
+        TokenType::Bang if is_unary_prefix_context(prev_prev) => return false,
         TokenType::Less if angle_depth > 0 => return false,
         TokenType::Colon if angle_depth > 0 || bracket_depth > 0 => return false,
         TokenType::Minus if is_unary_prefix_context(prev_prev) => return false,
@@ -478,6 +478,7 @@ fn is_spaced_before_paren(ident: &str) -> bool {
             | "elseif"
             | "select"
             | "spawn"
+            | "defer"
             | "perform"
             | "handle"
             | "trait"
@@ -559,6 +560,7 @@ fn is_block_opener_ctx(
         | TokenType::Struct
         | TokenType::Enum
         | TokenType::Loop => true,
+        TokenType::Do if matches!(prev, Some(TokenType::Identifier(s)) if s == "defer") => true,
         TokenType::Identifier(s)
             if matches!(
                 s.as_str(),

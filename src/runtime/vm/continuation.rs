@@ -223,6 +223,8 @@ pub struct ScriptFrame {
     pub block_id: BlockId,
     pub pc: usize,
     pub resume_dst: Option<VReg>,
+    /// G2: LIFO stack of deferred cleanup closures registered via `defer ...` in this frame.
+    pub defers: Vec<(FnId, Arc<Vec<UpvalueValue>>)>,
 }
 
 impl ScriptFrame {
@@ -416,6 +418,14 @@ pub enum CallFrame {
     ErrorContext { prefix: String },
     /// Restores `autograd.no_grad_depth` on normal return or error unwind.
     NoGradGuard,
+    /// G2: Drains a frame's registered `defer` closures in LIFO order before finalizing
+    /// a normal return, tail call, or error unwind.
+    DeferDrain {
+        program: Arc<ControlProgram>,
+        globals: ModuleGlobals,
+        remaining: Vec<(FnId, Arc<Vec<UpvalueValue>>)>,
+        outcome: Option<Result<Value, MoraError>>,
+    },
 }
 
 /// Multi-shot delimited continuation captured up to the matching [`HandleBarrierState`].
@@ -675,6 +685,7 @@ pub fn materialize_frame_named(
         block_id,
         pc: 0,
         resume_dst: None,
+        defers: Vec::new(),
     })
 }
 

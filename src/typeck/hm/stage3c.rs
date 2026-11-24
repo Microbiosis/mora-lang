@@ -123,16 +123,20 @@ fn subst_generics_inner(ty: &Type, map: &HashMap<&str, &Type>) -> Type {
             let new_shape = match shape {
                 ShapeType::Ranked(dims) => ShapeType::Ranked(
                     dims.iter()
-                        .map(|d| match d {
-                            DimExpr::Symbolic(sym) => match map.get(sym.as_str()) {
-                                Some(Type::ConstInt(n)) if *n >= 0 => DimExpr::Known(*n as usize),
-                                Some(Type::TypeVar(TypeVarId::Meta(id))) => DimExpr::Var(*id),
-                                Some(Type::TypeVar(TypeVarId::Rigid(r))) => {
-                                    DimExpr::Symbolic(r.clone())
-                                }
-                                _ => d.clone(),
-                            },
-                            other => other.clone(),
+                        .map(|d| {
+                            d.map_leaves(&mut |leaf| match leaf {
+                                DimExpr::Symbolic(sym) => match map.get(sym.as_str()) {
+                                    Some(Type::ConstInt(n)) if *n >= 0 => {
+                                        DimExpr::Known(*n as usize)
+                                    }
+                                    Some(Type::TypeVar(TypeVarId::Meta(id))) => DimExpr::Var(*id),
+                                    Some(Type::TypeVar(TypeVarId::Rigid(r))) => {
+                                        DimExpr::Symbolic(r.clone())
+                                    }
+                                    _ => leaf.clone(),
+                                },
+                                other => other.clone(),
+                            })
                         })
                         .collect(),
                 ),
@@ -338,6 +342,16 @@ impl HMInference {
                         }
                     }
                 }
+                if matches!(tk.as_str(), "param" | "buffer" | "transient")
+                    && !tv.eq_ignore_ascii_case("true")
+                    && !tv.eq_ignore_ascii_case("false")
+                {
+                    self.errors.push(TypeError::InvalidLiteral {
+                        what: format!("@tag({tk}=...) boolean flag on '{name}.{}'", f.name),
+                        value: tv.clone(),
+                        span: Some(f.span),
+                    });
+                }
             }
             // Type-check field default initializer against declared field type.
             if let Some(def_expr) = &f.default {
@@ -463,7 +477,11 @@ impl HMInference {
                     m.span,
                 );
                 match res {
-                    Ok((body_ty, _)) => {
+                    Ok((body_ty, body_row)) => {
+                        if let Some(ref declared) = m.effect_annotation {
+                            let ctx = format!("trait method '{name}::{}'", m.name);
+                            self.check_declared_effect_row(declared, &body_row, &ctx, m.span);
+                        }
                         if !matches!(body_ty, Type::Error) {
                             let c = SpannedConstraint::new(
                                 Constraint::Subtype {
@@ -707,6 +725,30 @@ impl HMInference {
                     } else {
                         self.subst.apply(&body_ty)
                     };
+                    let effective_row = if let Some(ref declared) = m.effect_annotation {
+                        let ctx = format!("method '{target_type}::{}'", m.name);
+                        self.check_declared_effect_row(declared, &body_row, &ctx, m.span)
+                    } else {
+                        body_row
+                    };
+                    // Enforce trait method's declared effect row contract if implementing a trait.
+                    if let Some(tr_name) = trait_name {
+                        let trait_decl_eff = self
+                            .collect_trait_chain(tr_name)
+                            .into_iter()
+                            .find_map(|anc| {
+                                self.trait_defs.get(&anc).and_then(|td| {
+                                    td.methods
+                                        .iter()
+                                        .find(|tm| tm.name == m.name)
+                                        .and_then(|tm| tm.effect_row.clone())
+                                })
+                            });
+                        if let Some(ref trait_eff) = trait_decl_eff {
+                            let ctx = format!("trait '{tr_name}::{}' contract", m.name);
+                            self.check_declared_effect_row(trait_eff, &effective_row, &ctx, m.span);
+                        }
+                    }
                     // Backfill inferred return type and effect row into the impl method table!
                     if let Some(tr_name) = trait_name {
                         if let Some(entry) = self.trait_impl_methods.get_mut(&(
@@ -715,14 +757,14 @@ impl HMInference {
                             m.name.clone(),
                         )) {
                             entry.return_type = inferred_ret;
-                            entry.effect_row = body_row;
+                            entry.effect_row = effective_row;
                         }
                     } else if let Some(entry) = self
                         .inherent_impls
                         .get_mut(&(target_type.to_string(), m.name.clone()))
                     {
                         entry.return_type = inferred_ret;
-                        entry.effect_row = body_row;
+                        entry.effect_row = effective_row;
                     }
                 }
                 Err(errs) => self.errors.extend(errs),
@@ -1302,6 +1344,161 @@ impl HMInference {
                 }
                 "json" if args.is_empty() && named_args.is_empty() => {
                     return Some(Ok((Type::String, acc_row)));
+                }
+                "parameters" if args.is_empty() && named_args.is_empty() => {
+                    return Some(Ok((Type::List(Box::new(Type::any_tensor())), acc_row)));
+                }
+                "named_parameters" | "state_dict" => {
+                    let mut row = acc_row;
+                    let total = args.len() + named_args.len();
+                    if total > 1 {
+                        self.errors.push(TypeError::ArityMismatch {
+                            expected: 1,
+                            actual: total,
+                            span,
+                        });
+                    }
+                    if let Some(arg) = args.first() {
+                        let (t, r) = self.infer_recover(arg);
+                        row = self.merge_rows(row, r, arg.span);
+                        if !matches!(t, Type::Error | Type::Nil) {
+                            self.constraints.push(SpannedConstraint::new(
+                                Constraint::Subtype {
+                                    sub: Box::new(t),
+                                    sup: Box::new(Type::String),
+                                },
+                                arg.span,
+                            ));
+                        }
+                    }
+                    for (k, arg) in named_args {
+                        let (t, r) = self.infer_recover(arg);
+                        row = self.merge_rows(row, r, arg.span);
+                        if k != "prefix" {
+                            self.errors.push(TypeError::UnificationFailure {
+                                expected: format!("named parameter 'prefix' on {method}()"),
+                                got: format!("unknown keyword argument '{k}'"),
+                                span: Some(arg.span),
+                            });
+                        } else if !matches!(t, Type::Error | Type::Nil) {
+                            self.constraints.push(SpannedConstraint::new(
+                                Constraint::Subtype {
+                                    sub: Box::new(t),
+                                    sup: Box::new(Type::String),
+                                },
+                                arg.span,
+                            ));
+                        }
+                    }
+                    return Some(Ok((
+                        Type::Dict(Box::new(Type::String), Box::new(Type::any_tensor())),
+                        row,
+                    )));
+                }
+                "load_state_dict" => {
+                    let mut row = acc_row;
+                    let total = args.len() + named_args.len();
+                    if total == 0 || total > 2 {
+                        self.errors.push(TypeError::ArityMismatch {
+                            expected: 1,
+                            actual: total,
+                            span,
+                        });
+                    }
+                    if let Some(state_arg) = args.first() {
+                        let (t, r) = self.infer_recover(state_arg);
+                        row = self.merge_rows(row, r, state_arg.span);
+                        if !matches!(t, Type::Error) {
+                            self.constraints.push(SpannedConstraint::new(
+                                Constraint::Subtype {
+                                    sub: Box::new(t),
+                                    sup: Box::new(Type::Dict(
+                                        Box::new(Type::String),
+                                        Box::new(Type::Any),
+                                    )),
+                                },
+                                state_arg.span,
+                            ));
+                        }
+                    }
+                    if let Some(strict_arg) = args.get(1) {
+                        let (t, r) = self.infer_recover(strict_arg);
+                        row = self.merge_rows(row, r, strict_arg.span);
+                        if !matches!(t, Type::Error) {
+                            self.constraints.push(SpannedConstraint::new(
+                                Constraint::Subtype {
+                                    sub: Box::new(t),
+                                    sup: Box::new(Type::Bool),
+                                },
+                                strict_arg.span,
+                            ));
+                        }
+                    }
+                    for (k, arg) in named_args {
+                        let (t, r) = self.infer_recover(arg);
+                        row = self.merge_rows(row, r, arg.span);
+                        match k.as_str() {
+                            "state" | "state_dict" => {
+                                if !matches!(t, Type::Error) {
+                                    self.constraints.push(SpannedConstraint::new(
+                                        Constraint::Subtype {
+                                            sub: Box::new(t),
+                                            sup: Box::new(Type::Dict(
+                                                Box::new(Type::String),
+                                                Box::new(Type::Any),
+                                            )),
+                                        },
+                                        arg.span,
+                                    ));
+                                }
+                            }
+                            "strict" => {
+                                if !matches!(t, Type::Error) {
+                                    self.constraints.push(SpannedConstraint::new(
+                                        Constraint::Subtype {
+                                            sub: Box::new(t),
+                                            sup: Box::new(Type::Bool),
+                                        },
+                                        arg.span,
+                                    ));
+                                }
+                            }
+                            _ => {
+                                self.errors.push(TypeError::UnificationFailure {
+                                    expected:
+                                        "named parameter 'state' or 'strict' on load_state_dict()"
+                                            .to_string(),
+                                    got: format!("unknown keyword argument '{k}'"),
+                                    span: Some(arg.span),
+                                });
+                            }
+                        }
+                    }
+                    return Some(Ok((recv_ty.clone(), row)));
+                }
+                "to_device" => {
+                    let mut row = acc_row;
+                    if args.len() != 1 || !named_args.is_empty() {
+                        self.errors.push(TypeError::ArityMismatch {
+                            expected: 1,
+                            actual: args.len() + named_args.len(),
+                            span,
+                        });
+                    }
+                    if let Some(dev_arg) = args.first() {
+                        let (t, r) = self.infer_recover(dev_arg);
+                        row = self.merge_rows(row, r, dev_arg.span);
+                        if !matches!(t, Type::Error) {
+                            self.constraints.push(SpannedConstraint::new(
+                                Constraint::Subtype {
+                                    sub: Box::new(t),
+                                    sup: Box::new(Type::String),
+                                },
+                                dev_arg.span,
+                            ));
+                        }
+                    }
+                    return Some(Ok((recv_ty.clone(), row)));
                 }
                 _ => {}
             }

@@ -250,6 +250,14 @@ impl<'a> VmEngine<'a> {
                         });
                     }
                     ScriptStep::Err(msg) => {
+                        if !frame.defers.is_empty() {
+                            self.frames.push(CallFrame::DeferDrain {
+                                program: frame.program,
+                                globals: frame.globals,
+                                remaining: frame.defers,
+                                outcome: None,
+                            });
+                        }
                         self.handle_error(msg)?;
                     }
                 },
@@ -280,6 +288,9 @@ impl<'a> VmEngine<'a> {
                 CallFrame::NoGradGuard => {
                     unreachable!("NoGradGuard popped directly without return delivery")
                 }
+                CallFrame::DeferDrain { .. } => {
+                    unreachable!("DeferDrain popped directly without return delivery")
+                }
             }
         }
     }
@@ -304,6 +315,41 @@ impl<'a> VmEngine<'a> {
                 CallFrame::NoGradGuard => {
                     self.core.autograd.exit_no_grad();
                     continue;
+                }
+                CallFrame::DeferDrain {
+                    program,
+                    globals,
+                    mut remaining,
+                    outcome,
+                } => {
+                    let effective_outcome = outcome.unwrap_or(Ok(val));
+                    if let Some((fn_id, upvalues)) = remaining.pop() {
+                        let defer_frame = materialize_frame(
+                            Arc::clone(&program),
+                            fn_id,
+                            Arc::clone(&globals),
+                            upvalues,
+                            &[],
+                        )?;
+                        self.frames.push(CallFrame::DeferDrain {
+                            program,
+                            globals,
+                            remaining,
+                            outcome: Some(effective_outcome),
+                        });
+                        self.frames.push(CallFrame::Script(Box::new(defer_frame)));
+                        return Ok(None);
+                    }
+                    match effective_outcome {
+                        Ok(ret_val) => {
+                            val = ret_val;
+                            continue;
+                        }
+                        Err(saved_err) => {
+                            self.handle_error(saved_err)?;
+                            return Ok(None);
+                        }
+                    }
                 }
                 CallFrame::AutoResume(cont) => {
                     self.resume_continuation(&cont, val)?;
@@ -940,8 +986,62 @@ impl<'a> VmEngine<'a> {
                 ) => {
                     let _ = self.core.autograd.pop_tape(tape_id);
                 }
-                CallFrame::Script(_)
-                | CallFrame::HandleBarrier(_)
+                CallFrame::Script(mut sf) => {
+                    if let Some((fn_id, upvalues)) = sf.defers.pop() {
+                        match materialize_frame(
+                            Arc::clone(&sf.program),
+                            fn_id,
+                            Arc::clone(&sf.globals),
+                            upvalues,
+                            &[],
+                        ) {
+                            Ok(defer_frame) => {
+                                self.frames.push(CallFrame::DeferDrain {
+                                    program: sf.program,
+                                    globals: sf.globals,
+                                    remaining: sf.defers,
+                                    outcome: Some(Err(err)),
+                                });
+                                self.frames.push(CallFrame::Script(Box::new(defer_frame)));
+                                return Ok(());
+                            }
+                            Err(e) => {
+                                err = e;
+                            }
+                        }
+                    }
+                }
+                CallFrame::DeferDrain {
+                    program,
+                    globals,
+                    mut remaining,
+                    outcome: _,
+                } => {
+                    if let Some((fn_id, upvalues)) = remaining.pop() {
+                        match materialize_frame(
+                            Arc::clone(&program),
+                            fn_id,
+                            Arc::clone(&globals),
+                            upvalues,
+                            &[],
+                        ) {
+                            Ok(defer_frame) => {
+                                self.frames.push(CallFrame::DeferDrain {
+                                    program,
+                                    globals,
+                                    remaining,
+                                    outcome: Some(Err(err)),
+                                });
+                                self.frames.push(CallFrame::Script(Box::new(defer_frame)));
+                                return Ok(());
+                            }
+                            Err(e) => {
+                                err = e;
+                            }
+                        }
+                    }
+                }
+                CallFrame::HandleBarrier(_)
                 | CallFrame::AutoResume(_)
                 | CallFrame::Combinator(_)
                 | CallFrame::Transaction(_)
@@ -1270,6 +1370,14 @@ enum ScriptStep {
 }
 
 impl<'a> VmEngine<'a> {
+    #[inline]
+    fn push_script_frame_suspending(&mut self, frame: &mut ScriptFrame) {
+        let saved_defers = std::mem::take(&mut frame.defers);
+        let mut pushed = frame.clone();
+        pushed.defers = saved_defers;
+        self.frames.push(CallFrame::Script(Box::new(pushed)));
+    }
+
     fn step_script(&mut self, frame: &mut ScriptFrame) -> ScriptStep {
         let mut cancel_budget: u32 = 0;
         loop {
@@ -1358,6 +1466,26 @@ impl<'a> VmEngine<'a> {
                     }
                     ControlTerminator::Return(opt_r) | ControlTerminator::Halt(opt_r) => {
                         let val = opt_r.map(|r| frame.get_val(r)).unwrap_or(Value::Nil);
+                        if let Some((fn_id, upvalues)) = frame.defers.pop() {
+                            let defer_frame = match materialize_frame(
+                                Arc::clone(&frame.program),
+                                fn_id,
+                                Arc::clone(&frame.globals),
+                                upvalues,
+                                &[],
+                            ) {
+                                Ok(f) => f,
+                                Err(e) => return ScriptStep::Err(e),
+                            };
+                            self.frames.push(CallFrame::DeferDrain {
+                                program: Arc::clone(&frame.program),
+                                globals: Arc::clone(&frame.globals),
+                                remaining: std::mem::take(&mut frame.defers),
+                                outcome: Some(Ok(val)),
+                            });
+                            self.frames.push(CallFrame::Script(Box::new(defer_frame)));
+                            return ScriptStep::Suspended;
+                        }
                         return ScriptStep::Completed(val);
                     }
                     ControlTerminator::Perform {
@@ -1372,7 +1500,7 @@ impl<'a> VmEngine<'a> {
                         frame.resume_dst = None;
 
                         if let Some(barrier_idx) = self.find_barrier(&effect_name) {
-                            self.frames.push(CallFrame::Script(Box::new(frame.clone())));
+                            self.push_script_frame_suspending(frame);
                             if let Err(e) =
                                 self.capture_and_enter_handler(barrier_idx, &effect_name, arg_vals)
                             {
@@ -1399,6 +1527,28 @@ impl<'a> VmEngine<'a> {
                             Ok(a) => a,
                             Err(e) => return ScriptStep::Err(e),
                         };
+                        if !frame.defers.is_empty() {
+                            let defers = std::mem::take(&mut frame.defers);
+                            self.frames.push(CallFrame::DeferDrain {
+                                program: Arc::clone(&frame.program),
+                                globals: Arc::clone(&frame.globals),
+                                remaining: defers,
+                                outcome: None,
+                            });
+                            match action {
+                                CallAction::Done(val) => return ScriptStep::Completed(val),
+                                CallAction::AwaitFuture(fut) => {
+                                    self.pending_yield = Some(VmYield::AwaitFuture(fut));
+                                    return ScriptStep::Suspended;
+                                }
+                                other => {
+                                    if let Err(e) = self.apply_action_chained(other) {
+                                        return ScriptStep::Err(e);
+                                    }
+                                    return ScriptStep::Suspended;
+                                }
+                            }
+                        }
                         match action {
                             CallAction::Done(val) => return ScriptStep::Completed(val),
                             CallAction::AwaitFuture(fut) => {
@@ -1498,7 +1648,7 @@ impl<'a> VmEngine<'a> {
             CallAction::AwaitFuture(fut) => {
                 frame.pc += 1;
                 frame.resume_dst = Some(dst);
-                self.frames.push(CallFrame::Script(Box::new(frame.clone())));
+                self.push_script_frame_suspending(frame);
                 self.pending_yield = Some(VmYield::AwaitFuture(fut));
                 StepOutcome::Yielded
             }
@@ -1510,7 +1660,7 @@ impl<'a> VmEngine<'a> {
                 if let Some(barrier_idx) = self.find_barrier(label) {
                     frame.pc += 1;
                     frame.resume_dst = Some(dst);
-                    self.frames.push(CallFrame::Script(Box::new(frame.clone())));
+                    self.push_script_frame_suspending(frame);
                     if let Err(e) = self.capture_and_enter_handler(barrier_idx, label, args) {
                         return StepOutcome::Err(e);
                     }
@@ -1530,7 +1680,7 @@ impl<'a> VmEngine<'a> {
             other => {
                 frame.pc += 1;
                 frame.resume_dst = Some(dst);
-                self.frames.push(CallFrame::Script(Box::new(frame.clone())));
+                self.push_script_frame_suspending(frame);
                 if let Err(e) = self.apply_action_chained(other) {
                     // Frame is on self.frames, handle_error will unwind it!
                     return StepOutcome::Err(e);
@@ -2208,7 +2358,7 @@ impl<'a> VmEngine<'a> {
                 };
                 frame.pc += 1;
                 frame.resume_dst = Some(dst);
-                self.frames.push(CallFrame::Script(Box::new(frame.clone())));
+                self.push_script_frame_suspending(frame);
                 self.frames.push(CallFrame::HandleBarrier(barrier));
                 self.frames.push(CallFrame::Script(Box::new(body_frame)));
                 StepOutcome::Yielded
@@ -2253,7 +2403,7 @@ impl<'a> VmEngine<'a> {
                 };
                 frame.pc += 1;
                 frame.resume_dst = Some(dst);
-                self.frames.push(CallFrame::Script(Box::new(frame.clone())));
+                self.push_script_frame_suspending(frame);
                 self.frames.push(CallFrame::Transaction(tx));
                 self.frames.push(CallFrame::Script(Box::new(body_frame)));
                 StepOutcome::Yielded
@@ -2270,11 +2420,13 @@ impl<'a> VmEngine<'a> {
                 };
                 frame.pc += 1;
                 frame.resume_dst = Some(dst);
-                self.frames.push(CallFrame::Script(Box::new(frame.clone())));
+                self.push_script_frame_suspending(frame);
                 match self.advance_parallel(&mut pf) {
                     Ok(true) => StepOutcome::Yielded,
                     Ok(false) => {
-                        self.frames.pop();
+                        if let Some(CallFrame::Script(restored)) = self.frames.pop() {
+                            frame.defers = restored.defers;
+                        }
                         frame.pc -= 1;
                         frame.resume_dst = None;
                         frame.set_val(dst, pf.last_val);
@@ -2309,7 +2461,7 @@ impl<'a> VmEngine<'a> {
                 self.core.autograd.enter_no_grad();
                 frame.pc += 1;
                 frame.resume_dst = Some(dst);
-                self.frames.push(CallFrame::Script(Box::new(frame.clone())));
+                self.push_script_frame_suspending(frame);
                 self.frames.push(CallFrame::NoGradGuard);
                 self.frames.push(CallFrame::Script(Box::new(body_frame)));
                 StepOutcome::Yielded
@@ -2369,7 +2521,7 @@ impl<'a> VmEngine<'a> {
                 let saved_env = self.core.environment.clone();
                 frame.pc += 1;
                 frame.resume_dst = None;
-                self.frames.push(CallFrame::Script(Box::new(frame.clone())));
+                self.push_script_frame_suspending(frame);
                 self.frames.push(CallFrame::ImportFinalize {
                     saved_env,
                     child_program: child_prog,
@@ -2683,6 +2835,50 @@ impl<'a> VmEngine<'a> {
                 StepOutcome::NextInst
             }
             ControlInst::KeepAlive(_) => StepOutcome::NextInst,
+            ControlInst::TryProbe(dst, src) => {
+                let is_ok = match &frame.regs[src.0 as usize] {
+                    RegSlot::Nil => false,
+                    RegSlot::Boxed(v) => match v.as_ref() {
+                        Value::Nil => false,
+                        Value::EnumVariant { variant, .. }
+                            if variant == "Err" || variant == "None" =>
+                        {
+                            false
+                        }
+                        _ => true,
+                    },
+                    _ => true,
+                };
+                frame.set_slot(dst, RegSlot::Bool(is_ok));
+                StepOutcome::NextInst
+            }
+            ControlInst::TryUnwrap(dst, src) => {
+                let unwrapped = match &frame.regs[src.0 as usize] {
+                    RegSlot::Boxed(v) => match v.as_ref() {
+                        Value::EnumVariant {
+                            variant, payload, ..
+                        } if variant == "Ok" || variant == "Some" => match payload.len() {
+                            0 => Value::Nil,
+                            1 => payload[0].clone(),
+                            _ => Value::List(payload.clone().into()),
+                        },
+                        other => other.clone(),
+                    },
+                    other => other.to_value(),
+                };
+                frame.set_val(dst, unwrapped);
+                StepOutcome::NextInst
+            }
+            ControlInst::PushDefer { fn_id, captures } => {
+                let upvalues = resolve_captures(
+                    &captures,
+                    &frame.locals,
+                    &frame.upvalues,
+                    frame.program.func(fn_id),
+                );
+                frame.defers.push((fn_id, Arc::new(upvalues)));
+                StepOutcome::NextInst
+            }
             ControlInst::RegisterKernel { name, program, dst } => {
                 let n = frame.program.symbols.resolve(name).to_string();
                 let compiled = Arc::new(
@@ -2858,7 +3054,7 @@ impl<'a> VmEngine<'a> {
         };
         frame.pc += 1;
         frame.resume_dst = Some(dst);
-        self.frames.push(CallFrame::Script(Box::new(frame.clone())));
+        self.push_script_frame_suspending(frame);
         self.frames
             .push(CallFrame::Combinator(CombinatorFrame::SelectResume(
                 Box::new(select_state),

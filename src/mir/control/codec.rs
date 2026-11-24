@@ -1641,6 +1641,21 @@ fn write_inst(w: &mut ByteWriter, inst: &ControlInst) -> MoraResult<()> {
             w.write_u8(51);
             w.write_local(*slot);
         }
+        ControlInst::TryProbe(dst, src) => {
+            w.write_u8(52);
+            w.write_reg(*dst);
+            w.write_reg(*src);
+        }
+        ControlInst::TryUnwrap(dst, src) => {
+            w.write_u8(53);
+            w.write_reg(*dst);
+            w.write_reg(*src);
+        }
+        ControlInst::PushDefer { fn_id, captures } => {
+            w.write_u8(54);
+            w.write_fn(*fn_id);
+            w.write_captures(captures)?;
+        }
     }
     Ok(())
 }
@@ -2117,6 +2132,12 @@ fn read_inst(r: &mut ByteReader<'_>) -> MoraResult<ControlInst> {
             }
         }
         51 => ControlInst::FreshLocalCell(r.read_local()?),
+        52 => ControlInst::TryProbe(r.read_reg()?, r.read_reg()?),
+        53 => ControlInst::TryUnwrap(r.read_reg()?, r.read_reg()?),
+        54 => ControlInst::PushDefer {
+            fn_id: r.read_fn()?,
+            captures: r.read_captures()?,
+        },
         other => return Err(corrupt(format!("invalid ControlInst opcode {other}"))),
     })
 }
@@ -2766,6 +2787,103 @@ make_counters()
                     Value::Int(12),
                     Value::Int(22),
                     Value::Int(32),
+                ]
+                .into(),
+            )
+        );
+    }
+
+    #[test]
+    fn roundtrip_try_and_defer_opcodes_52_53_54() {
+        let src = r#"
+enum Res<T, E>
+  Ok(T)
+  Err(E)
+end
+
+let log = atom([])
+
+task step(x: int): Res<int, string>
+  if x < 0
+    return Res::Err("neg")
+  end
+  return Res::Ok(x * 10)
+end
+
+task run(a: int, b: int): Res<int, string>
+  defer swap(log, fn(xs) => xs.push("d1"))
+  let v1 = step(a)?
+  defer do
+    swap(log, fn(xs) => xs.push("d2"))
+  end
+  let v2 = step(b)?
+  return Res::Ok(v1 + v2)
+end
+
+let r1 = run(2, 3)
+let r2 = run(2, -1)
+let out_ok = match r1 with
+  Res::Ok(v) -> v
+  Res::Err(_) -> -1
+end
+let out_err = match r2 with
+  Res::Ok(_) -> ""
+  Res::Err(e) -> e
+end
+[out_ok, out_err, deref(log)]
+"#;
+        let (mut prog, _) = ParserV3::compile(src).expect("compile try+defer");
+        optimize_program(&mut prog, OptLevel::Aggressive);
+
+        let has_try_probe = prog.functions.iter().any(|f| {
+            f.blocks.iter().any(|b| {
+                b.insts
+                    .iter()
+                    .any(|i| matches!(i, ControlInst::TryProbe(_, _)))
+            })
+        });
+        let has_try_unwrap = prog.functions.iter().any(|f| {
+            f.blocks.iter().any(|b| {
+                b.insts
+                    .iter()
+                    .any(|i| matches!(i, ControlInst::TryUnwrap(_, _)))
+            })
+        });
+        let has_push_defer = prog.functions.iter().any(|f| {
+            f.blocks.iter().any(|b| {
+                b.insts
+                    .iter()
+                    .any(|i| matches!(i, ControlInst::PushDefer { .. }))
+            })
+        });
+        assert!(has_try_probe && has_try_unwrap && has_push_defer);
+
+        let pkg = CompiledPackage {
+            opt_level: 2,
+            entry: prog,
+            modules: BTreeMap::new(),
+        };
+        let encoded = encode_package(&pkg).expect("encode MORABC02 with opcodes 52..54");
+        let decoded = decode_package(&encoded).expect("decode MORABC02 with opcodes 52..54");
+
+        let mut core = CoreRuntime::default();
+        let (val, _) =
+            execute_program(Arc::new(decoded.entry), &mut core).expect("execute decoded try+defer");
+        assert_eq!(
+            val,
+            Value::List(
+                vec![
+                    Value::Int(50),
+                    Value::String("neg".to_string()),
+                    Value::List(
+                        vec![
+                            Value::String("d2".to_string()),
+                            Value::String("d1".to_string()),
+                            Value::String("d2".to_string()),
+                            Value::String("d1".to_string()),
+                        ]
+                        .into(),
+                    ),
                 ]
                 .into(),
             )

@@ -231,7 +231,10 @@ print(y1.to_list())
     #[cfg(target_arch = "x86_64")]
     {
         assert!(
-            jit_lines[0] == "x86_64-avx2" || jit_lines[0] == "x86_64-sse2",
+            matches!(
+                jit_lines[0].as_str(),
+                "x86_64-avx2-fma" | "x86_64-avx2" | "x86_64-sse2"
+            ),
             "expected native x86-64 JIT ISA, got {}",
             jit_lines[0]
         );

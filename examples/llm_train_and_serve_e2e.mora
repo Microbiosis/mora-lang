@@ -1,0 +1,159 @@
+-- Flagship End-to-End LLM Stack in Pure Mora (`v0.112.0` Phase P5-5)
+--
+-- Demonstrates a complete, zero-external-dependency LLM lifecycle written 100% in Mora:
+--   1. Byte-level BPE Tokenizer training + lossless UTF-8 encoding (`std/nn/tokenizer`)
+--   2. Mini Llama/Qwen CausalLM (RoPE + RMSNorm + GQA + SwiGLU) trained via PyTree
+--      `value_and_grad` + `clip_grad_norm` + `cosine_lr_schedule` + `AdamW` (`std/nn/layers`, `std/nn/optim`)
+--   3. In-memory Safetensors & GGUF v3 (weights + BPE metadata) checkpoint round-trip parity
+--   4. Live OpenAI HTTP + real-time SSE streaming (`/v1/chat/completions`), RadixAttention KV
+--      prefix reuse (`/metrics`), MCP tools (`std/mcp`), and `std/trace` latency telemetry
+--
+-- Run:   mora examples/llm_train_and_serve_e2e.mora
+-- Check: mora --check examples/llm_train_and_serve_e2e.mora
+
+import "std/nn/layers"
+import "std/nn/optim"
+import "std/nn/tokenizer"
+import "std/nn/safetensors"
+import "std/nn/gguf"
+import "std/nn/serving"
+import "std/net/http"
+import "std/mcp"
+import "std/trace"
+
+trace_clear()
+trace_start()
+
+print("=== 1. Train Byte-Level BPE Tokenizer ===")
+let corpus = ["mora trains neural networks fast. ", "mora serves streaming completions fast. ", "mora runs radix attention and mcp tools. "]
+let tok = train_bpe(corpus, 16)
+let probe = "mora trains fast! 你好🚀"
+let probe_ids = tok.encode(probe, false, false)
+assert_eq(tok.decode(probe_ids, true), probe)
+print("BPE vocab:", tok.vocab_size(), "merges:", tok.merges.len(), "roundtrip: PASS")
+
+print("=== 2. Train Mini CausalLM (RoPE + RMSNorm + GQA + SwiGLU + AdamW) ===")
+let cfg = ModelConfig(vocab_size = tok.vocab_size(), d_model = 16, n_layers = 1, n_heads = 4, n_kv_heads = 2, d_ff = 32, dtype = "f32", device = "cpu")
+let model = causal_lm_init(cfg, 0.12)
+let train_ids = tok.encode("mora trains fast", false, false)
+let inp_ids: list<int> = []
+let tgt_ids: list<int> = []
+let k = 0
+while k + 1 < train_ids.len()
+  assign inp_ids = inp_ids.push(train_ids[k])
+  assign tgt_ids = tgt_ids.push(train_ids[k + 1])
+  assign k = k + 1
+end
+
+let params = model.parameters()
+let opt = adamw_new(params, 0.05, 0.9, 0.999, 0.00000001, 0.001)
+let first_loss = 0.0
+let last_loss = 0.0
+let step = 0
+while step < 10
+  let loss_fn = fn(ps: list<any>)
+    let m = model.with_parameters(ps)
+    let logits = m.forward(inp_ids)
+    return cross_entropy_loss(logits, tgt_ids)
+  end
+  let vg = value_and_grad(loss_fn)(params)
+  let loss_v = float(vg[0])
+  let grads = clip_grad_norm(vg[1], 5.0)
+  if step == 0 then
+    assign first_loss = loss_v
+  end
+  assign last_loss = loss_v
+  let lr = cosine_lr_schedule(step, 2, 10, 0.06, 0.01)
+  let upd = opt.step(params, grads, lr)
+  assign params = upd.params
+  assign opt = upd.state
+  assign step = step + 1
+end
+assign model = model.with_parameters(params)
+assert(last_loss < first_loss * 0.7, "training must substantially decrease loss")
+print("Training loss:", first_loss, "->", last_loss, "PASS")
+
+print("=== 3. Checkpoint Round-Trip (Safetensors + GGUF v3 w/ BPE Metadata) ===")
+let orig_logits = model.forward(inp_ids)
+let st_meta: dict<string, string> = {"framework": "mora", "version": "0.112.0"}
+let st_buf = match safetensors_encode(model.state_dict(), st_meta) with
+    SafetensorsResult::Ok(b) -> b
+    SafetensorsResult::Err(_) -> Tensor::zeros([0], "u8")
+  end
+  assert(st_buf.numel() > 0)
+
+  let gguf_meta = tok.to_gguf_metadata()
+  let gguf_buf = match gguf_encode(model.state_dict(), gguf_meta, 32) with
+      GgufResult::Ok(b) -> b
+      GgufResult::Err(_) -> Tensor::zeros([0], "u8")
+    end
+    assert(gguf_buf.numel() > 0)
+
+    let empty_t: dict<string, any> = {}
+    let dec_res = gguf_decode(gguf_buf, "cpu")
+    let reloaded_tensors = match dec_res with
+        GgufResult::Ok(f) -> f.tensors
+        GgufResult::Err(_) -> empty_t
+      end
+      let reloaded_meta = match dec_res with
+          GgufResult::Ok(f) -> f.header.metadata
+          GgufResult::Err(_) -> empty_t
+        end
+        let reloaded_model = causal_lm_from_state_dict(cfg, reloaded_tensors)
+        let reloaded_tok = from_gguf_metadata(reloaded_meta)
+        let reload_diff = float((orig_logits - reloaded_model.forward(inp_ids)).abs().max())
+        assert(reload_diff < 0.00001, "GGUF reloaded weights must match exactly")
+        print("Safetensors bytes:", st_buf.numel(), "GGUF v3 bytes:", gguf_buf.numel(), "max_diff:", reload_diff)
+
+        print("=== 4. Live OpenAI HTTP + SSE Streaming + RadixAttention + MCP + Trace ===")
+        let kv = kv_allocator(64, 4, cfg.n_kv_heads, cfg.d_model / cfg.n_heads, "f32", "cpu")
+        let engine = create_serving_engine(reloaded_model, reloaded_tok, kv, "mora-e2e-mini")
+        let router_app = build_http_router(engine)
+
+        let listener = tcp_listen("127.0.0.1:0")
+        let addr = listener.local_addr()
+        let srv_h = spawn router_app.serve_listener(listener, 4)
+
+        let health = get(addr, "/health")
+        assert_eq(health.status, 200)
+
+        -- Turn 1 (JSON): warms RadixAttention with shared system prompt
+        let r1_body = "{\"model\":\"mora-e2e-mini\",\"messages\":[{\"role\":\"system\",\"content\":\"You are Mora AI engine.\"},{\"role\":\"user\",\"content\":\"Hello\"}],\"max_tokens\":4,\"stream\":false}"
+        let c1 = post(addr, "/v1/chat/completions", r1_body)
+        assert_eq(c1.status, 200)
+
+        -- Turn 2 (SSE stream): shares exact system prompt prefix -> RadixAttention cache hit!
+        let r2_body = "{\"model\":\"mora-e2e-mini\",\"messages\":[{\"role\":\"system\",\"content\":\"You are Mora AI engine.\"},{\"role\":\"user\",\"content\":\"Stream\"}],\"max_tokens\":4,\"stream\":true}"
+        let sse = open_sse_post(addr, "/v1/chat/completions", r2_body)
+        let chunks = 0
+        let got_done = false
+        while true
+          let ev = sse_read_event(sse)
+          if ev.data == "" then
+            break
+          end
+          if ev.data == "[DONE]" then
+            assign got_done = true
+            break
+          end
+          assign chunks = chunks + 1
+        end
+        sse.close()
+        assert(got_done and chunks >= 2)
+
+        let met = json.parse(get(addr, "/metrics").body)
+        assert_eq(int(str(met.get("requests_served"))), 2)
+        assert(int(str(met.get("prefix_cache_hits"))) >= 1)
+        let _served = srv_h.join()
+        listener.close()
+
+        let mcp_srv = build_mcp_server(engine)
+        let mcp_tools = json.parse(mcp_srv.handle_jsonrpc("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}"))
+        assert_eq(mcp_tools.get("result").get("tools").len(), 2)
+
+        let tr = trace_summary()
+        trace_stop()
+        engine.shutdown()
+
+        print("SSE chunks:", chunks, "RadixAttention hits:", met.get("prefix_cache_hits"), "hit_tokens:", met.get("prefix_hit_tokens"), "traced_spans:", tr.get("event_count"))
+        print("E2E LLM Train-Serialize-Serve PASS")

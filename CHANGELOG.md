@@ -2,9 +2,9 @@
 
 All notable changes to Mora will be documented in this file.
 
-## [0.112.0] — Unreleased（Phase P5-1A：清单 100% 闭环、纯 Mora `std/json` 与 Go-1.22 式循环每轮独立闭包捕获）
+## [0.112.0] — Phase P5 生产级端到端 LLM 栈：GPU `kernel` v2、RadixAttention 前缀缓存与 AVX2+FMA GEMM JIT、分布式 `ProcessGroup` v2、纯 Mora `std/nn/` 全栈与 `mora profile`/`mora bench` 工具链
 
-> 本版为 `v0.111.0`（Phase P4）之后的下一开发版本；`v0.111.0` 已严格拆出并仅包含 Phase P4 及跨平台发布修复。
+在不引入任何外部 Cargo 依赖（保持 `Cargo.toml` / `Cargo.lock` 唯一 1 包、**0 生产依赖 / 0 测试依赖**）与严格 Rust stable 通道的前提下，完成 `v0.112.0`（Phase P5）全部五个核心里程碑（P5-1A/1B ~ P5-5），达成从零依赖纯 Mora BPE 分词、Transformer 训练、Safetensors/GGUF 权重序列化到 RadixAttention + OpenAI HTTP/SSE + MCP 服务的端到端生产闭环。
 
 ### P5-1A：模块清单 100% 闭环与循环每轮独立闭包变量捕获（`tests/inventory_100_percent_closure.rs`）
 
@@ -12,6 +12,44 @@ All notable changes to Mora will be documented in this file.
 - **静态资源配额与统一环境 EffectRow**：为 `memory_pool` / `kv_allocator` / `set_quota` 补充编译期字节配额校验，在 I/O、网络与并发原语发射统一环境 `EffectRow` 标签（`io` / `async`），并修复 `HMInference::merge_rows` 行变量合并对称性。
 - **JSON 底座收口与纯 Mora `std/json.mora`**：将 `current_merge_strategies` 从 `CoreRuntime` 迁入 `Environment`，合并 `src/lsp/json.rs` 至 `src/flow/json.rs`，新增内嵌纯 Mora 标准库 `std/json.mora`（支持编译期 `@tag(json=...)` 编解码）。
 - **Go-1.22 式循环每轮独立闭包捕获**：新增 `ControlInst::FreshLocalCell(LocalSlot)`（`MORABC02` opcode 51），支持 `while` / `for` 循环体及循环内 `match` 分支模式绑定捕获变量的每轮独立单元分配，并验证 `--opt=2` 与 `.morac` 字节码往返执行。
+
+### P5-1B：生产级 GPU `kernel` v2（共享内存、同步栅栏、2D/3D 网格与低精度/位运算）（`tests/p5_loop_scoping_and_gpu_kernel_v2.rs`）
+
+- **共享内存、工作组栅栏与 2D/3D 发射几何**：`kernel` 块新增工作组局部共享内存 `shared tile: [f32|f64|i32; N]`、`sync_threads()` 栅栏、完整 2D/3D 网格启动 `k.launch([gx, gy, gz], [bx, by, bz], ...)` 及全部 15 个索引内建函数（`global_id_x/y/z`、`local_id_x/y/z`、`group_id_x/y/z`、`local_size_x/y/z`、`num_groups_x/y/z`）。
+- **低精度与整型缓冲 + 全语言位运算**：新增 `buf<f16>`、`buf<bf16>`、`buf<u8>`、`buf<i32>` 缓冲类型与全语言 `&`/`|`/`^`/`<<`/`>>` 位运算（不与嵌套泛型 `>>` 冲突），`MORABC02` 与 `mora fmt` 完整支持。
+- **四后端实机对等**：CUDA PTX 7.0（`.shared` / `bar.sync 0` / `cvt.f32.f16` / `bf16` 位移）、Vulkan SPIR-V 1.0（`Workgroup` 共享数组 / `OpControlBarrier` / 零扩展无锁 `OpAtomicAnd`+`OpAtomicOr` 亚字写回）、Metal MSL（`threadgroup` / `threadgroup_barrier`）与 CPU 协作式工作组模拟执行器（含分歧栅栏检测）；RTX 5070 实机 `cuda:0` + `vulkan:0` + CPU 验证 5/5 通过。
+
+### P5-2：RadixAttention 内容寻址 KV 前缀缓存、GPU Swap-Out/Swap-In 与 AVX2+FMA `FusedLinearAct` 原生 JIT（`tests/p5_radix_kv_swap_and_jit_v2.rs`）
+
+- **P5-2A RadixAttention 前缀树与自动显存换出/换入（`src/runtime/kv_cache.rs`）**：
+  - `KVPageAllocator` 内建内容寻址 `RadixTrie`（`kv.cache_prefix(seq_id, tokens)`、`kv.match_prefix(tokens)`、`kv.attach_prefix(seq_id, tokens)`），统一活跃序列与前缀树引用计数，保留 `write_kv` 写时复制（CoW）隔离与 GPU 物理 VRAM 页常驻。
+  - 配额/容量受限时自动按 LRU 淘汰非活跃前缀叶节点，支持 `swap_out(seq_id)`（GPU VRAM → 主机 RAM 卸载并释放物理显存页）与 `swap_in(seq_id)`（透明回传 GPU VRAM），`kv.stats()` 暴露 `prefix_cache_hits`、`prefix_cached_pages`、`prefix_evictions` 与 `swapped_seqs`。
+- **P5-2B 严格 W^X x86-64 AVX2+FMA `FusedLinearAct` 微核原生 JIT（`src/runtime/native_jit.rs`）**：
+  - 面向 `FusedLinearAct`（GEMM + bias + `relu`/`silu`/`gelu`/`tanh`/`sigmoid`/`none`）实现 `4×8`（`f32`）/ `4×4`（`f64`）及 `1×8`/`1×4` 寄存器分块 `vfmadd231ps`/`vfmadd231pd` 机器码生成器（仅用 Win64 & SysV 易失寄存器 `ymm0..ymm5`），严格执行 `RW → RX` 权限切换。
+  - 接入 `CpuDeviceBackend::run_fused_linear_act_into` 并在 `dag.cost_report()` 报告 `native_jit_gemm_dispatches`；经 `MORA_DISABLE_NATIVE_JIT=1` 全形状全激活函数逐元素数值对等校验通过。
+
+### P5-3：分布式 `ProcessGroup` v2（2 阶段带宽最优 Ring AllReduce、P2P、2D `split` 与异步重叠通信）（`tests/p5_distributed_v2.rs`）
+
+- **2 阶段带宽最优 TCP Ring AllReduce（`src/runtime/distributed.rs`）**：实现真正 Scatter-Reduce + AllGather 两阶段环形归约，`stats()` 新增 `wire_bytes_sent` / `wire_bytes_recv`，4-rank 实测严格吻合 $2\frac{W-1}{W}S$ 理论最优通信量。
+- **非阻塞 P2P、2D `split` 拓扑切分与异步通信重叠**：新增 `pg.send(tensor, dst)` / `pg.recv(src)`（支持 1F1B 流水线并行，`InProc` 保持 GPU VRAM 常驻，`TcpRing` 采用单字节 `CONN_KIND_RING`/`CONN_KIND_P2P` 帧复用）、`pg.split(color, key?)`（支持正交 `TP × DP` 2D 网格与动态 TCP 子环监听端口交换），以及发射保序的 `pg.all_reduce_async(tensor, op?) -> TaskHandle<Tensor>`（`ProcessGroup::allocate_seq` + `TcpRingState::acquire_io(seq)`，彻底消除多张量并发流水线归约竞态）。
+
+### P5-4：纯 Mora `std/nn/` 完整 LLM 标准库、PyTree 自动微分、词法模块导入与 `mora profile`/`mora bench` CLI（`tests/p5_std_nn_llm_and_perf_cli.rs`）
+
+- **纯 Mora `std/nn/` 四大标准库（内嵌于 `resolve_std_module`）**：
+  - `std/nn/layers.mora`：编译期 Const Generic `Linear<const IN: int, const OUT: int>`、`Embedding`、`RMSNorm`、可微 `apply_rope`、`SwiGLU`、`GroupedQueryAttention`（可微 `forward` + `KVPageAllocator` RadixAttention `forward_cached`）、`TransformerBlock` 与完整 Llama/Qwen 架构 `CausalLM`（支持 `.safetensors`/`.gguf` 存取及 KV 缓存贪婪生成）。
+  - `std/nn/optim.mora`：`cross_entropy_loss`、`cosine_lr_schedule`、`clip_grad_norm`、基于 `all_reduce_async` 的 `sync_grads_async`、`SGD` 与 `AdamW`。
+  - `std/nn/tokenizer.mora`：256 字节无损 BPE `Tokenizer`（`train_bpe`、`encode`、RFC 3629 UTF-8 安全 `decode`、GGUF `tokenizer.ggml.*` 元数据往返）。
+  - `std/nn/serving.mora` + `std/net/http.mora`（`open_sse_post`）：基于 `spawn` + `channel` + `KVPageAllocator` RadixAttention 的连续批处理 `ServingEngine`、OpenAI 兼容 HTTP + 实时 SSE 流式 `/v1/chat/completions`（含 `[DONE]`）+ `/v1/models` + `/metrics` + `/health`（挂载 `trace_http_middleware`），以及原生 `std/mcp` 推理工具服务。
+- **编译器/VM 底层补强**：
+  - 递归 PyTree `grad`/`value_and_grad`（`GradTreeSpec`），在 HM 类型检查与堆帧 VM 中一等支持 `list<Tensor>` 与 `dict<string, Tensor>` 任意层模型参数求导。
+  - 真正词法级模块导入作用域（`ModuleGlobalsInner.imports`），保证传递 `import` 在 `impl` 方法、闭包、`parallel` 与 `spawn` 纤程中始终准确解析。
+- **性能工程 CLI 工具链（`src/cli/profile.rs`、`src/cli/bench.rs`）**：
+  - 新增 `mora profile <file.mora> [--out <trace.json>] [--summary] [--opt=<0|1|2>]`（一键激活 `TraceProfiler`、打印分类耗时摘要表并导出 Chrome Trace JSON）。
+  - 新增 `mora bench [paths...] [--filter <pat>] [--iters <N>] [--warmup <W>] [--opt=<0|1|2>]`（自动发现 `*_bench.mora` / `bench_*.mora` 中零参 `task bench_*()` 并输出 `MIN`/`P50`/`P95`/`MEAN`/`OPS/SEC` 延迟分位表）。
+
+### P5-5：旗舰端到端纯 Mora LLM 示例与全仓 CI 同步（`examples/llm_train_and_serve_e2e.mora`）
+
+- 新增零外部副作用端到端旗舰示例 `examples/llm_train_and_serve_e2e.mora`（已纳入 `tests/p3_cli_fmt_test_and_examples.rs` 自动化类型检查、格式化校验与实跑门禁），单文件完整串起 BPE 训练 → Mini `CausalLM` + `AdamW` 训练收敛 → Safetensors & GGUF v3 零误差权重/词表往返 → 实时 OpenAI HTTP/SSE 流式推理 + RadixAttention 缓存命中 + MCP 工具 + `std/trace` 追踪。
 
 ## [0.111.0] — Phase P4 全栈深水区里程碑：编译期 Const Generics 与源码级 GPU `kernel`、16B 未装箱 VM 与 M:N 协作式纤程、代价模型与严格 W^X 原生 JIT、分布式集合通信与纳秒级 `std/trace`
 

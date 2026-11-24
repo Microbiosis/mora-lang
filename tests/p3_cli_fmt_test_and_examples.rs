@@ -155,6 +155,10 @@ end
         "std/mcp.mora",
         "std/nn/safetensors.mora",
         "std/nn/gguf.mora",
+        "std/nn/layers.mora",
+        "std/nn/optim.mora",
+        "std/nn/tokenizer.mora",
+        "std/nn/serving.mora",
     ] {
         let std_path = repo_root.join(rel);
         let pass1 = Command::new(mora_bin())
@@ -429,15 +433,20 @@ fn p3_all_examples_typecheck_and_run_cleanly() {
         } else if name == "cloud_http_https_mcp.mora" {
             assert!(stdout.contains("prompt_len=10,budget=64"));
             assert!(stdout.contains("mora-cloud-ready"));
+        } else if name == "llm_train_and_serve_e2e.mora" {
+            assert!(stdout.contains("Training loss:"));
+            assert!(stdout.contains("RadixAttention hits:"));
+            assert!(stdout.contains("E2E LLM Train-Serialize-Serve PASS"));
         }
     }
 
-    // Verify all 3 new showcase examples pass `mora fmt --check` cleanly
+    // Verify all 4 showcase examples pass `mora fmt --check` cleanly
     let fmt_chk = Command::new(mora_bin())
         .args(["fmt", "--check"])
         .arg(examples_dir.join("ai_compute_dag_and_autograd.mora"))
         .arg(examples_dir.join("ml_weights_safetensors_gguf.mora"))
         .arg(examples_dir.join("cloud_http_https_mcp.mora"))
+        .arg(examples_dir.join("llm_train_and_serve_e2e.mora"))
         .output()
         .expect("run mora fmt --check on showcase examples");
     assert!(

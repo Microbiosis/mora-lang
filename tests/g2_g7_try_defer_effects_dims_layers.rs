@@ -777,4 +777,12 @@ ans
     let fmt1 = format_via_cli(src);
     let fmt2 = format_via_cli(&fmt1);
     assert_eq!(fmt1, fmt2, "mora fmt must be strictly idempotent");
+
+    // Verify generic return types followed by `! eff` keep exact spacing (`task_handle<string> ! io, async`).
+    let generic_eff = "export task read_async(p: string): task_handle<string> ! io, async\n  return spawn fn() file.read_text(p) end\nend\n";
+    assert_eq!(
+        format_via_cli(generic_eff),
+        generic_eff,
+        "generic return type + ! eff must preserve `<T>` and `! io` spacing"
+    );
 }

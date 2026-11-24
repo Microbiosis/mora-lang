@@ -101,7 +101,7 @@ end
 export task buf_reader(path: any, chunk_size: int = 4096): BufReader ! io
   let checked = file.check_path(path)
   let total = int(checked.size())
-  return BufReader(path=checked, total_bytes=total, cursor=0, chunk_size=chunk_size)
+  return BufReader(path = checked, total_bytes = total, cursor = 0, chunk_size = chunk_size)
 end
 
 impl BufReader
@@ -124,7 +124,7 @@ impl BufReader
     end
     let rem = self.total_bytes - self.cursor
     if rem <= 0 then
-      return ReadChunk(data=nil, next=self, bytes_read=0, eof=true)
+      return ReadChunk(data = nil, next = self, bytes_read = 0, eof = true)
     end
     let take = want
     if take > rem then
@@ -132,8 +132,8 @@ impl BufReader
     end
     let chunk = self.path.read_binary_range(self.cursor, take)
     let next_cursor = self.cursor + take
-    let next_reader = BufReader(path=self.path, total_bytes=self.total_bytes, cursor=next_cursor, chunk_size=self.chunk_size)
-    return ReadChunk(data=chunk, next=next_reader, bytes_read=take, eof=next_cursor >= self.total_bytes)
+    let next_reader = BufReader(path = self.path, total_bytes = self.total_bytes, cursor = next_cursor, chunk_size = self.chunk_size)
+    return ReadChunk(data = chunk, next = next_reader, bytes_read = take, eof = next_cursor >= self.total_bytes)
   end
 
   task read_all_text(self): string ! io
@@ -148,18 +148,18 @@ end
 
 export task buf_writer(path: any): BufWriter ! io
   let checked = file.check_path(path)
-  return BufWriter(path=checked, chunks=[])
+  return BufWriter(path = checked, chunks = [])
 end
 
 impl BufWriter
   task write(self, text: string): BufWriter ! pure
     let next = self.chunks.push(text)
-    return BufWriter(path=self.path, chunks=next)
+    return BufWriter(path = self.path, chunks = next)
   end
 
   task writeln(self, line: string): BufWriter ! pure
     let next = self.chunks.push(line + "\n")
-    return BufWriter(path=self.path, chunks=next)
+    return BufWriter(path = self.path, chunks = next)
   end
 
   task buffered_chunks(self): int ! pure
@@ -175,6 +175,6 @@ impl BufWriter
       assign i = i + 1
     end
     self.path.write_text(combined)
-    return BufWriter(path=self.path, chunks=[])
+    return BufWriter(path = self.path, chunks = [])
   end
 end

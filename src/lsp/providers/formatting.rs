@@ -262,6 +262,8 @@ pub(crate) fn format_mora_source(text: &str) -> String {
 
         let mut prev_prev: Option<&TokenType> = None;
         let mut prev: Option<&TokenType> = None;
+        let mut prev_closed_generic = false;
+        let mut prev_prev_closed_generic = false;
         let mut angle_depth: usize = 0;
         let mut bracket_depth: usize = 0;
         let in_trait_body = trait_depths.last().copied() == Some(depth);
@@ -279,6 +281,8 @@ pub(crate) fn format_mora_source(text: &str) -> String {
                                 | "dict"
                                 | "set"
                                 | "channel"
+                                | "task_handle"
+                                | "buf"
                                 | "Tensor"
                                 | "Result"
                                 | "Option"
@@ -301,6 +305,7 @@ pub(crate) fn format_mora_source(text: &str) -> String {
                     bracket_depth,
                     opens_generic,
                     closes_generic,
+                    prev_prev_closed_generic,
                 )
             {
                 out.push(' ');
@@ -357,6 +362,8 @@ pub(crate) fn format_mora_source(text: &str) -> String {
             if !matches!(tt, TokenType::Comment(_)) {
                 prev_prev = prev;
                 prev = Some(tt);
+                prev_prev_closed_generic = prev_closed_generic;
+                prev_closed_generic = closes_generic;
             }
         }
         trim_trailing_spaces(&mut out);
@@ -374,6 +381,7 @@ pub(crate) fn format_mora_source(text: &str) -> String {
 }
 
 /// Decide whether a single space separates `prev` and `curr` on the same source line.
+#[allow(clippy::too_many_arguments)]
 fn needs_space(
     prev_prev: Option<&crate::lexer::TokenType>,
     prev: Option<&crate::lexer::TokenType>,
@@ -382,6 +390,7 @@ fn needs_space(
     bracket_depth: usize,
     opens_generic: bool,
     closes_generic: bool,
+    prev_prev_closed_generic: bool,
 ) -> bool {
     use crate::lexer::TokenType;
 
@@ -455,7 +464,9 @@ fn needs_space(
         | TokenType::ColonColon
         | TokenType::Backtick
         | TokenType::Amp => return false,
-        TokenType::Bang if is_unary_prefix_context(prev_prev) => return false,
+        TokenType::Bang if !prev_prev_closed_generic && is_unary_prefix_context(prev_prev) => {
+            return false;
+        }
         TokenType::Less if angle_depth > 0 => return false,
         TokenType::Colon if angle_depth > 0 || bracket_depth > 0 => return false,
         TokenType::Minus if is_unary_prefix_context(prev_prev) => return false,

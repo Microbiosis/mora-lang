@@ -2409,6 +2409,21 @@ impl CudaDeviceBackend {
         }))
     }
 
+    fn resolve_or_alloc_vram(
+        &self,
+        st: &mut CudaContextState,
+        byte_len: usize,
+        dst: Option<Arc<dyn DeviceVramBuffer>>,
+    ) -> MoraResult<Arc<dyn DeviceVramBuffer>> {
+        if let Some(buf) = dst
+            && buf.device() == &self.inner.device
+            && buf.byte_len() >= byte_len
+        {
+            return Ok(buf);
+        }
+        Ok(self.alloc_owned_vram(st, byte_len)?)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn launch_matmul_kernel(
         api: &CudaDriverApi,
@@ -2710,6 +2725,7 @@ impl DeviceBackend for CudaDeviceBackend {
         a_shape: &[usize],
         b_shape: &[usize],
         dtype: DType,
+        dst: Option<Arc<dyn DeviceVramBuffer>>,
     ) -> MoraResult<Option<Arc<dyn DeviceVramBuffer>>> {
         if a_shape.len() < 2
             || b_shape.len() < 2
@@ -2748,7 +2764,7 @@ impl DeviceBackend for CudaDeviceBackend {
         let rc_ctx = unsafe { (self.inner.api.cu_ctx_set_current)(st.ctx) };
         cu_check(rc_ctx, "cuCtxSetCurrent(matmul_vram)")?;
 
-        let out_buf = self.alloc_owned_vram(&mut st, out_bytes)?;
+        let out_buf = self.resolve_or_alloc_vram(&mut st, out_bytes, dst)?;
         let mut temp_allocs: Vec<(CuDevicePtr, usize)> = Vec::with_capacity(2);
         let kernel = match dtype {
             DType::F64 => st.kernels.matmul_f64,
@@ -2773,7 +2789,7 @@ impl DeviceBackend for CudaDeviceBackend {
             Self::launch_matmul_kernel(
                 &self.inner.api,
                 kernel,
-                out_buf.ptr,
+                out_buf.raw_handle(),
                 a.raw_handle(),
                 b.raw_handle(),
                 d_ab,
@@ -2811,6 +2827,7 @@ impl DeviceBackend for CudaDeviceBackend {
         n: usize,
         _out_shape: &[usize],
         dtype: DType,
+        dst: Option<Arc<dyn DeviceVramBuffer>>,
     ) -> MoraResult<Option<Arc<dyn DeviceVramBuffer>>> {
         if !matches!(dtype, DType::F64 | DType::F32 | DType::F16 | DType::BF16) {
             return Ok(None);
@@ -2837,7 +2854,7 @@ impl DeviceBackend for CudaDeviceBackend {
         let rc_ctx = unsafe { (self.inner.api.cu_ctx_set_current)(st.ctx) };
         cu_check(rc_ctx, "cuCtxSetCurrent(fused_linear_act_vram)")?;
 
-        let out_buf = self.alloc_owned_vram(&mut st, out_bytes)?;
+        let out_buf = self.resolve_or_alloc_vram(&mut st, out_bytes, dst)?;
         let kernel = match dtype {
             DType::F64 => st.kernels.fused_linear_act_f64,
             DType::F32 => st.kernels.fused_linear_act_f32,
@@ -2856,7 +2873,7 @@ impl DeviceBackend for CudaDeviceBackend {
         Self::launch_linear_act_kernel(
             &self.inner.api,
             kernel,
-            out_buf.ptr,
+            out_buf.raw_handle(),
             x.raw_handle(),
             w.raw_handle(),
             d_bias,
@@ -2892,6 +2909,7 @@ impl DeviceBackend for CudaDeviceBackend {
         _x_shape: &[usize],
         _out_shape: &[usize],
         dtype: DType,
+        dst: Option<Arc<dyn DeviceVramBuffer>>,
     ) -> MoraResult<Option<Arc<dyn DeviceVramBuffer>>> {
         if !matches!(dtype, DType::F64 | DType::F32 | DType::F16 | DType::BF16)
             || m_total * n == 0
@@ -2928,7 +2946,8 @@ impl DeviceBackend for CudaDeviceBackend {
         cu_check(rc_ctx, "cuCtxSetCurrent(rms_norm_linear_vram)")?;
 
         let out_numel = m_total * n;
-        let out_buf = self.alloc_owned_vram(&mut st, dtype.storage_bytes(out_numel))?;
+        let out_buf = self.resolve_or_alloc_vram(&mut st, dtype.storage_bytes(out_numel), dst)?;
+        let out_ptr = out_buf.raw_handle();
         let mut temp_allocs: Vec<(CuDevicePtr, usize)> = Vec::with_capacity(6);
 
         let res = (|| -> MoraResult<()> {
@@ -2951,7 +2970,7 @@ impl DeviceBackend for CudaDeviceBackend {
                 None => 0u64,
             };
             let mut d_out_f64 = if dtype == DType::F64 {
-                out_buf.ptr
+                out_ptr
             } else {
                 let (p, c) = st.arena.alloc(&self.inner.api, out_numel * 8)?;
                 temp_allocs.push((p, c));
@@ -3028,7 +3047,7 @@ impl DeviceBackend for CudaDeviceBackend {
                 Self::launch_cast_from_f64(
                     &self.inner.api,
                     &st,
-                    out_buf.ptr,
+                    out_ptr,
                     d_out_f64,
                     out_numel,
                     dtype,
@@ -3061,6 +3080,7 @@ impl DeviceBackend for CudaDeviceBackend {
         scale: f64,
         k_is_transposed: bool,
         dtype: DType,
+        dst: Option<Arc<dyn DeviceVramBuffer>>,
     ) -> MoraResult<Option<Arc<dyn DeviceVramBuffer>>> {
         if !matches!(dtype, DType::F64 | DType::F32 | DType::F16 | DType::BF16)
             || q_shape.len() < 2
@@ -3127,7 +3147,8 @@ impl DeviceBackend for CudaDeviceBackend {
         let rc_ctx = unsafe { (self.inner.api.cu_ctx_set_current)(st.ctx) };
         cu_check(rc_ctx, "cuCtxSetCurrent(flash_attn_vram)")?;
 
-        let out_buf = self.alloc_owned_vram(&mut st, dtype.storage_bytes(out_numel))?;
+        let out_buf = self.resolve_or_alloc_vram(&mut st, dtype.storage_bytes(out_numel), dst)?;
+        let out_ptr = out_buf.raw_handle();
         let mut temp_allocs: Vec<(CuDevicePtr, usize)> = Vec::with_capacity(9);
         let res = (|| -> MoraResult<()> {
             let mut dev_q =
@@ -3143,7 +3164,7 @@ impl DeviceBackend for CudaDeviceBackend {
                 None => 0u64,
             };
             let mut dev_out = if dtype == DType::F64 {
-                out_buf.ptr
+                out_ptr
             } else {
                 let (p, c) = st.arena.alloc(&self.inner.api, out_numel * 8)?;
                 temp_allocs.push((p, c));
@@ -3218,7 +3239,7 @@ impl DeviceBackend for CudaDeviceBackend {
                 Self::launch_cast_from_f64(
                     &self.inner.api,
                     &st,
-                    out_buf.ptr,
+                    out_ptr,
                     dev_out,
                     out_numel,
                     dtype,
@@ -3246,6 +3267,7 @@ impl DeviceBackend for CudaDeviceBackend {
         out_shape: &[usize],
         out_numel: usize,
         dtype: DType,
+        dst: Option<Arc<dyn DeviceVramBuffer>>,
     ) -> MoraResult<Option<Arc<dyn DeviceVramBuffer>>> {
         let total_slots = inputs.len() + steps.len();
         if !matches!(dtype, DType::F64 | DType::F32 | DType::F16 | DType::BF16)
@@ -3274,7 +3296,8 @@ impl DeviceBackend for CudaDeviceBackend {
         let rc_ctx = unsafe { (self.inner.api.cu_ctx_set_current)(st.ctx) };
         cu_check(rc_ctx, "cuCtxSetCurrent(fused_ew_vram)")?;
 
-        let out_buf = self.alloc_owned_vram(&mut st, dtype.storage_bytes(out_numel))?;
+        let out_buf = self.resolve_or_alloc_vram(&mut st, dtype.storage_bytes(out_numel), dst)?;
+        let out_ptr = out_buf.raw_handle();
         let mut temp_allocs: Vec<(CuDevicePtr, usize)> = Vec::with_capacity(8 + inputs.len());
         let res = (|| -> MoraResult<()> {
             let mut dev_in_ptrs: Vec<u64> = Vec::with_capacity(inputs.len());
@@ -3284,7 +3307,7 @@ impl DeviceBackend for CudaDeviceBackend {
                 dev_in_ptrs.push(p);
             }
             let mut d_out = if dtype == DType::F64 {
-                out_buf.ptr
+                out_ptr
             } else {
                 let (p, c) = st.arena.alloc(&self.inner.api, out_numel * 8)?;
                 temp_allocs.push((p, c));
@@ -3345,14 +3368,7 @@ impl DeviceBackend for CudaDeviceBackend {
             };
             cu_check(rc_ew, "cuLaunchKernel(mora_fused_ew_f64, vram)")?;
             if dtype != DType::F64 {
-                Self::launch_cast_from_f64(
-                    &self.inner.api,
-                    &st,
-                    out_buf.ptr,
-                    d_out,
-                    out_numel,
-                    dtype,
-                )?;
+                Self::launch_cast_from_f64(&self.inner.api, &st, out_ptr, d_out, out_numel, dtype)?;
             }
             // SAFETY: Synchronize default stream before returning resident VRAM buffer.
             let rc_sync = unsafe { (self.inner.api.cu_ctx_synchronize)() };

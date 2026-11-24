@@ -30,12 +30,14 @@ pub(crate) struct NativeJitStats {
     pub(crate) compiled_kernels: u64,
     pub(crate) cache_hits: u64,
     pub(crate) native_dispatches: u64,
+    pub(crate) f32_native_dispatches: u64,
     pub(crate) fallback_dispatches: u64,
 }
 
 static STAT_COMPILED_KERNELS: AtomicU64 = AtomicU64::new(0);
 static STAT_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 static STAT_NATIVE_DISPATCHES: AtomicU64 = AtomicU64::new(0);
+static STAT_F32_NATIVE_DISPATCHES: AtomicU64 = AtomicU64::new(0);
 static STAT_FALLBACK_DISPATCHES: AtomicU64 = AtomicU64::new(0);
 
 /// Maximum total virtual slots (`n_inputs + steps.len()`) kept in the 32B-aligned stack scratchpad.
@@ -84,6 +86,7 @@ pub(crate) fn stats() -> NativeJitStats {
         compiled_kernels: STAT_COMPILED_KERNELS.load(Ordering::Relaxed),
         cache_hits: STAT_CACHE_HITS.load(Ordering::Relaxed),
         native_dispatches: STAT_NATIVE_DISPATCHES.load(Ordering::Relaxed),
+        f32_native_dispatches: STAT_F32_NATIVE_DISPATCHES.load(Ordering::Relaxed),
         fallback_dispatches: STAT_FALLBACK_DISPATCHES.load(Ordering::Relaxed),
     }
 }
@@ -155,15 +158,23 @@ mod x86_64_impl {
     use crate::value::tensor::quantize_for_dtype;
 
     use super::{
-        Ordering, STAT_CACHE_HITS, STAT_COMPILED_KERNELS, STAT_FALLBACK_DISPATCHES,
-        STAT_NATIVE_DISPATCHES, is_chain_supported, is_enabled,
+        Ordering, STAT_CACHE_HITS, STAT_COMPILED_KERNELS, STAT_F32_NATIVE_DISPATCHES,
+        STAT_FALLBACK_DISPATCHES, STAT_NATIVE_DISPATCHES, is_chain_supported, is_enabled,
     };
 
-    /// Uniform C ABI entry signature shared by both Windows x64 and System V AMD64 kernels.
+    /// Uniform C ABI entry signature shared by both Windows x64 and System V AMD64 `f64` kernels.
     type JitEwKernelFn = unsafe extern "C" fn(
         in_ptrs: *const *const f64,
         out_ptr: *mut f64,
         consts_ptr: *const f64,
+        len: usize,
+    );
+
+    /// G7: Uniform C ABI entry signature for native `8×f32` AVX2 / `1×f32` SSE kernels.
+    type JitEwKernelF32Fn = unsafe extern "C" fn(
+        in_ptrs: *const *const f32,
+        out_ptr: *mut f32,
+        consts_ptr: *const f32,
         len: usize,
     );
 
@@ -392,6 +403,34 @@ mod x86_64_impl {
         }
     }
 
+    struct CompiledNativeKernelF32 {
+        code: os_mem::WxCodeBuffer,
+        consts: Vec<f32>,
+    }
+
+    impl CompiledNativeKernelF32 {
+        #[inline]
+        fn invoke(&self, in_ptrs: &[*const f32], out: &mut [f32]) {
+            if out.is_empty() {
+                return;
+            }
+            let _ = self.code.page_len();
+            // SAFETY: `self.code` holds verified x86-64 `8×f32` AVX2 / `1×f32` SSE machine code
+            // matching `JitEwKernelF32Fn` in immutable RX memory, `in_ptrs` has length `n_inputs`,
+            // every non-broadcast slice has length `>= out.len()`, every broadcast slice has
+            // length `>= 1`, and `self.consts` holds every `f32` constant referenced by the code.
+            unsafe {
+                let func: JitEwKernelF32Fn = std::mem::transmute(self.code.as_ptr());
+                func(
+                    in_ptrs.as_ptr(),
+                    out.as_mut_ptr(),
+                    self.consts.as_ptr(),
+                    out.len(),
+                );
+            }
+        }
+    }
+
     // ── Deterministic x86-64 SSE2 + AVX2 Machine-Code Assembler ──
 
     struct X64Asm {
@@ -542,6 +581,113 @@ mod x86_64_impl {
         fn sse2_pd_rr(&mut self, opcode: u8, dst: u8, src: u8) {
             debug_assert!(dst < 8 && src < 8);
             self.emit(&[0x66, 0x0F, opcode, 0xC0 | (dst << 3) | src]);
+        }
+
+        // ── G7: AVX2 (256-bit, 8 × f32) instructions ──
+
+        /// `vbroadcastss ymm_d, [r8 + disp32]` (VEX.256.66.0F38.W0 18 /r)
+        fn vbroadcastss_r8_disp(&mut self, dst: u8, disp: i32) {
+            debug_assert!(dst < 8);
+            self.emit(&[0xC4, 0xC2, 0x7D, 0x18, 0x80 | (dst << 3)]);
+            self.emit_i32(disp);
+        }
+
+        /// `vbroadcastss ymm_d, [rdx]`
+        fn vbroadcastss_rdx(&mut self, dst: u8) {
+            debug_assert!(dst < 8);
+            self.emit(&[0xC4, 0xE2, 0x7D, 0x18, (dst << 3) | 0x02]);
+        }
+
+        /// `vmovups ymm_d, [rdx + rax*4]` (VEX.256.NP.0F.WIG 10 /r)
+        fn vmovups_load_rdx_rax4(&mut self, dst: u8) {
+            debug_assert!(dst < 8);
+            self.emit(&[0xC4, 0xE1, 0x7C, 0x10, (dst << 3) | 0x04, 0x82]);
+        }
+
+        /// `vmovups [r11 + rax*4], ymm_s` (VEX.256.NP.0F.WIG 11 /r)
+        fn vmovups_store_r11_rax4(&mut self, src: u8) {
+            debug_assert!(src < 8);
+            self.emit(&[0xC4, 0xC1, 0x7C, 0x11, (src << 3) | 0x04, 0x83]);
+        }
+
+        /// `vmovaps ymm_d, [rsp + disp32]` (32-byte aligned stack slot)
+        fn vmovaps_load_rsp(&mut self, dst: u8, disp: i32) {
+            debug_assert!(dst < 8);
+            self.emit(&[0xC4, 0xE1, 0x7C, 0x28, 0x84 | (dst << 3), 0x24]);
+            self.emit_i32(disp);
+        }
+
+        /// `vmovaps [rsp + disp32], ymm_s` (32-byte aligned stack slot)
+        fn vmovaps_store_rsp(&mut self, src: u8, disp: i32) {
+            debug_assert!(src < 8);
+            self.emit(&[0xC4, 0xE1, 0x7C, 0x29, 0x84 | (src << 3), 0x24]);
+            self.emit_i32(disp);
+        }
+
+        /// 3-operand AVX2 `op ymm_d, ymm_s1, ymm_s2` (VEX.256.NP.0F.WIG `opcode` /r)
+        fn vex_ps_rrr(&mut self, opcode: u8, dst: u8, src1: u8, src2: u8) {
+            debug_assert!(dst < 8 && src1 < 8 && src2 < 8);
+            let b2 = ((0x0F ^ src1) << 3) | 0x04; // W=0, ~vvvv, L=1 (256-bit), pp=00 (NP)
+            self.emit(&[0xC4, 0xE1, b2, opcode, 0xC0 | (dst << 3) | src2]);
+        }
+
+        /// `vsqrtps ymm_d, ymm_s`
+        fn vsqrtps_rr(&mut self, dst: u8, src: u8) {
+            debug_assert!(dst < 8 && src < 8);
+            self.emit(&[0xC4, 0xE1, 0x7C, 0x51, 0xC0 | (dst << 3) | src]);
+        }
+
+        // ── G7: SSE (32-bit scalar `f32`) instructions ──
+
+        /// `movss xmm_d, [r8 + disp32]`
+        fn movss_load_r8_disp(&mut self, dst: u8, disp: i32) {
+            debug_assert!(dst < 8);
+            self.emit(&[0xF3, 0x41, 0x0F, 0x10, 0x80 | (dst << 3)]);
+            self.emit_i32(disp);
+        }
+
+        /// `movss xmm_d, [rdx]`
+        fn movss_load_rdx(&mut self, dst: u8) {
+            debug_assert!(dst < 8);
+            self.emit(&[0xF3, 0x0F, 0x10, (dst << 3) | 0x02]);
+        }
+
+        /// `movss xmm_d, [rdx + rax*4]`
+        fn movss_load_rdx_rax4(&mut self, dst: u8) {
+            debug_assert!(dst < 8);
+            self.emit(&[0xF3, 0x0F, 0x10, (dst << 3) | 0x04, 0x82]);
+        }
+
+        /// `movss [r11 + rax*4], xmm_s`
+        fn movss_store_r11_rax4(&mut self, src: u8) {
+            debug_assert!(src < 8);
+            self.emit(&[0xF3, 0x41, 0x0F, 0x11, (src << 3) | 0x04, 0x83]);
+        }
+
+        /// `movss xmm_d, [rsp + disp32]`
+        fn movss_load_rsp(&mut self, dst: u8, disp: i32) {
+            debug_assert!(dst < 8);
+            self.emit(&[0xF3, 0x0F, 0x10, 0x84 | (dst << 3), 0x24]);
+            self.emit_i32(disp);
+        }
+
+        /// `movss [rsp + disp32], xmm_s`
+        fn movss_store_rsp(&mut self, src: u8, disp: i32) {
+            debug_assert!(src < 8);
+            self.emit(&[0xF3, 0x0F, 0x11, 0x84 | (src << 3), 0x24]);
+            self.emit_i32(disp);
+        }
+
+        /// `op xmm_d, xmm_s` (`F3 0F opcode ModRM` — `addss`/`subss`/`mulss`/`divss`/`sqrtss`/`maxss`)
+        fn sse_ss_rr(&mut self, opcode: u8, dst: u8, src: u8) {
+            debug_assert!(dst < 8 && src < 8);
+            self.emit(&[0xF3, 0x0F, opcode, 0xC0 | (dst << 3) | src]);
+        }
+
+        /// `op xmm_d, xmm_s` (`0F opcode ModRM` — `xorps`/`andps`)
+        fn sse_ps_rr(&mut self, opcode: u8, dst: u8, src: u8) {
+            debug_assert!(dst < 8 && src < 8);
+            self.emit(&[0x0F, opcode, 0xC0 | (dst << 3) | src]);
         }
     }
 
@@ -814,6 +960,271 @@ mod x86_64_impl {
         (a.buf, consts)
     }
 
+    /// G7: Emit strict W^X x86-64 AVX2 `8×f32` vector loop + SSE `1×f32` scalar tail kernel.
+    fn emit_kernel_code_f32(
+        n_inputs: usize,
+        broadcast_mask: u64,
+        steps: &[FusedEwStep],
+        use_avx2: bool,
+    ) -> (Vec<u8>, Vec<f32>) {
+        // Reserve consts[0]=+0.0f, consts[1]=sign_mask, consts[2]=abs_mask, then step immediates.
+        let mut consts = vec![
+            0.0_f32,
+            f32::from_bits(0x8000_0000),
+            f32::from_bits(0x7FFF_FFFF),
+        ];
+        let mut step_const_idx: Vec<usize> = Vec::with_capacity(steps.len());
+        for step in steps {
+            let c_opt = match *step {
+                FusedEwStep::AddScalar(_, c)
+                | FusedEwStep::SubScalar(_, c, _)
+                | FusedEwStep::MulScalar(_, c)
+                | FusedEwStep::DivScalar(_, c, _) => Some(c as f32),
+                _ => None,
+            };
+            if let Some(c) = c_opt {
+                let idx = consts.len();
+                consts.push(c);
+                step_const_idx.push(idx);
+            } else {
+                step_const_idx.push(0);
+            }
+        }
+
+        let total_slots = n_inputs + steps.len();
+        let frame_bytes = (total_slots * 32).max(32) as i32;
+        let slot_off = |slot: usize| -> i32 { (slot * 32) as i32 };
+
+        let mut a = X64Asm::new();
+
+        // Prologue: 32-byte aligned stack scratchpad.
+        a.emit(&[0x55]); // push rbp
+        a.emit(&[0x48, 0x89, 0xE5]); // mov rbp, rsp
+        a.emit(&[0x48, 0x83, 0xE4, 0xE0]); // and rsp, -32
+        a.emit(&[0x48, 0x81, 0xEC]); // sub rsp, frame_bytes
+        a.emit_i32(frame_bytes);
+
+        // Normalize calling convention args into (r10=in_ptrs, r11=out_ptr, r8=consts_ptr, r9=len).
+        #[cfg(windows)]
+        {
+            a.emit(&[0x49, 0x89, 0xCA]); // mov r10, rcx
+            a.emit(&[0x49, 0x89, 0xD3]); // mov r11, rdx
+        }
+        #[cfg(unix)]
+        {
+            a.emit(&[0x49, 0x89, 0xFA]); // mov r10, rdi
+            a.emit(&[0x49, 0x89, 0xF3]); // mov r11, rsi
+            a.emit(&[0x49, 0x89, 0xD0]); // mov r8, rdx
+            a.emit(&[0x49, 0x89, 0xC9]); // mov r9, rcx
+        }
+
+        // Loop counter `rax = 0`.
+        a.emit(&[0x31, 0xC0]); // xor eax, eax
+
+        // ── Optional AVX2 8×f32 Vector Loop ──
+        if use_avx2 {
+            a.vbroadcastss_r8_disp(2, 0); // ymm2 = [+0.0f; 8]
+            a.vbroadcastss_r8_disp(3, 4); // ymm3 = [sign_mask; 8]
+            a.vbroadcastss_r8_disp(4, 8); // ymm4 = [abs_mask; 8]
+
+            let avx_loop = a.pos();
+            a.emit(&[0x48, 0x8D, 0x48, 0x08]); // lea rcx, [rax + 8]
+            a.emit(&[0x4C, 0x39, 0xC9]); // cmp rcx, r9
+            a.emit(&[0x0F, 0x87]); // ja avx_done
+            let avx_exit_patch = a.pos();
+            a.emit_i32(0);
+
+            for i in 0..n_inputs {
+                a.mov_rdx_r10_disp((i * 8) as i32);
+                if (broadcast_mask & (1u64 << i)) != 0 {
+                    a.vbroadcastss_rdx(0);
+                } else {
+                    a.vmovups_load_rdx_rax4(0);
+                }
+                a.vmovaps_store_rsp(0, slot_off(i));
+            }
+
+            for (s_idx, step) in steps.iter().enumerate() {
+                let dst_slot = n_inputs + s_idx;
+                let c_disp = (step_const_idx[s_idx] * 4) as i32;
+                match *step {
+                    FusedEwStep::Add(lhs, rhs) => {
+                        a.vmovaps_load_rsp(0, slot_off(lhs));
+                        a.vmovaps_load_rsp(1, slot_off(rhs));
+                        a.vex_ps_rrr(0x58, 0, 0, 1); // vaddps
+                    }
+                    FusedEwStep::Sub(lhs, rhs) => {
+                        a.vmovaps_load_rsp(0, slot_off(lhs));
+                        a.vmovaps_load_rsp(1, slot_off(rhs));
+                        a.vex_ps_rrr(0x5C, 0, 0, 1); // vsubps
+                    }
+                    FusedEwStep::Mul(lhs, rhs) => {
+                        a.vmovaps_load_rsp(0, slot_off(lhs));
+                        a.vmovaps_load_rsp(1, slot_off(rhs));
+                        a.vex_ps_rrr(0x59, 0, 0, 1); // vmulps
+                    }
+                    FusedEwStep::AddScalar(lhs, _) => {
+                        a.vmovaps_load_rsp(0, slot_off(lhs));
+                        a.vbroadcastss_r8_disp(1, c_disp);
+                        a.vex_ps_rrr(0x58, 0, 0, 1);
+                    }
+                    FusedEwStep::SubScalar(lhs, _, false) => {
+                        a.vmovaps_load_rsp(0, slot_off(lhs));
+                        a.vbroadcastss_r8_disp(1, c_disp);
+                        a.vex_ps_rrr(0x5C, 0, 0, 1);
+                    }
+                    FusedEwStep::SubScalar(lhs, _, true) => {
+                        a.vbroadcastss_r8_disp(0, c_disp);
+                        a.vmovaps_load_rsp(1, slot_off(lhs));
+                        a.vex_ps_rrr(0x5C, 0, 0, 1);
+                    }
+                    FusedEwStep::MulScalar(lhs, _) => {
+                        a.vmovaps_load_rsp(0, slot_off(lhs));
+                        a.vbroadcastss_r8_disp(1, c_disp);
+                        a.vex_ps_rrr(0x59, 0, 0, 1);
+                    }
+                    FusedEwStep::DivScalar(lhs, _, false) => {
+                        a.vmovaps_load_rsp(0, slot_off(lhs));
+                        a.vbroadcastss_r8_disp(1, c_disp);
+                        a.vex_ps_rrr(0x5E, 0, 0, 1); // vdivps
+                    }
+                    FusedEwStep::Neg(lhs) => {
+                        a.vmovaps_load_rsp(0, slot_off(lhs));
+                        a.vex_ps_rrr(0x57, 0, 0, 3); // vxorps
+                    }
+                    FusedEwStep::Abs(lhs) => {
+                        a.vmovaps_load_rsp(0, slot_off(lhs));
+                        a.vex_ps_rrr(0x54, 0, 0, 4); // vandps
+                    }
+                    FusedEwStep::Sqrt(lhs) => {
+                        a.vmovaps_load_rsp(0, slot_off(lhs));
+                        a.vsqrtps_rr(0, 0);
+                    }
+                    FusedEwStep::Relu(lhs) => {
+                        a.vmovaps_load_rsp(0, slot_off(lhs));
+                        a.vex_ps_rrr(0x5F, 0, 0, 2); // vmaxps ymm0, ymm0, +0.0f
+                    }
+                    _ => unreachable!("is_chain_supported pre-filtered unsupported step"),
+                }
+                a.vmovaps_store_rsp(0, slot_off(dst_slot));
+            }
+
+            a.vmovups_store_r11_rax4(0);
+            a.emit(&[0x48, 0x83, 0xC0, 0x08]); // add rax, 8
+            a.emit(&[0xE9]); // jmp avx_loop
+            let back_patch = a.pos();
+            a.emit_i32(0);
+            a.patch_rel32(back_patch, avx_loop);
+
+            let avx_done = a.pos();
+            a.patch_rel32(avx_exit_patch, avx_done);
+            a.vzeroupper();
+        }
+
+        // ── SSE Scalar Tail Loop (`1 × f32` per iteration) ──
+        a.movss_load_r8_disp(2, 0); // xmm2 = +0.0f
+        a.movss_load_r8_disp(3, 4); // xmm3 = sign_mask
+        a.movss_load_r8_disp(4, 8); // xmm4 = abs_mask
+
+        let scalar_loop = a.pos();
+        a.emit(&[0x4C, 0x39, 0xC8]); // cmp rax, r9
+        a.emit(&[0x0F, 0x83]); // jae scalar_done
+        let scalar_exit_patch = a.pos();
+        a.emit_i32(0);
+
+        for i in 0..n_inputs {
+            a.mov_rdx_r10_disp((i * 8) as i32);
+            if (broadcast_mask & (1u64 << i)) != 0 {
+                a.movss_load_rdx(0);
+            } else {
+                a.movss_load_rdx_rax4(0);
+            }
+            a.movss_store_rsp(0, slot_off(i));
+        }
+
+        for (s_idx, step) in steps.iter().enumerate() {
+            let dst_slot = n_inputs + s_idx;
+            let c_disp = (step_const_idx[s_idx] * 4) as i32;
+            match *step {
+                FusedEwStep::Add(lhs, rhs) => {
+                    a.movss_load_rsp(0, slot_off(lhs));
+                    a.movss_load_rsp(1, slot_off(rhs));
+                    a.sse_ss_rr(0x58, 0, 1); // addss
+                }
+                FusedEwStep::Sub(lhs, rhs) => {
+                    a.movss_load_rsp(0, slot_off(lhs));
+                    a.movss_load_rsp(1, slot_off(rhs));
+                    a.sse_ss_rr(0x5C, 0, 1); // subss
+                }
+                FusedEwStep::Mul(lhs, rhs) => {
+                    a.movss_load_rsp(0, slot_off(lhs));
+                    a.movss_load_rsp(1, slot_off(rhs));
+                    a.sse_ss_rr(0x59, 0, 1); // mulss
+                }
+                FusedEwStep::AddScalar(lhs, _) => {
+                    a.movss_load_rsp(0, slot_off(lhs));
+                    a.movss_load_r8_disp(1, c_disp);
+                    a.sse_ss_rr(0x58, 0, 1);
+                }
+                FusedEwStep::SubScalar(lhs, _, false) => {
+                    a.movss_load_rsp(0, slot_off(lhs));
+                    a.movss_load_r8_disp(1, c_disp);
+                    a.sse_ss_rr(0x5C, 0, 1);
+                }
+                FusedEwStep::SubScalar(lhs, _, true) => {
+                    a.movss_load_r8_disp(0, c_disp);
+                    a.movss_load_rsp(1, slot_off(lhs));
+                    a.sse_ss_rr(0x5C, 0, 1);
+                }
+                FusedEwStep::MulScalar(lhs, _) => {
+                    a.movss_load_rsp(0, slot_off(lhs));
+                    a.movss_load_r8_disp(1, c_disp);
+                    a.sse_ss_rr(0x59, 0, 1);
+                }
+                FusedEwStep::DivScalar(lhs, _, false) => {
+                    a.movss_load_rsp(0, slot_off(lhs));
+                    a.movss_load_r8_disp(1, c_disp);
+                    a.sse_ss_rr(0x5E, 0, 1); // divss
+                }
+                FusedEwStep::Neg(lhs) => {
+                    a.movss_load_rsp(0, slot_off(lhs));
+                    a.sse_ps_rr(0x57, 0, 3); // xorps
+                }
+                FusedEwStep::Abs(lhs) => {
+                    a.movss_load_rsp(0, slot_off(lhs));
+                    a.sse_ps_rr(0x54, 0, 4); // andps
+                }
+                FusedEwStep::Sqrt(lhs) => {
+                    a.movss_load_rsp(0, slot_off(lhs));
+                    a.sse_ss_rr(0x51, 0, 0); // sqrtss
+                }
+                FusedEwStep::Relu(lhs) => {
+                    a.movss_load_rsp(0, slot_off(lhs));
+                    a.sse_ss_rr(0x5F, 0, 2); // maxss xmm0, +0.0f
+                }
+                _ => unreachable!("is_chain_supported pre-filtered unsupported step"),
+            }
+            a.movss_store_rsp(0, slot_off(dst_slot));
+        }
+
+        a.movss_store_r11_rax4(0);
+        a.emit(&[0x48, 0x83, 0xC0, 0x01]); // add rax, 1
+        a.emit(&[0xE9]); // jmp scalar_loop
+        let s_back_patch = a.pos();
+        a.emit_i32(0);
+        a.patch_rel32(s_back_patch, scalar_loop);
+
+        let scalar_done = a.pos();
+        a.patch_rel32(scalar_exit_patch, scalar_done);
+
+        // Epilogue.
+        a.emit(&[0x48, 0x89, 0xEC]); // mov rsp, rbp
+        a.emit(&[0x5D]); // pop rbp
+        a.emit(&[0xC3]); // ret
+
+        (a.buf, consts)
+    }
+
     fn kernel_cache_key(
         n_inputs: usize,
         broadcast_mask: u64,
@@ -891,6 +1302,37 @@ mod x86_64_impl {
     }
 
     static JIT_CACHE: OnceLock<RwLock<HashMap<u64, Arc<CompiledNativeKernel>>>> = OnceLock::new();
+    static JIT_CACHE_F32: OnceLock<RwLock<HashMap<u64, Arc<CompiledNativeKernelF32>>>> =
+        OnceLock::new();
+
+    fn get_or_compile_f32(
+        n_inputs: usize,
+        broadcast_mask: u64,
+        steps: &[FusedEwStep],
+        use_avx2: bool,
+    ) -> MoraResult<Arc<CompiledNativeKernelF32>> {
+        let key =
+            kernel_cache_key(n_inputs, broadcast_mask, steps, use_avx2) ^ 0xF320_F320_F320_F320;
+        let cache = JIT_CACHE_F32.get_or_init(|| RwLock::new(HashMap::new()));
+        if let Some(hit) = cache.read().get(&key).cloned() {
+            STAT_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+            return Ok(hit);
+        }
+        let (code_bytes, consts) = emit_kernel_code_f32(n_inputs, broadcast_mask, steps, use_avx2);
+        let wx_buf = os_mem::WxCodeBuffer::from_code(&code_bytes)?;
+        let kernel = Arc::new(CompiledNativeKernelF32 {
+            code: wx_buf,
+            consts,
+        });
+        let mut w = cache.write();
+        if let Some(existing) = w.get(&key).cloned() {
+            STAT_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+            return Ok(existing);
+        }
+        STAT_COMPILED_KERNELS.fetch_add(1, Ordering::Relaxed);
+        w.insert(key, Arc::clone(&kernel));
+        Ok(kernel)
+    }
 
     fn get_or_compile(
         n_inputs: usize,
@@ -957,6 +1399,24 @@ mod x86_64_impl {
 
         let use_avx2 = std::arch::is_x86_feature_detected!("avx2")
             && std::arch::is_x86_feature_detected!("avx");
+
+        // G7: Native `8×f32` AVX2 / `1×f32` SSE strict W^X fast path for `DType::F32`!
+        if dtype == DType::F32 {
+            let kernel = get_or_compile_f32(input_flats.len(), broadcast_mask, steps, use_avx2)?;
+            let f32_inputs: Vec<Vec<f32>> = input_flats
+                .iter()
+                .map(|flat| flat.iter().map(|&v| v as f32).collect())
+                .collect();
+            let f32_ptrs: Vec<*const f32> = f32_inputs.iter().map(|v| v.as_ptr()).collect();
+            let mut out_f32 = vec![0.0_f32; out_numel];
+            kernel.invoke(&f32_ptrs, &mut out_f32);
+            out.clear();
+            out.extend(out_f32.into_iter().map(f64::from));
+            STAT_NATIVE_DISPATCHES.fetch_add(1, Ordering::Relaxed);
+            STAT_F32_NATIVE_DISPATCHES.fetch_add(1, Ordering::Relaxed);
+            return Ok(true);
+        }
+
         let kernel = get_or_compile(input_flats.len(), broadcast_mask, steps, use_avx2)?;
 
         out.resize(out_numel, 0.0);
@@ -1102,6 +1562,141 @@ mod tests {
             assert!(st.compiled_kernels >= 1);
             assert!(st.cache_hits >= 1);
             assert!(st.native_dispatches >= 16);
+        }
+    }
+
+    #[test]
+    fn native_wx_jit_8xf32_avx2_is_bit_exact_with_f32_reference_across_lengths_and_edges() {
+        let steps = vec![
+            FusedEwStep::Mul(0, 1),                 // slot 3: x * y
+            FusedEwStep::AddScalar(3, 1.25),        // slot 4: x*y + 1.25
+            FusedEwStep::Sub(4, 2),                 // slot 5: (x*y + 1.25) - bias (broadcast!)
+            FusedEwStep::MulScalar(5, -0.5),        // slot 6: * -0.5
+            FusedEwStep::Neg(6),                    // slot 7: negate
+            FusedEwStep::Relu(7),                   // slot 8: relu
+            FusedEwStep::Abs(8),                    // slot 9: abs
+            FusedEwStep::Sqrt(9),                   // slot 10: sqrt
+            FusedEwStep::DivScalar(10, 2.0, false), // slot 11: / 2.0
+            FusedEwStep::SubScalar(11, 3.0, true),  // slot 12: 3.0 - s11
+        ];
+        let bias = vec![0.35_f64];
+
+        let eval_f32_ref = |x: f32, y: f32, b: f32| -> f32 {
+            let s3 = x * y;
+            let s4 = s3 + 1.25_f32;
+            let s5 = s4 - b;
+            let s6 = s5 * -0.5_f32;
+            let s7 = -s6;
+            let s8 = if s7 > 0.0_f32 { s7 } else { 0.0_f32 };
+            let s9 = s8.abs();
+            let s10 = s9.sqrt();
+            let s11 = s10 / 2.0_f32;
+            3.0_f32 - s11
+        };
+
+        let before = stats().f32_native_dispatches;
+        for len in [
+            0usize, 1, 2, 3, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 257,
+        ] {
+            let x: Vec<f64> = (0..len)
+                .map(|i| (((i as f32) * 0.37 - 4.2) * if i % 3 == 0 { -1.0 } else { 1.0 }) as f64)
+                .collect();
+            let y: Vec<f64> = (0..len)
+                .map(|i| ((i as f32) * -0.19 + 2.1) as f64)
+                .collect();
+
+            let mut out_jit = Vec::new();
+            let ran = try_run_fused_elementwise_into(
+                &[&x, &y, &bias],
+                &[&[len], &[len], &[1]],
+                &steps,
+                &[len],
+                len,
+                DType::F32,
+                &mut out_jit,
+            )
+            .expect("native f32 JIT execution");
+
+            #[cfg(target_arch = "x86_64")]
+            if is_enabled() {
+                assert!(
+                    ran,
+                    "x86-64 native 8×f32 JIT must accept supported chain at len={len}"
+                );
+            }
+
+            if ran {
+                assert_eq!(out_jit.len(), len);
+                for i in 0..len {
+                    let got = out_jit[i] as f32;
+                    let expected = eval_f32_ref(x[i] as f32, y[i] as f32, bias[0] as f32);
+                    assert_eq!(
+                        got.to_bits(),
+                        expected.to_bits(),
+                        "8×f32 bit-exact mismatch at len={len} idx={i}: jit={got} ({:#x}) vs ref={expected} ({:#x})",
+                        got.to_bits(),
+                        expected.to_bits()
+                    );
+                }
+            }
+        }
+
+        // IEEE-754 edge cases for `8×f32` AVX2 + `1×f32` SSE tail (len=9 crosses 8+1 boundary!).
+        let edge_x: Vec<f64> = vec![
+            -0.0_f32,
+            0.0_f32,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            -4.0_f32,
+            9.0_f32,
+            -16.0_f32,
+            25.0_f32,
+        ]
+        .into_iter()
+        .map(f64::from)
+        .collect();
+        let edge_steps = vec![
+            FusedEwStep::Neg(0),
+            FusedEwStep::Relu(1),
+            FusedEwStep::Sqrt(2),
+            FusedEwStep::Abs(3),
+        ];
+        let mut out_jit = Vec::new();
+        let ran = try_run_fused_elementwise_into(
+            &[&edge_x],
+            &[&[edge_x.len()]],
+            &edge_steps,
+            &[edge_x.len()],
+            edge_x.len(),
+            DType::F32,
+            &mut out_jit,
+        )
+        .expect("f32 edge JIT");
+        if ran {
+            for (i, &in_v) in edge_x.iter().enumerate() {
+                let x = in_v as f32;
+                let neg = -x;
+                let relu = if neg > 0.0_f32 { neg } else { 0.0_f32 };
+                let expected = relu.sqrt().abs();
+                let got = out_jit[i] as f32;
+                if expected.is_nan() {
+                    assert!(got.is_nan(), "idx={i}: expected NaN, got {got}");
+                } else {
+                    assert_eq!(
+                        got.to_bits(),
+                        expected.to_bits(),
+                        "f32 IEEE-754 edge mismatch at idx={i}: jit={got} vs ref={expected}"
+                    );
+                }
+            }
+            #[cfg(target_arch = "x86_64")]
+            if is_enabled() {
+                assert!(
+                    stats().f32_native_dispatches > before,
+                    "expected f32_native_dispatches counter to increment"
+                );
+            }
         }
     }
 }

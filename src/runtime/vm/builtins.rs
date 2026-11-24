@@ -2620,6 +2620,31 @@ fn resolve_compute_dag_method(
             let compiled = dag.compile_with_cache(core.shared().dag_cache());
             Ok(CallAction::Done(Value::ComputeDag(Arc::new(compiled))))
         }
+        "vjp" | "grad" | "jvp" => {
+            if args.len() > 1 {
+                return Err(MoraError::Runtime(format!(
+                    "ComputeDag.{method}(input_idx?) expects 0 or 1 argument, got {}",
+                    args.len()
+                )));
+            }
+            let input_idx = match args.first() {
+                None => 0usize,
+                Some(Value::Int(i)) if *i >= 0 => *i as usize,
+                Some(other) => {
+                    return Err(MoraError::Runtime(format!(
+                        "ComputeDag.{method}: input_idx must be a non-negative Int, got {}",
+                        crate::flow::dynamic_type_name(other)
+                    )));
+                }
+            };
+            let diff_dag = match method {
+                "vjp" => dag.build_vjp(input_idx)?,
+                "grad" => dag.build_grad(input_idx)?,
+                "jvp" => dag.build_jvp(input_idx)?,
+                _ => unreachable!(),
+            };
+            Ok(CallAction::Done(Value::ComputeDag(Arc::new(diff_dag))))
+        }
         "run" => {
             let raw_inputs: Vec<Value> = if args.len() == 1
                 && let Value::List(xs) = &args[0]
@@ -2772,6 +2797,7 @@ fn resolve_compute_dag_method(
                 ));
             }
             let mem = dag.memory_plan();
+            let (vram_allocs, vram_reuses) = dag.vram_reuse_stats();
             let mut m = std::collections::HashMap::new();
             m.insert(
                 "total_intermediates".to_string(),
@@ -2792,6 +2818,22 @@ fn resolve_compute_dag_method(
             m.insert(
                 "reuse_count".to_string(),
                 Value::Int(mem.reuse_count as i64),
+            );
+            m.insert(
+                "vram_peak_slots".to_string(),
+                Value::Int(mem.vram_peak_slots as i64),
+            );
+            m.insert(
+                "vram_peak_bytes".to_string(),
+                Value::Int(mem.vram_peak_bytes as i64),
+            );
+            m.insert(
+                "vram_scratch_allocs".to_string(),
+                Value::Int(vram_allocs as i64),
+            );
+            m.insert(
+                "vram_buffer_reuses".to_string(),
+                Value::Int(vram_reuses as i64),
             );
             Ok(CallAction::Done(Value::Dict(m)))
         }
@@ -2862,6 +2904,18 @@ fn resolve_compute_dag_method(
             m.insert(
                 "native_jit_dispatches".to_string(),
                 Value::Int(rep.native_jit_dispatches as i64),
+            );
+            m.insert(
+                "native_jit_f32_dispatches".to_string(),
+                Value::Int(rep.native_jit_f32_dispatches as i64),
+            );
+            m.insert(
+                "vram_scratch_allocs".to_string(),
+                Value::Int(rep.vram_scratch_allocs as i64),
+            );
+            m.insert(
+                "vram_buffer_reuses".to_string(),
+                Value::Int(rep.vram_buffer_reuses as i64),
             );
             let node_list: Vec<Value> = rep
                 .node_costs
@@ -3254,6 +3308,38 @@ fn resolve_kv_allocator_method(
             }
             let seq_id = as_u64(&args[0], "seq_id")?;
             Ok(CallAction::Done(Value::Int(kv.free_seq(seq_id)? as i64)))
+        }
+        "swap_out" => {
+            if args.len() != 1 {
+                return Err(MoraError::Runtime(
+                    "kv_allocator.swap_out(seq_id) expects 1 argument".to_string(),
+                ));
+            }
+            let seq_id = as_u64(&args[0], "seq_id")?;
+            Ok(CallAction::Done(Value::Int(kv.swap_out(seq_id)? as i64)))
+        }
+        "swap_in" => {
+            if args.len() != 1 {
+                return Err(MoraError::Runtime(
+                    "kv_allocator.swap_in(seq_id) expects 1 argument".to_string(),
+                ));
+            }
+            let seq_id = as_u64(&args[0], "seq_id")?;
+            let (raw_pages, fired) = kv.swap_in_with_watermarks(seq_id)?;
+            let pages: Vec<Value> = raw_pages
+                .into_iter()
+                .map(|p| Value::Int(p as i64))
+                .collect();
+            Ok(dispatch_with_watermarks(Value::List(pages.into()), fired))
+        }
+        "is_swapped" => {
+            if args.len() != 1 {
+                return Err(MoraError::Runtime(
+                    "kv_allocator.is_swapped(seq_id) expects 1 argument".to_string(),
+                ));
+            }
+            let seq_id = as_u64(&args[0], "seq_id")?;
+            Ok(CallAction::Done(Value::Bool(kv.is_swapped(seq_id))))
         }
         "evict_lru" => {
             if !args.is_empty() {

@@ -1302,6 +1302,14 @@ fn method_signature_builtin(receiver: &Type, method: &str) -> Option<Signature> 
             vec![("self".to_string(), Type::ComputeDag)],
             Type::ComputeDag,
         )),
+        (Type::ComputeDag, "vjp" | "grad" | "jvp") => Some(Signature::with_min_arity(
+            vec![
+                ("self".to_string(), Type::ComputeDag),
+                ("input_idx".to_string(), Type::Int),
+            ],
+            1,
+            Type::ComputeDag,
+        )),
         (Type::ComputeDag, "run") => Some(Signature::variadic(
             vec![
                 ("self".to_string(), Type::ComputeDag),
@@ -1451,6 +1459,27 @@ fn method_signature_builtin(receiver: &Type, method: &str) -> Option<Signature> 
                 ("requester_priority".to_string(), Type::Int),
             ],
             Type::List(Box::new(Type::Int)),
+        )),
+        (Type::KVAllocator, "swap_out") => Some(Signature::new(
+            vec![
+                ("self".to_string(), Type::KVAllocator),
+                ("seq_id".to_string(), Type::Int),
+            ],
+            Type::Int,
+        )),
+        (Type::KVAllocator, "swap_in") => Some(Signature::new(
+            vec![
+                ("self".to_string(), Type::KVAllocator),
+                ("seq_id".to_string(), Type::Int),
+            ],
+            Type::List(Box::new(Type::Int)),
+        )),
+        (Type::KVAllocator, "is_swapped") => Some(Signature::new(
+            vec![
+                ("self".to_string(), Type::KVAllocator),
+                ("seq_id".to_string(), Type::Int),
+            ],
+            Type::Bool,
         )),
         (
             Type::KVAllocator,

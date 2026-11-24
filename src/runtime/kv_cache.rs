@@ -44,6 +44,14 @@ struct SeqKvState {
     last_access_tick: u64,
 }
 
+/// G3: Host-RAM swapped sequence state downloaded from physical VRAM/pool pages.
+#[derive(Debug, Clone)]
+struct SwappedSeqState {
+    host_pages: Vec<(Vec<u8>, Vec<u8>)>,
+    num_tokens: usize,
+    priority: i64,
+}
+
 #[derive(Debug)]
 struct KvPoolInner {
     free_pages: Vec<usize>,
@@ -55,12 +63,17 @@ struct KvPoolInner {
     k_vram_pages: Vec<Option<Arc<dyn DeviceVramBuffer>>>,
     v_vram_pages: Vec<Option<Arc<dyn DeviceVramBuffer>>>,
     seqs: HashMap<u64, SeqKvState>,
+    swapped_seqs: HashMap<u64, SwappedSeqState>,
     tick: u64,
     max_bytes: Option<usize>,
     watermarks: Vec<WatermarkHook>,
     evictions: u64,
     preemptions: u64,
     watermark_triggers: u64,
+    swap_outs: u64,
+    swap_ins: u64,
+    swap_out_bytes: u64,
+    swap_in_bytes: u64,
 }
 
 /// Paged KV-cache memory allocator with Copy-on-Write prefix sharing, hard byte quotas,
@@ -179,12 +192,17 @@ impl KVPageAllocator {
                 k_vram_pages: vec![None; total_pages],
                 v_vram_pages: vec![None; total_pages],
                 seqs: HashMap::new(),
+                swapped_seqs: HashMap::new(),
                 tick: 0,
                 max_bytes,
                 watermarks: Vec::new(),
                 evictions: 0,
                 preemptions: 0,
                 watermark_triggers: 0,
+                swap_outs: 0,
+                swap_ins: 0,
+                swap_out_bytes: 0,
+                swap_in_bytes: 0,
             }),
         }))
     }
@@ -374,7 +392,7 @@ impl KVPageAllocator {
     /// Register a new sequence `seq_id` with explicit scheduling `priority` (higher = more protected).
     pub(crate) fn alloc_seq_with_priority(&self, seq_id: u64, priority: i64) -> MoraResult<bool> {
         let mut inner = self.inner.lock();
-        if inner.seqs.contains_key(&seq_id) {
+        if inner.seqs.contains_key(&seq_id) || inner.swapped_seqs.contains_key(&seq_id) {
             return Err(MoraError::Runtime(format!(
                 "kv_allocator: sequence {seq_id} already allocated"
             )));
@@ -392,24 +410,34 @@ impl KVPageAllocator {
         Ok(true)
     }
 
-    /// Update the scheduling priority of an active sequence `seq_id`.
+    /// Update the scheduling priority of an active or swapped sequence `seq_id`.
     pub(crate) fn set_priority(&self, seq_id: u64, priority: i64) -> MoraResult<()> {
         let mut inner = self.inner.lock();
-        let seq = inner.seqs.get_mut(&seq_id).ok_or_else(|| {
-            MoraError::Runtime(format!("kv_allocator: unknown sequence {seq_id}"))
-        })?;
-        seq.priority = priority;
-        Ok(())
+        if let Some(seq) = inner.seqs.get_mut(&seq_id) {
+            seq.priority = priority;
+            return Ok(());
+        }
+        if let Some(swapped) = inner.swapped_seqs.get_mut(&seq_id) {
+            swapped.priority = priority;
+            return Ok(());
+        }
+        Err(MoraError::Runtime(format!(
+            "kv_allocator: unknown sequence {seq_id}"
+        )))
     }
 
-    /// Query the scheduling priority of an active sequence `seq_id`.
+    /// Query the scheduling priority of an active or swapped sequence `seq_id`.
     pub(crate) fn seq_priority(&self, seq_id: u64) -> MoraResult<i64> {
         let inner = self.inner.lock();
-        inner
-            .seqs
-            .get(&seq_id)
-            .map(|s| s.priority)
-            .ok_or_else(|| MoraError::Runtime(format!("kv_allocator: unknown sequence {seq_id}")))
+        if let Some(s) = inner.seqs.get(&seq_id) {
+            return Ok(s.priority);
+        }
+        if let Some(s) = inner.swapped_seqs.get(&seq_id) {
+            return Ok(s.priority);
+        }
+        Err(MoraError::Runtime(format!(
+            "kv_allocator: unknown sequence {seq_id}"
+        )))
     }
 
     /// Configure or update the hard byte quota `max_bytes`.
@@ -480,6 +508,11 @@ impl KVPageAllocator {
             ],
         );
         let mut inner = self.inner.lock();
+        if inner.swapped_seqs.contains_key(&seq_id) {
+            return Err(MoraError::Runtime(format!(
+                "kv_allocator.append_tokens: sequence {seq_id} is swapped out to host RAM; call swap_in({seq_id}) first"
+            )));
+        }
         let tick = Self::next_tick(&mut inner);
         let cur_tokens = inner
             .seqs
@@ -524,9 +557,14 @@ impl KVPageAllocator {
     /// Fork `src_seq_id` into `dst_seq_id`, inheriting priority and sharing physical pages via CoW.
     pub fn fork_seq(&self, src_seq_id: u64, dst_seq_id: u64) -> MoraResult<Vec<usize>> {
         let mut inner = self.inner.lock();
-        if inner.seqs.contains_key(&dst_seq_id) {
+        if inner.seqs.contains_key(&dst_seq_id) || inner.swapped_seqs.contains_key(&dst_seq_id) {
             return Err(MoraError::Runtime(format!(
                 "kv_allocator: destination sequence {dst_seq_id} already allocated"
+            )));
+        }
+        if inner.swapped_seqs.contains_key(&src_seq_id) {
+            return Err(MoraError::Runtime(format!(
+                "kv_allocator.fork_seq: source sequence {src_seq_id} is swapped out to host RAM; call swap_in({src_seq_id}) first"
             )));
         }
         let tick = Self::next_tick(&mut inner);
@@ -600,6 +638,11 @@ impl KVPageAllocator {
         let v_vals = v.to_flat_vec();
 
         let mut inner = self.inner.lock();
+        if inner.swapped_seqs.contains_key(&seq_id) {
+            return Err(MoraError::Runtime(format!(
+                "kv_allocator.write_kv: sequence {seq_id} is swapped out to host RAM; call swap_in({seq_id}) first"
+            )));
+        }
         let tick = Self::next_tick(&mut inner);
         let logical_page = token_pos / self.page_tokens;
         let slot_in_page = token_pos % self.page_tokens;
@@ -665,6 +708,11 @@ impl KVPageAllocator {
     /// When physically backed by GPU VRAM, reads directly from the sequence's resident VRAM pages.
     pub fn read_kv(&self, seq_id: u64) -> MoraResult<(Arc<Tensor>, Arc<Tensor>)> {
         let mut inner = self.inner.lock();
+        if inner.swapped_seqs.contains_key(&seq_id) {
+            return Err(MoraError::Runtime(format!(
+                "kv_allocator.read_kv: sequence {seq_id} is swapped out to host RAM; call swap_in({seq_id}) first"
+            )));
+        }
         let tick = Self::next_tick(&mut inner);
         let seq = inner.seqs.get_mut(&seq_id).ok_or_else(|| {
             MoraError::Runtime(format!("kv_allocator: unknown sequence {seq_id}"))
@@ -718,9 +766,13 @@ impl KVPageAllocator {
         Ok((kt, vt))
     }
 
-    /// Free sequence `seq_id`, returning the number of physical pages reclaimed to the free pool.
+    /// Free sequence `seq_id` (resident or swapped out), returning the number of physical pages
+    /// reclaimed to the free pool.
     pub fn free_seq(&self, seq_id: u64) -> MoraResult<usize> {
         let mut inner = self.inner.lock();
+        if inner.swapped_seqs.remove(&seq_id).is_some() {
+            return Ok(0);
+        }
         let seq = inner.seqs.remove(&seq_id).ok_or_else(|| {
             MoraError::Runtime(format!("kv_allocator: unknown sequence {seq_id}"))
         })?;
@@ -732,6 +784,174 @@ impl KVPageAllocator {
         }
         self.refresh_watermark_hysteresis(&mut inner);
         Ok(freed)
+    }
+
+    /// G3: Offload an active sequence's K/V pages from physical VRAM/pool into host RAM,
+    /// freeing its physical pages and GPU VRAM buffers back to the pool and updating watermark
+    /// hysteresis. Returns the number of physical pages reclaimed.
+    pub(crate) fn swap_out(&self, seq_id: u64) -> MoraResult<usize> {
+        let _trace = crate::runtime::profiler::TraceScope::enter(
+            "kv_cache",
+            "kv_swap_out",
+            vec![("seq_id".to_string(), seq_id.to_string())],
+        );
+        let mut inner = self.inner.lock();
+        if inner.swapped_seqs.contains_key(&seq_id) {
+            return Err(MoraError::Runtime(format!(
+                "kv_allocator.swap_out: sequence {seq_id} is already swapped out"
+            )));
+        }
+        let seq = inner.seqs.get(&seq_id).cloned().ok_or_else(|| {
+            MoraError::Runtime(format!("kv_allocator: unknown sequence {seq_id}"))
+        })?;
+
+        let mut host_pages = Vec::with_capacity(seq.page_table.len());
+        let mut transferred_bytes: usize = 0;
+        for &pid in &seq.page_table {
+            let (raw_k, raw_v) = if self.vram_backed
+                && let (Some(k_vram), Some(v_vram)) = (
+                    inner.k_vram_pages[pid].as_ref(),
+                    inner.v_vram_pages[pid].as_ref(),
+                ) {
+                let mut rk = vec![0u8; k_vram.byte_len()];
+                let mut rv = vec![0u8; v_vram.byte_len()];
+                k_vram.download_bytes(&mut rk)?;
+                v_vram.download_bytes(&mut rv)?;
+                (rk, rv)
+            } else {
+                (
+                    inner.k_pages[pid].copy_bytes_out(),
+                    inner.v_pages[pid].copy_bytes_out(),
+                )
+            };
+            transferred_bytes += raw_k.len() + raw_v.len();
+            host_pages.push((raw_k, raw_v));
+        }
+
+        inner.seqs.remove(&seq_id);
+        let mut freed = 0usize;
+        for pid in seq.page_table {
+            if Self::release_physical_page(&mut inner, pid) {
+                freed += 1;
+            }
+        }
+        inner.swapped_seqs.insert(
+            seq_id,
+            SwappedSeqState {
+                host_pages,
+                num_tokens: seq.num_tokens,
+                priority: seq.priority,
+            },
+        );
+        inner.swap_outs += 1;
+        inner.swap_out_bytes += transferred_bytes as u64;
+        self.refresh_watermark_hysteresis(&mut inner);
+        Ok(freed)
+    }
+
+    /// G3: Restore a swapped-out sequence from host RAM back into freshly allocated physical pages
+    /// (and physical GPU VRAM when `vram_backed`), enforcing both pool capacity and hard `max_bytes`
+    /// quota atomically before committing. Returns `(new_page_table, triggered_watermarks)`.
+    pub(crate) fn swap_in_with_watermarks(
+        &self,
+        seq_id: u64,
+    ) -> MoraResult<(Vec<usize>, Vec<TriggeredWatermark>)> {
+        let _trace = crate::runtime::profiler::TraceScope::enter(
+            "kv_cache",
+            "kv_swap_in",
+            vec![("seq_id".to_string(), seq_id.to_string())],
+        );
+        let mut inner = self.inner.lock();
+        if inner.seqs.contains_key(&seq_id) {
+            return Err(MoraError::Runtime(format!(
+                "kv_allocator.swap_in: sequence {seq_id} is already resident"
+            )));
+        }
+        let swapped = inner.swapped_seqs.get(&seq_id).cloned().ok_or_else(|| {
+            MoraError::Runtime(format!("kv_allocator: unknown sequence {seq_id}"))
+        })?;
+        let pages_needed = swapped.host_pages.len();
+        self.ensure_can_allocate(&inner, pages_needed, seq_id)?;
+
+        let mut newly = Vec::with_capacity(pages_needed);
+        for _ in 0..pages_needed {
+            match self.alloc_physical_page(&mut inner) {
+                Ok(pid) => newly.push(pid),
+                Err(e) => {
+                    for pid in newly {
+                        let _ = Self::release_physical_page(&mut inner, pid);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        let mut transferred_bytes: usize = 0;
+        for (&pid, (raw_k, raw_v)) in newly.iter().zip(swapped.host_pages.iter()) {
+            let kb = match AlignedByteBuffer::from_raw_bytes(raw_k, self.elems_per_page, self.dtype)
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    for p in newly {
+                        let _ = Self::release_physical_page(&mut inner, p);
+                    }
+                    return Err(e);
+                }
+            };
+            let vb = match AlignedByteBuffer::from_raw_bytes(raw_v, self.elems_per_page, self.dtype)
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    for p in newly {
+                        let _ = Self::release_physical_page(&mut inner, p);
+                    }
+                    return Err(e);
+                }
+            };
+            inner.k_pages[pid] = kb;
+            inner.v_pages[pid] = vb;
+            if self.vram_backed {
+                let up_res = inner.k_vram_pages[pid]
+                    .as_ref()
+                    .map(|b| b.upload_bytes(raw_k))
+                    .transpose()
+                    .and_then(|_| {
+                        inner.v_vram_pages[pid]
+                            .as_ref()
+                            .map(|b| b.upload_bytes(raw_v))
+                            .transpose()
+                    });
+                if let Err(e) = up_res {
+                    for p in newly {
+                        let _ = Self::release_physical_page(&mut inner, p);
+                    }
+                    return Err(e);
+                }
+            }
+            transferred_bytes += raw_k.len() + raw_v.len();
+        }
+
+        inner.swapped_seqs.remove(&seq_id);
+        let tick = Self::next_tick(&mut inner);
+        let page_table = newly.clone();
+        inner.seqs.insert(
+            seq_id,
+            SeqKvState {
+                page_table: newly,
+                num_tokens: swapped.num_tokens,
+                priority: swapped.priority,
+                last_access_tick: tick,
+            },
+        );
+        inner.swap_ins += 1;
+        inner.swap_in_bytes += transferred_bytes as u64;
+        let fired = self.collect_triggered_watermarks(&mut inner);
+        Ok((page_table, fired))
+    }
+
+    /// Return true if `seq_id` is currently swapped out to host RAM.
+    pub(crate) fn is_swapped(&self, seq_id: u64) -> bool {
+        self.inner.lock().swapped_seqs.contains_key(&seq_id)
     }
 
     /// Evict the least-recently-used sequence, returning its `seq_id` (or `-1` if no sequences active).
@@ -816,11 +1036,15 @@ impl KVPageAllocator {
 
     pub fn seq_tokens(&self, seq_id: u64) -> MoraResult<usize> {
         let inner = self.inner.lock();
-        inner
-            .seqs
-            .get(&seq_id)
-            .map(|s| s.num_tokens)
-            .ok_or_else(|| MoraError::Runtime(format!("kv_allocator: unknown sequence {seq_id}")))
+        if let Some(s) = inner.seqs.get(&seq_id) {
+            return Ok(s.num_tokens);
+        }
+        if let Some(s) = inner.swapped_seqs.get(&seq_id) {
+            return Ok(s.num_tokens);
+        }
+        Err(MoraError::Runtime(format!(
+            "kv_allocator: unknown sequence {seq_id}"
+        )))
     }
 
     pub fn free_pages(&self) -> usize {
@@ -900,9 +1124,32 @@ impl KVPageAllocator {
             "preemptions".to_string(),
             Value::Int(inner.preemptions as i64),
         );
+        let swapped_pages: usize = inner
+            .swapped_seqs
+            .values()
+            .map(|s| s.host_pages.len())
+            .sum();
         m.insert(
             "watermark_triggers".to_string(),
             Value::Int(inner.watermark_triggers as i64),
+        );
+        m.insert(
+            "swapped_seqs".to_string(),
+            Value::Int(inner.swapped_seqs.len() as i64),
+        );
+        m.insert(
+            "swapped_pages".to_string(),
+            Value::Int(swapped_pages as i64),
+        );
+        m.insert("swap_outs".to_string(), Value::Int(inner.swap_outs as i64));
+        m.insert("swap_ins".to_string(), Value::Int(inner.swap_ins as i64));
+        m.insert(
+            "swap_out_bytes".to_string(),
+            Value::Int(inner.swap_out_bytes as i64),
+        );
+        m.insert(
+            "swap_in_bytes".to_string(),
+            Value::Int(inner.swap_in_bytes as i64),
         );
         m
     }

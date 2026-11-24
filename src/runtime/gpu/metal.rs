@@ -3,11 +3,11 @@
 //! Architecture:
 //! - Zero compile-time SDK / Cargo dependencies: on `#[cfg(target_os = "macos")]`, dynamically loads
 //!   `/System/Library/Frameworks/Metal.framework/Metal` and `/usr/lib/libobjc.A.dylib`, obtains the
-//!   default `MTLDevice` via `MTLCreateSystemDefaultDevice()`, compiles Mora's 6 MSL (Metal Shading
+//!   default `MTLDevice` via `MTLCreateSystemDefaultDevice()`, compiles Mora's 12 MSL (Metal Shading
 //!   Language) compute kernels at runtime via `newLibraryWithSource:options:error:`, and dispatches
-//!   persistent VRAM-resident `MatMul` (2D & batched ND in `f32`/`f16`/`bf16`), `FusedLinearAct`
-//!   (`f32`/`f16`/`bf16`), `FusedRmsNormLinear`, `FusedFlashAttention`, and `FusedElementwise`
-//!   directly on Apple Silicon / AMD Metal GPUs with zero host `simd_kernels` fallback.
+//!   persistent VRAM-resident `MatMul` (2D & batched ND), `FusedLinearAct`, `FusedRmsNormLinear`,
+//!   `FusedFlashAttention`, and `FusedElementwise` natively in `f32`/`f16`/`bf16` directly on Apple
+//!   Silicon / AMD Metal GPUs with zero host `simd_kernels` fallback.
 //! - On non-macOS hosts (Windows/Linux), cleanly returns empty hardware list so `metal:N` tagged
 //!   graphs transparently fall back to `EmulatedDeviceBackend`.
 
@@ -189,6 +189,58 @@ kernel void mora_rms_norm_f32(
     }
 }
 
+kernel void mora_rms_norm_f16(
+    device const half* X [[buffer(0)]],
+    device const half* Gamma [[buffer(1)]],
+    device half* Out [[buffer(2)]],
+    device const uint* Params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint M = Params[0];
+    uint K = Params[1];
+    uint has_gamma = Params[2];
+    uint gamma_len = Params[3];
+    float eps = as_type<float>(Params[4]);
+    if (gid >= M) return;
+    uint base = gid * K;
+    float sq = 0.0f;
+    for (uint j = 0u; j < K; ++j) {
+        float v = float(X[base + j]);
+        sq = fma(v, v, sq);
+    }
+    float inv = rsqrt(sq / float(K) + eps);
+    for (uint j = 0u; j < K; ++j) {
+        float g = (has_gamma != 0u) ? float(Gamma[j % gamma_len]) : 1.0f;
+        Out[base + j] = half(float(X[base + j]) * inv * g);
+    }
+}
+
+kernel void mora_rms_norm_bf16(
+    device const ushort* X [[buffer(0)]],
+    device const ushort* Gamma [[buffer(1)]],
+    device ushort* Out [[buffer(2)]],
+    device const uint* Params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint M = Params[0];
+    uint K = Params[1];
+    uint has_gamma = Params[2];
+    uint gamma_len = Params[3];
+    float eps = as_type<float>(Params[4]);
+    if (gid >= M) return;
+    uint base = gid * K;
+    float sq = 0.0f;
+    for (uint j = 0u; j < K; ++j) {
+        float v = mora_bf16_to_f32(X[base + j]);
+        sq = fma(v, v, sq);
+    }
+    float inv = rsqrt(sq / float(K) + eps);
+    for (uint j = 0u; j < K; ++j) {
+        float g = (has_gamma != 0u) ? mora_bf16_to_f32(Gamma[j % gamma_len]) : 1.0f;
+        Out[base + j] = mora_f32_to_bf16(mora_bf16_to_f32(X[base + j]) * inv * g);
+    }
+}
+
 kernel void mora_fused_flash_attention_f32(
     device const float* Q [[buffer(0)]],
     device const float* K [[buffer(1)]],
@@ -251,6 +303,171 @@ kernel void mora_fused_flash_attention_f32(
     Out[(batch * s_q + q_pos) * d_v + dv] = (l_sum > 0.0f) ? (acc / l_sum) : 0.0f;
 }
 
+kernel void mora_fused_flash_attention_f16(
+    device const half* Q [[buffer(0)]],
+    device const half* K [[buffer(1)]],
+    device const half* V [[buffer(2)]],
+    device const half* Mask [[buffer(3)]],
+    device half* Out [[buffer(4)]],
+    device const uint* QBases [[buffer(5)]],
+    device const uint* KBases [[buffer(6)]],
+    device const uint* VBases [[buffer(7)]],
+    device const uint* MBases [[buffer(8)]],
+    device const uint* Params [[buffer(9)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint batches = Params[0];
+    uint s_q = Params[1];
+    uint s_k = Params[2];
+    uint d_k = Params[3];
+    uint d_v = Params[4];
+    uint k_transposed = Params[5];
+    uint has_mask = Params[6];
+    uint mask_sq_s = Params[7];
+    uint mask_sk_s = Params[8];
+    float scale = as_type<float>(Params[9]);
+    uint dv = gid.x;
+    uint q_pos = gid.y;
+    uint batch = gid.z;
+    if (dv >= d_v || q_pos >= s_q || batch >= batches) return;
+
+    uint q_row = QBases[batch] + q_pos * d_k;
+    uint k_base = KBases[batch];
+    uint v_base = VBases[batch];
+    uint m_base = MBases[batch];
+
+    float m_max = -1.0e38f;
+    float l_sum = 0.0f;
+    float acc = 0.0f;
+    for (uint j = 0u; j < s_k; ++j) {
+        float dot = 0.0f;
+        if (k_transposed != 0u) {
+            for (uint d = 0u; d < d_k; ++d) {
+                dot = fma(float(Q[q_row + d]), float(K[k_base + d * s_k + j]), dot);
+            }
+        } else {
+            uint k_row = k_base + j * d_k;
+            for (uint d = 0u; d < d_k; ++d) {
+                dot = fma(float(Q[q_row + d]), float(K[k_row + d]), dot);
+            }
+        }
+        float score = dot * scale;
+        if (has_mask != 0u) {
+            score += float(Mask[m_base + q_pos * mask_sq_s + j * mask_sk_s]);
+        }
+        float new_max = max(m_max, score);
+        float alpha = exp(m_max - new_max);
+        float p = exp(score - new_max);
+        l_sum = l_sum * alpha + p;
+        acc = acc * alpha + p * float(V[v_base + j * d_v + dv]);
+        m_max = new_max;
+    }
+    Out[(batch * s_q + q_pos) * d_v + dv] = half((l_sum > 0.0f) ? (acc / l_sum) : 0.0f);
+}
+
+kernel void mora_fused_flash_attention_bf16(
+    device const ushort* Q [[buffer(0)]],
+    device const ushort* K [[buffer(1)]],
+    device const ushort* V [[buffer(2)]],
+    device const ushort* Mask [[buffer(3)]],
+    device ushort* Out [[buffer(4)]],
+    device const uint* QBases [[buffer(5)]],
+    device const uint* KBases [[buffer(6)]],
+    device const uint* VBases [[buffer(7)]],
+    device const uint* MBases [[buffer(8)]],
+    device const uint* Params [[buffer(9)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint batches = Params[0];
+    uint s_q = Params[1];
+    uint s_k = Params[2];
+    uint d_k = Params[3];
+    uint d_v = Params[4];
+    uint k_transposed = Params[5];
+    uint has_mask = Params[6];
+    uint mask_sq_s = Params[7];
+    uint mask_sk_s = Params[8];
+    float scale = as_type<float>(Params[9]);
+    uint dv = gid.x;
+    uint q_pos = gid.y;
+    uint batch = gid.z;
+    if (dv >= d_v || q_pos >= s_q || batch >= batches) return;
+
+    uint q_row = QBases[batch] + q_pos * d_k;
+    uint k_base = KBases[batch];
+    uint v_base = VBases[batch];
+    uint m_base = MBases[batch];
+
+    float m_max = -1.0e38f;
+    float l_sum = 0.0f;
+    float acc = 0.0f;
+    for (uint j = 0u; j < s_k; ++j) {
+        float dot = 0.0f;
+        if (k_transposed != 0u) {
+            for (uint d = 0u; d < d_k; ++d) {
+                dot = fma(
+                    mora_bf16_to_f32(Q[q_row + d]),
+                    mora_bf16_to_f32(K[k_base + d * s_k + j]),
+                    dot);
+            }
+        } else {
+            uint k_row = k_base + j * d_k;
+            for (uint d = 0u; d < d_k; ++d) {
+                dot = fma(
+                    mora_bf16_to_f32(Q[q_row + d]),
+                    mora_bf16_to_f32(K[k_row + d]),
+                    dot);
+            }
+        }
+        float score = dot * scale;
+        if (has_mask != 0u) {
+            score += mora_bf16_to_f32(Mask[m_base + q_pos * mask_sq_s + j * mask_sk_s]);
+        }
+        float new_max = max(m_max, score);
+        float alpha = exp(m_max - new_max);
+        float p = exp(score - new_max);
+        l_sum = l_sum * alpha + p;
+        acc = acc * alpha + p * mora_bf16_to_f32(V[v_base + j * d_v + dv]);
+        m_max = new_max;
+    }
+    Out[(batch * s_q + q_pos) * d_v + dv] =
+        mora_f32_to_bf16((l_sum > 0.0f) ? (acc / l_sum) : 0.0f);
+}
+
+static inline float mora_eval_ew_op(uint op, float a, float b, float imm) {
+    switch (op) {
+        case 0u: return a + b;
+        case 1u: return a - b;
+        case 2u: return a * b;
+        case 3u: return a / b;
+        case 4u: return mora_safe_pow(a, b);
+        case 5u: return a + imm;
+        case 6u: return a - imm;
+        case 7u: return imm - a;
+        case 8u: return a * imm;
+        case 9u: return a / imm;
+        case 10u: return imm / a;
+        case 11u: return mora_safe_pow(a, imm);
+        case 12u: return mora_safe_pow(imm, a);
+        case 13u: return -a;
+        case 14u: return max(a, 0.0f);
+        case 15u: {
+            float c = 0.79788456f * (a + 0.044715f * a * a * a);
+            return 0.5f * a * (1.0f + tanh(c));
+        }
+        case 16u: return a / (1.0f + exp(clamp(-a, -40.0f, 40.0f)));
+        case 17u: return tanh(a);
+        case 18u: return 1.0f / (1.0f + exp(clamp(-a, -40.0f, 40.0f)));
+        case 19u: return exp(a);
+        case 20u: return log(a);
+        case 21u: return sqrt(a);
+        case 22u: return sin(a);
+        case 23u: return cos(a);
+        case 24u: return fabs(a);
+        default: return a;
+    }
+}
+
 kernel void mora_fused_elementwise_f32(
     device float* Out [[buffer(0)]],
     device const float* In0 [[buffer(1)]],
@@ -303,46 +520,126 @@ kernel void mora_fused_elementwise_f32(
     }
 
     for (uint s = 0u; s < num_steps; ++s) {
-        uint op = Ops[s];
-        float a = slots[ArgA[s]];
-        float b = slots[ArgB[s]];
         float imm = as_type<float>(Meta[5u + s]);
-        float r = 0.0f;
-        switch (op) {
-            case 0u: r = a + b; break;
-            case 1u: r = a - b; break;
-            case 2u: r = a * b; break;
-            case 3u: r = a / b; break;
-            case 4u: r = mora_safe_pow(a, b); break;
-            case 5u: r = a + imm; break;
-            case 6u: r = a - imm; break;
-            case 7u: r = imm - a; break;
-            case 8u: r = a * imm; break;
-            case 9u: r = a / imm; break;
-            case 10u: r = imm / a; break;
-            case 11u: r = mora_safe_pow(a, imm); break;
-            case 12u: r = mora_safe_pow(imm, a); break;
-            case 13u: r = -a; break;
-            case 14u: r = max(a, 0.0f); break;
-            case 15u: {
-                float c = 0.79788456f * (a + 0.044715f * a * a * a);
-                r = 0.5f * a * (1.0f + tanh(c));
-                break;
-            }
-            case 16u: r = a / (1.0f + exp(clamp(-a, -40.0f, 40.0f))); break;
-            case 17u: r = tanh(a); break;
-            case 18u: r = 1.0f / (1.0f + exp(clamp(-a, -40.0f, 40.0f))); break;
-            case 19u: r = exp(a); break;
-            case 20u: r = log(a); break;
-            case 21u: r = sqrt(a); break;
-            case 22u: r = sin(a); break;
-            case 23u: r = cos(a); break;
-            case 24u: r = fabs(a); break;
-            default: r = a; break;
-        }
-        slots[num_inputs + s] = r;
+        slots[num_inputs + s] = mora_eval_ew_op(Ops[s], slots[ArgA[s]], slots[ArgB[s]], imm);
     }
     Out[gid] = slots[num_inputs + num_steps - 1u];
+}
+
+kernel void mora_fused_elementwise_f16(
+    device half* Out [[buffer(0)]],
+    device const half* In0 [[buffer(1)]],
+    device const half* In1 [[buffer(2)]],
+    device const half* In2 [[buffer(3)]],
+    device const half* In3 [[buffer(4)]],
+    device const uint* Strides [[buffer(5)]],
+    device const uint* OutShape [[buffer(6)]],
+    device const uint* Ops [[buffer(7)]],
+    device const uint* ArgA [[buffer(8)]],
+    device const uint* ArgB [[buffer(9)]],
+    device const uint* Meta [[buffer(10)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint ndim = Meta[0];
+    uint num_inputs = Meta[1];
+    uint num_steps = Meta[2];
+    uint out_numel = Meta[3];
+    uint packed_mode = Meta[4];
+    if (gid >= out_numel) return;
+
+    uint coords[16];
+    uint rem = gid;
+    for (uint d = ndim; d > 0u; --d) {
+        uint idx = d - 1u;
+        uint dim = OutShape[idx];
+        coords[idx] = rem % dim;
+        rem /= dim;
+    }
+
+    float slots[64];
+    uint off_base = 5u + num_steps;
+    for (uint i = 0u; i < num_inputs; ++i) {
+        uint flat = 0u;
+        uint s_off = i * ndim;
+        for (uint d = 0u; d < ndim; ++d) {
+            flat += coords[d] * Strides[s_off + d];
+        }
+        if (packed_mode != 0u) {
+            slots[i] = float(In0[Meta[off_base + i] + flat]);
+        } else if (i == 0u) {
+            slots[i] = float(In0[flat]);
+        } else if (i == 1u) {
+            slots[i] = float(In1[flat]);
+        } else if (i == 2u) {
+            slots[i] = float(In2[flat]);
+        } else {
+            slots[i] = float(In3[flat]);
+        }
+    }
+
+    for (uint s = 0u; s < num_steps; ++s) {
+        float imm = as_type<float>(Meta[5u + s]);
+        slots[num_inputs + s] = mora_eval_ew_op(Ops[s], slots[ArgA[s]], slots[ArgB[s]], imm);
+    }
+    Out[gid] = half(slots[num_inputs + num_steps - 1u]);
+}
+
+kernel void mora_fused_elementwise_bf16(
+    device ushort* Out [[buffer(0)]],
+    device const ushort* In0 [[buffer(1)]],
+    device const ushort* In1 [[buffer(2)]],
+    device const ushort* In2 [[buffer(3)]],
+    device const ushort* In3 [[buffer(4)]],
+    device const uint* Strides [[buffer(5)]],
+    device const uint* OutShape [[buffer(6)]],
+    device const uint* Ops [[buffer(7)]],
+    device const uint* ArgA [[buffer(8)]],
+    device const uint* ArgB [[buffer(9)]],
+    device const uint* Meta [[buffer(10)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint ndim = Meta[0];
+    uint num_inputs = Meta[1];
+    uint num_steps = Meta[2];
+    uint out_numel = Meta[3];
+    uint packed_mode = Meta[4];
+    if (gid >= out_numel) return;
+
+    uint coords[16];
+    uint rem = gid;
+    for (uint d = ndim; d > 0u; --d) {
+        uint idx = d - 1u;
+        uint dim = OutShape[idx];
+        coords[idx] = rem % dim;
+        rem /= dim;
+    }
+
+    float slots[64];
+    uint off_base = 5u + num_steps;
+    for (uint i = 0u; i < num_inputs; ++i) {
+        uint flat = 0u;
+        uint s_off = i * ndim;
+        for (uint d = 0u; d < ndim; ++d) {
+            flat += coords[d] * Strides[s_off + d];
+        }
+        if (packed_mode != 0u) {
+            slots[i] = mora_bf16_to_f32(In0[Meta[off_base + i] + flat]);
+        } else if (i == 0u) {
+            slots[i] = mora_bf16_to_f32(In0[flat]);
+        } else if (i == 1u) {
+            slots[i] = mora_bf16_to_f32(In1[flat]);
+        } else if (i == 2u) {
+            slots[i] = mora_bf16_to_f32(In2[flat]);
+        } else {
+            slots[i] = mora_bf16_to_f32(In3[flat]);
+        }
+    }
+
+    for (uint s = 0u; s < num_steps; ++s) {
+        float imm = as_type<float>(Meta[5u + s]);
+        slots[num_inputs + s] = mora_eval_ew_op(Ops[s], slots[ArgA[s]], slots[ArgB[s]], imm);
+    }
+    Out[gid] = mora_f32_to_bf16(slots[num_inputs + num_steps - 1u]);
 }
 "#;
 
@@ -514,8 +811,14 @@ mod macos_impl {
         pipe_linear_f16: Id,
         pipe_linear_bf16: Id,
         pipe_rms_norm_f32: Id,
+        pipe_rms_norm_f16: Id,
+        pipe_rms_norm_bf16: Id,
         pipe_flash_attn_f32: Id,
+        pipe_flash_attn_f16: Id,
+        pipe_flash_attn_bf16: Id,
         pipe_fused_ew_f32: Id,
+        pipe_fused_ew_f16: Id,
+        pipe_fused_ew_bf16: Id,
         dummy_buf: Id,
         custom_pipes: HashMap<u64, Id>,
     }
@@ -539,12 +842,22 @@ mod macos_impl {
                 self.objc.release(pipe);
             }
             self.objc.release(st.dummy_buf);
-            self.objc.release(st.pipe_fused_ew_f32);
-            self.objc.release(st.pipe_flash_attn_f32);
-            self.objc.release(st.pipe_rms_norm_f32);
-            self.objc.release(st.pipe_linear_bf16);
-            self.objc.release(st.pipe_linear_f16);
-            self.objc.release(st.pipe_linear_f32);
+            for pipe in [
+                st.pipe_fused_ew_bf16,
+                st.pipe_fused_ew_f16,
+                st.pipe_fused_ew_f32,
+                st.pipe_flash_attn_bf16,
+                st.pipe_flash_attn_f16,
+                st.pipe_flash_attn_f32,
+                st.pipe_rms_norm_bf16,
+                st.pipe_rms_norm_f16,
+                st.pipe_rms_norm_f32,
+                st.pipe_linear_bf16,
+                st.pipe_linear_f16,
+                st.pipe_linear_f32,
+            ] {
+                self.objc.release(pipe);
+            }
             self.objc.release(st.queue);
             self.objc.release(st.mtl_dev);
         }
@@ -856,6 +1169,21 @@ mod macos_impl {
             }))
         }
 
+        fn resolve_or_alloc_vram(
+            &self,
+            st: &MetalState,
+            byte_len: usize,
+            dst: Option<Arc<dyn DeviceVramBuffer>>,
+        ) -> MoraResult<Arc<dyn DeviceVramBuffer>> {
+            if let Some(buf) = dst
+                && buf.device() == &self.inner.device
+                && buf.byte_len() >= byte_len
+            {
+                return Ok(buf);
+            }
+            Ok(self.alloc_owned_vram(st, byte_len)?)
+        }
+
         fn dispatch_compute(
             objc: &ObjC,
             queue: Id,
@@ -933,7 +1261,8 @@ mod macos_impl {
             k: usize,
             act: u32,
             dtype: DType,
-        ) -> MoraResult<Option<Arc<MetalVramBuffer>>> {
+            dst: Option<Arc<dyn DeviceVramBuffer>>,
+        ) -> MoraResult<Option<Arc<dyn DeviceVramBuffer>>> {
             let Some((pipe, elem_bytes)) = Self::pipeline_for_linear(st, dtype) else {
                 return Ok(None);
             };
@@ -950,7 +1279,7 @@ mod macos_impl {
                 act,
                 batches as u32,
             ];
-            let out_buf = self.alloc_owned_vram(st, batches * m * n * elem_bytes)?;
+            let out_buf = self.resolve_or_alloc_vram(st, batches * m * n * elem_bytes, dst)?;
             let mut temps = Vec::with_capacity(3);
             let run = (|| -> MoraResult<()> {
                 let h_p =
@@ -978,7 +1307,15 @@ mod macos_impl {
                     &self.inner.objc,
                     st.queue,
                     pipe,
-                    &[a_buf, b_buf, h_bias, out_buf.buf, h_p, h_ab, h_bb],
+                    &[
+                        a_buf,
+                        b_buf,
+                        h_bias,
+                        out_buf.raw_handle() as Id,
+                        h_p,
+                        h_ab,
+                        h_bb,
+                    ],
                     grid,
                     tg,
                 )
@@ -1212,6 +1549,7 @@ mod macos_impl {
             a_shape: &[usize],
             b_shape: &[usize],
             dtype: DType,
+            dst: Option<Arc<dyn DeviceVramBuffer>>,
         ) -> MoraResult<Option<Arc<dyn DeviceVramBuffer>>> {
             if a_shape.len() < 2
                 || b_shape.len() < 2
@@ -1256,6 +1594,7 @@ mod macos_impl {
                 k,
                 0,
                 dtype,
+                dst,
             )?;
             if let Some(buf) = out {
                 self.inner.counters.on_vram_hit();
@@ -1276,6 +1615,7 @@ mod macos_impl {
             n: usize,
             _out_shape: &[usize],
             dtype: DType,
+            dst: Option<Arc<dyn DeviceVramBuffer>>,
         ) -> MoraResult<Option<Arc<dyn DeviceVramBuffer>>> {
             if m_total * n == 0 || !matches!(dtype, DType::F32 | DType::F16 | DType::BF16) {
                 return Ok(None);
@@ -1305,6 +1645,7 @@ mod macos_impl {
                 k,
                 act_code(act),
                 dtype,
+                dst,
             )?;
             if let Some(buf) = out {
                 self.inner.counters.on_vram_hit();
@@ -1328,8 +1669,13 @@ mod macos_impl {
             _x_shape: &[usize],
             _out_shape: &[usize],
             dtype: DType,
+            dst: Option<Arc<dyn DeviceVramBuffer>>,
         ) -> MoraResult<Option<Arc<dyn DeviceVramBuffer>>> {
-            if dtype != DType::F32 || m_total == 0 || k == 0 || n == 0 {
+            if !matches!(dtype, DType::F32 | DType::F16 | DType::BF16)
+                || m_total == 0
+                || k == 0
+                || n == 0
+            {
                 return Ok(None);
             }
             let (h_gamma, has_gamma, gamma_len) = match gamma {
@@ -1354,12 +1700,28 @@ mod macos_impl {
                     }
                 }
             };
+            let elem_bytes = if dtype == DType::F32 { 4usize } else { 2usize };
 
             let st = self.inner.state.lock();
+            let rms_pipe = match dtype {
+                DType::F32 => st.pipe_rms_norm_f32,
+                DType::F16 => {
+                    self.inner.counters.on_f16_dispatch();
+                    st.pipe_rms_norm_f16
+                }
+                DType::BF16 => {
+                    self.inner.counters.on_bf16_dispatch();
+                    st.pipe_rms_norm_bf16
+                }
+                _ => unreachable!(),
+            };
             let mut temps = Vec::with_capacity(2);
-            let run = (|| -> MoraResult<Arc<MetalVramBuffer>> {
-                let norm_buf =
-                    Self::alloc_mtl_buf_len(&self.inner.objc, st.mtl_dev, m_total * k * 4)?;
+            let run = (|| -> MoraResult<Arc<dyn DeviceVramBuffer>> {
+                let norm_buf = Self::alloc_mtl_buf_len(
+                    &self.inner.objc,
+                    st.mtl_dev,
+                    m_total * k * elem_bytes,
+                )?;
                 temps.push(norm_buf);
                 let rms_params: [u32; 5] = [
                     m_total as u32,
@@ -1378,7 +1740,7 @@ mod macos_impl {
                 Self::dispatch_compute(
                     &self.inner.objc,
                     st.queue,
-                    st.pipe_rms_norm_f32,
+                    rms_pipe,
                     &[x.raw_handle() as Id, g_buf, norm_buf, h_rp],
                     MtlSize {
                         width: m_total.max(1),
@@ -1403,7 +1765,8 @@ mod macos_impl {
                     n,
                     k,
                     act_code(act),
-                    DType::F32,
+                    dtype,
+                    dst,
                 )?
                 else {
                     return Err(MoraError::Runtime(
@@ -1432,8 +1795,13 @@ mod macos_impl {
             scale: f64,
             k_is_transposed: bool,
             dtype: DType,
+            dst: Option<Arc<dyn DeviceVramBuffer>>,
         ) -> MoraResult<Option<Arc<dyn DeviceVramBuffer>>> {
-            if dtype != DType::F32 || q_shape.len() < 2 || k_shape.len() < 2 || v_shape.len() < 2 {
+            if !matches!(dtype, DType::F32 | DType::F16 | DType::BF16)
+                || q_shape.len() < 2
+                || k_shape.len() < 2
+                || v_shape.len() < 2
+            {
                 return Ok(None);
             }
             let s_q = q_shape[q_shape.len() - 2];
@@ -1500,9 +1868,22 @@ mod macos_impl {
                 mask_sk_s,
                 (scale as f32).to_bits(),
             ];
+            let elem_bytes = if dtype == DType::F32 { 4usize } else { 2usize };
 
             let st = self.inner.state.lock();
-            let out_buf = self.alloc_owned_vram(&st, out_numel * 4)?;
+            let pipe = match dtype {
+                DType::F32 => st.pipe_flash_attn_f32,
+                DType::F16 => {
+                    self.inner.counters.on_f16_dispatch();
+                    st.pipe_flash_attn_f16
+                }
+                DType::BF16 => {
+                    self.inner.counters.on_bf16_dispatch();
+                    st.pipe_flash_attn_bf16
+                }
+                _ => unreachable!(),
+            };
+            let out_buf = self.resolve_or_alloc_vram(&st, out_numel * elem_bytes, dst)?;
             let mut temps = Vec::with_capacity(5);
             let run = (|| -> MoraResult<()> {
                 let h_qb =
@@ -1518,13 +1899,13 @@ mod macos_impl {
                 Self::dispatch_compute(
                     &self.inner.objc,
                     st.queue,
-                    st.pipe_flash_attn_f32,
+                    pipe,
                     &[
                         q.raw_handle() as Id,
                         k.raw_handle() as Id,
                         v.raw_handle() as Id,
                         h_mask_opt.unwrap_or(st.dummy_buf),
-                        out_buf.buf,
+                        out_buf.raw_handle() as Id,
                         h_qb,
                         h_kb,
                         h_vb,
@@ -1558,9 +1939,10 @@ mod macos_impl {
             out_shape: &[usize],
             out_numel: usize,
             dtype: DType,
+            dst: Option<Arc<dyn DeviceVramBuffer>>,
         ) -> MoraResult<Option<Arc<dyn DeviceVramBuffer>>> {
             let total_slots = inputs.len() + steps.len();
-            if dtype != DType::F32
+            if !matches!(dtype, DType::F32 | DType::F16 | DType::BF16)
                 || out_numel == 0
                 || steps.is_empty()
                 || inputs.is_empty()
@@ -1590,9 +1972,22 @@ mod macos_impl {
             meta.push(0u32); // packed_mode = 0 (direct MTLBuffer bindings)
             meta.extend_from_slice(&imm_bits);
             meta.resize(meta.len() + inputs.len(), 0);
+            let elem_bytes = if dtype == DType::F32 { 4usize } else { 2usize };
 
             let st = self.inner.state.lock();
-            let out_buf = self.alloc_owned_vram(&st, out_numel * 4)?;
+            let pipe = match dtype {
+                DType::F32 => st.pipe_fused_ew_f32,
+                DType::F16 => {
+                    self.inner.counters.on_f16_dispatch();
+                    st.pipe_fused_ew_f16
+                }
+                DType::BF16 => {
+                    self.inner.counters.on_bf16_dispatch();
+                    st.pipe_fused_ew_bf16
+                }
+                _ => unreachable!(),
+            };
+            let out_buf = self.resolve_or_alloc_vram(&st, out_numel * elem_bytes, dst)?;
             let mut temps = Vec::with_capacity(6);
             let run = (|| -> MoraResult<()> {
                 let h_st = Self::upload_temp_slice(
@@ -1618,9 +2013,9 @@ mod macos_impl {
                 Self::dispatch_compute(
                     &self.inner.objc,
                     st.queue,
-                    st.pipe_fused_ew_f32,
+                    pipe,
                     &[
-                        out_buf.buf,
+                        out_buf.raw_handle() as Id,
                         in_h(0),
                         in_h(1),
                         in_h(2),
@@ -2386,55 +2781,41 @@ mod macos_impl {
                 return Vec::new();
             }
 
-            let pipes = (
-                build_pipeline(&objc, mtl_dev, lib, "mora_fused_linear_f32"),
-                build_pipeline(&objc, mtl_dev, lib, "mora_fused_linear_f16"),
-                build_pipeline(&objc, mtl_dev, lib, "mora_fused_linear_bf16"),
-                build_pipeline(&objc, mtl_dev, lib, "mora_rms_norm_f32"),
-                build_pipeline(&objc, mtl_dev, lib, "mora_fused_flash_attention_f32"),
-                build_pipeline(&objc, mtl_dev, lib, "mora_fused_elementwise_f32"),
-            );
+            let kernel_names = [
+                "mora_fused_linear_f32",
+                "mora_fused_linear_f16",
+                "mora_fused_linear_bf16",
+                "mora_rms_norm_f32",
+                "mora_rms_norm_f16",
+                "mora_rms_norm_bf16",
+                "mora_fused_flash_attention_f32",
+                "mora_fused_flash_attention_f16",
+                "mora_fused_flash_attention_bf16",
+                "mora_fused_elementwise_f32",
+                "mora_fused_elementwise_f16",
+                "mora_fused_elementwise_bf16",
+            ];
+            let mut built: Vec<Id> = Vec::with_capacity(kernel_names.len());
+            for name in kernel_names {
+                match build_pipeline(&objc, mtl_dev, lib, name) {
+                    Some(p) => built.push(p),
+                    None => {
+                        for p in built {
+                            objc.release(p);
+                        }
+                        objc.release(lib);
+                        objc.release(queue);
+                        objc.release(mtl_dev);
+                        return Vec::new();
+                    }
+                }
+            }
             objc.release(lib);
 
-            let (
-                Some(pipe_linear_f32),
-                Some(pipe_linear_f16),
-                Some(pipe_linear_bf16),
-                Some(pipe_rms_norm_f32),
-                Some(pipe_flash_attn_f32),
-                Some(pipe_fused_ew_f32),
-            ) = pipes
-            else {
-                if let Some(p) = pipes.0 {
-                    objc.release(p);
-                }
-                if let Some(p) = pipes.1 {
-                    objc.release(p);
-                }
-                if let Some(p) = pipes.2 {
-                    objc.release(p);
-                }
-                if let Some(p) = pipes.3 {
-                    objc.release(p);
-                }
-                if let Some(p) = pipes.4 {
-                    objc.release(p);
-                }
-                if let Some(p) = pipes.5 {
-                    objc.release(p);
-                }
-                objc.release(queue);
-                objc.release(mtl_dev);
-                return Vec::new();
-            };
-
             let Ok(dummy_buf) = MetalDeviceBackend::alloc_mtl_buf_len(&objc, mtl_dev, 16) else {
-                objc.release(pipe_fused_ew_f32);
-                objc.release(pipe_flash_attn_f32);
-                objc.release(pipe_rms_norm_f32);
-                objc.release(pipe_linear_bf16);
-                objc.release(pipe_linear_f16);
-                objc.release(pipe_linear_f32);
+                for p in built {
+                    objc.release(p);
+                }
                 objc.release(queue);
                 objc.release(mtl_dev);
                 return Vec::new();
@@ -2457,12 +2838,18 @@ mod macos_impl {
                 state: Mutex::new(MetalState {
                     mtl_dev,
                     queue,
-                    pipe_linear_f32,
-                    pipe_linear_f16,
-                    pipe_linear_bf16,
-                    pipe_rms_norm_f32,
-                    pipe_flash_attn_f32,
-                    pipe_fused_ew_f32,
+                    pipe_linear_f32: built[0],
+                    pipe_linear_f16: built[1],
+                    pipe_linear_bf16: built[2],
+                    pipe_rms_norm_f32: built[3],
+                    pipe_rms_norm_f16: built[4],
+                    pipe_rms_norm_bf16: built[5],
+                    pipe_flash_attn_f32: built[6],
+                    pipe_flash_attn_f16: built[7],
+                    pipe_flash_attn_bf16: built[8],
+                    pipe_fused_ew_f32: built[9],
+                    pipe_fused_ew_f16: built[10],
+                    pipe_fused_ew_bf16: built[11],
                     dummy_buf,
                     custom_pipes: HashMap::new(),
                 }),
@@ -2489,14 +2876,20 @@ mod tests {
     use crate::runtime::gpu::kernel_compiler::{KernelLaunchArg, emit_msl};
 
     #[test]
-    fn metal_msl_defines_all_six_kernels_and_balanced_braces() {
+    fn metal_msl_defines_all_twelve_kernels_and_balanced_braces() {
         for kernel in [
             "kernel void mora_fused_linear_f32(",
             "kernel void mora_fused_linear_f16(",
             "kernel void mora_fused_linear_bf16(",
             "kernel void mora_rms_norm_f32(",
+            "kernel void mora_rms_norm_f16(",
+            "kernel void mora_rms_norm_bf16(",
             "kernel void mora_fused_flash_attention_f32(",
+            "kernel void mora_fused_flash_attention_f16(",
+            "kernel void mora_fused_flash_attention_bf16(",
             "kernel void mora_fused_elementwise_f32(",
+            "kernel void mora_fused_elementwise_f16(",
+            "kernel void mora_fused_elementwise_bf16(",
         ] {
             assert!(
                 MORA_METAL_MSL.contains(kernel),

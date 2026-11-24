@@ -3,12 +3,14 @@
 //! Zero external SDK (`shaderc` / `glslang`) or Cargo dependencies, and zero optional Vulkan
 //! extensions required (pure SPIR-V 1.0 + `GLSL.std.450`, portable across NVIDIA, AMD, Intel,
 //! and Apple MoltenVK):
-//! 1. `emit_spirv_fused_linear_f32`: 2D & broadcast batched ND MatMul + Linear + Bias + Activation (`f32`)
-//! 2. `emit_spirv_fused_linear_half(false)`: native race-free packed `f16` (`UnpackHalf2x16`/`PackHalf2x16`)
-//! 3. `emit_spirv_fused_linear_half(true)`: native race-free packed `bf16` (bit-shift + IEEE RNE)
-//! 4. `emit_spirv_rms_norm_f32`: GPU row-wise RMSNorm [* gamma] for `FusedRmsNormLinear`
-//! 5. `emit_spirv_flash_attention_f32`: single-pass online-softmax FlashAttention-2 with GQA/mask
-//! 6. `emit_spirv_fused_elementwise_f32`: single-launch 25-opcode bytecode broadcast evaluator
+//! 1-3.  `emit_spirv_fused_linear_f32` / `emit_spirv_fused_linear_half(false|true)`:
+//!       2D & broadcast batched ND MatMul + Linear + Bias + Activation (`f32`/`f16`/`bf16`)
+//! 4-6.  `emit_spirv_rms_norm_f32` / `emit_spirv_rms_norm_half(false|true)`:
+//!       GPU row-wise RMSNorm [* gamma] for `FusedRmsNormLinear` (`f32`/`f16`/`bf16`)
+//! 7-9.  `emit_spirv_flash_attention_f32` / `emit_spirv_flash_attention_half(false|true)`:
+//!       single-pass online-softmax FlashAttention-2 with GQA/mask (`f32`/`f16`/`bf16`)
+//! 10-12. `emit_spirv_fused_elementwise_f32` / `emit_spirv_fused_elementwise_half(false|true)`:
+//!       single-launch 25-opcode bytecode broadcast evaluator (`f32`/`f16`/`bf16`)
 
 const OP_EXT_INST_IMPORT: u16 = 11;
 const OP_EXT_INST: u16 = 12;
@@ -2113,6 +2115,1534 @@ pub(super) fn emit_spirv_fused_elementwise_f32() -> Vec<u32> {
     let final_v = b.alloc_id();
     b.inst(OP_LOAD, &[ty_f32, final_v, p_last]);
     b.store_buf(ptr_unif_f32, var_out, c_u0, tid, final_v);
+    b.inst(OP_BRANCH, &[lbl_exit]);
+
+    b.inst(OP_LABEL, &[lbl_exit]);
+    b.inst(OP_RETURN, &[]);
+    b.inst(OP_FUNCTION_END, &[]);
+    b.finish()
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// G4: Shared Packed-16-bit (`f16`/`bf16`) SPIR-V 1.0 Helpers + 6 Native Half Shaders
+// ═════════════════════════════════════════════════════════════════════════════
+
+struct HalfSpirvCtx {
+    glsl_ext: u32,
+    ty_bool: u32,
+    ty_u32: u32,
+    ty_f32: u32,
+    ty_vec2: u32,
+    ptr_unif_u32: u32,
+    c_u0: u32,
+    c_u1: u32,
+    c_u16: u32,
+    c_mask_hi: u32,
+    c_mask_lo: u32,
+    c_mask_abs: u32,
+    c_inf: u32,
+    c_round_bias: u32,
+    c_qnan: u32,
+}
+
+fn spv_unpack_half(
+    b: &mut SpirvBuilder,
+    hc: &HalfSpirvCtx,
+    is_bf16: bool,
+    var_buf: u32,
+    idx: u32,
+) -> u32 {
+    let word_idx = b.alloc_id();
+    b.inst(OP_SHIFT_RIGHT_LOGICAL, &[hc.ty_u32, word_idx, idx, hc.c_u1]);
+    let word = b.load_buf(hc.ptr_unif_u32, hc.ty_u32, var_buf, hc.c_u0, word_idx);
+    let lane_bit = b.alloc_id();
+    b.inst(OP_BITWISE_AND, &[hc.ty_u32, lane_bit, idx, hc.c_u1]);
+    let is_odd = b.alloc_id();
+    b.inst(OP_INOT_EQUAL, &[hc.ty_bool, is_odd, lane_bit, hc.c_u0]);
+    if is_bf16 {
+        let lo_bits = b.alloc_id();
+        b.inst(OP_SHIFT_LEFT_LOGICAL, &[hc.ty_u32, lo_bits, word, hc.c_u16]);
+        let hi_bits = b.alloc_id();
+        b.inst(OP_BITWISE_AND, &[hc.ty_u32, hi_bits, word, hc.c_mask_hi]);
+        let bits = b.alloc_id();
+        b.inst(OP_SELECT, &[hc.ty_u32, bits, is_odd, hi_bits, lo_bits]);
+        let fval = b.alloc_id();
+        b.inst(OP_BITCAST, &[hc.ty_f32, fval, bits]);
+        fval
+    } else {
+        let pair = b.alloc_id();
+        b.inst(
+            OP_EXT_INST,
+            &[hc.ty_vec2, pair, hc.glsl_ext, GLSL_UNPACK_HALF_2X16, word],
+        );
+        let f0 = b.alloc_id();
+        b.inst(OP_COMPOSITE_EXTRACT, &[hc.ty_f32, f0, pair, 0]);
+        let f1 = b.alloc_id();
+        b.inst(OP_COMPOSITE_EXTRACT, &[hc.ty_f32, f1, pair, 1]);
+        let fval = b.alloc_id();
+        b.inst(OP_SELECT, &[hc.ty_f32, fval, is_odd, f1, f0]);
+        fval
+    }
+}
+
+fn spv_pack_half_pair(
+    b: &mut SpirvBuilder,
+    hc: &HalfSpirvCtx,
+    is_bf16: bool,
+    v0: u32,
+    v1: u32,
+) -> u32 {
+    if is_bf16 {
+        let pack_one = |b: &mut SpirvBuilder, fv: u32| -> u32 {
+            let bits = b.alloc_id();
+            b.inst(OP_BITCAST, &[hc.ty_u32, bits, fv]);
+            let abs_b = b.alloc_id();
+            b.inst(OP_BITWISE_AND, &[hc.ty_u32, abs_b, bits, hc.c_mask_abs]);
+            let is_nan = b.alloc_id();
+            b.inst(OP_UGREATER_THAN, &[hc.ty_bool, is_nan, abs_b, hc.c_inf]);
+            let hi16 = b.alloc_id();
+            b.inst(OP_SHIFT_RIGHT_LOGICAL, &[hc.ty_u32, hi16, bits, hc.c_u16]);
+            let lsb = b.alloc_id();
+            b.inst(OP_BITWISE_AND, &[hc.ty_u32, lsb, hi16, hc.c_u1]);
+            let bias = b.alloc_id();
+            b.inst(OP_IADD, &[hc.ty_u32, bias, hc.c_round_bias, lsb]);
+            let rounded_raw = b.alloc_id();
+            b.inst(OP_IADD, &[hc.ty_u32, rounded_raw, bits, bias]);
+            let rounded = b.alloc_id();
+            b.inst(
+                OP_SHIFT_RIGHT_LOGICAL,
+                &[hc.ty_u32, rounded, rounded_raw, hc.c_u16],
+            );
+            let nan_h = b.alloc_id();
+            b.inst(OP_BITWISE_OR, &[hc.ty_u32, nan_h, hi16, hc.c_qnan]);
+            let chosen = b.alloc_id();
+            b.inst(OP_SELECT, &[hc.ty_u32, chosen, is_nan, nan_h, rounded]);
+            let masked = b.alloc_id();
+            b.inst(OP_BITWISE_AND, &[hc.ty_u32, masked, chosen, hc.c_mask_lo]);
+            masked
+        };
+        let h0 = pack_one(b, v0);
+        let h1 = pack_one(b, v1);
+        let h1_sh = b.alloc_id();
+        b.inst(OP_SHIFT_LEFT_LOGICAL, &[hc.ty_u32, h1_sh, h1, hc.c_u16]);
+        let comb = b.alloc_id();
+        b.inst(OP_BITWISE_OR, &[hc.ty_u32, comb, h0, h1_sh]);
+        comb
+    } else {
+        let vec2_val = b.alloc_id();
+        b.inst(OP_COMPOSITE_CONSTRUCT, &[hc.ty_vec2, vec2_val, v0, v1]);
+        let pk = b.alloc_id();
+        b.inst(
+            OP_EXT_INST,
+            &[hc.ty_u32, pk, hc.glsl_ext, GLSL_PACK_HALF_2X16, vec2_val],
+        );
+        pk
+    }
+}
+
+/// Race-free packed 16-bit (`f16` or `bf16`) GPU RMSNorm (4 SSBOs, all `u32[]`).
+/// Each thread computes 2 adjacent flat output elements (`pair_idx * 2 + lane`), eliminating all
+/// write races even when `K` is odd.
+pub(super) fn emit_spirv_rms_norm_half(is_bf16: bool) -> Vec<u32> {
+    let mut b = SpirvBuilder::new();
+    b.inst(OP_CAPABILITY, &[1]);
+    let glsl_ext = b.alloc_id();
+    let mut ext_ops = vec![glsl_ext];
+    SpirvBuilder::push_str_words(&mut ext_ops, "GLSL.std.450");
+    b.inst(OP_EXT_INST_IMPORT, &ext_ops);
+    b.inst(OP_MEMORY_MODEL, &[0, 1]);
+
+    let main_fn = b.alloc_id();
+    let var_gid = b.alloc_id();
+    let mut ep_ops = vec![5, main_fn];
+    SpirvBuilder::push_str_words(&mut ep_ops, "main");
+    ep_ops.push(var_gid);
+    b.inst(OP_ENTRY_POINT, &ep_ops);
+    b.inst(OP_EXECUTION_MODE, &[main_fn, 17, 64, 1, 1]);
+
+    let ty_u32_arr = b.alloc_id();
+    let ty_u32_buf = b.alloc_id();
+    let var_x = b.alloc_id();
+    let var_gamma = b.alloc_id();
+    let var_out = b.alloc_id();
+    let var_params = b.alloc_id();
+
+    b.inst(OP_DECORATE, &[var_gid, DEC_BUILT_IN, 28]);
+    b.inst(OP_DECORATE, &[ty_u32_arr, DEC_ARRAY_STRIDE, 4]);
+    b.inst(OP_DECORATE, &[ty_u32_buf, DEC_BUFFER_BLOCK]);
+    b.inst(OP_MEMBER_DECORATE, &[ty_u32_buf, 0, DEC_OFFSET, 0]);
+    for (binding, var_id) in [(0u32, var_x), (1, var_gamma), (2, var_out), (3, var_params)] {
+        b.inst(OP_DECORATE, &[var_id, DEC_DESCRIPTOR_SET, 0]);
+        b.inst(OP_DECORATE, &[var_id, DEC_BINDING, binding]);
+    }
+
+    let ty_void = b.alloc_id();
+    b.inst(OP_TYPE_VOID, &[ty_void]);
+    let ty_fn = b.alloc_id();
+    b.inst(OP_TYPE_FUNCTION, &[ty_fn, ty_void]);
+    let ty_bool = b.alloc_id();
+    b.inst(OP_TYPE_BOOL, &[ty_bool]);
+    let ty_u32 = b.alloc_id();
+    b.inst(OP_TYPE_INT, &[ty_u32, 32, 0]);
+    let ty_f32 = b.alloc_id();
+    b.inst(OP_TYPE_FLOAT, &[ty_f32, 32]);
+    let ty_vec2 = b.alloc_id();
+    b.inst(OP_TYPE_VECTOR, &[ty_vec2, ty_f32, 2]);
+    let ty_uvec3 = b.alloc_id();
+    b.inst(OP_TYPE_VECTOR, &[ty_uvec3, ty_u32, 3]);
+    let ptr_in_uvec3 = b.alloc_id();
+    b.inst(OP_TYPE_POINTER, &[ptr_in_uvec3, SC_INPUT, ty_uvec3]);
+
+    b.inst(OP_TYPE_RUNTIME_ARRAY, &[ty_u32_arr, ty_u32]);
+    b.inst(OP_TYPE_STRUCT, &[ty_u32_buf, ty_u32_arr]);
+    let ptr_unif_u32_buf = b.alloc_id();
+    b.inst(OP_TYPE_POINTER, &[ptr_unif_u32_buf, SC_UNIFORM, ty_u32_buf]);
+    let ptr_unif_u32 = b.alloc_id();
+    b.inst(OP_TYPE_POINTER, &[ptr_unif_u32, SC_UNIFORM, ty_u32]);
+
+    let c_u0 = b.c_u32(ty_u32, 0);
+    let c_u1 = b.c_u32(ty_u32, 1);
+    let c_u2 = b.c_u32(ty_u32, 2);
+    let c_u3 = b.c_u32(ty_u32, 3);
+    let c_u4 = b.c_u32(ty_u32, 4);
+    let c_f0 = b.c_f32(ty_f32, 0.0);
+    let c_f1 = b.c_f32(ty_f32, 1.0);
+    let hc = HalfSpirvCtx {
+        glsl_ext,
+        ty_bool,
+        ty_u32,
+        ty_f32,
+        ty_vec2,
+        ptr_unif_u32,
+        c_u0,
+        c_u1,
+        c_u16: b.c_u32(ty_u32, 16),
+        c_mask_hi: b.c_u32(ty_u32, 0xffff_0000),
+        c_mask_lo: b.c_u32(ty_u32, 0x0000_ffff),
+        c_mask_abs: b.c_u32(ty_u32, 0x7fff_ffff),
+        c_inf: b.c_u32(ty_u32, 0x7f80_0000),
+        c_round_bias: b.c_u32(ty_u32, 0x0000_7fff),
+        c_qnan: b.c_u32(ty_u32, 0x0000_0040),
+    };
+
+    let ty_arr2_f32 = b.alloc_id();
+    b.inst(OP_TYPE_ARRAY, &[ty_arr2_f32, ty_f32, c_u2]);
+    let ptr_fn_arr2 = b.alloc_id();
+    b.inst(OP_TYPE_POINTER, &[ptr_fn_arr2, SC_FUNCTION, ty_arr2_f32]);
+    let ptr_fn_f32 = b.alloc_id();
+    b.inst(OP_TYPE_POINTER, &[ptr_fn_f32, SC_FUNCTION, ty_f32]);
+
+    b.inst(OP_VARIABLE, &[ptr_in_uvec3, var_gid, SC_INPUT]);
+    for v in [var_x, var_gamma, var_out, var_params] {
+        b.inst(OP_VARIABLE, &[ptr_unif_u32_buf, v, SC_UNIFORM]);
+    }
+
+    b.inst(OP_FUNCTION, &[ty_void, main_fn, 0, ty_fn]);
+    let lbl_entry = b.alloc_id();
+    let lbl_body = b.alloc_id();
+    let lbl_lane_hdr = b.alloc_id();
+    let lbl_lane_body = b.alloc_id();
+    let lbl_in_elem = b.alloc_id();
+    let lbl_k_hdr = b.alloc_id();
+    let lbl_k_body = b.alloc_id();
+    let lbl_k_cont = b.alloc_id();
+    let lbl_k_exit = b.alloc_id();
+    let lbl_lane_merge = b.alloc_id();
+    let lbl_lane_cont = b.alloc_id();
+    let lbl_lane_exit = b.alloc_id();
+    let lbl_exit = b.alloc_id();
+
+    b.inst(OP_LABEL, &[lbl_entry]);
+    let var_lane_out = b.alloc_id();
+    b.inst(OP_VARIABLE, &[ptr_fn_arr2, var_lane_out, SC_FUNCTION]);
+
+    let gid_val = b.alloc_id();
+    b.inst(OP_LOAD, &[ty_uvec3, gid_val, var_gid]);
+    let pair_idx = b.alloc_id();
+    b.inst(OP_COMPOSITE_EXTRACT, &[ty_u32, pair_idx, gid_val, 0]);
+
+    let p_m = b.load_buf(ptr_unif_u32, ty_u32, var_params, c_u0, c_u0);
+    let p_k = b.load_buf(ptr_unif_u32, ty_u32, var_params, c_u0, c_u1);
+    let p_has_gamma = b.load_buf(ptr_unif_u32, ty_u32, var_params, c_u0, c_u2);
+    let p_gamma_len = b.load_buf(ptr_unif_u32, ty_u32, var_params, c_u0, c_u3);
+    let p_eps_bits = b.load_buf(ptr_unif_u32, ty_u32, var_params, c_u0, c_u4);
+    let eps = b.alloc_id();
+    b.inst(OP_BITCAST, &[ty_f32, eps, p_eps_bits]);
+    let has_gamma_b = b.alloc_id();
+    b.inst(OP_INOT_EQUAL, &[ty_bool, has_gamma_b, p_has_gamma, c_u0]);
+    let k_f = b.alloc_id();
+    b.inst(OP_CONVERT_U_TO_F, &[ty_f32, k_f, p_k]);
+
+    let total_elems = b.alloc_id();
+    b.inst(OP_IMUL, &[ty_u32, total_elems, p_m, p_k]);
+    let tp1 = b.alloc_id();
+    b.inst(OP_IADD, &[ty_u32, tp1, total_elems, c_u1]);
+    let total_pairs = b.alloc_id();
+    b.inst(OP_SHIFT_RIGHT_LOGICAL, &[ty_u32, total_pairs, tp1, c_u1]);
+
+    let in_bounds = b.alloc_id();
+    b.inst(OP_ULESS_THAN, &[ty_bool, in_bounds, pair_idx, total_pairs]);
+    b.inst(OP_SELECTION_MERGE, &[lbl_exit, 0]);
+    b.inst(OP_BRANCH_CONDITIONAL, &[in_bounds, lbl_body, lbl_exit]);
+
+    b.inst(OP_LABEL, &[lbl_body]);
+    let p_lo0 = b.alloc_id();
+    b.inst(OP_ACCESS_CHAIN, &[ptr_fn_f32, p_lo0, var_lane_out, c_u0]);
+    b.inst(OP_STORE, &[p_lo0, c_f0]);
+    let p_lo1 = b.alloc_id();
+    b.inst(OP_ACCESS_CHAIN, &[ptr_fn_f32, p_lo1, var_lane_out, c_u1]);
+    b.inst(OP_STORE, &[p_lo1, c_f0]);
+    let base_flat = b.alloc_id();
+    b.inst(OP_SHIFT_LEFT_LOGICAL, &[ty_u32, base_flat, pair_idx, c_u1]);
+    b.inst(OP_BRANCH, &[lbl_lane_hdr]);
+
+    let lane_phi = b.alloc_id();
+    let lane_next = b.alloc_id();
+    b.inst(OP_LABEL, &[lbl_lane_hdr]);
+    b.inst(
+        OP_PHI,
+        &[ty_u32, lane_phi, c_u0, lbl_body, lane_next, lbl_lane_cont],
+    );
+    let lane_cond = b.alloc_id();
+    b.inst(OP_ULESS_THAN, &[ty_bool, lane_cond, lane_phi, c_u2]);
+    b.inst(OP_LOOP_MERGE, &[lbl_lane_exit, lbl_lane_cont, 0]);
+    b.inst(
+        OP_BRANCH_CONDITIONAL,
+        &[lane_cond, lbl_lane_body, lbl_lane_exit],
+    );
+
+    b.inst(OP_LABEL, &[lbl_lane_body]);
+    let flat = b.alloc_id();
+    b.inst(OP_IADD, &[ty_u32, flat, base_flat, lane_phi]);
+    let elem_ok = b.alloc_id();
+    b.inst(OP_ULESS_THAN, &[ty_bool, elem_ok, flat, total_elems]);
+    b.inst(OP_SELECTION_MERGE, &[lbl_lane_merge, 0]);
+    b.inst(
+        OP_BRANCH_CONDITIONAL,
+        &[elem_ok, lbl_in_elem, lbl_lane_merge],
+    );
+
+    b.inst(OP_LABEL, &[lbl_in_elem]);
+    let row = b.alloc_id();
+    b.inst(OP_UDIV, &[ty_u32, row, flat, p_k]);
+    let col = b.alloc_id();
+    b.inst(OP_UMOD, &[ty_u32, col, flat, p_k]);
+    let row_k = b.alloc_id();
+    b.inst(OP_IMUL, &[ty_u32, row_k, row, p_k]);
+    b.inst(OP_BRANCH, &[lbl_k_hdr]);
+
+    let t_phi = b.alloc_id();
+    let sq_phi = b.alloc_id();
+    let t_next = b.alloc_id();
+    let sq_next = b.alloc_id();
+    b.inst(OP_LABEL, &[lbl_k_hdr]);
+    b.inst(
+        OP_PHI,
+        &[ty_u32, t_phi, c_u0, lbl_in_elem, t_next, lbl_k_cont],
+    );
+    b.inst(
+        OP_PHI,
+        &[ty_f32, sq_phi, c_f0, lbl_in_elem, sq_next, lbl_k_cont],
+    );
+    let k_cond = b.alloc_id();
+    b.inst(OP_ULESS_THAN, &[ty_bool, k_cond, t_phi, p_k]);
+    b.inst(OP_LOOP_MERGE, &[lbl_k_exit, lbl_k_cont, 0]);
+    b.inst(OP_BRANCH_CONDITIONAL, &[k_cond, lbl_k_body, lbl_k_exit]);
+
+    b.inst(OP_LABEL, &[lbl_k_body]);
+    let x_idx = b.alloc_id();
+    b.inst(OP_IADD, &[ty_u32, x_idx, row_k, t_phi]);
+    let xv = spv_unpack_half(&mut b, &hc, is_bf16, var_x, x_idx);
+    let xv_sq = b.alloc_id();
+    b.inst(OP_FMUL, &[ty_f32, xv_sq, xv, xv]);
+    b.inst(OP_FADD, &[ty_f32, sq_next, sq_phi, xv_sq]);
+    b.inst(OP_BRANCH, &[lbl_k_cont]);
+
+    b.inst(OP_LABEL, &[lbl_k_cont]);
+    b.inst(OP_IADD, &[ty_u32, t_next, t_phi, c_u1]);
+    b.inst(OP_BRANCH, &[lbl_k_hdr]);
+
+    b.inst(OP_LABEL, &[lbl_k_exit]);
+    let ms = b.alloc_id();
+    b.inst(OP_FDIV, &[ty_f32, ms, sq_phi, k_f]);
+    let ms_eps = b.alloc_id();
+    b.inst(OP_FADD, &[ty_f32, ms_eps, ms, eps]);
+    let rms = b.alloc_id();
+    b.inst(OP_EXT_INST, &[ty_f32, rms, glsl_ext, GLSL_SQRT, ms_eps]);
+    let inv_rms = b.alloc_id();
+    b.inst(OP_FDIV, &[ty_f32, inv_rms, c_f1, rms]);
+    let cur_x = spv_unpack_half(&mut b, &hc, is_bf16, var_x, flat);
+    let xn = b.alloc_id();
+    b.inst(OP_FMUL, &[ty_f32, xn, cur_x, inv_rms]);
+    let g_idx = b.alloc_id();
+    b.inst(OP_UMOD, &[ty_u32, g_idx, col, p_gamma_len]);
+    let g_raw = spv_unpack_half(&mut b, &hc, is_bf16, var_gamma, g_idx);
+    let g_eff = b.alloc_id();
+    b.inst(OP_SELECT, &[ty_f32, g_eff, has_gamma_b, g_raw, c_f1]);
+    let out_v = b.alloc_id();
+    b.inst(OP_FMUL, &[ty_f32, out_v, xn, g_eff]);
+    let p_dst = b.alloc_id();
+    b.inst(
+        OP_ACCESS_CHAIN,
+        &[ptr_fn_f32, p_dst, var_lane_out, lane_phi],
+    );
+    b.inst(OP_STORE, &[p_dst, out_v]);
+    b.inst(OP_BRANCH, &[lbl_lane_merge]);
+
+    b.inst(OP_LABEL, &[lbl_lane_merge]);
+    b.inst(OP_BRANCH, &[lbl_lane_cont]);
+
+    b.inst(OP_LABEL, &[lbl_lane_cont]);
+    b.inst(OP_IADD, &[ty_u32, lane_next, lane_phi, c_u1]);
+    b.inst(OP_BRANCH, &[lbl_lane_hdr]);
+
+    b.inst(OP_LABEL, &[lbl_lane_exit]);
+    let v0 = b.alloc_id();
+    b.inst(OP_LOAD, &[ty_f32, v0, p_lo0]);
+    let v1 = b.alloc_id();
+    b.inst(OP_LOAD, &[ty_f32, v1, p_lo1]);
+    let packed = spv_pack_half_pair(&mut b, &hc, is_bf16, v0, v1);
+    b.store_buf(ptr_unif_u32, var_out, c_u0, pair_idx, packed);
+    b.inst(OP_BRANCH, &[lbl_exit]);
+
+    b.inst(OP_LABEL, &[lbl_exit]);
+    b.inst(OP_RETURN, &[]);
+    b.inst(OP_FUNCTION_END, &[]);
+    b.finish()
+}
+
+/// Race-free packed 16-bit (`f16` or `bf16`) single-pass Online-Softmax FlashAttention-2
+/// (10 SSBOs, all `u32[]`). Each thread computes 2 adjacent flat output elements.
+pub(super) fn emit_spirv_flash_attention_half(is_bf16: bool) -> Vec<u32> {
+    let mut b = SpirvBuilder::new();
+    b.inst(OP_CAPABILITY, &[1]);
+    let glsl_ext = b.alloc_id();
+    let mut ext_ops = vec![glsl_ext];
+    SpirvBuilder::push_str_words(&mut ext_ops, "GLSL.std.450");
+    b.inst(OP_EXT_INST_IMPORT, &ext_ops);
+    b.inst(OP_MEMORY_MODEL, &[0, 1]);
+
+    let main_fn = b.alloc_id();
+    let var_gid = b.alloc_id();
+    let mut ep_ops = vec![5, main_fn];
+    SpirvBuilder::push_str_words(&mut ep_ops, "main");
+    ep_ops.push(var_gid);
+    b.inst(OP_ENTRY_POINT, &ep_ops);
+    b.inst(OP_EXECUTION_MODE, &[main_fn, 17, 64, 1, 1]);
+
+    let ty_u32_arr = b.alloc_id();
+    let ty_u32_buf = b.alloc_id();
+    let var_q = b.alloc_id();
+    let var_k = b.alloc_id();
+    let var_v = b.alloc_id();
+    let var_mask = b.alloc_id();
+    let var_out = b.alloc_id();
+    let var_qb = b.alloc_id();
+    let var_kb = b.alloc_id();
+    let var_vb = b.alloc_id();
+    let var_mb = b.alloc_id();
+    let var_params = b.alloc_id();
+
+    b.inst(OP_DECORATE, &[var_gid, DEC_BUILT_IN, 28]);
+    b.inst(OP_DECORATE, &[ty_u32_arr, DEC_ARRAY_STRIDE, 4]);
+    b.inst(OP_DECORATE, &[ty_u32_buf, DEC_BUFFER_BLOCK]);
+    b.inst(OP_MEMBER_DECORATE, &[ty_u32_buf, 0, DEC_OFFSET, 0]);
+    for (binding, var_id) in [
+        (0u32, var_q),
+        (1, var_k),
+        (2, var_v),
+        (3, var_mask),
+        (4, var_out),
+        (5, var_qb),
+        (6, var_kb),
+        (7, var_vb),
+        (8, var_mb),
+        (9, var_params),
+    ] {
+        b.inst(OP_DECORATE, &[var_id, DEC_DESCRIPTOR_SET, 0]);
+        b.inst(OP_DECORATE, &[var_id, DEC_BINDING, binding]);
+    }
+
+    let ty_void = b.alloc_id();
+    b.inst(OP_TYPE_VOID, &[ty_void]);
+    let ty_fn = b.alloc_id();
+    b.inst(OP_TYPE_FUNCTION, &[ty_fn, ty_void]);
+    let ty_bool = b.alloc_id();
+    b.inst(OP_TYPE_BOOL, &[ty_bool]);
+    let ty_u32 = b.alloc_id();
+    b.inst(OP_TYPE_INT, &[ty_u32, 32, 0]);
+    let ty_f32 = b.alloc_id();
+    b.inst(OP_TYPE_FLOAT, &[ty_f32, 32]);
+    let ty_vec2 = b.alloc_id();
+    b.inst(OP_TYPE_VECTOR, &[ty_vec2, ty_f32, 2]);
+    let ty_uvec3 = b.alloc_id();
+    b.inst(OP_TYPE_VECTOR, &[ty_uvec3, ty_u32, 3]);
+    let ptr_in_uvec3 = b.alloc_id();
+    b.inst(OP_TYPE_POINTER, &[ptr_in_uvec3, SC_INPUT, ty_uvec3]);
+
+    b.inst(OP_TYPE_RUNTIME_ARRAY, &[ty_u32_arr, ty_u32]);
+    b.inst(OP_TYPE_STRUCT, &[ty_u32_buf, ty_u32_arr]);
+    let ptr_unif_u32_buf = b.alloc_id();
+    b.inst(OP_TYPE_POINTER, &[ptr_unif_u32_buf, SC_UNIFORM, ty_u32_buf]);
+    let ptr_unif_u32 = b.alloc_id();
+    b.inst(OP_TYPE_POINTER, &[ptr_unif_u32, SC_UNIFORM, ty_u32]);
+
+    let c_u: Vec<u32> = (0..10).map(|i| b.c_u32(ty_u32, i)).collect();
+    let c_f0 = b.c_f32(ty_f32, 0.0);
+    let c_f_neginf = b.c_f32(ty_f32, -3.4e38_f32);
+    let c_f_mask_cut = b.c_f32(ty_f32, -1.0e30_f32);
+    let c_f_exp_lo = b.c_f32(ty_f32, -80.0);
+    let hc = HalfSpirvCtx {
+        glsl_ext,
+        ty_bool,
+        ty_u32,
+        ty_f32,
+        ty_vec2,
+        ptr_unif_u32,
+        c_u0: c_u[0],
+        c_u1: c_u[1],
+        c_u16: b.c_u32(ty_u32, 16),
+        c_mask_hi: b.c_u32(ty_u32, 0xffff_0000),
+        c_mask_lo: b.c_u32(ty_u32, 0x0000_ffff),
+        c_mask_abs: b.c_u32(ty_u32, 0x7fff_ffff),
+        c_inf: b.c_u32(ty_u32, 0x7f80_0000),
+        c_round_bias: b.c_u32(ty_u32, 0x0000_7fff),
+        c_qnan: b.c_u32(ty_u32, 0x0000_0040),
+    };
+
+    let ty_arr2_f32 = b.alloc_id();
+    b.inst(OP_TYPE_ARRAY, &[ty_arr2_f32, ty_f32, c_u[2]]);
+    let ptr_fn_arr2 = b.alloc_id();
+    b.inst(OP_TYPE_POINTER, &[ptr_fn_arr2, SC_FUNCTION, ty_arr2_f32]);
+    let ptr_fn_f32 = b.alloc_id();
+    b.inst(OP_TYPE_POINTER, &[ptr_fn_f32, SC_FUNCTION, ty_f32]);
+
+    b.inst(OP_VARIABLE, &[ptr_in_uvec3, var_gid, SC_INPUT]);
+    for v in [
+        var_q, var_k, var_v, var_mask, var_out, var_qb, var_kb, var_vb, var_mb, var_params,
+    ] {
+        b.inst(OP_VARIABLE, &[ptr_unif_u32_buf, v, SC_UNIFORM]);
+    }
+
+    b.inst(OP_FUNCTION, &[ty_void, main_fn, 0, ty_fn]);
+    let lbl_entry = b.alloc_id();
+    let lbl_body = b.alloc_id();
+    let lbl_lane_hdr = b.alloc_id();
+    let lbl_lane_body = b.alloc_id();
+    let lbl_in_elem = b.alloc_id();
+    let lbl_k_hdr = b.alloc_id();
+    let lbl_k_body = b.alloc_id();
+    let lbl_d_hdr = b.alloc_id();
+    let lbl_d_body = b.alloc_id();
+    let lbl_d_cont = b.alloc_id();
+    let lbl_d_exit = b.alloc_id();
+    let lbl_k_cont = b.alloc_id();
+    let lbl_k_exit = b.alloc_id();
+    let lbl_lane_merge = b.alloc_id();
+    let lbl_lane_cont = b.alloc_id();
+    let lbl_lane_exit = b.alloc_id();
+    let lbl_exit = b.alloc_id();
+
+    b.inst(OP_LABEL, &[lbl_entry]);
+    let var_lane_out = b.alloc_id();
+    b.inst(OP_VARIABLE, &[ptr_fn_arr2, var_lane_out, SC_FUNCTION]);
+
+    let gid_val = b.alloc_id();
+    b.inst(OP_LOAD, &[ty_uvec3, gid_val, var_gid]);
+    let pair_idx = b.alloc_id();
+    b.inst(OP_COMPOSITE_EXTRACT, &[ty_u32, pair_idx, gid_val, 0]);
+
+    let p_batches = b.load_buf(ptr_unif_u32, ty_u32, var_params, c_u[0], c_u[0]);
+    let p_sq = b.load_buf(ptr_unif_u32, ty_u32, var_params, c_u[0], c_u[1]);
+    let p_sk = b.load_buf(ptr_unif_u32, ty_u32, var_params, c_u[0], c_u[2]);
+    let p_dk = b.load_buf(ptr_unif_u32, ty_u32, var_params, c_u[0], c_u[3]);
+    let p_dv = b.load_buf(ptr_unif_u32, ty_u32, var_params, c_u[0], c_u[4]);
+    let p_kt = b.load_buf(ptr_unif_u32, ty_u32, var_params, c_u[0], c_u[5]);
+    let p_hm = b.load_buf(ptr_unif_u32, ty_u32, var_params, c_u[0], c_u[6]);
+    let p_msq = b.load_buf(ptr_unif_u32, ty_u32, var_params, c_u[0], c_u[7]);
+    let p_msk = b.load_buf(ptr_unif_u32, ty_u32, var_params, c_u[0], c_u[8]);
+    let p_scale_bits = b.load_buf(ptr_unif_u32, ty_u32, var_params, c_u[0], c_u[9]);
+    let scale = b.alloc_id();
+    b.inst(OP_BITCAST, &[ty_f32, scale, p_scale_bits]);
+    let is_kt = b.alloc_id();
+    b.inst(OP_INOT_EQUAL, &[ty_bool, is_kt, p_kt, c_u[0]]);
+    let has_mask_b = b.alloc_id();
+    b.inst(OP_INOT_EQUAL, &[ty_bool, has_mask_b, p_hm, c_u[0]]);
+
+    let sq_dv = b.alloc_id();
+    b.inst(OP_IMUL, &[ty_u32, sq_dv, p_sq, p_dv]);
+    let total_elems = b.alloc_id();
+    b.inst(OP_IMUL, &[ty_u32, total_elems, p_batches, sq_dv]);
+    let tp1 = b.alloc_id();
+    b.inst(OP_IADD, &[ty_u32, tp1, total_elems, c_u[1]]);
+    let total_pairs = b.alloc_id();
+    b.inst(OP_SHIFT_RIGHT_LOGICAL, &[ty_u32, total_pairs, tp1, c_u[1]]);
+
+    let in_bounds = b.alloc_id();
+    b.inst(OP_ULESS_THAN, &[ty_bool, in_bounds, pair_idx, total_pairs]);
+    b.inst(OP_SELECTION_MERGE, &[lbl_exit, 0]);
+    b.inst(OP_BRANCH_CONDITIONAL, &[in_bounds, lbl_body, lbl_exit]);
+
+    b.inst(OP_LABEL, &[lbl_body]);
+    let p_lo0 = b.alloc_id();
+    b.inst(OP_ACCESS_CHAIN, &[ptr_fn_f32, p_lo0, var_lane_out, c_u[0]]);
+    b.inst(OP_STORE, &[p_lo0, c_f0]);
+    let p_lo1 = b.alloc_id();
+    b.inst(OP_ACCESS_CHAIN, &[ptr_fn_f32, p_lo1, var_lane_out, c_u[1]]);
+    b.inst(OP_STORE, &[p_lo1, c_f0]);
+    let base_flat = b.alloc_id();
+    b.inst(
+        OP_SHIFT_LEFT_LOGICAL,
+        &[ty_u32, base_flat, pair_idx, c_u[1]],
+    );
+    b.inst(OP_BRANCH, &[lbl_lane_hdr]);
+
+    let lane_phi = b.alloc_id();
+    let lane_next = b.alloc_id();
+    b.inst(OP_LABEL, &[lbl_lane_hdr]);
+    b.inst(
+        OP_PHI,
+        &[ty_u32, lane_phi, c_u[0], lbl_body, lane_next, lbl_lane_cont],
+    );
+    let lane_cond = b.alloc_id();
+    b.inst(OP_ULESS_THAN, &[ty_bool, lane_cond, lane_phi, c_u[2]]);
+    b.inst(OP_LOOP_MERGE, &[lbl_lane_exit, lbl_lane_cont, 0]);
+    b.inst(
+        OP_BRANCH_CONDITIONAL,
+        &[lane_cond, lbl_lane_body, lbl_lane_exit],
+    );
+
+    b.inst(OP_LABEL, &[lbl_lane_body]);
+    let flat = b.alloc_id();
+    b.inst(OP_IADD, &[ty_u32, flat, base_flat, lane_phi]);
+    let elem_ok = b.alloc_id();
+    b.inst(OP_ULESS_THAN, &[ty_bool, elem_ok, flat, total_elems]);
+    b.inst(OP_SELECTION_MERGE, &[lbl_lane_merge, 0]);
+    b.inst(
+        OP_BRANCH_CONDITIONAL,
+        &[elem_ok, lbl_in_elem, lbl_lane_merge],
+    );
+
+    b.inst(OP_LABEL, &[lbl_in_elem]);
+    let batch = b.alloc_id();
+    b.inst(OP_UDIV, &[ty_u32, batch, flat, sq_dv]);
+    let rem = b.alloc_id();
+    b.inst(OP_UMOD, &[ty_u32, rem, flat, sq_dv]);
+    let qi = b.alloc_id();
+    b.inst(OP_UDIV, &[ty_u32, qi, rem, p_dv]);
+    let di = b.alloc_id();
+    b.inst(OP_UMOD, &[ty_u32, di, rem, p_dv]);
+
+    let q_base0 = b.load_buf(ptr_unif_u32, ty_u32, var_qb, c_u[0], batch);
+    let k_base = b.load_buf(ptr_unif_u32, ty_u32, var_kb, c_u[0], batch);
+    let v_base = b.load_buf(ptr_unif_u32, ty_u32, var_vb, c_u[0], batch);
+    let m_base = b.load_buf(ptr_unif_u32, ty_u32, var_mb, c_u[0], batch);
+    let qi_dk = b.alloc_id();
+    b.inst(OP_IMUL, &[ty_u32, qi_dk, qi, p_dk]);
+    let q_row_base = b.alloc_id();
+    b.inst(OP_IADD, &[ty_u32, q_row_base, q_base0, qi_dk]);
+    let qi_msq = b.alloc_id();
+    b.inst(OP_IMUL, &[ty_u32, qi_msq, qi, p_msq]);
+    let mask_row_base = b.alloc_id();
+    b.inst(OP_IADD, &[ty_u32, mask_row_base, m_base, qi_msq]);
+    b.inst(OP_BRANCH, &[lbl_k_hdr]);
+
+    let kj_phi = b.alloc_id();
+    let m_phi = b.alloc_id();
+    let l_phi = b.alloc_id();
+    let acc_phi = b.alloc_id();
+    let kj_next = b.alloc_id();
+    let m_next = b.alloc_id();
+    let l_next = b.alloc_id();
+    let acc_next = b.alloc_id();
+
+    b.inst(OP_LABEL, &[lbl_k_hdr]);
+    b.inst(
+        OP_PHI,
+        &[ty_u32, kj_phi, c_u[0], lbl_in_elem, kj_next, lbl_k_cont],
+    );
+    b.inst(
+        OP_PHI,
+        &[ty_f32, m_phi, c_f_neginf, lbl_in_elem, m_next, lbl_k_cont],
+    );
+    b.inst(
+        OP_PHI,
+        &[ty_f32, l_phi, c_f0, lbl_in_elem, l_next, lbl_k_cont],
+    );
+    b.inst(
+        OP_PHI,
+        &[ty_f32, acc_phi, c_f0, lbl_in_elem, acc_next, lbl_k_cont],
+    );
+    let k_cond = b.alloc_id();
+    b.inst(OP_ULESS_THAN, &[ty_bool, k_cond, kj_phi, p_sk]);
+    b.inst(OP_LOOP_MERGE, &[lbl_k_exit, lbl_k_cont, 0]);
+    b.inst(OP_BRANCH_CONDITIONAL, &[k_cond, lbl_k_body, lbl_k_exit]);
+
+    b.inst(OP_LABEL, &[lbl_k_body]);
+    let kj_dk = b.alloc_id();
+    b.inst(OP_IMUL, &[ty_u32, kj_dk, kj_phi, p_dk]);
+    let k_norm_row = b.alloc_id();
+    b.inst(OP_IADD, &[ty_u32, k_norm_row, k_base, kj_dk]);
+    b.inst(OP_BRANCH, &[lbl_d_hdr]);
+
+    let t_phi = b.alloc_id();
+    let dot_phi = b.alloc_id();
+    let t_next = b.alloc_id();
+    let dot_next = b.alloc_id();
+    b.inst(OP_LABEL, &[lbl_d_hdr]);
+    b.inst(
+        OP_PHI,
+        &[ty_u32, t_phi, c_u[0], lbl_k_body, t_next, lbl_d_cont],
+    );
+    b.inst(
+        OP_PHI,
+        &[ty_f32, dot_phi, c_f0, lbl_k_body, dot_next, lbl_d_cont],
+    );
+    let d_cond = b.alloc_id();
+    b.inst(OP_ULESS_THAN, &[ty_bool, d_cond, t_phi, p_dk]);
+    b.inst(OP_LOOP_MERGE, &[lbl_d_exit, lbl_d_cont, 0]);
+    b.inst(OP_BRANCH_CONDITIONAL, &[d_cond, lbl_d_body, lbl_d_exit]);
+
+    b.inst(OP_LABEL, &[lbl_d_body]);
+    let q_idx = b.alloc_id();
+    b.inst(OP_IADD, &[ty_u32, q_idx, q_row_base, t_phi]);
+    let qv = spv_unpack_half(&mut b, &hc, is_bf16, var_q, q_idx);
+
+    let k_idx_norm = b.alloc_id();
+    b.inst(OP_IADD, &[ty_u32, k_idx_norm, k_norm_row, t_phi]);
+    let t_sk = b.alloc_id();
+    b.inst(OP_IMUL, &[ty_u32, t_sk, t_phi, p_sk]);
+    let k_t0 = b.alloc_id();
+    b.inst(OP_IADD, &[ty_u32, k_t0, k_base, t_sk]);
+    let k_idx_tr = b.alloc_id();
+    b.inst(OP_IADD, &[ty_u32, k_idx_tr, k_t0, kj_phi]);
+    let k_idx = b.alloc_id();
+    b.inst(OP_SELECT, &[ty_u32, k_idx, is_kt, k_idx_tr, k_idx_norm]);
+    let kv = spv_unpack_half(&mut b, &hc, is_bf16, var_k, k_idx);
+
+    let prod = b.alloc_id();
+    b.inst(OP_FMUL, &[ty_f32, prod, qv, kv]);
+    b.inst(OP_FADD, &[ty_f32, dot_next, dot_phi, prod]);
+    b.inst(OP_BRANCH, &[lbl_d_cont]);
+
+    b.inst(OP_LABEL, &[lbl_d_cont]);
+    b.inst(OP_IADD, &[ty_u32, t_next, t_phi, c_u[1]]);
+    b.inst(OP_BRANCH, &[lbl_d_hdr]);
+
+    b.inst(OP_LABEL, &[lbl_d_exit]);
+    let score0 = b.alloc_id();
+    b.inst(OP_FMUL, &[ty_f32, score0, dot_phi, scale]);
+
+    let kj_msk = b.alloc_id();
+    b.inst(OP_IMUL, &[ty_u32, kj_msk, kj_phi, p_msk]);
+    let mask_idx_raw = b.alloc_id();
+    b.inst(OP_IADD, &[ty_u32, mask_idx_raw, mask_row_base, kj_msk]);
+    let mask_idx = b.alloc_id();
+    b.inst(
+        OP_SELECT,
+        &[ty_u32, mask_idx, has_mask_b, mask_idx_raw, c_u[0]],
+    );
+    let mask_v = spv_unpack_half(&mut b, &hc, is_bf16, var_mask, mask_idx);
+    let score_m = b.alloc_id();
+    b.inst(OP_FADD, &[ty_f32, score_m, score0, mask_v]);
+    let score = b.alloc_id();
+    b.inst(OP_SELECT, &[ty_f32, score, has_mask_b, score_m, score0]);
+
+    let valid = b.alloc_id();
+    b.inst(OP_FORD_GREATER_THAN, &[ty_bool, valid, score, c_f_mask_cut]);
+    let eff_score = b.alloc_id();
+    b.inst(OP_SELECT, &[ty_f32, eff_score, valid, score, m_phi]);
+    let m_cand = b.alloc_id();
+    b.inst(
+        OP_EXT_INST,
+        &[ty_f32, m_cand, glsl_ext, GLSL_FMAX, m_phi, eff_score],
+    );
+    b.inst(OP_SELECT, &[ty_f32, m_next, valid, m_cand, m_phi]);
+
+    let l_zero = b.alloc_id();
+    b.inst(OP_FORD_EQUAL, &[ty_bool, l_zero, l_phi, c_f0]);
+    let dm = b.alloc_id();
+    b.inst(OP_FSUB, &[ty_f32, dm, m_phi, m_next]);
+    let dm_c = b.alloc_id();
+    b.inst(
+        OP_EXT_INST,
+        &[ty_f32, dm_c, glsl_ext, GLSL_FCLAMP, dm, c_f_exp_lo, c_f0],
+    );
+    let exp_dm = b.alloc_id();
+    b.inst(OP_EXT_INST, &[ty_f32, exp_dm, glsl_ext, GLSL_EXP, dm_c]);
+    let alpha = b.alloc_id();
+    b.inst(OP_SELECT, &[ty_f32, alpha, l_zero, c_f0, exp_dm]);
+
+    let ds = b.alloc_id();
+    b.inst(OP_FSUB, &[ty_f32, ds, eff_score, m_next]);
+    let ds_c = b.alloc_id();
+    b.inst(
+        OP_EXT_INST,
+        &[ty_f32, ds_c, glsl_ext, GLSL_FCLAMP, ds, c_f_exp_lo, c_f0],
+    );
+    let exp_ds = b.alloc_id();
+    b.inst(OP_EXT_INST, &[ty_f32, exp_ds, glsl_ext, GLSL_EXP, ds_c]);
+    let p_w = b.alloc_id();
+    b.inst(OP_SELECT, &[ty_f32, p_w, valid, exp_ds, c_f0]);
+
+    let kj_dv = b.alloc_id();
+    b.inst(OP_IMUL, &[ty_u32, kj_dv, kj_phi, p_dv]);
+    let v_i0 = b.alloc_id();
+    b.inst(OP_IADD, &[ty_u32, v_i0, v_base, kj_dv]);
+    let v_idx = b.alloc_id();
+    b.inst(OP_IADD, &[ty_u32, v_idx, v_i0, di]);
+    let vv = spv_unpack_half(&mut b, &hc, is_bf16, var_v, v_idx);
+
+    let l_scaled = b.alloc_id();
+    b.inst(OP_FMUL, &[ty_f32, l_scaled, l_phi, alpha]);
+    let l_cand = b.alloc_id();
+    b.inst(OP_FADD, &[ty_f32, l_cand, l_scaled, p_w]);
+    b.inst(OP_SELECT, &[ty_f32, l_next, valid, l_cand, l_phi]);
+
+    let acc_scaled = b.alloc_id();
+    b.inst(OP_FMUL, &[ty_f32, acc_scaled, acc_phi, alpha]);
+    let pv = b.alloc_id();
+    b.inst(OP_FMUL, &[ty_f32, pv, p_w, vv]);
+    let acc_cand = b.alloc_id();
+    b.inst(OP_FADD, &[ty_f32, acc_cand, acc_scaled, pv]);
+    b.inst(OP_SELECT, &[ty_f32, acc_next, valid, acc_cand, acc_phi]);
+    b.inst(OP_BRANCH, &[lbl_k_cont]);
+
+    b.inst(OP_LABEL, &[lbl_k_cont]);
+    b.inst(OP_IADD, &[ty_u32, kj_next, kj_phi, c_u[1]]);
+    b.inst(OP_BRANCH, &[lbl_k_hdr]);
+
+    b.inst(OP_LABEL, &[lbl_k_exit]);
+    let l_pos = b.alloc_id();
+    b.inst(OP_FORD_GREATER_THAN, &[ty_bool, l_pos, l_phi, c_f0]);
+    let acc_div = b.alloc_id();
+    b.inst(OP_FDIV, &[ty_f32, acc_div, acc_phi, l_phi]);
+    let out_val = b.alloc_id();
+    b.inst(OP_SELECT, &[ty_f32, out_val, l_pos, acc_div, c_f0]);
+    let p_dst = b.alloc_id();
+    b.inst(
+        OP_ACCESS_CHAIN,
+        &[ptr_fn_f32, p_dst, var_lane_out, lane_phi],
+    );
+    b.inst(OP_STORE, &[p_dst, out_val]);
+    b.inst(OP_BRANCH, &[lbl_lane_merge]);
+
+    b.inst(OP_LABEL, &[lbl_lane_merge]);
+    b.inst(OP_BRANCH, &[lbl_lane_cont]);
+
+    b.inst(OP_LABEL, &[lbl_lane_cont]);
+    b.inst(OP_IADD, &[ty_u32, lane_next, lane_phi, c_u[1]]);
+    b.inst(OP_BRANCH, &[lbl_lane_hdr]);
+
+    b.inst(OP_LABEL, &[lbl_lane_exit]);
+    let v0 = b.alloc_id();
+    b.inst(OP_LOAD, &[ty_f32, v0, p_lo0]);
+    let v1 = b.alloc_id();
+    b.inst(OP_LOAD, &[ty_f32, v1, p_lo1]);
+    let packed = spv_pack_half_pair(&mut b, &hc, is_bf16, v0, v1);
+    b.store_buf(ptr_unif_u32, var_out, c_u[0], pair_idx, packed);
+    b.inst(OP_BRANCH, &[lbl_exit]);
+
+    b.inst(OP_LABEL, &[lbl_exit]);
+    b.inst(OP_RETURN, &[]);
+    b.inst(OP_FUNCTION_END, &[]);
+    b.finish()
+}
+
+/// Race-free packed 16-bit (`f16` or `bf16`) 25-opcode FusedElementwise broadcast evaluator
+/// (11 SSBOs, all `u32[]`). Each thread evaluates 2 adjacent flat output elements in `f32`
+/// registers and packs them race-free into `Out[pair_idx]`.
+pub(super) fn emit_spirv_fused_elementwise_half(is_bf16: bool) -> Vec<u32> {
+    let mut b = SpirvBuilder::new();
+    b.inst(OP_CAPABILITY, &[1]);
+    let glsl_ext = b.alloc_id();
+    let mut ext_ops = vec![glsl_ext];
+    SpirvBuilder::push_str_words(&mut ext_ops, "GLSL.std.450");
+    b.inst(OP_EXT_INST_IMPORT, &ext_ops);
+    b.inst(OP_MEMORY_MODEL, &[0, 1]);
+
+    let main_fn = b.alloc_id();
+    let var_gid = b.alloc_id();
+    let mut ep_ops = vec![5, main_fn];
+    SpirvBuilder::push_str_words(&mut ep_ops, "main");
+    ep_ops.push(var_gid);
+    b.inst(OP_ENTRY_POINT, &ep_ops);
+    b.inst(OP_EXECUTION_MODE, &[main_fn, 17, 64, 1, 1]);
+
+    let ty_u32_arr = b.alloc_id();
+    let ty_u32_buf = b.alloc_id();
+    let var_out = b.alloc_id();
+    let var_in0 = b.alloc_id();
+    let var_in1 = b.alloc_id();
+    let var_in2 = b.alloc_id();
+    let var_in3 = b.alloc_id();
+    let var_strides = b.alloc_id();
+    let var_oshape = b.alloc_id();
+    let var_ops = b.alloc_id();
+    let var_arga = b.alloc_id();
+    let var_argb = b.alloc_id();
+    let var_meta = b.alloc_id();
+
+    b.inst(OP_DECORATE, &[var_gid, DEC_BUILT_IN, 28]);
+    b.inst(OP_DECORATE, &[ty_u32_arr, DEC_ARRAY_STRIDE, 4]);
+    b.inst(OP_DECORATE, &[ty_u32_buf, DEC_BUFFER_BLOCK]);
+    b.inst(OP_MEMBER_DECORATE, &[ty_u32_buf, 0, DEC_OFFSET, 0]);
+    for (binding, var_id) in [
+        (0u32, var_out),
+        (1, var_in0),
+        (2, var_in1),
+        (3, var_in2),
+        (4, var_in3),
+        (5, var_strides),
+        (6, var_oshape),
+        (7, var_ops),
+        (8, var_arga),
+        (9, var_argb),
+        (10, var_meta),
+    ] {
+        b.inst(OP_DECORATE, &[var_id, DEC_DESCRIPTOR_SET, 0]);
+        b.inst(OP_DECORATE, &[var_id, DEC_BINDING, binding]);
+    }
+
+    let ty_void = b.alloc_id();
+    b.inst(OP_TYPE_VOID, &[ty_void]);
+    let ty_fn = b.alloc_id();
+    b.inst(OP_TYPE_FUNCTION, &[ty_fn, ty_void]);
+    let ty_bool = b.alloc_id();
+    b.inst(OP_TYPE_BOOL, &[ty_bool]);
+    let ty_u32 = b.alloc_id();
+    b.inst(OP_TYPE_INT, &[ty_u32, 32, 0]);
+    let ty_f32 = b.alloc_id();
+    b.inst(OP_TYPE_FLOAT, &[ty_f32, 32]);
+    let ty_vec2 = b.alloc_id();
+    b.inst(OP_TYPE_VECTOR, &[ty_vec2, ty_f32, 2]);
+    let ty_uvec3 = b.alloc_id();
+    b.inst(OP_TYPE_VECTOR, &[ty_uvec3, ty_u32, 3]);
+    let ptr_in_uvec3 = b.alloc_id();
+    b.inst(OP_TYPE_POINTER, &[ptr_in_uvec3, SC_INPUT, ty_uvec3]);
+
+    b.inst(OP_TYPE_RUNTIME_ARRAY, &[ty_u32_arr, ty_u32]);
+    b.inst(OP_TYPE_STRUCT, &[ty_u32_buf, ty_u32_arr]);
+    let ptr_unif_u32_buf = b.alloc_id();
+    b.inst(OP_TYPE_POINTER, &[ptr_unif_u32_buf, SC_UNIFORM, ty_u32_buf]);
+    let ptr_unif_u32 = b.alloc_id();
+    b.inst(OP_TYPE_POINTER, &[ptr_unif_u32, SC_UNIFORM, ty_u32]);
+
+    let c_u0 = b.c_u32(ty_u32, 0);
+    let c_u1 = b.c_u32(ty_u32, 1);
+    let c_u2 = b.c_u32(ty_u32, 2);
+    let c_u3 = b.c_u32(ty_u32, 3);
+    let c_u4 = b.c_u32(ty_u32, 4);
+    let c_u5 = b.c_u32(ty_u32, 5);
+    let c_u16 = b.c_u32(ty_u32, 16);
+    let c_u64 = b.c_u32(ty_u32, 64);
+
+    let hc = HalfSpirvCtx {
+        glsl_ext,
+        ty_bool,
+        ty_u32,
+        ty_f32,
+        ty_vec2,
+        ptr_unif_u32,
+        c_u0,
+        c_u1,
+        c_u16,
+        c_mask_hi: b.c_u32(ty_u32, 0xffff_0000),
+        c_mask_lo: b.c_u32(ty_u32, 0x0000_ffff),
+        c_mask_abs: b.c_u32(ty_u32, 0x7fff_ffff),
+        c_inf: b.c_u32(ty_u32, 0x7f80_0000),
+        c_round_bias: b.c_u32(ty_u32, 0x0000_7fff),
+        c_qnan: b.c_u32(ty_u32, 0x0000_0040),
+    };
+
+    let ty_slots = b.alloc_id();
+    b.inst(OP_TYPE_ARRAY, &[ty_slots, ty_f32, c_u64]);
+    let ptr_fn_slots = b.alloc_id();
+    b.inst(OP_TYPE_POINTER, &[ptr_fn_slots, SC_FUNCTION, ty_slots]);
+    let ty_coords = b.alloc_id();
+    b.inst(OP_TYPE_ARRAY, &[ty_coords, ty_u32, c_u16]);
+    let ptr_fn_coords = b.alloc_id();
+    b.inst(OP_TYPE_POINTER, &[ptr_fn_coords, SC_FUNCTION, ty_coords]);
+    let ty_arr2_f32 = b.alloc_id();
+    b.inst(OP_TYPE_ARRAY, &[ty_arr2_f32, ty_f32, c_u2]);
+    let ptr_fn_arr2 = b.alloc_id();
+    b.inst(OP_TYPE_POINTER, &[ptr_fn_arr2, SC_FUNCTION, ty_arr2_f32]);
+    let ptr_fn_f32 = b.alloc_id();
+    b.inst(OP_TYPE_POINTER, &[ptr_fn_f32, SC_FUNCTION, ty_f32]);
+    let ptr_fn_u32 = b.alloc_id();
+    b.inst(OP_TYPE_POINTER, &[ptr_fn_u32, SC_FUNCTION, ty_u32]);
+
+    let c_f0 = b.c_f32(ty_f32, 0.0);
+    let c_f1 = b.c_f32(ty_f32, 1.0);
+    let c_f2 = b.c_f32(ty_f32, 2.0);
+    let c_f3 = b.c_f32(ty_f32, 3.0);
+    let c_f05 = b.c_f32(ty_f32, 0.5);
+    let c_gelu_a = b.c_f32(ty_f32, 0.797_884_6);
+    let c_gelu_b = b.c_f32(ty_f32, 0.044_715);
+    let c_f_lo = b.c_f32(ty_f32, -40.0);
+    let c_f_hi = b.c_f32(ty_f32, 40.0);
+
+    b.inst(OP_VARIABLE, &[ptr_in_uvec3, var_gid, SC_INPUT]);
+    for v in [
+        var_out,
+        var_in0,
+        var_in1,
+        var_in2,
+        var_in3,
+        var_strides,
+        var_oshape,
+        var_ops,
+        var_arga,
+        var_argb,
+        var_meta,
+    ] {
+        b.inst(OP_VARIABLE, &[ptr_unif_u32_buf, v, SC_UNIFORM]);
+    }
+
+    b.inst(OP_FUNCTION, &[ty_void, main_fn, 0, ty_fn]);
+    let lbl_entry = b.alloc_id();
+    let lbl_body = b.alloc_id();
+    let lbl_lane_hdr = b.alloc_id();
+    let lbl_lane_body = b.alloc_id();
+    let lbl_in_elem = b.alloc_id();
+    let lbl_dec_hdr = b.alloc_id();
+    let lbl_dec_body = b.alloc_id();
+    let lbl_dec_cont = b.alloc_id();
+    let lbl_dec_exit = b.alloc_id();
+    let lbl_in_hdr = b.alloc_id();
+    let lbl_in_body = b.alloc_id();
+    let lbl_st_hdr = b.alloc_id();
+    let lbl_st_body = b.alloc_id();
+    let lbl_st_cont = b.alloc_id();
+    let lbl_st_exit = b.alloc_id();
+    let lbl_in_packed = b.alloc_id();
+    let lbl_in_direct = b.alloc_id();
+    let lbl_in_c0 = b.alloc_id();
+    let lbl_in_c1 = b.alloc_id();
+    let lbl_in_c2 = b.alloc_id();
+    let lbl_in_c3 = b.alloc_id();
+    let lbl_in_sw_merge = b.alloc_id();
+    let lbl_in_fetch_merge = b.alloc_id();
+    let lbl_in_cont = b.alloc_id();
+    let lbl_in_exit = b.alloc_id();
+    let lbl_step_hdr = b.alloc_id();
+    let lbl_step_body = b.alloc_id();
+    let lbl_step_merge = b.alloc_id();
+    let lbl_step_cont = b.alloc_id();
+    let lbl_step_exit = b.alloc_id();
+    let lbl_lane_merge = b.alloc_id();
+    let lbl_lane_cont = b.alloc_id();
+    let lbl_lane_exit = b.alloc_id();
+    let lbl_exit = b.alloc_id();
+    let op_lbls: Vec<u32> = (0..25).map(|_| b.alloc_id()).collect();
+
+    b.inst(OP_LABEL, &[lbl_entry]);
+    let var_slots = b.alloc_id();
+    b.inst(OP_VARIABLE, &[ptr_fn_slots, var_slots, SC_FUNCTION]);
+    let var_coords = b.alloc_id();
+    b.inst(OP_VARIABLE, &[ptr_fn_coords, var_coords, SC_FUNCTION]);
+    let var_lane_out = b.alloc_id();
+    b.inst(OP_VARIABLE, &[ptr_fn_arr2, var_lane_out, SC_FUNCTION]);
+    let var_in_val = b.alloc_id();
+    b.inst(OP_VARIABLE, &[ptr_fn_f32, var_in_val, SC_FUNCTION]);
+    let var_step_res = b.alloc_id();
+    b.inst(OP_VARIABLE, &[ptr_fn_f32, var_step_res, SC_FUNCTION]);
+
+    let gid_val = b.alloc_id();
+    b.inst(OP_LOAD, &[ty_uvec3, gid_val, var_gid]);
+    let pair_idx = b.alloc_id();
+    b.inst(OP_COMPOSITE_EXTRACT, &[ty_u32, pair_idx, gid_val, 0]);
+
+    let p_ndim = b.load_buf(ptr_unif_u32, ty_u32, var_meta, c_u0, c_u0);
+    let p_n_in = b.load_buf(ptr_unif_u32, ty_u32, var_meta, c_u0, c_u1);
+    let p_n_steps = b.load_buf(ptr_unif_u32, ty_u32, var_meta, c_u0, c_u2);
+    let p_numel = b.load_buf(ptr_unif_u32, ty_u32, var_meta, c_u0, c_u3);
+    let p_packed = b.load_buf(ptr_unif_u32, ty_u32, var_meta, c_u0, c_u4);
+    let is_packed = b.alloc_id();
+    b.inst(OP_INOT_EQUAL, &[ty_bool, is_packed, p_packed, c_u0]);
+    let offsets_base = b.alloc_id();
+    b.inst(OP_IADD, &[ty_u32, offsets_base, c_u5, p_n_steps]);
+
+    let tp1 = b.alloc_id();
+    b.inst(OP_IADD, &[ty_u32, tp1, p_numel, c_u1]);
+    let total_pairs = b.alloc_id();
+    b.inst(OP_SHIFT_RIGHT_LOGICAL, &[ty_u32, total_pairs, tp1, c_u1]);
+
+    let in_bounds = b.alloc_id();
+    b.inst(OP_ULESS_THAN, &[ty_bool, in_bounds, pair_idx, total_pairs]);
+    b.inst(OP_SELECTION_MERGE, &[lbl_exit, 0]);
+    b.inst(OP_BRANCH_CONDITIONAL, &[in_bounds, lbl_body, lbl_exit]);
+
+    b.inst(OP_LABEL, &[lbl_body]);
+    let p_lo0 = b.alloc_id();
+    b.inst(OP_ACCESS_CHAIN, &[ptr_fn_f32, p_lo0, var_lane_out, c_u0]);
+    b.inst(OP_STORE, &[p_lo0, c_f0]);
+    let p_lo1 = b.alloc_id();
+    b.inst(OP_ACCESS_CHAIN, &[ptr_fn_f32, p_lo1, var_lane_out, c_u1]);
+    b.inst(OP_STORE, &[p_lo1, c_f0]);
+    let base_flat = b.alloc_id();
+    b.inst(OP_SHIFT_LEFT_LOGICAL, &[ty_u32, base_flat, pair_idx, c_u1]);
+    b.inst(OP_BRANCH, &[lbl_lane_hdr]);
+
+    let lane_phi = b.alloc_id();
+    let lane_next = b.alloc_id();
+    b.inst(OP_LABEL, &[lbl_lane_hdr]);
+    b.inst(
+        OP_PHI,
+        &[ty_u32, lane_phi, c_u0, lbl_body, lane_next, lbl_lane_cont],
+    );
+    let lane_cond = b.alloc_id();
+    b.inst(OP_ULESS_THAN, &[ty_bool, lane_cond, lane_phi, c_u2]);
+    b.inst(OP_LOOP_MERGE, &[lbl_lane_exit, lbl_lane_cont, 0]);
+    b.inst(
+        OP_BRANCH_CONDITIONAL,
+        &[lane_cond, lbl_lane_body, lbl_lane_exit],
+    );
+
+    b.inst(OP_LABEL, &[lbl_lane_body]);
+    let tid = b.alloc_id();
+    b.inst(OP_IADD, &[ty_u32, tid, base_flat, lane_phi]);
+    let elem_ok = b.alloc_id();
+    b.inst(OP_ULESS_THAN, &[ty_bool, elem_ok, tid, p_numel]);
+    b.inst(OP_SELECTION_MERGE, &[lbl_lane_merge, 0]);
+    b.inst(
+        OP_BRANCH_CONDITIONAL,
+        &[elem_ok, lbl_in_elem, lbl_lane_merge],
+    );
+
+    b.inst(OP_LABEL, &[lbl_in_elem]);
+    b.inst(OP_BRANCH, &[lbl_dec_hdr]);
+
+    let d_rem_phi = b.alloc_id();
+    let rem_phi = b.alloc_id();
+    let d_rem_next = b.alloc_id();
+    let rem_next = b.alloc_id();
+    b.inst(OP_LABEL, &[lbl_dec_hdr]);
+    b.inst(
+        OP_PHI,
+        &[
+            ty_u32,
+            d_rem_phi,
+            p_ndim,
+            lbl_in_elem,
+            d_rem_next,
+            lbl_dec_cont,
+        ],
+    );
+    b.inst(
+        OP_PHI,
+        &[ty_u32, rem_phi, tid, lbl_in_elem, rem_next, lbl_dec_cont],
+    );
+    let dec_cond = b.alloc_id();
+    b.inst(OP_UGREATER_THAN, &[ty_bool, dec_cond, d_rem_phi, c_u0]);
+    b.inst(OP_LOOP_MERGE, &[lbl_dec_exit, lbl_dec_cont, 0]);
+    b.inst(
+        OP_BRANCH_CONDITIONAL,
+        &[dec_cond, lbl_dec_body, lbl_dec_exit],
+    );
+
+    b.inst(OP_LABEL, &[lbl_dec_body]);
+    b.inst(OP_ISUB, &[ty_u32, d_rem_next, d_rem_phi, c_u1]);
+    let dim_sz = b.load_buf(ptr_unif_u32, ty_u32, var_oshape, c_u0, d_rem_next);
+    let coord = b.alloc_id();
+    b.inst(OP_UMOD, &[ty_u32, coord, rem_phi, dim_sz]);
+    b.inst(OP_UDIV, &[ty_u32, rem_next, rem_phi, dim_sz]);
+    let pc = b.alloc_id();
+    b.inst(OP_ACCESS_CHAIN, &[ptr_fn_u32, pc, var_coords, d_rem_next]);
+    b.inst(OP_STORE, &[pc, coord]);
+    b.inst(OP_BRANCH, &[lbl_dec_cont]);
+
+    b.inst(OP_LABEL, &[lbl_dec_cont]);
+    b.inst(OP_BRANCH, &[lbl_dec_hdr]);
+
+    b.inst(OP_LABEL, &[lbl_dec_exit]);
+    b.inst(OP_BRANCH, &[lbl_in_hdr]);
+
+    let inp_phi = b.alloc_id();
+    let inp_next = b.alloc_id();
+    b.inst(OP_LABEL, &[lbl_in_hdr]);
+    b.inst(
+        OP_PHI,
+        &[ty_u32, inp_phi, c_u0, lbl_dec_exit, inp_next, lbl_in_cont],
+    );
+    let in_cond = b.alloc_id();
+    b.inst(OP_ULESS_THAN, &[ty_bool, in_cond, inp_phi, p_n_in]);
+    b.inst(OP_LOOP_MERGE, &[lbl_in_exit, lbl_in_cont, 0]);
+    b.inst(OP_BRANCH_CONDITIONAL, &[in_cond, lbl_in_body, lbl_in_exit]);
+
+    b.inst(OP_LABEL, &[lbl_in_body]);
+    let inp_ndim = b.alloc_id();
+    b.inst(OP_IMUL, &[ty_u32, inp_ndim, inp_phi, p_ndim]);
+    b.inst(OP_BRANCH, &[lbl_st_hdr]);
+
+    let sd_phi = b.alloc_id();
+    let off_phi = b.alloc_id();
+    let sd_next = b.alloc_id();
+    let off_next = b.alloc_id();
+    b.inst(OP_LABEL, &[lbl_st_hdr]);
+    b.inst(
+        OP_PHI,
+        &[ty_u32, sd_phi, c_u0, lbl_in_body, sd_next, lbl_st_cont],
+    );
+    b.inst(
+        OP_PHI,
+        &[ty_u32, off_phi, c_u0, lbl_in_body, off_next, lbl_st_cont],
+    );
+    let st_cond = b.alloc_id();
+    b.inst(OP_ULESS_THAN, &[ty_bool, st_cond, sd_phi, p_ndim]);
+    b.inst(OP_LOOP_MERGE, &[lbl_st_exit, lbl_st_cont, 0]);
+    b.inst(OP_BRANCH_CONDITIONAL, &[st_cond, lbl_st_body, lbl_st_exit]);
+
+    b.inst(OP_LABEL, &[lbl_st_body]);
+    let pc2 = b.alloc_id();
+    b.inst(OP_ACCESS_CHAIN, &[ptr_fn_u32, pc2, var_coords, sd_phi]);
+    let cv = b.alloc_id();
+    b.inst(OP_LOAD, &[ty_u32, cv, pc2]);
+    let s_idx = b.alloc_id();
+    b.inst(OP_IADD, &[ty_u32, s_idx, inp_ndim, sd_phi]);
+    let stride = b.load_buf(ptr_unif_u32, ty_u32, var_strides, c_u0, s_idx);
+    let term = b.alloc_id();
+    b.inst(OP_IMUL, &[ty_u32, term, cv, stride]);
+    b.inst(OP_IADD, &[ty_u32, off_next, off_phi, term]);
+    b.inst(OP_BRANCH, &[lbl_st_cont]);
+
+    b.inst(OP_LABEL, &[lbl_st_cont]);
+    b.inst(OP_IADD, &[ty_u32, sd_next, sd_phi, c_u1]);
+    b.inst(OP_BRANCH, &[lbl_st_hdr]);
+
+    b.inst(OP_LABEL, &[lbl_st_exit]);
+    b.inst(OP_SELECTION_MERGE, &[lbl_in_fetch_merge, 0]);
+    b.inst(
+        OP_BRANCH_CONDITIONAL,
+        &[is_packed, lbl_in_packed, lbl_in_direct],
+    );
+
+    b.inst(OP_LABEL, &[lbl_in_packed]);
+    let ob_idx = b.alloc_id();
+    b.inst(OP_IADD, &[ty_u32, ob_idx, offsets_base, inp_phi]);
+    let base_off = b.load_buf(ptr_unif_u32, ty_u32, var_meta, c_u0, ob_idx);
+    let pk_idx = b.alloc_id();
+    b.inst(OP_IADD, &[ty_u32, pk_idx, base_off, off_phi]);
+    let pk_val = spv_unpack_half(&mut b, &hc, is_bf16, var_in0, pk_idx);
+    b.inst(OP_STORE, &[var_in_val, pk_val]);
+    b.inst(OP_BRANCH, &[lbl_in_fetch_merge]);
+
+    b.inst(OP_LABEL, &[lbl_in_direct]);
+    b.inst(OP_SELECTION_MERGE, &[lbl_in_sw_merge, 0]);
+    b.inst(
+        OP_SWITCH,
+        &[inp_phi, lbl_in_c3, 0, lbl_in_c0, 1, lbl_in_c1, 2, lbl_in_c2],
+    );
+    for (lbl, var_in) in [
+        (lbl_in_c0, var_in0),
+        (lbl_in_c1, var_in1),
+        (lbl_in_c2, var_in2),
+        (lbl_in_c3, var_in3),
+    ] {
+        b.inst(OP_LABEL, &[lbl]);
+        let v = spv_unpack_half(&mut b, &hc, is_bf16, var_in, off_phi);
+        b.inst(OP_STORE, &[var_in_val, v]);
+        b.inst(OP_BRANCH, &[lbl_in_sw_merge]);
+    }
+    b.inst(OP_LABEL, &[lbl_in_sw_merge]);
+    b.inst(OP_BRANCH, &[lbl_in_fetch_merge]);
+
+    b.inst(OP_LABEL, &[lbl_in_fetch_merge]);
+    let loaded_in = b.alloc_id();
+    b.inst(OP_LOAD, &[ty_f32, loaded_in, var_in_val]);
+    let ps_in = b.alloc_id();
+    b.inst(OP_ACCESS_CHAIN, &[ptr_fn_f32, ps_in, var_slots, inp_phi]);
+    b.inst(OP_STORE, &[ps_in, loaded_in]);
+    b.inst(OP_BRANCH, &[lbl_in_cont]);
+
+    b.inst(OP_LABEL, &[lbl_in_cont]);
+    b.inst(OP_IADD, &[ty_u32, inp_next, inp_phi, c_u1]);
+    b.inst(OP_BRANCH, &[lbl_in_hdr]);
+
+    b.inst(OP_LABEL, &[lbl_in_exit]);
+    b.inst(OP_BRANCH, &[lbl_step_hdr]);
+
+    let s_phi = b.alloc_id();
+    let s_next = b.alloc_id();
+    b.inst(OP_LABEL, &[lbl_step_hdr]);
+    b.inst(
+        OP_PHI,
+        &[ty_u32, s_phi, c_u0, lbl_in_exit, s_next, lbl_step_cont],
+    );
+    let s_cond = b.alloc_id();
+    b.inst(OP_ULESS_THAN, &[ty_bool, s_cond, s_phi, p_n_steps]);
+    b.inst(OP_LOOP_MERGE, &[lbl_step_exit, lbl_step_cont, 0]);
+    b.inst(
+        OP_BRANCH_CONDITIONAL,
+        &[s_cond, lbl_step_body, lbl_step_exit],
+    );
+
+    b.inst(OP_LABEL, &[lbl_step_body]);
+    let op_v = b.load_buf(ptr_unif_u32, ty_u32, var_ops, c_u0, s_phi);
+    let a_slot = b.load_buf(ptr_unif_u32, ty_u32, var_arga, c_u0, s_phi);
+    let b_slot = b.load_buf(ptr_unif_u32, ty_u32, var_argb, c_u0, s_phi);
+    let imm_idx = b.alloc_id();
+    b.inst(OP_IADD, &[ty_u32, imm_idx, c_u5, s_phi]);
+    let imm_bits = b.load_buf(ptr_unif_u32, ty_u32, var_meta, c_u0, imm_idx);
+    let imm = b.alloc_id();
+    b.inst(OP_BITCAST, &[ty_f32, imm, imm_bits]);
+
+    let pa = b.alloc_id();
+    b.inst(OP_ACCESS_CHAIN, &[ptr_fn_f32, pa, var_slots, a_slot]);
+    let va = b.alloc_id();
+    b.inst(OP_LOAD, &[ty_f32, va, pa]);
+    let pb = b.alloc_id();
+    b.inst(OP_ACCESS_CHAIN, &[ptr_fn_f32, pb, var_slots, b_slot]);
+    let vb = b.alloc_id();
+    b.inst(OP_LOAD, &[ty_f32, vb, pb]);
+
+    let emit_safe_pow = |b: &mut SpirvBuilder, base: u32, exp: u32| -> u32 {
+        let is_sq = b.alloc_id();
+        b.inst(OP_FORD_EQUAL, &[ty_bool, is_sq, exp, c_f2]);
+        let is_cu = b.alloc_id();
+        b.inst(OP_FORD_EQUAL, &[ty_bool, is_cu, exp, c_f3]);
+        let sq = b.alloc_id();
+        b.inst(OP_FMUL, &[ty_f32, sq, base, base]);
+        let cu = b.alloc_id();
+        b.inst(OP_FMUL, &[ty_f32, cu, sq, base]);
+        let abs_b = b.alloc_id();
+        b.inst(OP_EXT_INST, &[ty_f32, abs_b, glsl_ext, GLSL_FABS, base]);
+        let is_z = b.alloc_id();
+        b.inst(OP_FORD_EQUAL, &[ty_bool, is_z, abs_b, c_f0]);
+        let safe_b = b.alloc_id();
+        b.inst(OP_SELECT, &[ty_f32, safe_b, is_z, c_f1, abs_b]);
+        let gen_p = b.alloc_id();
+        b.inst(
+            OP_EXT_INST,
+            &[ty_f32, gen_p, glsl_ext, GLSL_POW, safe_b, exp],
+        );
+        let gen_z = b.alloc_id();
+        b.inst(OP_SELECT, &[ty_f32, gen_z, is_z, c_f0, gen_p]);
+        let r1 = b.alloc_id();
+        b.inst(OP_SELECT, &[ty_f32, r1, is_cu, cu, gen_z]);
+        let r2 = b.alloc_id();
+        b.inst(OP_SELECT, &[ty_f32, r2, is_sq, sq, r1]);
+        r2
+    };
+
+    let mut sw_ops = vec![op_v, op_lbls[24]];
+    for code in 0..24u32 {
+        sw_ops.push(code);
+        sw_ops.push(op_lbls[code as usize]);
+    }
+    b.inst(OP_SELECTION_MERGE, &[lbl_step_merge, 0]);
+    b.inst(OP_SWITCH, &sw_ops);
+
+    let finish_case = |b: &mut SpirvBuilder, res: u32| {
+        b.inst(OP_STORE, &[var_step_res, res]);
+        b.inst(OP_BRANCH, &[lbl_step_merge]);
+    };
+
+    b.inst(OP_LABEL, &[op_lbls[0]]);
+    let r = b.alloc_id();
+    b.inst(OP_FADD, &[ty_f32, r, va, vb]);
+    finish_case(&mut b, r);
+
+    b.inst(OP_LABEL, &[op_lbls[1]]);
+    let r = b.alloc_id();
+    b.inst(OP_FSUB, &[ty_f32, r, va, vb]);
+    finish_case(&mut b, r);
+
+    b.inst(OP_LABEL, &[op_lbls[2]]);
+    let r = b.alloc_id();
+    b.inst(OP_FMUL, &[ty_f32, r, va, vb]);
+    finish_case(&mut b, r);
+
+    b.inst(OP_LABEL, &[op_lbls[3]]);
+    let r = b.alloc_id();
+    b.inst(OP_FDIV, &[ty_f32, r, va, vb]);
+    finish_case(&mut b, r);
+
+    b.inst(OP_LABEL, &[op_lbls[4]]);
+    let r = emit_safe_pow(&mut b, va, vb);
+    finish_case(&mut b, r);
+
+    b.inst(OP_LABEL, &[op_lbls[5]]);
+    let r = b.alloc_id();
+    b.inst(OP_FADD, &[ty_f32, r, va, imm]);
+    finish_case(&mut b, r);
+
+    b.inst(OP_LABEL, &[op_lbls[6]]);
+    let r = b.alloc_id();
+    b.inst(OP_FSUB, &[ty_f32, r, va, imm]);
+    finish_case(&mut b, r);
+
+    b.inst(OP_LABEL, &[op_lbls[7]]);
+    let r = b.alloc_id();
+    b.inst(OP_FSUB, &[ty_f32, r, imm, va]);
+    finish_case(&mut b, r);
+
+    b.inst(OP_LABEL, &[op_lbls[8]]);
+    let r = b.alloc_id();
+    b.inst(OP_FMUL, &[ty_f32, r, va, imm]);
+    finish_case(&mut b, r);
+
+    b.inst(OP_LABEL, &[op_lbls[9]]);
+    let r = b.alloc_id();
+    b.inst(OP_FDIV, &[ty_f32, r, va, imm]);
+    finish_case(&mut b, r);
+
+    b.inst(OP_LABEL, &[op_lbls[10]]);
+    let r = b.alloc_id();
+    b.inst(OP_FDIV, &[ty_f32, r, imm, va]);
+    finish_case(&mut b, r);
+
+    b.inst(OP_LABEL, &[op_lbls[11]]);
+    let r = emit_safe_pow(&mut b, va, imm);
+    finish_case(&mut b, r);
+
+    b.inst(OP_LABEL, &[op_lbls[12]]);
+    let r = emit_safe_pow(&mut b, imm, va);
+    finish_case(&mut b, r);
+
+    b.inst(OP_LABEL, &[op_lbls[13]]);
+    let r = b.alloc_id();
+    b.inst(OP_FNEGATE, &[ty_f32, r, va]);
+    finish_case(&mut b, r);
+
+    b.inst(OP_LABEL, &[op_lbls[14]]);
+    let r = b.alloc_id();
+    b.inst(OP_EXT_INST, &[ty_f32, r, glsl_ext, GLSL_FMAX, va, c_f0]);
+    finish_case(&mut b, r);
+
+    b.inst(OP_LABEL, &[op_lbls[15]]);
+    let x2 = b.alloc_id();
+    b.inst(OP_FMUL, &[ty_f32, x2, va, va]);
+    let x3 = b.alloc_id();
+    b.inst(OP_FMUL, &[ty_f32, x3, x2, va]);
+    let cx3 = b.alloc_id();
+    b.inst(OP_FMUL, &[ty_f32, cx3, c_gelu_b, x3]);
+    let i1 = b.alloc_id();
+    b.inst(OP_FADD, &[ty_f32, i1, va, cx3]);
+    let i2 = b.alloc_id();
+    b.inst(OP_FMUL, &[ty_f32, i2, c_gelu_a, i1]);
+    let th = b.alloc_id();
+    b.inst(OP_EXT_INST, &[ty_f32, th, glsl_ext, GLSL_TANH, i2]);
+    let op_th = b.alloc_id();
+    b.inst(OP_FADD, &[ty_f32, op_th, c_f1, th]);
+    let hx = b.alloc_id();
+    b.inst(OP_FMUL, &[ty_f32, hx, c_f05, va]);
+    let r = b.alloc_id();
+    b.inst(OP_FMUL, &[ty_f32, r, hx, op_th]);
+    finish_case(&mut b, r);
+
+    b.inst(OP_LABEL, &[op_lbls[16]]);
+    let na = b.alloc_id();
+    b.inst(OP_FNEGATE, &[ty_f32, na, va]);
+    let nac = b.alloc_id();
+    b.inst(
+        OP_EXT_INST,
+        &[ty_f32, nac, glsl_ext, GLSL_FCLAMP, na, c_f_lo, c_f_hi],
+    );
+    let ena = b.alloc_id();
+    b.inst(OP_EXT_INST, &[ty_f32, ena, glsl_ext, GLSL_EXP, nac]);
+    let ope = b.alloc_id();
+    b.inst(OP_FADD, &[ty_f32, ope, c_f1, ena]);
+    let r = b.alloc_id();
+    b.inst(OP_FDIV, &[ty_f32, r, va, ope]);
+    finish_case(&mut b, r);
+
+    b.inst(OP_LABEL, &[op_lbls[17]]);
+    let r = b.alloc_id();
+    b.inst(OP_EXT_INST, &[ty_f32, r, glsl_ext, GLSL_TANH, va]);
+    finish_case(&mut b, r);
+
+    b.inst(OP_LABEL, &[op_lbls[18]]);
+    let na = b.alloc_id();
+    b.inst(OP_FNEGATE, &[ty_f32, na, va]);
+    let nac = b.alloc_id();
+    b.inst(
+        OP_EXT_INST,
+        &[ty_f32, nac, glsl_ext, GLSL_FCLAMP, na, c_f_lo, c_f_hi],
+    );
+    let ena = b.alloc_id();
+    b.inst(OP_EXT_INST, &[ty_f32, ena, glsl_ext, GLSL_EXP, nac]);
+    let ope = b.alloc_id();
+    b.inst(OP_FADD, &[ty_f32, ope, c_f1, ena]);
+    let r = b.alloc_id();
+    b.inst(OP_FDIV, &[ty_f32, r, c_f1, ope]);
+    finish_case(&mut b, r);
+
+    b.inst(OP_LABEL, &[op_lbls[19]]);
+    let r = b.alloc_id();
+    b.inst(OP_EXT_INST, &[ty_f32, r, glsl_ext, GLSL_EXP, va]);
+    finish_case(&mut b, r);
+
+    b.inst(OP_LABEL, &[op_lbls[20]]);
+    let r = b.alloc_id();
+    b.inst(OP_EXT_INST, &[ty_f32, r, glsl_ext, GLSL_LOG, va]);
+    finish_case(&mut b, r);
+
+    b.inst(OP_LABEL, &[op_lbls[21]]);
+    let r = b.alloc_id();
+    b.inst(OP_EXT_INST, &[ty_f32, r, glsl_ext, GLSL_SQRT, va]);
+    finish_case(&mut b, r);
+
+    b.inst(OP_LABEL, &[op_lbls[22]]);
+    let r = b.alloc_id();
+    b.inst(OP_EXT_INST, &[ty_f32, r, glsl_ext, GLSL_SIN, va]);
+    finish_case(&mut b, r);
+
+    b.inst(OP_LABEL, &[op_lbls[23]]);
+    let r = b.alloc_id();
+    b.inst(OP_EXT_INST, &[ty_f32, r, glsl_ext, GLSL_COS, va]);
+    finish_case(&mut b, r);
+
+    b.inst(OP_LABEL, &[op_lbls[24]]);
+    let r = b.alloc_id();
+    b.inst(OP_EXT_INST, &[ty_f32, r, glsl_ext, GLSL_FABS, va]);
+    finish_case(&mut b, r);
+
+    b.inst(OP_LABEL, &[lbl_step_merge]);
+    let sres = b.alloc_id();
+    b.inst(OP_LOAD, &[ty_f32, sres, var_step_res]);
+    let dst_slot = b.alloc_id();
+    b.inst(OP_IADD, &[ty_u32, dst_slot, p_n_in, s_phi]);
+    let p_dst = b.alloc_id();
+    b.inst(OP_ACCESS_CHAIN, &[ptr_fn_f32, p_dst, var_slots, dst_slot]);
+    b.inst(OP_STORE, &[p_dst, sres]);
+    b.inst(OP_BRANCH, &[lbl_step_cont]);
+
+    b.inst(OP_LABEL, &[lbl_step_cont]);
+    b.inst(OP_IADD, &[ty_u32, s_next, s_phi, c_u1]);
+    b.inst(OP_BRANCH, &[lbl_step_hdr]);
+
+    b.inst(OP_LABEL, &[lbl_step_exit]);
+    let last_s0 = b.alloc_id();
+    b.inst(OP_IADD, &[ty_u32, last_s0, p_n_in, p_n_steps]);
+    let last_slot = b.alloc_id();
+    b.inst(OP_ISUB, &[ty_u32, last_slot, last_s0, c_u1]);
+    let p_last = b.alloc_id();
+    b.inst(OP_ACCESS_CHAIN, &[ptr_fn_f32, p_last, var_slots, last_slot]);
+    let final_v = b.alloc_id();
+    b.inst(OP_LOAD, &[ty_f32, final_v, p_last]);
+    let p_lane_dst = b.alloc_id();
+    b.inst(
+        OP_ACCESS_CHAIN,
+        &[ptr_fn_f32, p_lane_dst, var_lane_out, lane_phi],
+    );
+    b.inst(OP_STORE, &[p_lane_dst, final_v]);
+    b.inst(OP_BRANCH, &[lbl_lane_merge]);
+
+    b.inst(OP_LABEL, &[lbl_lane_merge]);
+    b.inst(OP_BRANCH, &[lbl_lane_cont]);
+
+    b.inst(OP_LABEL, &[lbl_lane_cont]);
+    b.inst(OP_IADD, &[ty_u32, lane_next, lane_phi, c_u1]);
+    b.inst(OP_BRANCH, &[lbl_lane_hdr]);
+
+    b.inst(OP_LABEL, &[lbl_lane_exit]);
+    let v0 = b.alloc_id();
+    b.inst(OP_LOAD, &[ty_f32, v0, p_lo0]);
+    let v1 = b.alloc_id();
+    b.inst(OP_LOAD, &[ty_f32, v1, p_lo1]);
+    let packed = spv_pack_half_pair(&mut b, &hc, is_bf16, v0, v1);
+    b.store_buf(ptr_unif_u32, var_out, c_u0, pair_idx, packed);
     b.inst(OP_BRANCH, &[lbl_exit]);
 
     b.inst(OP_LABEL, &[lbl_exit]);

@@ -230,6 +230,8 @@ pub trait DeviceBackend: Send + Sync {
     }
 
     /// Zero-copy VRAM-to-VRAM MatMul kernel operating directly on resident [`DeviceVramBuffer`]s.
+    /// When `dst` is `Some(buf)` on the same device with sufficient byte capacity, writes in-place
+    /// into `buf` without allocating a new VRAM buffer.
     fn run_matmul_vram(
         &self,
         _a: &dyn DeviceVramBuffer,
@@ -237,6 +239,7 @@ pub trait DeviceBackend: Send + Sync {
         _a_shape: &[usize],
         _b_shape: &[usize],
         _dtype: DType,
+        _dst: Option<Arc<dyn DeviceVramBuffer>>,
     ) -> MoraResult<Option<Arc<dyn DeviceVramBuffer>>> {
         Ok(None)
     }
@@ -254,6 +257,7 @@ pub trait DeviceBackend: Send + Sync {
         _n: usize,
         _out_shape: &[usize],
         _dtype: DType,
+        _dst: Option<Arc<dyn DeviceVramBuffer>>,
     ) -> MoraResult<Option<Arc<dyn DeviceVramBuffer>>> {
         Ok(None)
     }
@@ -274,6 +278,7 @@ pub trait DeviceBackend: Send + Sync {
         _x_shape: &[usize],
         _out_shape: &[usize],
         _dtype: DType,
+        _dst: Option<Arc<dyn DeviceVramBuffer>>,
     ) -> MoraResult<Option<Arc<dyn DeviceVramBuffer>>> {
         Ok(None)
     }
@@ -293,6 +298,7 @@ pub trait DeviceBackend: Send + Sync {
         _scale: f64,
         _k_is_transposed: bool,
         _dtype: DType,
+        _dst: Option<Arc<dyn DeviceVramBuffer>>,
     ) -> MoraResult<Option<Arc<dyn DeviceVramBuffer>>> {
         Ok(None)
     }
@@ -307,6 +313,7 @@ pub trait DeviceBackend: Send + Sync {
         _out_shape: &[usize],
         _out_numel: usize,
         _dtype: DType,
+        _dst: Option<Arc<dyn DeviceVramBuffer>>,
     ) -> MoraResult<Option<Arc<dyn DeviceVramBuffer>>> {
         Ok(None)
     }
@@ -674,6 +681,10 @@ pub enum DagOp {
     Sin(usize),
     Cos(usize),
     Abs(usize),
+    /// Exact Heaviside step (`1.0` if `x > 0.0`, else `0.0`) used by IR-level symbolic AD of `Relu`.
+    StepPos(usize),
+    /// Exact signum (`1.0` if `x > 0.0`, `-1.0` if `x < 0.0`, else `0.0`) used by IR-level AD of `Abs`.
+    Sign(usize),
     Softmax(usize),
     RmsNorm(usize, f64),
     LayerNorm(usize, f64),
@@ -741,6 +752,8 @@ impl DagOp {
             Self::Sin(_) => "Sin",
             Self::Cos(_) => "Cos",
             Self::Abs(_) => "Abs",
+            Self::StepPos(_) => "StepPos",
+            Self::Sign(_) => "Sign",
             Self::Softmax(_) => "Softmax",
             Self::RmsNorm(_, _) => "RmsNorm",
             Self::LayerNorm(_, _) => "LayerNorm",
@@ -795,6 +808,8 @@ impl DagOp {
             | Self::Sin(a)
             | Self::Cos(a)
             | Self::Abs(a)
+            | Self::StepPos(a)
+            | Self::Sign(a)
             | Self::Softmax(a)
             | Self::RmsNorm(a, _)
             | Self::LayerNorm(a, _) => vec![*a],
@@ -867,6 +882,8 @@ impl DagOp {
             | Self::Sin(a)
             | Self::Cos(a)
             | Self::Abs(a)
+            | Self::StepPos(a)
+            | Self::Sign(a)
             | Self::Softmax(a)
             | Self::RmsNorm(a, _)
             | Self::LayerNorm(a, _) => m(a),
@@ -941,6 +958,10 @@ pub struct DagMemoryPlan {
     pub naive_peak_bytes: usize,
     pub planned_peak_bytes: usize,
     pub reuse_count: usize,
+    /// Number of physical GPU VRAM scratch slots in `slots` (`device != Cpu`).
+    pub vram_peak_slots: usize,
+    /// Sum of planned physical GPU VRAM scratch slot bytes (`device != Cpu`).
+    pub vram_peak_bytes: usize,
 }
 
 impl DagMemoryPlan {
@@ -958,6 +979,15 @@ impl DagMemoryPlan {
         }
         if dag.output < n {
             last_use[dag.output] = n;
+        }
+        // Zero-copy view ops (`Reshape` / `Identity`) may alias their input VRAM buffer;
+        // extend source liveness through any alias chain so physical VRAM slots never overwrite live views.
+        for idx in (0..n).rev() {
+            if let DagOp::Reshape(src, _) | DagOp::Identity(src) = dag.nodes[idx].op
+                && last_use[idx] > last_use[src]
+            {
+                last_use[src] = last_use[idx];
+            }
         }
 
         let mut node_slots: Vec<Option<usize>> = vec![None; n];
@@ -1029,6 +1059,12 @@ impl DagMemoryPlan {
         let planned_peak_bytes: usize = slots.iter().map(|s| s.bytes).sum();
         let reuse_count: usize = slot_uses.iter().map(|&c| c.saturating_sub(1)).sum();
         let buffer_slots = slots.len();
+        let vram_peak_slots = slots.iter().filter(|s| s.device != Device::Cpu).count();
+        let vram_peak_bytes: usize = slots
+            .iter()
+            .filter(|s| s.device != Device::Cpu)
+            .map(|s| s.bytes)
+            .sum();
 
         Self {
             node_slots,
@@ -1038,14 +1074,20 @@ impl DagMemoryPlan {
             naive_peak_bytes,
             planned_peak_bytes,
             reuse_count,
+            vram_peak_slots,
+            vram_peak_bytes,
         }
     }
 }
 
-/// Reusable physical scratch arena matching a [`DagMemoryPlan`].
+/// Reusable physical scratch arena matching a [`DagMemoryPlan`] (both host CPU and GPU VRAM slots).
 #[derive(Debug)]
 struct DagWorkspace {
     slots: Vec<Vec<f64>>,
+    /// Persistent physical GPU VRAM scratch buffers keyed by `DagMemoryPlan` slot id.
+    /// Allocated lazily once per slot at `slot.bytes` capacity and reused across non-overlapping
+    /// nodes within each run AND across repeated `CompiledDagPlan::execute` calls.
+    vram_slots: Vec<Option<Arc<dyn DeviceVramBuffer>>>,
     output_buf: Vec<f64>,
 }
 
@@ -1056,15 +1098,17 @@ impl DagWorkspace {
             .iter()
             .map(|s| Vec::with_capacity(s.capacity_elems))
             .collect();
+        let vram_slots = vec![None; plan.slots.len()];
         Self {
             slots,
+            vram_slots,
             output_buf: Vec::with_capacity(output_numel),
         }
     }
 }
 
 /// Compiled execution plan containing a fused DAG, static buffer reuse plan, pre-decoded constants,
-/// and a thread-safe checkoutable reusable [`DagWorkspace`].
+/// and a thread-safe checkoutable reusable [`DagWorkspace`] (host + physical GPU VRAM scratch pool).
 #[derive(Debug)]
 pub struct CompiledDagPlan {
     pub fingerprint: u64,
@@ -1073,6 +1117,8 @@ pub struct CompiledDagPlan {
     const_flats: Vec<Option<Vec<f64>>>,
     output_numel: usize,
     workspace: Mutex<Option<DagWorkspace>>,
+    vram_scratch_allocs: AtomicU64,
+    vram_buffer_reuses: AtomicU64,
 }
 
 impl CompiledDagPlan {
@@ -1101,7 +1147,17 @@ impl CompiledDagPlan {
             const_flats,
             output_numel,
             workspace: Mutex::new(Some(ws)),
+            vram_scratch_allocs: AtomicU64::new(0),
+            vram_buffer_reuses: AtomicU64::new(0),
         }
+    }
+
+    /// Snapshot `(vram_scratch_allocs, vram_buffer_reuses)` observed across executions of this plan.
+    pub(crate) fn vram_reuse_stats(&self) -> (u64, u64) {
+        (
+            self.vram_scratch_allocs.load(Ordering::Relaxed),
+            self.vram_buffer_reuses.load(Ordering::Relaxed),
+        )
     }
 
     /// Execute this compiled plan using its pooled reusable [`DagWorkspace`] (falling back to a
@@ -1118,6 +1174,7 @@ impl CompiledDagPlan {
             &self.const_flats,
             &mut ws,
             inputs,
+            Some((&self.vram_scratch_allocs, &self.vram_buffer_reuses)),
         );
         if let Some(mut guard) = self.workspace.try_lock()
             && guard.is_none()
@@ -1242,6 +1299,9 @@ pub(crate) struct DagCostReport {
     pub(crate) native_jit_compiled: u64,
     pub(crate) native_jit_cache_hits: u64,
     pub(crate) native_jit_dispatches: u64,
+    pub(crate) native_jit_f32_dispatches: u64,
+    pub(crate) vram_scratch_allocs: u64,
+    pub(crate) vram_buffer_reuses: u64,
 }
 
 /// P4-3: Analytical FLOPs, memory-traffic, and roofline cost model for [`TensorComputeDag`].
@@ -1343,7 +1403,9 @@ impl DagCostModel {
                 | DagOp::DivScalar(a, _, _)
                 | DagOp::Neg(a)
                 | DagOp::Relu(a)
-                | DagOp::Abs(a) => (out_elems, node_bytes(*a), out_bytes, 0),
+                | DagOp::Abs(a)
+                | DagOp::StepPos(a)
+                | DagOp::Sign(a) => (out_elems, node_bytes(*a), out_bytes, 0),
                 DagOp::PowScalar(a, _, _) | DagOp::Gelu(a) => {
                     (out_elems * 8, node_bytes(*a), out_bytes, 0)
                 }
@@ -1496,6 +1558,10 @@ impl DagCostModel {
         let (arithmetic_intensity, bottleneck) =
             Self::classify(total_flops, total_memory_bytes, &out_dev);
         let jit_stats = crate::runtime::native_jit::stats();
+        let (vram_scratch_allocs, vram_buffer_reuses) = dag
+            .compiled_plan
+            .as_ref()
+            .map_or((0, 0), |p| p.vram_reuse_stats());
 
         DagCostReport {
             node_costs,
@@ -1514,6 +1580,9 @@ impl DagCostModel {
             native_jit_compiled: jit_stats.compiled_kernels,
             native_jit_cache_hits: jit_stats.cache_hits,
             native_jit_dispatches: jit_stats.native_dispatches,
+            native_jit_f32_dispatches: jit_stats.f32_native_dispatches,
+            vram_scratch_allocs,
+            vram_buffer_reuses,
         }
     }
 }
@@ -2465,6 +2534,14 @@ impl TensorComputeDag {
         Ok((out, dur_ns, events))
     }
 
+    /// Snapshot `(vram_scratch_allocs, vram_buffer_reuses)` observed across executions of this DAG's
+    /// attached compiled plan (or `(0, 0)` if not yet compiled).
+    pub(crate) fn vram_reuse_stats(&self) -> (u64, u64) {
+        self.compiled_plan
+            .as_ref()
+            .map_or((0, 0), |p| p.vram_reuse_stats())
+    }
+
     /// Execute this compute graph on `inputs` using attached [`CompiledDagPlan`] if present,
     /// otherwise building a [`DagMemoryPlan`] + scratch workspace directly.
     pub fn run(&self, inputs: &[Arc<Tensor>]) -> MoraResult<Arc<Tensor>> {
@@ -2486,7 +2563,7 @@ impl TensorComputeDag {
             .and_then(|n| checked_numel(&n.shape).ok())
             .unwrap_or(1);
         let mut ws = DagWorkspace::from_plan(&mem, out_numel);
-        execute_dag_with_workspace(self, &mem, &const_flats, &mut ws, inputs)
+        execute_dag_with_workspace(self, &mem, &const_flats, &mut ws, inputs, None)
     }
 
     /// Execute this compute graph using the runtime's [`DagPlanCache`] when compiled/fused,
@@ -2626,6 +2703,7 @@ fn try_eval_node_vram(
     inputs: &[Arc<Tensor>],
     mem: &DagMemoryPlan,
     slot_vram: &[Option<Arc<dyn DeviceVramBuffer>>],
+    dst_vram: Option<Arc<dyn DeviceVramBuffer>>,
 ) -> MoraResult<Option<Arc<dyn DeviceVramBuffer>>> {
     if !backend.supports_vram_residency() {
         return Ok(None);
@@ -2634,29 +2712,42 @@ fn try_eval_node_vram(
     let shape_of = |id: usize| dag.nodes[id].shape.as_slice();
     let out_numel = checked_numel(&node.shape)?;
 
-    let run_ew_vram =
-        |ids: &[usize], steps: &[FusedEwStep]| -> MoraResult<Option<Arc<dyn DeviceVramBuffer>>> {
-            let mut owned = Vec::with_capacity(ids.len());
-            for &id in ids {
-                let Some(buf) = get_v(id) else {
-                    return Ok(None);
-                };
-                if buf.device() != &node.device {
-                    return Ok(None);
-                }
-                owned.push(buf);
+    // Ensure `dst_vram` never aliases any live input handle before passing it as an in-place target.
+    let safe_dst = dst_vram.filter(|dst| {
+        let dst_h = dst.raw_handle();
+        !node
+            .op
+            .inputs()
+            .into_iter()
+            .any(|pred| get_v(pred).is_some_and(|b| b.raw_handle() == dst_h))
+    });
+
+    let run_ew_vram = |ids: &[usize],
+                       steps: &[FusedEwStep],
+                       dst: Option<Arc<dyn DeviceVramBuffer>>|
+     -> MoraResult<Option<Arc<dyn DeviceVramBuffer>>> {
+        let mut owned = Vec::with_capacity(ids.len());
+        for &id in ids {
+            let Some(buf) = get_v(id) else {
+                return Ok(None);
+            };
+            if buf.device() != &node.device {
+                return Ok(None);
             }
-            let refs: Vec<&dyn DeviceVramBuffer> = owned.iter().map(|b| b.as_ref()).collect();
-            let shapes: Vec<&[usize]> = ids.iter().map(|&id| shape_of(id)).collect();
-            backend.run_fused_elementwise_vram(
-                &refs,
-                &shapes,
-                steps,
-                &node.shape,
-                out_numel,
-                node.dtype,
-            )
-        };
+            owned.push(buf);
+        }
+        let refs: Vec<&dyn DeviceVramBuffer> = owned.iter().map(|b| b.as_ref()).collect();
+        let shapes: Vec<&[usize]> = ids.iter().map(|&id| shape_of(id)).collect();
+        backend.run_fused_elementwise_vram(
+            &refs,
+            &shapes,
+            steps,
+            &node.shape,
+            out_numel,
+            node.dtype,
+            dst,
+        )
+    };
 
     match &node.op {
         DagOp::Input(_) | DagOp::ConstTensor(_) => Ok(None),
@@ -2671,6 +2762,7 @@ fn try_eval_node_vram(
                 shape_of(*a),
                 shape_of(*b),
                 node.dtype,
+                safe_dst,
             )
         }
         DagOp::FusedLinearAct { x, w, bias, act } => {
@@ -2702,6 +2794,7 @@ fn try_eval_node_vram(
                 n,
                 &node.shape,
                 node.dtype,
+                safe_dst,
             )
         }
         DagOp::FusedRmsNormLinear {
@@ -2753,6 +2846,7 @@ fn try_eval_node_vram(
                 x_shape,
                 &node.shape,
                 node.dtype,
+                safe_dst,
             )
         }
         DagOp::FusedFlashAttention {
@@ -2788,31 +2882,38 @@ fn try_eval_node_vram(
                 *scale,
                 *k_is_transposed,
                 node.dtype,
+                safe_dst,
             )
         }
-        DagOp::FusedElementwise { inputs: ids, steps } => run_ew_vram(ids, steps),
-        DagOp::Add(a, b) => run_ew_vram(&[*a, *b], &[FusedEwStep::Add(0, 1)]),
-        DagOp::Sub(a, b) => run_ew_vram(&[*a, *b], &[FusedEwStep::Sub(0, 1)]),
-        DagOp::Mul(a, b) => run_ew_vram(&[*a, *b], &[FusedEwStep::Mul(0, 1)]),
-        DagOp::Div(a, b) => run_ew_vram(&[*a, *b], &[FusedEwStep::Div(0, 1)]),
-        DagOp::Pow(a, b) => run_ew_vram(&[*a, *b], &[FusedEwStep::Pow(0, 1)]),
-        DagOp::AddScalar(a, c) => run_ew_vram(&[*a], &[FusedEwStep::AddScalar(0, *c)]),
-        DagOp::SubScalar(a, c, r) => run_ew_vram(&[*a], &[FusedEwStep::SubScalar(0, *c, *r)]),
-        DagOp::MulScalar(a, c) => run_ew_vram(&[*a], &[FusedEwStep::MulScalar(0, *c)]),
-        DagOp::DivScalar(a, c, r) => run_ew_vram(&[*a], &[FusedEwStep::DivScalar(0, *c, *r)]),
-        DagOp::PowScalar(a, c, r) => run_ew_vram(&[*a], &[FusedEwStep::PowScalar(0, *c, *r)]),
-        DagOp::Neg(a) => run_ew_vram(&[*a], &[FusedEwStep::Neg(0)]),
-        DagOp::Relu(a) => run_ew_vram(&[*a], &[FusedEwStep::Relu(0)]),
-        DagOp::Gelu(a) => run_ew_vram(&[*a], &[FusedEwStep::Gelu(0)]),
-        DagOp::Silu(a) => run_ew_vram(&[*a], &[FusedEwStep::Silu(0)]),
-        DagOp::Tanh(a) => run_ew_vram(&[*a], &[FusedEwStep::Tanh(0)]),
-        DagOp::Sigmoid(a) => run_ew_vram(&[*a], &[FusedEwStep::Sigmoid(0)]),
-        DagOp::Exp(a) => run_ew_vram(&[*a], &[FusedEwStep::Exp(0)]),
-        DagOp::Ln(a) => run_ew_vram(&[*a], &[FusedEwStep::Ln(0)]),
-        DagOp::Sqrt(a) => run_ew_vram(&[*a], &[FusedEwStep::Sqrt(0)]),
-        DagOp::Sin(a) => run_ew_vram(&[*a], &[FusedEwStep::Sin(0)]),
-        DagOp::Cos(a) => run_ew_vram(&[*a], &[FusedEwStep::Cos(0)]),
-        DagOp::Abs(a) => run_ew_vram(&[*a], &[FusedEwStep::Abs(0)]),
+        DagOp::FusedElementwise { inputs: ids, steps } => run_ew_vram(ids, steps, safe_dst),
+        DagOp::Add(a, b) => run_ew_vram(&[*a, *b], &[FusedEwStep::Add(0, 1)], safe_dst),
+        DagOp::Sub(a, b) => run_ew_vram(&[*a, *b], &[FusedEwStep::Sub(0, 1)], safe_dst),
+        DagOp::Mul(a, b) => run_ew_vram(&[*a, *b], &[FusedEwStep::Mul(0, 1)], safe_dst),
+        DagOp::Div(a, b) => run_ew_vram(&[*a, *b], &[FusedEwStep::Div(0, 1)], safe_dst),
+        DagOp::Pow(a, b) => run_ew_vram(&[*a, *b], &[FusedEwStep::Pow(0, 1)], safe_dst),
+        DagOp::AddScalar(a, c) => run_ew_vram(&[*a], &[FusedEwStep::AddScalar(0, *c)], safe_dst),
+        DagOp::SubScalar(a, c, r) => {
+            run_ew_vram(&[*a], &[FusedEwStep::SubScalar(0, *c, *r)], safe_dst)
+        }
+        DagOp::MulScalar(a, c) => run_ew_vram(&[*a], &[FusedEwStep::MulScalar(0, *c)], safe_dst),
+        DagOp::DivScalar(a, c, r) => {
+            run_ew_vram(&[*a], &[FusedEwStep::DivScalar(0, *c, *r)], safe_dst)
+        }
+        DagOp::PowScalar(a, c, r) => {
+            run_ew_vram(&[*a], &[FusedEwStep::PowScalar(0, *c, *r)], safe_dst)
+        }
+        DagOp::Neg(a) => run_ew_vram(&[*a], &[FusedEwStep::Neg(0)], safe_dst),
+        DagOp::Relu(a) => run_ew_vram(&[*a], &[FusedEwStep::Relu(0)], safe_dst),
+        DagOp::Gelu(a) => run_ew_vram(&[*a], &[FusedEwStep::Gelu(0)], safe_dst),
+        DagOp::Silu(a) => run_ew_vram(&[*a], &[FusedEwStep::Silu(0)], safe_dst),
+        DagOp::Tanh(a) => run_ew_vram(&[*a], &[FusedEwStep::Tanh(0)], safe_dst),
+        DagOp::Sigmoid(a) => run_ew_vram(&[*a], &[FusedEwStep::Sigmoid(0)], safe_dst),
+        DagOp::Exp(a) => run_ew_vram(&[*a], &[FusedEwStep::Exp(0)], safe_dst),
+        DagOp::Ln(a) => run_ew_vram(&[*a], &[FusedEwStep::Ln(0)], safe_dst),
+        DagOp::Sqrt(a) => run_ew_vram(&[*a], &[FusedEwStep::Sqrt(0)], safe_dst),
+        DagOp::Sin(a) => run_ew_vram(&[*a], &[FusedEwStep::Sin(0)], safe_dst),
+        DagOp::Cos(a) => run_ew_vram(&[*a], &[FusedEwStep::Cos(0)], safe_dst),
+        DagOp::Abs(a) => run_ew_vram(&[*a], &[FusedEwStep::Abs(0)], safe_dst),
         _ => Ok(None),
     }
 }
@@ -2823,6 +2924,7 @@ fn execute_dag_with_workspace(
     const_flats: &[Option<Vec<f64>>],
     ws: &mut DagWorkspace,
     inputs: &[Arc<Tensor>],
+    vram_stats: Option<(&AtomicU64, &AtomicU64)>,
 ) -> MoraResult<Arc<Tensor>> {
     if inputs.len() != dag.input_specs.len() {
         return Err(MoraError::Runtime(format!(
@@ -2867,28 +2969,67 @@ fn execute_dag_with_workspace(
 
         let dst_slot_opt = mem.node_slots[idx];
 
-        // ── Zero-copy GPU VRAM-to-VRAM fast path ──
+        // ── Zero-copy GPU VRAM-to-VRAM fast path with DagMemoryPlan physical VRAM slot pooling ──
         let backend = backend_for_device(&node.device);
-        if backend.supports_vram_residency()
-            && let Some(out_vram) =
-                try_eval_node_vram(backend.as_ref(), dag, node, inputs, mem, &slot_vram)?
-        {
-            if idx == dag.output {
-                return Tensor::from_vram_output(
-                    out_vram,
-                    node.shape.clone(),
-                    node.dtype,
-                    node.device.clone(),
-                    false,
-                );
+        if backend.supports_vram_residency() {
+            let is_view_alias = matches!(node.op, DagOp::Reshape(_, _) | DagOp::Identity(_));
+            let (pooled_dst, was_reused_slot) = if !is_view_alias
+                && idx != dag.output
+                && let Some(s_id) = dst_slot_opt
+            {
+                let slot_plan = &mem.slots[s_id];
+                let slot_bytes = slot_plan.bytes.max(16);
+                if let Some(existing) = &ws.vram_slots[s_id]
+                    && existing.device() == &node.device
+                    && existing.byte_len() >= slot_bytes
+                {
+                    (Some(Arc::clone(existing)), true)
+                } else if let Some(fresh) = backend.alloc_vram_buffer(slot_bytes)? {
+                    ws.vram_slots[s_id] = Some(Arc::clone(&fresh));
+                    if let Some((allocs, _)) = vram_stats {
+                        allocs.fetch_add(1, Ordering::Relaxed);
+                    }
+                    (Some(fresh), false)
+                } else {
+                    (None, false)
+                }
+            } else {
+                (None, false)
+            };
+
+            let pooled_handle = pooled_dst.as_ref().map(|b| b.raw_handle());
+            if let Some(out_vram) = try_eval_node_vram(
+                backend.as_ref(),
+                dag,
+                node,
+                inputs,
+                mem,
+                &slot_vram,
+                pooled_dst,
+            )? {
+                if was_reused_slot
+                    && pooled_handle.is_some_and(|h| h == out_vram.raw_handle())
+                    && let Some((_, reuses)) = vram_stats
+                {
+                    reuses.fetch_add(1, Ordering::Relaxed);
+                }
+                if idx == dag.output {
+                    return Tensor::from_vram_output(
+                        out_vram,
+                        node.shape.clone(),
+                        node.dtype,
+                        node.device.clone(),
+                        false,
+                    );
+                }
+                if let Some(s_id) = dst_slot_opt {
+                    let numel = checked_numel(&node.shape)?;
+                    slot_vram[s_id] = Some(out_vram);
+                    slot_host_valid[s_id] = false;
+                    slot_meta[s_id] = (numel, node.dtype);
+                }
+                continue;
             }
-            if let Some(s_id) = dst_slot_opt {
-                let numel = checked_numel(&node.shape)?;
-                slot_vram[s_id] = Some(out_vram);
-                slot_host_valid[s_id] = false;
-                slot_meta[s_id] = (numel, node.dtype);
-            }
-            continue;
         }
 
         // Materialize host slices lazily for any predecessors required by host/hybrid dispatch.
@@ -2906,9 +3047,11 @@ fn execute_dag_with_workspace(
                         && let Some(vbuf) = &slot_vram[s_id]
                     {
                         let (numel, dt) = slot_meta[s_id];
+                        let needed_bytes = dt.storage_bytes(numel);
                         let mut raw = vec![0u8; vbuf.byte_len()];
                         vbuf.download_bytes(&mut raw)?;
-                        let aligned = AlignedByteBuffer::from_raw_bytes(&raw, numel, dt)?;
+                        let aligned =
+                            AlignedByteBuffer::from_raw_bytes(&raw[..needed_bytes], numel, dt)?;
                         let dst_slot = &mut ws.slots[s_id];
                         dst_slot.clear();
                         dst_slot.reserve(numel);
@@ -3307,6 +3450,32 @@ fn eval_node_into(
             out_numel,
             dst,
         ),
+        DagOp::StepPos(a) => {
+            let src = get(*a);
+            dst.clear();
+            dst.reserve(src.len());
+            for &v in src {
+                let out_v = if v > 0.0 { 1.0 } else { 0.0 };
+                dst.push(quantize_for_dtype(out_v, node.dtype));
+            }
+            Ok(())
+        }
+        DagOp::Sign(a) => {
+            let src = get(*a);
+            dst.clear();
+            dst.reserve(src.len());
+            for &v in src {
+                let out_v = if v > 0.0 {
+                    1.0
+                } else if v < 0.0 {
+                    -1.0
+                } else {
+                    0.0
+                };
+                dst.push(quantize_for_dtype(out_v, node.dtype));
+            }
+            Ok(())
+        }
         DagOp::MatMul(a, b) => backend.run_matmul_into(
             get(*a),
             get(*b),
@@ -3619,5 +3788,1220 @@ fn hash_ew_step(h: &mut FnvHasher, step: &FusedEwStep) {
             h.write_u8(22);
             h.write_u64(a as u64);
         }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 6. IR-Level Symbolic Differentiation (VJP / Grad / JVP) on `TensorComputeDag`
+// ════════════════════════════════════════════════════════════════════════════
+
+fn broadcast_shapes_dag(a: &[usize], b: &[usize]) -> MoraResult<Vec<usize>> {
+    let rank = a.len().max(b.len());
+    let mut out = vec![1usize; rank];
+    for i in 0..rank {
+        let da = if i < rank - a.len() {
+            1
+        } else {
+            a[i - (rank - a.len())]
+        };
+        let db = if i < rank - b.len() {
+            1
+        } else {
+            b[i - (rank - b.len())]
+        };
+        if da == db {
+            out[i] = da;
+        } else if da == 1 {
+            out[i] = db;
+        } else if db == 1 {
+            out[i] = da;
+        } else {
+            return Err(MoraError::Runtime(format!(
+                "ComputeDag AD: incompatible broadcast shapes {a:?} and {b:?}"
+            )));
+        }
+    }
+    Ok(out)
+}
+
+fn matmul_shape_dag(a: &[usize], b: &[usize]) -> MoraResult<Vec<usize>> {
+    match (a.len(), b.len()) {
+        (1, 1) => Ok(Vec::new()),
+        (2, 1) => Ok(vec![a[0]]),
+        (1, 2) => Ok(vec![b[1]]),
+        (ra, rb) if ra >= 2 && rb >= 2 => {
+            let mut out = broadcast_shapes_dag(&a[..ra - 2], &b[..rb - 2])?;
+            out.push(a[ra - 2]);
+            out.push(b[rb - 1]);
+            Ok(out)
+        }
+        _ => Err(MoraError::Runtime(format!(
+            "ComputeDag AD: unsupported matmul shapes {a:?} @ {b:?}"
+        ))),
+    }
+}
+
+fn sum_axis_shape_dag(shape: &[usize], axis: usize, keepdim: bool) -> Vec<usize> {
+    if keepdim {
+        let mut out = shape.to_vec();
+        if axis < out.len() {
+            out[axis] = 1;
+        }
+        out
+    } else {
+        shape
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &d)| if i == axis { None } else { Some(d) })
+            .collect()
+    }
+}
+
+struct DagIrBuilder {
+    nodes: Vec<DagNode>,
+}
+
+impl DagIrBuilder {
+    fn new() -> Self {
+        Self { nodes: Vec::new() }
+    }
+
+    fn from_nodes(nodes: Vec<DagNode>) -> Self {
+        Self { nodes }
+    }
+
+    fn push(&mut self, op: DagOp, shape: Vec<usize>, dtype: DType, device: Device) -> usize {
+        let id = self.nodes.len();
+        self.nodes.push(DagNode {
+            op,
+            shape,
+            dtype,
+            device,
+        });
+        id
+    }
+
+    fn shape(&self, id: usize) -> Vec<usize> {
+        self.nodes[id].shape.clone()
+    }
+
+    fn dtype(&self, id: usize) -> DType {
+        self.nodes[id].dtype
+    }
+
+    fn device(&self, id: usize) -> Device {
+        self.nodes[id].device.clone()
+    }
+
+    fn const_filled(
+        &mut self,
+        val: f64,
+        shape: &[usize],
+        dtype: DType,
+        device: &Device,
+    ) -> MoraResult<usize> {
+        let n = checked_numel(shape)?;
+        let t = Tensor::from_raw(vec![val; n], shape.to_vec(), dtype, device.clone(), false)?;
+        Ok(self.push(DagOp::ConstTensor(t), shape.to_vec(), dtype, device.clone()))
+    }
+
+    fn add(&mut self, a: usize, b: usize) -> MoraResult<usize> {
+        let sh = broadcast_shapes_dag(&self.nodes[a].shape, &self.nodes[b].shape)?;
+        let dt = self.dtype(a);
+        let dev = self.device(a);
+        Ok(self.push(DagOp::Add(a, b), sh, dt, dev))
+    }
+
+    fn sub(&mut self, a: usize, b: usize) -> MoraResult<usize> {
+        let sh = broadcast_shapes_dag(&self.nodes[a].shape, &self.nodes[b].shape)?;
+        let dt = self.dtype(a);
+        let dev = self.device(a);
+        Ok(self.push(DagOp::Sub(a, b), sh, dt, dev))
+    }
+
+    fn mul(&mut self, a: usize, b: usize) -> MoraResult<usize> {
+        let sh = broadcast_shapes_dag(&self.nodes[a].shape, &self.nodes[b].shape)?;
+        let dt = self.dtype(a);
+        let dev = self.device(a);
+        Ok(self.push(DagOp::Mul(a, b), sh, dt, dev))
+    }
+
+    fn div(&mut self, a: usize, b: usize) -> MoraResult<usize> {
+        let sh = broadcast_shapes_dag(&self.nodes[a].shape, &self.nodes[b].shape)?;
+        let dt = self.dtype(a);
+        let dev = self.device(a);
+        Ok(self.push(DagOp::Div(a, b), sh, dt, dev))
+    }
+
+    fn pow(&mut self, a: usize, b: usize) -> MoraResult<usize> {
+        let sh = broadcast_shapes_dag(&self.nodes[a].shape, &self.nodes[b].shape)?;
+        let dt = self.dtype(a);
+        let dev = self.device(a);
+        Ok(self.push(DagOp::Pow(a, b), sh, dt, dev))
+    }
+
+    fn unary(&mut self, op: DagOp, src: usize) -> usize {
+        let sh = self.shape(src);
+        let dt = self.dtype(src);
+        let dev = self.device(src);
+        self.push(op, sh, dt, dev)
+    }
+
+    fn matmul(&mut self, a: usize, b: usize) -> MoraResult<usize> {
+        let sh = matmul_shape_dag(&self.nodes[a].shape, &self.nodes[b].shape)?;
+        let dt = self.dtype(a);
+        let dev = self.device(a);
+        Ok(self.push(DagOp::MatMul(a, b), sh, dt, dev))
+    }
+
+    fn transpose(&mut self, a: usize, d0: usize, d1: usize) -> usize {
+        let mut sh = self.shape(a);
+        sh.swap(d0, d1);
+        let dt = self.dtype(a);
+        let dev = self.device(a);
+        self.push(DagOp::Transpose(a, d0, d1), sh, dt, dev)
+    }
+
+    fn reshape(&mut self, a: usize, target: Vec<usize>) -> usize {
+        let dt = self.dtype(a);
+        let dev = self.device(a);
+        self.push(DagOp::Reshape(a, target.clone()), target, dt, dev)
+    }
+
+    fn sum_axis(&mut self, a: usize, axis: usize, keepdim: bool) -> usize {
+        let sh = sum_axis_shape_dag(&self.nodes[a].shape, axis, keepdim);
+        let dt = self.dtype(a);
+        let dev = self.device(a);
+        self.push(DagOp::SumAxis(a, axis, keepdim), sh, dt, dev)
+    }
+
+    fn unbroadcast_to(&mut self, grad_id: usize, target_shape: &[usize]) -> usize {
+        let cur_sh = self.shape(grad_id);
+        if cur_sh == target_shape {
+            return grad_id;
+        }
+        let dt = self.dtype(grad_id);
+        let dev = self.device(grad_id);
+        if target_shape.is_empty() {
+            return self.push(DagOp::Sum(grad_id), Vec::new(), dt, dev);
+        }
+        let mut cur = grad_id;
+        while self.nodes[cur].shape.len() > target_shape.len() {
+            cur = self.sum_axis(cur, 0, false);
+        }
+        for (ax, &tdim) in target_shape.iter().enumerate() {
+            if tdim == 1 && self.nodes[cur].shape[ax] > 1 {
+                cur = self.sum_axis(cur, ax, true);
+            }
+        }
+        if self.nodes[cur].shape != target_shape {
+            cur = self.reshape(cur, target_shape.to_vec());
+        }
+        cur
+    }
+
+    fn broadcast_to_shape(&mut self, val_id: usize, target_shape: &[usize]) -> MoraResult<usize> {
+        if self.nodes[val_id].shape == target_shape {
+            return Ok(val_id);
+        }
+        let dt = self.dtype(val_id);
+        let dev = self.device(val_id);
+        let zeros = self.const_filled(0.0, target_shape, dt, &dev)?;
+        self.add(val_id, zeros)
+    }
+
+    fn gelu_derivative(&mut self, a: usize) -> MoraResult<usize> {
+        // Exact derivative of tanh-approx GELU:
+        //   u = k * (a + 0.044715 * a^3), t = tanh(u)
+        //   d/da = 0.5*(1+t) + 0.5*a*(1-t^2)*k*(1 + 3*0.044715*a^2)
+        let k = (2.0_f64 / std::f64::consts::PI).sqrt();
+        let a2 = self.mul(a, a)?;
+        let a3 = self.mul(a2, a)?;
+        let c_a3 = self.unary(DagOp::MulScalar(a3, 0.044715), a3);
+        let inner = self.add(a, c_a3)?;
+        let u = self.unary(DagOp::MulScalar(inner, k), inner);
+        let t = self.unary(DagOp::Tanh(u), u);
+        let one_plus_t = self.unary(DagOp::AddScalar(t, 1.0), t);
+        let term1 = self.unary(DagOp::MulScalar(one_plus_t, 0.5), one_plus_t);
+        let t2 = self.mul(t, t)?;
+        let sech2 = self.unary(DagOp::SubScalar(t2, 1.0, true), t2);
+        let three_c_a2 = self.unary(DagOp::MulScalar(a2, 3.0 * 0.044715), a2);
+        let one_plus = self.unary(DagOp::AddScalar(three_c_a2, 1.0), three_c_a2);
+        let du = self.unary(DagOp::MulScalar(one_plus, k), one_plus);
+        let half_a = self.unary(DagOp::MulScalar(a, 0.5), a);
+        let prod1 = self.mul(half_a, sech2)?;
+        let term2 = self.mul(prod1, du)?;
+        self.add(term1, term2)
+    }
+
+    fn silu_derivative(&mut self, a: usize, y: usize) -> MoraResult<usize> {
+        // d/da (a * sigmoid(a)) = sigmoid(a) + y * (1 - sigmoid(a))
+        let s = self.unary(DagOp::Sigmoid(a), a);
+        let one_minus_s = self.unary(DagOp::SubScalar(s, 1.0, true), s);
+        let y_oms = self.mul(y, one_minus_s)?;
+        self.add(s, y_oms)
+    }
+
+    fn apply_fused_act(&mut self, x: usize, act: FusedAct) -> usize {
+        match act {
+            FusedAct::None => x,
+            FusedAct::Relu => self.unary(DagOp::Relu(x), x),
+            FusedAct::Gelu => self.unary(DagOp::Gelu(x), x),
+            FusedAct::Silu => self.unary(DagOp::Silu(x), x),
+            FusedAct::Tanh => self.unary(DagOp::Tanh(x), x),
+            FusedAct::Sigmoid => self.unary(DagOp::Sigmoid(x), x),
+        }
+    }
+}
+
+impl TensorComputeDag {
+    /// Lower any fused nodes (`FusedLinearAct`, `FusedRmsNormLinear`, `FusedFlashAttention`,
+    /// `FusedElementwise`) back into primitive `DagOp` nodes so IR-level symbolic AD
+    /// (`build_vjp`, `build_grad`, `build_jvp`) handles both unfused and fused graphs uniformly.
+    pub(crate) fn unfuse_to_primitives(&self) -> MoraResult<Self> {
+        if !self.nodes.iter().any(|n| n.op.is_fused()) {
+            return Ok(self.clone());
+        }
+        let mut b = DagIrBuilder::new();
+        let mut map = vec![0usize; self.nodes.len()];
+        for (idx, node) in self.nodes.iter().enumerate() {
+            let new_id = match &node.op {
+                DagOp::FusedLinearAct { x, w, bias, act } => {
+                    let mm = b.matmul(map[*x], map[*w])?;
+                    let biased = match bias {
+                        Some(bi) => b.add(mm, map[*bi])?,
+                        None => mm,
+                    };
+                    b.apply_fused_act(biased, *act)
+                }
+                DagOp::FusedRmsNormLinear {
+                    x,
+                    eps,
+                    gamma,
+                    w,
+                    bias,
+                    act,
+                } => {
+                    let mx = map[*x];
+                    let rn = b.unary(DagOp::RmsNorm(mx, *eps), mx);
+                    let scaled = match gamma {
+                        Some(gi) => b.mul(rn, map[*gi])?,
+                        None => rn,
+                    };
+                    let mm = b.matmul(scaled, map[*w])?;
+                    let biased = match bias {
+                        Some(bi) => b.add(mm, map[*bi])?,
+                        None => mm,
+                    };
+                    b.apply_fused_act(biased, *act)
+                }
+                DagOp::FusedFlashAttention {
+                    q,
+                    k,
+                    v,
+                    mask,
+                    scale,
+                    k_is_transposed,
+                } => {
+                    let mq = map[*q];
+                    let mk = map[*k];
+                    let mv = map[*v];
+                    let kt = if *k_is_transposed {
+                        mk
+                    } else {
+                        let kr = b.nodes[mk].shape.len();
+                        b.transpose(mk, kr - 2, kr - 1)
+                    };
+                    let scores = b.matmul(mq, kt)?;
+                    let scaled = if (*scale - 1.0).abs() > 0.0 {
+                        b.unary(DagOp::MulScalar(scores, *scale), scores)
+                    } else {
+                        scores
+                    };
+                    let logits = match mask {
+                        Some(mi) => b.add(scaled, map[*mi])?,
+                        None => scaled,
+                    };
+                    let probs = b.unary(DagOp::Softmax(logits), logits);
+                    b.matmul(probs, mv)?
+                }
+                DagOp::FusedElementwise { inputs, steps } => {
+                    let mut slots: Vec<usize> = inputs.iter().map(|&i| map[i]).collect();
+                    for step in steps {
+                        let step_id = match *step {
+                            FusedEwStep::Add(s0, s1) => b.add(slots[s0], slots[s1])?,
+                            FusedEwStep::Sub(s0, s1) => b.sub(slots[s0], slots[s1])?,
+                            FusedEwStep::Mul(s0, s1) => b.mul(slots[s0], slots[s1])?,
+                            FusedEwStep::Div(s0, s1) => b.div(slots[s0], slots[s1])?,
+                            FusedEwStep::Pow(s0, s1) => b.pow(slots[s0], slots[s1])?,
+                            FusedEwStep::AddScalar(s0, c) => {
+                                b.unary(DagOp::AddScalar(slots[s0], c), slots[s0])
+                            }
+                            FusedEwStep::SubScalar(s0, c, r) => {
+                                b.unary(DagOp::SubScalar(slots[s0], c, r), slots[s0])
+                            }
+                            FusedEwStep::MulScalar(s0, c) => {
+                                b.unary(DagOp::MulScalar(slots[s0], c), slots[s0])
+                            }
+                            FusedEwStep::DivScalar(s0, c, r) => {
+                                b.unary(DagOp::DivScalar(slots[s0], c, r), slots[s0])
+                            }
+                            FusedEwStep::PowScalar(s0, c, r) => {
+                                b.unary(DagOp::PowScalar(slots[s0], c, r), slots[s0])
+                            }
+                            FusedEwStep::Neg(s0) => b.unary(DagOp::Neg(slots[s0]), slots[s0]),
+                            FusedEwStep::Relu(s0) => b.unary(DagOp::Relu(slots[s0]), slots[s0]),
+                            FusedEwStep::Gelu(s0) => b.unary(DagOp::Gelu(slots[s0]), slots[s0]),
+                            FusedEwStep::Silu(s0) => b.unary(DagOp::Silu(slots[s0]), slots[s0]),
+                            FusedEwStep::Tanh(s0) => b.unary(DagOp::Tanh(slots[s0]), slots[s0]),
+                            FusedEwStep::Sigmoid(s0) => {
+                                b.unary(DagOp::Sigmoid(slots[s0]), slots[s0])
+                            }
+                            FusedEwStep::Exp(s0) => b.unary(DagOp::Exp(slots[s0]), slots[s0]),
+                            FusedEwStep::Ln(s0) => b.unary(DagOp::Ln(slots[s0]), slots[s0]),
+                            FusedEwStep::Sqrt(s0) => b.unary(DagOp::Sqrt(slots[s0]), slots[s0]),
+                            FusedEwStep::Sin(s0) => b.unary(DagOp::Sin(slots[s0]), slots[s0]),
+                            FusedEwStep::Cos(s0) => b.unary(DagOp::Cos(slots[s0]), slots[s0]),
+                            FusedEwStep::Abs(s0) => b.unary(DagOp::Abs(slots[s0]), slots[s0]),
+                        };
+                        slots.push(step_id);
+                    }
+                    *slots.last().ok_or_else(|| {
+                        MoraError::Runtime("ComputeDag unfuse: empty FusedElementwise".to_string())
+                    })?
+                }
+                _ => {
+                    let mut cloned = node.clone();
+                    cloned.op.remap_inputs(&map);
+                    b.push(cloned.op, cloned.shape, cloned.dtype, cloned.device)
+                }
+            };
+            map[idx] = new_id;
+        }
+        Ok(Self {
+            input_specs: self.input_specs.clone(),
+            nodes: b.nodes,
+            output: map[self.output],
+            fused: false,
+            algebraic_rewrites: 0,
+            compiled_plan: None,
+        })
+    }
+
+    fn build_vjp_internal(&self, input_idx: usize, seed_ones: bool) -> MoraResult<Self> {
+        if input_idx >= self.input_specs.len() {
+            return Err(MoraError::Runtime(format!(
+                "ComputeDag.{}: input index {input_idx} out of bounds (graph has {} input(s))",
+                if seed_ones { "grad" } else { "vjp" },
+                self.input_specs.len()
+            )));
+        }
+        let prim = self.unfuse_to_primitives()?;
+        let n_fwd = prim.nodes.len();
+        let out_node = &prim.nodes[prim.output];
+        let out_shape = out_node.shape.clone();
+        let out_dtype = out_node.dtype;
+        let out_dev = out_node.device.clone();
+
+        let mut b = DagIrBuilder::from_nodes(prim.nodes.clone());
+        let mut new_input_specs = prim.input_specs.clone();
+
+        let seed_id = if seed_ones {
+            b.const_filled(1.0, &out_shape, out_dtype, &out_dev)?
+        } else {
+            let slot = new_input_specs.len();
+            new_input_specs.push((out_shape.clone(), out_dtype, out_dev.clone()));
+            b.push(DagOp::Input(slot), out_shape, out_dtype, out_dev)
+        };
+
+        let mut adj: Vec<Option<usize>> = vec![None; n_fwd];
+        adj[prim.output] = Some(seed_id);
+
+        let acc = |adj: &mut [Option<usize>],
+                   target: usize,
+                   contrib: usize,
+                   builder: &mut DagIrBuilder|
+         -> MoraResult<()> {
+            if let Some(prev) = adj[target] {
+                adj[target] = Some(builder.add(prev, contrib)?);
+            } else {
+                adj[target] = Some(contrib);
+            }
+            Ok(())
+        };
+
+        for idx in (0..n_fwd).rev() {
+            let Some(g) = adj[idx] else {
+                continue;
+            };
+            let node_op = prim.nodes[idx].op.clone();
+            match node_op {
+                DagOp::Input(_) | DagOp::ConstTensor(_) | DagOp::StepPos(_) | DagOp::Sign(_) => {}
+                DagOp::Identity(a) => acc(&mut adj, a, g, &mut b)?,
+                DagOp::Reshape(a, _) => {
+                    let sh_a = b.shape(a);
+                    let r = b.reshape(g, sh_a);
+                    acc(&mut adj, a, r, &mut b)?;
+                }
+                DagOp::Transpose(a, d0, d1) => {
+                    let t = b.transpose(g, d0, d1);
+                    acc(&mut adj, a, t, &mut b)?;
+                }
+                DagOp::Add(a, rhs) => {
+                    let sa = b.shape(a);
+                    let sb = b.shape(rhs);
+                    let da = b.unbroadcast_to(g, &sa);
+                    let db = b.unbroadcast_to(g, &sb);
+                    acc(&mut adj, a, da, &mut b)?;
+                    acc(&mut adj, rhs, db, &mut b)?;
+                }
+                DagOp::Sub(a, rhs) => {
+                    let sa = b.shape(a);
+                    let sb = b.shape(rhs);
+                    let da = b.unbroadcast_to(g, &sa);
+                    let ng = b.unary(DagOp::Neg(g), g);
+                    let db = b.unbroadcast_to(ng, &sb);
+                    acc(&mut adj, a, da, &mut b)?;
+                    acc(&mut adj, rhs, db, &mut b)?;
+                }
+                DagOp::Mul(a, rhs) => {
+                    let sa = b.shape(a);
+                    let sb = b.shape(rhs);
+                    let ga = b.mul(g, rhs)?;
+                    let da = b.unbroadcast_to(ga, &sa);
+                    let gb = b.mul(g, a)?;
+                    let db = b.unbroadcast_to(gb, &sb);
+                    acc(&mut adj, a, da, &mut b)?;
+                    acc(&mut adj, rhs, db, &mut b)?;
+                }
+                DagOp::Div(a, rhs) => {
+                    let sa = b.shape(a);
+                    let sb = b.shape(rhs);
+                    let ga = b.div(g, rhs)?;
+                    let da = b.unbroadcast_to(ga, &sa);
+                    let num = b.mul(g, a)?;
+                    let den = b.mul(rhs, rhs)?;
+                    let frac = b.div(num, den)?;
+                    let neg_frac = b.unary(DagOp::Neg(frac), frac);
+                    let db = b.unbroadcast_to(neg_frac, &sb);
+                    acc(&mut adj, a, da, &mut b)?;
+                    acc(&mut adj, rhs, db, &mut b)?;
+                }
+                DagOp::Pow(a, rhs) => {
+                    let sa = b.shape(a);
+                    let sb = b.shape(rhs);
+                    let bm1 = b.unary(DagOp::SubScalar(rhs, 1.0, false), rhs);
+                    let pow_bm1 = b.pow(a, bm1)?;
+                    let b_pow = b.mul(rhs, pow_bm1)?;
+                    let ga = b.mul(g, b_pow)?;
+                    let da = b.unbroadcast_to(ga, &sa);
+                    let ln_a = b.unary(DagOp::Ln(a), a);
+                    let y_lna = b.mul(idx, ln_a)?;
+                    let gb = b.mul(g, y_lna)?;
+                    let db = b.unbroadcast_to(gb, &sb);
+                    acc(&mut adj, a, da, &mut b)?;
+                    acc(&mut adj, rhs, db, &mut b)?;
+                }
+                DagOp::AddScalar(a, _) => acc(&mut adj, a, g, &mut b)?,
+                DagOp::SubScalar(a, _, rev) => {
+                    let da = if rev { b.unary(DagOp::Neg(g), g) } else { g };
+                    acc(&mut adj, a, da, &mut b)?;
+                }
+                DagOp::MulScalar(a, c) => {
+                    let da = b.unary(DagOp::MulScalar(g, c), g);
+                    acc(&mut adj, a, da, &mut b)?;
+                }
+                DagOp::DivScalar(a, c, rev) => {
+                    let da = if !rev {
+                        b.unary(DagOp::DivScalar(g, c, false), g)
+                    } else {
+                        let a2 = b.mul(a, a)?;
+                        let div = b.div(g, a2)?;
+                        b.unary(DagOp::MulScalar(div, -c), div)
+                    };
+                    acc(&mut adj, a, da, &mut b)?;
+                }
+                DagOp::PowScalar(a, c, rev) => {
+                    if !rev {
+                        if c == 1.0 {
+                            acc(&mut adj, a, g, &mut b)?;
+                        } else if c == 2.0 {
+                            let two_a = b.unary(DagOp::MulScalar(a, 2.0), a);
+                            let da = b.mul(g, two_a)?;
+                            acc(&mut adj, a, da, &mut b)?;
+                        } else if c != 0.0 {
+                            let p = b.unary(DagOp::PowScalar(a, c - 1.0, false), a);
+                            let cp = b.unary(DagOp::MulScalar(p, c), p);
+                            let da = b.mul(g, cp)?;
+                            acc(&mut adj, a, da, &mut b)?;
+                        }
+                    } else if c > 0.0 {
+                        let scaled = b.unary(DagOp::MulScalar(idx, c.ln()), idx);
+                        let da = b.mul(g, scaled)?;
+                        acc(&mut adj, a, da, &mut b)?;
+                    }
+                }
+                DagOp::Neg(a) => {
+                    let ng = b.unary(DagOp::Neg(g), g);
+                    acc(&mut adj, a, ng, &mut b)?;
+                }
+                DagOp::Exp(a) => {
+                    let da = b.mul(g, idx)?;
+                    acc(&mut adj, a, da, &mut b)?;
+                }
+                DagOp::Ln(a) => {
+                    let da = b.div(g, a)?;
+                    acc(&mut adj, a, da, &mut b)?;
+                }
+                DagOp::Sqrt(a) => {
+                    let two_y = b.unary(DagOp::MulScalar(idx, 2.0), idx);
+                    let da = b.div(g, two_y)?;
+                    acc(&mut adj, a, da, &mut b)?;
+                }
+                DagOp::Sin(a) => {
+                    let ca = b.unary(DagOp::Cos(a), a);
+                    let da = b.mul(g, ca)?;
+                    acc(&mut adj, a, da, &mut b)?;
+                }
+                DagOp::Cos(a) => {
+                    let sa = b.unary(DagOp::Sin(a), a);
+                    let prod = b.mul(g, sa)?;
+                    let da = b.unary(DagOp::Neg(prod), prod);
+                    acc(&mut adj, a, da, &mut b)?;
+                }
+                DagOp::Tanh(a) => {
+                    let y2 = b.mul(idx, idx)?;
+                    let one_m_y2 = b.unary(DagOp::SubScalar(y2, 1.0, true), y2);
+                    let da = b.mul(g, one_m_y2)?;
+                    acc(&mut adj, a, da, &mut b)?;
+                }
+                DagOp::Sigmoid(a) => {
+                    let oms = b.unary(DagOp::SubScalar(idx, 1.0, true), idx);
+                    let deriv = b.mul(idx, oms)?;
+                    let da = b.mul(g, deriv)?;
+                    acc(&mut adj, a, da, &mut b)?;
+                }
+                DagOp::Silu(a) => {
+                    let deriv = b.silu_derivative(a, idx)?;
+                    let da = b.mul(g, deriv)?;
+                    acc(&mut adj, a, da, &mut b)?;
+                }
+                DagOp::Gelu(a) => {
+                    let deriv = b.gelu_derivative(a)?;
+                    let da = b.mul(g, deriv)?;
+                    acc(&mut adj, a, da, &mut b)?;
+                }
+                DagOp::Relu(a) => {
+                    let mask = b.unary(DagOp::StepPos(a), a);
+                    let da = b.mul(g, mask)?;
+                    acc(&mut adj, a, da, &mut b)?;
+                }
+                DagOp::Abs(a) => {
+                    let sgn = b.unary(DagOp::Sign(a), a);
+                    let da = b.mul(g, sgn)?;
+                    acc(&mut adj, a, da, &mut b)?;
+                }
+                DagOp::Sum(a) => {
+                    let sa = b.shape(a);
+                    let dt = b.dtype(a);
+                    let dev = b.device(a);
+                    let ones = b.const_filled(1.0, &sa, dt, &dev)?;
+                    let da = b.mul(ones, g)?;
+                    acc(&mut adj, a, da, &mut b)?;
+                }
+                DagOp::Mean(a) => {
+                    let sa = b.shape(a);
+                    let n = checked_numel(&sa)?.max(1) as f64;
+                    let dt = b.dtype(a);
+                    let dev = b.device(a);
+                    let scaled_g = b.unary(DagOp::DivScalar(g, n, false), g);
+                    let ones = b.const_filled(1.0, &sa, dt, &dev)?;
+                    let da = b.mul(ones, scaled_g)?;
+                    acc(&mut adj, a, da, &mut b)?;
+                }
+                DagOp::SumAxis(a, axis, keepdim) => {
+                    let sa = b.shape(a);
+                    let dt = b.dtype(a);
+                    let dev = b.device(a);
+                    let g_kd = if keepdim {
+                        g
+                    } else {
+                        let mut kd_sh = b.shape(g);
+                        kd_sh.insert(axis.min(kd_sh.len()), 1);
+                        b.reshape(g, kd_sh)
+                    };
+                    let ones = b.const_filled(1.0, &sa, dt, &dev)?;
+                    let da = b.mul(ones, g_kd)?;
+                    acc(&mut adj, a, da, &mut b)?;
+                }
+                DagOp::Gather(a, indices) => {
+                    let sa = b.shape(a);
+                    let out_n = checked_numel(&sa)?;
+                    let dt = b.dtype(a);
+                    let dev = b.device(a);
+                    let sc = b.push(DagOp::ScatterAdd(g, out_n, indices), sa, dt, dev);
+                    acc(&mut adj, a, sc, &mut b)?;
+                }
+                DagOp::ScatterAdd(a, _, indices) => {
+                    let sa = b.shape(a);
+                    let dt = b.dtype(a);
+                    let dev = b.device(a);
+                    let ga = b.push(DagOp::Gather(g, indices), sa, dt, dev);
+                    acc(&mut adj, a, ga, &mut b)?;
+                }
+                DagOp::MatMul(a, rhs) => {
+                    let sa = b.shape(a);
+                    let sb = b.shape(rhs);
+                    match (sa.len(), sb.len()) {
+                        (ra, rb) if ra >= 2 && rb >= 2 => {
+                            let bt = b.transpose(rhs, rb - 2, rb - 1);
+                            let da_raw = b.matmul(g, bt)?;
+                            let da = b.unbroadcast_to(da_raw, &sa);
+                            let at = b.transpose(a, ra - 2, ra - 1);
+                            let db_raw = b.matmul(at, g)?;
+                            let db = b.unbroadcast_to(db_raw, &sb);
+                            acc(&mut adj, a, da, &mut b)?;
+                            acc(&mut adj, rhs, db, &mut b)?;
+                        }
+                        (1, 1) => {
+                            let da = b.mul(rhs, g)?;
+                            let db = b.mul(a, g)?;
+                            acc(&mut adj, a, da, &mut b)?;
+                            acc(&mut adj, rhs, db, &mut b)?;
+                        }
+                        (2, 1) => {
+                            let g_col = b.reshape(g, vec![sa[0], 1]);
+                            let b_row = b.reshape(rhs, vec![1, sb[0]]);
+                            let da = b.matmul(g_col, b_row)?;
+                            let at = b.transpose(a, 0, 1);
+                            let db_col = b.matmul(at, g_col)?;
+                            let db = b.reshape(db_col, sb);
+                            acc(&mut adj, a, da, &mut b)?;
+                            acc(&mut adj, rhs, db, &mut b)?;
+                        }
+                        (1, 2) => {
+                            let g_row = b.reshape(g, vec![1, sb[1]]);
+                            let bt = b.transpose(rhs, 0, 1);
+                            let da_row = b.matmul(g_row, bt)?;
+                            let da = b.reshape(da_row, sa.clone());
+                            let a_col = b.reshape(a, vec![sa[0], 1]);
+                            let db = b.matmul(a_col, g_row)?;
+                            acc(&mut adj, a, da, &mut b)?;
+                            acc(&mut adj, rhs, db, &mut b)?;
+                        }
+                        _ => {
+                            return Err(MoraError::Runtime(format!(
+                                "ComputeDag VJP: unsupported MatMul shapes {sa:?} @ {sb:?}"
+                            )));
+                        }
+                    }
+                }
+                DagOp::Softmax(a) => {
+                    let rank = b.nodes[idx].shape.len();
+                    let last_ax = rank.saturating_sub(1);
+                    let gy = b.mul(g, idx)?;
+                    let dot = if rank == 0 {
+                        gy
+                    } else {
+                        b.sum_axis(gy, last_ax, true)
+                    };
+                    let diff = b.sub(g, dot)?;
+                    let da = b.mul(idx, diff)?;
+                    acc(&mut adj, a, da, &mut b)?;
+                }
+                DagOp::RmsNorm(a, eps) => {
+                    let sa = b.shape(a);
+                    let rank = sa.len();
+                    let last_ax = rank.saturating_sub(1);
+                    let d = sa.last().copied().unwrap_or(1).max(1) as f64;
+                    let a2 = b.mul(a, a)?;
+                    let sum_sq = if rank == 0 {
+                        a2
+                    } else {
+                        b.sum_axis(a2, last_ax, true)
+                    };
+                    let ms = b.unary(DagOp::MulScalar(sum_sq, 1.0 / d), sum_sq);
+                    let ms_eps = b.unary(DagOp::AddScalar(ms, eps), ms);
+                    let rms = b.unary(DagOp::Sqrt(ms_eps), ms_eps);
+                    let inv_rms = b.unary(DagOp::DivScalar(rms, 1.0, true), rms);
+                    let gy = b.mul(g, idx)?;
+                    let dot = if rank == 0 {
+                        gy
+                    } else {
+                        b.sum_axis(gy, last_ax, true)
+                    };
+                    let mean_gy = b.unary(DagOp::MulScalar(dot, 1.0 / d), dot);
+                    let proj = b.mul(idx, mean_gy)?;
+                    let sub = b.sub(g, proj)?;
+                    let da = b.mul(inv_rms, sub)?;
+                    acc(&mut adj, a, da, &mut b)?;
+                }
+                DagOp::LayerNorm(a, eps) => {
+                    let sa = b.shape(a);
+                    let rank = sa.len();
+                    let last_ax = rank.saturating_sub(1);
+                    let d = sa.last().copied().unwrap_or(1).max(1) as f64;
+                    let sum_a = if rank == 0 {
+                        a
+                    } else {
+                        b.sum_axis(a, last_ax, true)
+                    };
+                    let mean = b.unary(DagOp::MulScalar(sum_a, 1.0 / d), sum_a);
+                    let centered = b.sub(a, mean)?;
+                    let c2 = b.mul(centered, centered)?;
+                    let sum_c2 = if rank == 0 {
+                        c2
+                    } else {
+                        b.sum_axis(c2, last_ax, true)
+                    };
+                    let var = b.unary(DagOp::MulScalar(sum_c2, 1.0 / d), sum_c2);
+                    let var_eps = b.unary(DagOp::AddScalar(var, eps), var);
+                    let std = b.unary(DagOp::Sqrt(var_eps), var_eps);
+                    let inv_std = b.unary(DagOp::DivScalar(std, 1.0, true), std);
+                    let sum_g = if rank == 0 {
+                        g
+                    } else {
+                        b.sum_axis(g, last_ax, true)
+                    };
+                    let mean_g = b.unary(DagOp::MulScalar(sum_g, 1.0 / d), sum_g);
+                    let gy = b.mul(g, idx)?;
+                    let sum_gy = if rank == 0 {
+                        gy
+                    } else {
+                        b.sum_axis(gy, last_ax, true)
+                    };
+                    let mean_gy = b.unary(DagOp::MulScalar(sum_gy, 1.0 / d), sum_gy);
+                    let g_centered = b.sub(g, mean_g)?;
+                    let y_term = b.mul(idx, mean_gy)?;
+                    let diff = b.sub(g_centered, y_term)?;
+                    let da = b.mul(inv_std, diff)?;
+                    acc(&mut adj, a, da, &mut b)?;
+                }
+                DagOp::FusedLinearAct { .. }
+                | DagOp::FusedRmsNormLinear { .. }
+                | DagOp::FusedFlashAttention { .. }
+                | DagOp::FusedElementwise { .. } => {
+                    unreachable!("unfuse_to_primitives removes all fused nodes")
+                }
+            }
+        }
+
+        // Accumulate adjoints across all `DagOp::Input(input_idx)` occurrences (handles graphs that
+        // reference the same input slot across multiple nodes or return a constant independent of it).
+        let mut grad_out: Option<usize> = None;
+        for (idx, node) in prim.nodes.iter().enumerate() {
+            if matches!(node.op, DagOp::Input(s) if s == input_idx)
+                && let Some(g) = adj[idx]
+            {
+                grad_out = match grad_out {
+                    None => Some(g),
+                    Some(prev) => Some(b.add(prev, g)?),
+                };
+            }
+        }
+        let raw_out = match grad_out {
+            Some(id) => id,
+            None => {
+                let (ref sh, dt, ref dev) = prim.input_specs[input_idx];
+                b.const_filled(0.0, sh, dt, dev)?
+            }
+        };
+        let (nodes, output) = compact_live_nodes(b.nodes, raw_out);
+        Ok(Self {
+            input_specs: new_input_specs,
+            nodes,
+            output,
+            fused: false,
+            algebraic_rewrites: 0,
+            compiled_plan: None,
+        })
+    }
+
+    /// Build a first-class symbolic reverse-mode VJP [`TensorComputeDag`] with respect to
+    /// `input_idx`. The returned DAG takes `(x_0, ..., x_{N-1}, dy)` and computes `J_f(x)^T dy`.
+    pub(crate) fn build_vjp(&self, input_idx: usize) -> MoraResult<Self> {
+        self.build_vjp_internal(input_idx, false)
+    }
+
+    /// Build a first-class symbolic reverse-mode gradient [`TensorComputeDag`] with respect to
+    /// `input_idx` (seeding output cotangent `dy = ones_like(output)`). The returned DAG takes
+    /// `(x_0, ..., x_{N-1})` and computes `d(sum(f(x))) / dx_{input_idx}`.
+    pub(crate) fn build_grad(&self, input_idx: usize) -> MoraResult<Self> {
+        self.build_vjp_internal(input_idx, true)
+    }
+
+    /// Build a first-class symbolic forward-mode JVP [`TensorComputeDag`] with respect to
+    /// `input_idx`. The returned DAG takes `(x_0, ..., x_{N-1}, dx)` and computes `J_f(x) dx`.
+    pub(crate) fn build_jvp(&self, input_idx: usize) -> MoraResult<Self> {
+        if input_idx >= self.input_specs.len() {
+            return Err(MoraError::Runtime(format!(
+                "ComputeDag.jvp: input index {input_idx} out of bounds (graph has {} input(s))",
+                self.input_specs.len()
+            )));
+        }
+        let prim = self.unfuse_to_primitives()?;
+        let n_fwd = prim.nodes.len();
+        let mut b = DagIrBuilder::from_nodes(prim.nodes.clone());
+        let mut new_input_specs = prim.input_specs.clone();
+        let (tan_sh, tan_dt, tan_dev) = prim.input_specs[input_idx].clone();
+        let tan_slot = new_input_specs.len();
+        new_input_specs.push((tan_sh.clone(), tan_dt, tan_dev.clone()));
+        let dx_node = b.push(DagOp::Input(tan_slot), tan_sh, tan_dt, tan_dev);
+
+        let mut tan: Vec<Option<usize>> = vec![None; n_fwd];
+        for (idx, node) in prim.nodes.iter().enumerate() {
+            let y_sh = &node.shape;
+            tan[idx] = match &node.op {
+                DagOp::Input(s) => {
+                    if *s == input_idx {
+                        Some(dx_node)
+                    } else {
+                        None
+                    }
+                }
+                DagOp::ConstTensor(_) | DagOp::StepPos(_) | DagOp::Sign(_) => None,
+                DagOp::Identity(a) => tan[*a],
+                DagOp::Reshape(a, sh) => tan[*a].map(|ta| b.reshape(ta, sh.clone())),
+                DagOp::Transpose(a, d0, d1) => tan[*a].map(|ta| b.transpose(ta, *d0, *d1)),
+                DagOp::Add(a, rhs) => match (tan[*a], tan[*rhs]) {
+                    (Some(ta), Some(tb)) => Some(b.add(ta, tb)?),
+                    (Some(ta), None) => Some(b.broadcast_to_shape(ta, y_sh)?),
+                    (None, Some(tb)) => Some(b.broadcast_to_shape(tb, y_sh)?),
+                    (None, None) => None,
+                },
+                DagOp::Sub(a, rhs) => match (tan[*a], tan[*rhs]) {
+                    (Some(ta), Some(tb)) => Some(b.sub(ta, tb)?),
+                    (Some(ta), None) => Some(b.broadcast_to_shape(ta, y_sh)?),
+                    (None, Some(tb)) => {
+                        let nb = b.unary(DagOp::Neg(tb), tb);
+                        Some(b.broadcast_to_shape(nb, y_sh)?)
+                    }
+                    (None, None) => None,
+                },
+                DagOp::Mul(a, rhs) => {
+                    let t1 = match tan[*a] {
+                        Some(ta) => Some(b.mul(ta, *rhs)?),
+                        None => None,
+                    };
+                    let t2 = match tan[*rhs] {
+                        Some(tb) => Some(b.mul(*a, tb)?),
+                        None => None,
+                    };
+                    match (t1, t2) {
+                        (Some(x), Some(y)) => Some(b.add(x, y)?),
+                        (Some(x), None) | (None, Some(x)) => Some(x),
+                        (None, None) => None,
+                    }
+                }
+                DagOp::Div(a, rhs) => {
+                    let t1 = match tan[*a] {
+                        Some(ta) => Some(b.div(ta, *rhs)?),
+                        None => None,
+                    };
+                    let t2 = match tan[*rhs] {
+                        Some(tb) => {
+                            let num = b.mul(*a, tb)?;
+                            let den = b.mul(*rhs, *rhs)?;
+                            Some(b.div(num, den)?)
+                        }
+                        None => None,
+                    };
+                    match (t1, t2) {
+                        (Some(x), Some(y)) => Some(b.sub(x, y)?),
+                        (Some(x), None) => Some(x),
+                        (None, Some(y)) => Some(b.unary(DagOp::Neg(y), y)),
+                        (None, None) => None,
+                    }
+                }
+                DagOp::Pow(a, rhs) => {
+                    let t1 = match tan[*a] {
+                        Some(ta) => {
+                            let bm1 = b.unary(DagOp::SubScalar(*rhs, 1.0, false), *rhs);
+                            let pow_bm1 = b.pow(*a, bm1)?;
+                            let factor = b.mul(*rhs, pow_bm1)?;
+                            Some(b.mul(ta, factor)?)
+                        }
+                        None => None,
+                    };
+                    let t2 = match tan[*rhs] {
+                        Some(tb) => {
+                            let lna = b.unary(DagOp::Ln(*a), *a);
+                            let ylna = b.mul(idx, lna)?;
+                            Some(b.mul(tb, ylna)?)
+                        }
+                        None => None,
+                    };
+                    match (t1, t2) {
+                        (Some(x), Some(y)) => Some(b.add(x, y)?),
+                        (Some(x), None) | (None, Some(x)) => Some(x),
+                        (None, None) => None,
+                    }
+                }
+                DagOp::AddScalar(a, _) => tan[*a],
+                DagOp::SubScalar(a, _, rev) => tan[*a].map(|ta| {
+                    if *rev {
+                        b.unary(DagOp::Neg(ta), ta)
+                    } else {
+                        ta
+                    }
+                }),
+                DagOp::MulScalar(a, c) => tan[*a].map(|ta| b.unary(DagOp::MulScalar(ta, *c), ta)),
+                DagOp::DivScalar(a, c, rev) => match tan[*a] {
+                    None => None,
+                    Some(ta) if !rev => Some(b.unary(DagOp::DivScalar(ta, *c, false), ta)),
+                    Some(ta) => {
+                        let a2 = b.mul(*a, *a)?;
+                        let frac = b.div(ta, a2)?;
+                        Some(b.unary(DagOp::MulScalar(frac, -*c), frac))
+                    }
+                },
+                DagOp::PowScalar(a, c, rev) => match tan[*a] {
+                    None => None,
+                    Some(ta) if !rev => {
+                        if *c == 1.0 {
+                            Some(ta)
+                        } else if *c == 2.0 {
+                            let two_a = b.unary(DagOp::MulScalar(*a, 2.0), *a);
+                            Some(b.mul(ta, two_a)?)
+                        } else if *c == 0.0 {
+                            None
+                        } else {
+                            let p = b.unary(DagOp::PowScalar(*a, *c - 1.0, false), *a);
+                            let cp = b.unary(DagOp::MulScalar(p, *c), p);
+                            Some(b.mul(ta, cp)?)
+                        }
+                    }
+                    Some(ta) => {
+                        if *c > 0.0 {
+                            let scaled = b.unary(DagOp::MulScalar(idx, c.ln()), idx);
+                            Some(b.mul(ta, scaled)?)
+                        } else {
+                            None
+                        }
+                    }
+                },
+                DagOp::Neg(a) => tan[*a].map(|ta| b.unary(DagOp::Neg(ta), ta)),
+                DagOp::Exp(a) => match tan[*a] {
+                    Some(ta) => Some(b.mul(ta, idx)?),
+                    None => None,
+                },
+                DagOp::Ln(a) => match tan[*a] {
+                    Some(ta) => Some(b.div(ta, *a)?),
+                    None => None,
+                },
+                DagOp::Sqrt(a) => match tan[*a] {
+                    Some(ta) => {
+                        let two_y = b.unary(DagOp::MulScalar(idx, 2.0), idx);
+                        Some(b.div(ta, two_y)?)
+                    }
+                    None => None,
+                },
+                DagOp::Sin(a) => match tan[*a] {
+                    Some(ta) => {
+                        let ca = b.unary(DagOp::Cos(*a), *a);
+                        Some(b.mul(ta, ca)?)
+                    }
+                    None => None,
+                },
+                DagOp::Cos(a) => match tan[*a] {
+                    Some(ta) => {
+                        let sa = b.unary(DagOp::Sin(*a), *a);
+                        let p = b.mul(ta, sa)?;
+                        Some(b.unary(DagOp::Neg(p), p))
+                    }
+                    None => None,
+                },
+                DagOp::Tanh(a) => match tan[*a] {
+                    Some(ta) => {
+                        let y2 = b.mul(idx, idx)?;
+                        let sech2 = b.unary(DagOp::SubScalar(y2, 1.0, true), y2);
+                        Some(b.mul(ta, sech2)?)
+                    }
+                    None => None,
+                },
+                DagOp::Sigmoid(a) => match tan[*a] {
+                    Some(ta) => {
+                        let oms = b.unary(DagOp::SubScalar(idx, 1.0, true), idx);
+                        let d = b.mul(idx, oms)?;
+                        Some(b.mul(ta, d)?)
+                    }
+                    None => None,
+                },
+                DagOp::Silu(a) => match tan[*a] {
+                    Some(ta) => {
+                        let d = b.silu_derivative(*a, idx)?;
+                        Some(b.mul(ta, d)?)
+                    }
+                    None => None,
+                },
+                DagOp::Gelu(a) => match tan[*a] {
+                    Some(ta) => {
+                        let d = b.gelu_derivative(*a)?;
+                        Some(b.mul(ta, d)?)
+                    }
+                    None => None,
+                },
+                DagOp::Relu(a) => match tan[*a] {
+                    Some(ta) => {
+                        let m = b.unary(DagOp::StepPos(*a), *a);
+                        Some(b.mul(ta, m)?)
+                    }
+                    None => None,
+                },
+                DagOp::Abs(a) => match tan[*a] {
+                    Some(ta) => {
+                        let s = b.unary(DagOp::Sign(*a), *a);
+                        Some(b.mul(ta, s)?)
+                    }
+                    None => None,
+                },
+                DagOp::MatMul(a, rhs) => {
+                    let t1 = match tan[*a] {
+                        Some(ta) => Some(b.matmul(ta, *rhs)?),
+                        None => None,
+                    };
+                    let t2 = match tan[*rhs] {
+                        Some(tb) => Some(b.matmul(*a, tb)?),
+                        None => None,
+                    };
+                    match (t1, t2) {
+                        (Some(x), Some(y)) => Some(b.add(x, y)?),
+                        (Some(x), None) | (None, Some(x)) => Some(x),
+                        (None, None) => None,
+                    }
+                }
+                DagOp::Sum(a) => tan[*a]
+                    .map(|ta| b.push(DagOp::Sum(ta), Vec::new(), node.dtype, node.device.clone())),
+                DagOp::Mean(a) => tan[*a]
+                    .map(|ta| b.push(DagOp::Mean(ta), Vec::new(), node.dtype, node.device.clone())),
+                DagOp::SumAxis(a, ax, kd) => tan[*a].map(|ta| b.sum_axis(ta, *ax, *kd)),
+                DagOp::Gather(a, idxs) => tan[*a].map(|ta| {
+                    b.push(
+                        DagOp::Gather(ta, idxs.clone()),
+                        y_sh.clone(),
+                        node.dtype,
+                        node.device.clone(),
+                    )
+                }),
+                DagOp::ScatterAdd(a, out_n, idxs) => tan[*a].map(|ta| {
+                    b.push(
+                        DagOp::ScatterAdd(ta, *out_n, idxs.clone()),
+                        y_sh.clone(),
+                        node.dtype,
+                        node.device.clone(),
+                    )
+                }),
+                DagOp::Softmax(a) => match tan[*a] {
+                    None => None,
+                    Some(ta) => {
+                        let rank = y_sh.len();
+                        let last_ax = rank.saturating_sub(1);
+                        let yta = b.mul(idx, ta)?;
+                        let dot = if rank == 0 {
+                            yta
+                        } else {
+                            b.sum_axis(yta, last_ax, true)
+                        };
+                        let diff = b.sub(ta, dot)?;
+                        Some(b.mul(idx, diff)?)
+                    }
+                },
+                DagOp::RmsNorm(a, eps) => match tan[*a] {
+                    None => None,
+                    Some(ta) => {
+                        let sa = b.shape(*a);
+                        let rank = sa.len();
+                        let last_ax = rank.saturating_sub(1);
+                        let d = sa.last().copied().unwrap_or(1).max(1) as f64;
+                        let a2 = b.mul(*a, *a)?;
+                        let sum_sq = if rank == 0 {
+                            a2
+                        } else {
+                            b.sum_axis(a2, last_ax, true)
+                        };
+                        let ms = b.unary(DagOp::MulScalar(sum_sq, 1.0 / d), sum_sq);
+                        let ms_eps = b.unary(DagOp::AddScalar(ms, *eps), ms);
+                        let rms = b.unary(DagOp::Sqrt(ms_eps), ms_eps);
+                        let inv_rms = b.unary(DagOp::DivScalar(rms, 1.0, true), rms);
+                        let yta = b.mul(idx, ta)?;
+                        let dot = if rank == 0 {
+                            yta
+                        } else {
+                            b.sum_axis(yta, last_ax, true)
+                        };
+                        let mean_yta = b.unary(DagOp::MulScalar(dot, 1.0 / d), dot);
+                        let proj = b.mul(idx, mean_yta)?;
+                        let diff = b.sub(ta, proj)?;
+                        Some(b.mul(inv_rms, diff)?)
+                    }
+                },
+                DagOp::LayerNorm(a, eps) => match tan[*a] {
+                    None => None,
+                    Some(ta) => {
+                        let sa = b.shape(*a);
+                        let rank = sa.len();
+                        let last_ax = rank.saturating_sub(1);
+                        let d = sa.last().copied().unwrap_or(1).max(1) as f64;
+                        let sum_a = if rank == 0 {
+                            *a
+                        } else {
+                            b.sum_axis(*a, last_ax, true)
+                        };
+                        let mean = b.unary(DagOp::MulScalar(sum_a, 1.0 / d), sum_a);
+                        let centered = b.sub(*a, mean)?;
+                        let c2 = b.mul(centered, centered)?;
+                        let sum_c2 = if rank == 0 {
+                            c2
+                        } else {
+                            b.sum_axis(c2, last_ax, true)
+                        };
+                        let var = b.unary(DagOp::MulScalar(sum_c2, 1.0 / d), sum_c2);
+                        let var_eps = b.unary(DagOp::AddScalar(var, *eps), var);
+                        let std = b.unary(DagOp::Sqrt(var_eps), var_eps);
+                        let inv_std = b.unary(DagOp::DivScalar(std, 1.0, true), std);
+                        let sum_ta = if rank == 0 {
+                            ta
+                        } else {
+                            b.sum_axis(ta, last_ax, true)
+                        };
+                        let mean_ta = b.unary(DagOp::MulScalar(sum_ta, 1.0 / d), sum_ta);
+                        let yta = b.mul(idx, ta)?;
+                        let sum_yta = if rank == 0 {
+                            yta
+                        } else {
+                            b.sum_axis(yta, last_ax, true)
+                        };
+                        let mean_yta = b.unary(DagOp::MulScalar(sum_yta, 1.0 / d), sum_yta);
+                        let ta_c = b.sub(ta, mean_ta)?;
+                        let proj = b.mul(idx, mean_yta)?;
+                        let diff = b.sub(ta_c, proj)?;
+                        Some(b.mul(inv_std, diff)?)
+                    }
+                },
+                DagOp::FusedLinearAct { .. }
+                | DagOp::FusedRmsNormLinear { .. }
+                | DagOp::FusedFlashAttention { .. }
+                | DagOp::FusedElementwise { .. } => {
+                    unreachable!("unfuse_to_primitives removes all fused nodes")
+                }
+            };
+        }
+
+        let raw_out = match tan[prim.output] {
+            Some(id) => id,
+            None => {
+                let out_n = &prim.nodes[prim.output];
+                b.const_filled(0.0, &out_n.shape, out_n.dtype, &out_n.device)?
+            }
+        };
+        let (nodes, output) = compact_live_nodes(b.nodes, raw_out);
+        Ok(Self {
+            input_specs: new_input_specs,
+            nodes,
+            output,
+            fused: false,
+            algebraic_rewrites: 0,
+            compiled_plan: None,
+        })
     }
 }

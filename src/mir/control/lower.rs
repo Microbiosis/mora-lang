@@ -2207,9 +2207,15 @@ fn lower_expr_single(
             Ok(FlowState::Active(stack.current_mut().emit_nil()))
         }
 
-        WitnessKind::KernelDef { name, params, body } => {
-            let kprog =
-                crate::runtime::gpu::kernel_compiler::lower_witness_kernel(name, params, body)?;
+        WitnessKind::KernelDef {
+            name,
+            params,
+            shared,
+            body,
+        } => {
+            let kprog = crate::runtime::gpu::kernel_compiler::lower_witness_kernel(
+                name, params, shared, body,
+            )?;
             let sym = prog.intern(name);
             let slot = if stack.current_mut().kind == FunctionKind::Main {
                 Some(prog.alloc_global(name, GlobalKind::Kernel))

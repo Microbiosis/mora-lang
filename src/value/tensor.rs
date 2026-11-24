@@ -873,6 +873,39 @@ impl Tensor {
         Ok(())
     }
 
+    /// P5-1B: Copy the exact hardware-packed contiguous little-endian bytes of a zero-offset tensor.
+    pub(crate) fn copy_contiguous_raw_bytes(&self) -> MoraResult<Vec<u8>> {
+        if !self.is_contiguous() || self.offset != 0 {
+            return Err(MoraError::Runtime(
+                "copy_contiguous_raw_bytes requires a contiguous zero-offset Tensor".to_string(),
+            ));
+        }
+        let guard = self.storage.read_host();
+        Ok(guard.copy_bytes_out())
+    }
+
+    /// P5-1B: Overwrite a contiguous zero-offset tensor's storage from raw little-endian bytes
+    /// (supporting `f16`/`bf16`/`u8`/`i32`/`f32`/`f64` buffers from CPU kernel execution).
+    pub(crate) fn overwrite_contiguous_raw(
+        &self,
+        raw: &[u8],
+        expected_dtype: DType,
+    ) -> MoraResult<()> {
+        if self.dtype != expected_dtype || !self.is_contiguous() || self.offset != 0 {
+            return Err(MoraError::Runtime(format!(
+                "overwrite_contiguous_raw requires a contiguous zero-offset {} Tensor",
+                expected_dtype.canonical_type_name()
+            )));
+        }
+        let next = AlignedByteBuffer::from_raw_bytes(raw, self.numel(), expected_dtype)?;
+        {
+            let mut guard = self.storage.write_host();
+            *guard = next;
+        }
+        self.storage.sync_host_to_vram();
+        Ok(())
+    }
+
     /// Construct a contiguous compact tensor losslessly from `Value`s.
     pub fn from_values(
         values: &[Value],

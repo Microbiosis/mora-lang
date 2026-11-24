@@ -905,6 +905,15 @@ impl ScalarValue {
                         "operator '@' is not defined for scalar dtype '{dt}'"
                     )));
                 }
+                BinaryOp::BitAnd
+                | BinaryOp::BitOr
+                | BinaryOp::BitXor
+                | BinaryOp::Shl
+                | BinaryOp::Shr => {
+                    return Err(MoraError::Runtime(format!(
+                        "bitwise operator '{op:?}' is not defined for floating-point dtype '{dt}'"
+                    )));
+                }
             };
             let scalar = Self::from_f64_quantized(out, dt).ok_or_else(|| {
                 MoraError::Runtime(format!("cannot quantize scalar result to '{dt}'"))
@@ -972,6 +981,17 @@ impl ScalarValue {
                     MoraError::Runtime(format!("integer overflow in '{dt}' power"))
                 })?
             }
+            BinaryOp::BitAnd => (a & b) as i128,
+            BinaryOp::BitOr => (a | b) as i128,
+            BinaryOp::BitXor => (a ^ b) as i128,
+            BinaryOp::Shl => {
+                let shift = (b as u32) & 63;
+                a.wrapping_shl(shift) as i128
+            }
+            BinaryOp::Shr => {
+                let shift = (b as u32) & 63;
+                a.wrapping_shr(shift) as i128
+            }
             _ => unreachable!(),
         };
 
@@ -1023,6 +1043,15 @@ fn eval_u64_binary(op: &BinaryOp, a: u64, b: u64) -> MoraResult<ScalarBinaryOut>
         BinaryOp::MatMul => Err(MoraError::Runtime(
             "operator '@' is not defined for scalar dtype 'u64'".to_string(),
         )),
+        BinaryOp::BitAnd => Ok(ScalarBinaryOut::Scalar(ScalarValue::U64(a & b))),
+        BinaryOp::BitOr => Ok(ScalarBinaryOut::Scalar(ScalarValue::U64(a | b))),
+        BinaryOp::BitXor => Ok(ScalarBinaryOut::Scalar(ScalarValue::U64(a ^ b))),
+        BinaryOp::Shl => Ok(ScalarBinaryOut::Scalar(ScalarValue::U64(
+            a.wrapping_shl((b as u32) & 63),
+        ))),
+        BinaryOp::Shr => Ok(ScalarBinaryOut::Scalar(ScalarValue::U64(
+            a.wrapping_shr((b as u32) & 63),
+        ))),
     }
 }
 

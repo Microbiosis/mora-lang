@@ -727,6 +727,33 @@ impl HMInference {
                 }
                 Ok((Type::Bool, merged_row))
             }
+            BitAnd | BitOr | BitXor | Shl | Shr => {
+                if matches!(left_ty, Type::Scalar(dt) if dt.is_int())
+                    || matches!(right_ty, Type::Scalar(dt) if dt.is_int())
+                {
+                    let out_ty = self.infer_scalar_binary_op(&left_ty, &right_ty, false, span)?;
+                    return Ok((out_ty, merged_row));
+                }
+                for operand in [&left_ty, &right_ty] {
+                    if !matches!(
+                        operand,
+                        Type::Int | Type::Any | Type::TypeVar(TypeVarId::Meta(_))
+                    ) {
+                        return Err(vec![TypeError::UnificationFailure {
+                            expected: "int".to_string(),
+                            got: operand.name(),
+                            span: Some(span),
+                        }]);
+                    }
+                    if matches!(operand, Type::TypeVar(TypeVarId::Meta(_))) {
+                        self.constraints.push(SpannedConstraint::new(
+                            Constraint::Eq(Box::new((*operand).clone()), Box::new(Type::Int)),
+                            span,
+                        ));
+                    }
+                }
+                Ok((Type::Int, merged_row))
+            }
         }
     }
 

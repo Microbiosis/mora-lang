@@ -200,6 +200,15 @@ pub fn eval_binary_tracked(
                     return numeric::eval_order(op, &ls, &rs);
                 }
             }
+            BinaryOp::BitAnd
+            | BinaryOp::BitOr
+            | BinaryOp::BitXor
+            | BinaryOp::Shl
+            | BinaryOp::Shr => {
+                return Err(MoraError::Runtime(format!(
+                    "Bitwise operator '{op:?}' is not defined on Tensor operands directly (use a GPU kernel or scalar int)"
+                )));
+            }
         }
     }
     if matches!(&left, Value::Scalar(_)) || matches!(&right, Value::Scalar(_)) {
@@ -339,6 +348,26 @@ pub fn eval_binary_tracked(
         // （f64 舍入导致），正是自洽性被破坏的表现。
         BinaryOp::Greater | BinaryOp::Less | BinaryOp::GreaterEqual | BinaryOp::LessEqual => {
             numeric::eval_order(op, &left, &right)
+        }
+        BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor | BinaryOp::Shl | BinaryOp::Shr => {
+            match (&left, &right) {
+                (Value::Int(a), Value::Int(b)) => {
+                    let res = match op {
+                        BinaryOp::BitAnd => a & b,
+                        BinaryOp::BitOr => a | b,
+                        BinaryOp::BitXor => a ^ b,
+                        BinaryOp::Shl => a.wrapping_shl((*b as u32) & 63),
+                        BinaryOp::Shr => a.wrapping_shr((*b as u32) & 63),
+                        _ => unreachable!(),
+                    };
+                    Ok(Value::Int(res))
+                }
+                _ => Err(MoraError::Runtime(format!(
+                    "Bitwise operator '{op:?}' requires integer operands, got {} and {}",
+                    type_name(&left),
+                    type_name(&right)
+                ))),
+            }
         }
     }
 }

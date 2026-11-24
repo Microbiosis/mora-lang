@@ -3006,16 +3006,14 @@ fn resolve_gpu_kernel_method(
         "emit_ptx" => Ok(CallAction::Done(Value::String(kernel.emit_ptx()))),
         "emit_msl" => Ok(CallAction::Done(Value::String(kernel.emit_msl()))),
         "emit_spirv_words" => {
-            let local_size_x = match args.first() {
-                None => 64u32,
-                Some(Value::Int(n)) if *n > 0 => *n as u32,
-                Some(other) => {
-                    return Err(MoraError::Runtime(format!(
-                        "gpu_kernel.emit_spirv_words: local_size_x must be positive int, got {other}"
-                    )));
-                }
+            let local_size = match args.first() {
+                None => [64u32, 1, 1],
+                Some(v) => parse_kernel_dim3(
+                    v,
+                    &format!("gpu_kernel '{}'.emit_spirv_words local_size", kernel.name()),
+                )?,
             };
-            let words = kernel.emit_spirv_words(local_size_x)?;
+            let words = kernel.emit_spirv_words(local_size)?;
             Ok(CallAction::Done(Value::List(
                 words
                     .into_iter()
@@ -3031,24 +3029,14 @@ fn resolve_gpu_kernel_method(
                     args.len()
                 )));
             }
-            let grid = match &args[0] {
-                Value::Int(n) if *n > 0 => *n as u32,
-                other => {
-                    return Err(MoraError::Runtime(format!(
-                        "gpu_kernel '{}'.launch: grid must be a positive int, got {other}",
-                        kernel.name()
-                    )));
-                }
-            };
-            let block = match &args[1] {
-                Value::Int(n) if *n > 0 => *n as u32,
-                other => {
-                    return Err(MoraError::Runtime(format!(
-                        "gpu_kernel '{}'.launch: block must be a positive int, got {other}",
-                        kernel.name()
-                    )));
-                }
-            };
+            let grid = parse_kernel_dim3(
+                &args[0],
+                &format!("gpu_kernel '{}'.launch grid", kernel.name()),
+            )?;
+            let block = parse_kernel_dim3(
+                &args[1],
+                &format!("gpu_kernel '{}'.launch block", kernel.name()),
+            )?;
             crate::runtime::gpu::kernel_compiler::launch_compiled_kernel(
                 kernel,
                 grid,
@@ -3060,6 +3048,29 @@ fn resolve_gpu_kernel_method(
         other => Err(MoraError::Runtime(format!(
             "GpuKernel '{}' has no method '{other}'",
             kernel.name()
+        ))),
+    }
+}
+
+fn parse_kernel_dim3(val: &Value, ctx: &str) -> MoraResult<[u32; 3]> {
+    match val {
+        Value::Int(n) if *n > 0 && *n <= i64::from(u32::MAX) => Ok([*n as u32, 1, 1]),
+        Value::List(items) if !items.is_empty() && items.len() <= 3 => {
+            let mut dims = [1u32; 3];
+            for (i, item) in items.iter().enumerate() {
+                match item {
+                    Value::Int(n) if *n > 0 && *n <= i64::from(u32::MAX) => dims[i] = *n as u32,
+                    other => {
+                        return Err(MoraError::Runtime(format!(
+                            "{ctx}: dimension[{i}] must be a positive int, got {other}"
+                        )));
+                    }
+                }
+            }
+            Ok(dims)
+        }
+        other => Err(MoraError::Runtime(format!(
+            "{ctx}: expected positive int or 1D..3D list<int>, got {other}"
         ))),
     }
 }

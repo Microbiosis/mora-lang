@@ -67,7 +67,9 @@ pub enum TokenType {
     Less,
     GreaterEqual,
     LessEqual,
-    Pipe, // `|>` pipeline operator
+    Shl,   // `<<` bitwise shift left
+    Caret, // `^` bitwise XOR
+    Pipe,  // `|>` pipeline operator
     // v0.85: standalone `|` — used for union type annotations (`string | number`).
     // `|` alone = Or; `|>` = Pipe. Distinct tokens to avoid ambiguity.
     Or,
@@ -105,8 +107,9 @@ pub enum TokenType {
     DotDotDot, // v0.16: '...' for list rest pattern
     Comma,
     Colon,
-    Amp,              // v0.21: '&' 借用
-    AmpMut,           // v0.21: '&mut' 可变借用
+    Semicolon, // `;` fixed-size array / shared memory length separator (`[f32; 256]`)
+    Amp,       // v0.21: '&' 借用 / bitwise AND
+    AmpMut,    // v0.21: '&mut' 可变借用
     Lifetime(String), // v0.21: 'a 生命周期标注
     /// v0.104.6 D202：`--` 行注释的**正文**（不含 `--`）。
     ///
@@ -397,10 +400,14 @@ impl Lexer {
             '<' => {
                 if self.match_char('=') {
                     Self::simple_token(TokenType::LessEqual, start_line, start_col)
+                } else if self.match_char('<') {
+                    Self::simple_token(TokenType::Shl, start_line, start_col)
                 } else {
                     Self::simple_token(TokenType::Less, start_line, start_col)
                 }
             }
+            '^' => Self::simple_token(TokenType::Caret, start_line, start_col),
+            ';' => Self::simple_token(TokenType::Semicolon, start_line, start_col),
             '=' => {
                 if self.match_char('=') {
                     Self::simple_token(TokenType::Equal, start_line, start_col)
@@ -422,15 +429,23 @@ impl Lexer {
             }
             // v0.06.2: ? 操作符
             '?' => Self::simple_token(TokenType::Question, start_line, start_col),
-            // v0.21: & 借用操作符
+            // v0.21: & 借用 / bitwise AND 操作符
             '&' => {
-                if self.match_char('m') && self.peek() == 'u' {
-                    // '&mut' 可变借用
-                    self.advance(); // consume 'u'
-                    self.advance(); // consume 't'
+                let is_mut = self.current + 2 < self.source.len()
+                    && self.source[self.current] == 'm'
+                    && self.source[self.current + 1] == 'u'
+                    && self.source[self.current + 2] == 't'
+                    && self
+                        .source
+                        .get(self.current + 3)
+                        .map(|c| !c.is_ascii_alphanumeric() && *c != '_')
+                        .unwrap_or(true);
+                if is_mut {
+                    self.advance(); // 'm'
+                    self.advance(); // 'u'
+                    self.advance(); // 't'
                     Self::simple_token(TokenType::AmpMut, start_line, start_col)
                 } else {
-                    // '&' 不可变借用
                     Self::simple_token(TokenType::Amp, start_line, start_col)
                 }
             }

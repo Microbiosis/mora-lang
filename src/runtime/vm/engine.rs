@@ -1812,6 +1812,15 @@ impl<'a> VmEngine<'a> {
                             BinaryOp::LessEqual => Ok(Some(RegSlot::Bool(a <= b))),
                             BinaryOp::Greater => Ok(Some(RegSlot::Bool(a > b))),
                             BinaryOp::GreaterEqual => Ok(Some(RegSlot::Bool(a >= b))),
+                            BinaryOp::BitAnd => Ok(Some(RegSlot::Int(a & b))),
+                            BinaryOp::BitOr => Ok(Some(RegSlot::Int(a | b))),
+                            BinaryOp::BitXor => Ok(Some(RegSlot::Int(a ^ b))),
+                            BinaryOp::Shl => {
+                                Ok(Some(RegSlot::Int(a.wrapping_shl((b as u32) & 63))))
+                            }
+                            BinaryOp::Shr => {
+                                Ok(Some(RegSlot::Int(a.wrapping_shr((b as u32) & 63))))
+                            }
                             _ => Ok(None),
                         };
                         match fast {

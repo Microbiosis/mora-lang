@@ -2620,8 +2620,8 @@ mod macos_impl {
         fn launch_custom_kernel(
             &self,
             kernel: &KernelProgram,
-            grid: u32,
-            block: u32,
+            grid: [u32; 3],
+            block: [u32; 3],
             args: &[KernelLaunchArg],
         ) -> MoraResult<bool> {
             // Metal Shading Language does not support 64-bit IEEE float compute buffers;
@@ -2693,14 +2693,14 @@ mod macos_impl {
                     buffers.push(h_scalars);
                 }
                 let total_grid = MtlSize {
-                    width: (grid.max(1) as usize).saturating_mul(block.max(1) as usize),
-                    height: 1,
-                    depth: 1,
+                    width: (grid[0].max(1) as usize).saturating_mul(block[0].max(1) as usize),
+                    height: (grid[1].max(1) as usize).saturating_mul(block[1].max(1) as usize),
+                    depth: (grid[2].max(1) as usize).saturating_mul(block[2].max(1) as usize),
                 };
                 let tg = MtlSize {
-                    width: block.max(1) as usize,
-                    height: 1,
-                    depth: 1,
+                    width: block[0].max(1) as usize,
+                    height: block[1].max(1) as usize,
+                    depth: block[2].max(1) as usize,
                 };
                 Self::dispatch_compute(
                     &self.inner.objc,
@@ -2923,6 +2923,7 @@ mod tests {
                     ty: KernelParamType::I32,
                 },
             ],
+            shared: Vec::new(),
             body: Vec::new(),
         };
         let msl = emit_msl(&prog);

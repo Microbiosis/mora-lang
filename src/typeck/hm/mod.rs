@@ -2322,9 +2322,12 @@ impl HMInference {
                 methods,
                 expr.span,
             ),
-            WitnessKind::KernelDef { name, params, body } => {
-                self.infer_kernel_def(name, params, body, expr.span)
-            }
+            WitnessKind::KernelDef {
+                name,
+                params,
+                shared,
+                body,
+            } => self.infer_kernel_def(name, params, shared, body, expr.span),
             WitnessKind::MacroDef { name, params, body } => {
                 self.infer_macro_def(name, params, body.as_ref(), expr.span)
             }

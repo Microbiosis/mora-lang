@@ -633,6 +633,11 @@ fn write_binary_op(w: &mut ByteWriter, op: BinaryOp) {
         BinaryOp::Less => 10,
         BinaryOp::GreaterEqual => 11,
         BinaryOp::LessEqual => 12,
+        BinaryOp::BitAnd => 13,
+        BinaryOp::BitOr => 14,
+        BinaryOp::BitXor => 15,
+        BinaryOp::Shl => 16,
+        BinaryOp::Shr => 17,
     };
     w.write_u8(tag);
 }
@@ -652,6 +657,11 @@ fn read_binary_op(r: &mut ByteReader<'_>) -> MoraResult<BinaryOp> {
         10 => BinaryOp::Less,
         11 => BinaryOp::GreaterEqual,
         12 => BinaryOp::LessEqual,
+        13 => BinaryOp::BitAnd,
+        14 => BinaryOp::BitOr,
+        15 => BinaryOp::BitXor,
+        16 => BinaryOp::Shl,
+        17 => BinaryOp::Shr,
         other => return Err(corrupt(format!("invalid BinaryOp tag {other}"))),
     })
 }

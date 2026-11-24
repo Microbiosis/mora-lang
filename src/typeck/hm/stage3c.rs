@@ -3065,11 +3065,12 @@ impl HMInference {
         &mut self,
         name: &str,
         params: &[crate::common::kernel_ir::KernelParam],
+        shared: &[crate::common::kernel_ir::KernelSharedArray],
         body: &[MirWitness],
         span: Span,
     ) -> Result<(Type, EffectRow), Vec<TypeError>> {
         if let Err(err) =
-            crate::runtime::gpu::kernel_compiler::lower_witness_kernel(name, params, body)
+            crate::runtime::gpu::kernel_compiler::lower_witness_kernel(name, params, shared, body)
         {
             self.errors.push(TypeError::UnificationFailure {
                 expected: format!("valid GPU kernel definition '{name}'"),
@@ -3138,12 +3139,16 @@ impl HMInference {
                     let (t, r) = self.infer_recover(a);
                     acc_row = self.merge_rows(acc_row, r, a.span);
                     if !matches!(t, Type::Error) {
+                        let dim_ty = Type::Union(vec![Type::Int, Type::List(Box::new(Type::Int))]);
                         let c = SpannedConstraint::new(
                             Constraint::Subtype {
                                 sub: Box::new(t),
-                                sup: Box::new(Type::Int),
+                                sup: Box::new(dim_ty),
                             },
                             a.span,
+                        )
+                        .with_hint(
+                            "gpu_kernel.emit_spirv_words local_size must be int or list<int>",
                         );
                         match unify::solve_spanned(&c, &self.subst) {
                             Ok(s) => self.subst = s,
@@ -3161,7 +3166,8 @@ impl HMInference {
                         span,
                     }]);
                 }
-                // Check grid & block are `int`.
+                // Check grid & block are `int` or `list<int>` (1D/2D/3D dimensions).
+                let dim_ty = Type::Union(vec![Type::Int, Type::List(Box::new(Type::Int))]);
                 for (label, arg) in [("grid", &args[0]), ("block", &args[1])] {
                     let (t, r) = self.infer_recover(arg);
                     acc_row = self.merge_rows(acc_row, r, arg.span);
@@ -3169,11 +3175,13 @@ impl HMInference {
                         let c = SpannedConstraint::new(
                             Constraint::Subtype {
                                 sub: Box::new(t),
-                                sup: Box::new(Type::Int),
+                                sup: Box::new(dim_ty.clone()),
                             },
                             arg.span,
                         )
-                        .with_hint(format!("kernel.launch '{label}' dimension must be int"));
+                        .with_hint(format!(
+                            "kernel.launch '{label}' dimension must be int or list<int>"
+                        ));
                         match unify::solve_spanned(&c, &self.subst) {
                             Ok(s) => self.subst = s,
                             Err(e) => self.errors.push(e),
@@ -3205,6 +3213,26 @@ impl HMInference {
                             },
                             KernelParamType::BufF64 => Type::Tensor {
                                 dtype: Box::new(Type::Float),
+                                shape: ShapeType::Unranked(None),
+                                device: unified_dev.clone(),
+                            },
+                            KernelParamType::BufF16 => Type::Tensor {
+                                dtype: Box::new(Type::Scalar(crate::common::DType::F16)),
+                                shape: ShapeType::Unranked(None),
+                                device: unified_dev.clone(),
+                            },
+                            KernelParamType::BufBF16 => Type::Tensor {
+                                dtype: Box::new(Type::Scalar(crate::common::DType::BF16)),
+                                shape: ShapeType::Unranked(None),
+                                device: unified_dev.clone(),
+                            },
+                            KernelParamType::BufU8 => Type::Tensor {
+                                dtype: Box::new(Type::Scalar(crate::common::DType::U8)),
+                                shape: ShapeType::Unranked(None),
+                                device: unified_dev.clone(),
+                            },
+                            KernelParamType::BufI32 => Type::Tensor {
+                                dtype: Box::new(Type::Scalar(crate::common::DType::I32)),
                                 shape: ShapeType::Unranked(None),
                                 device: unified_dev.clone(),
                             },

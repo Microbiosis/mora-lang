@@ -139,10 +139,11 @@ pub enum WitnessKind {
         target_generics: Vec<crate::mir::hint::TypeHint>,
         methods: Vec<WitnessImplMethod>,
     },
-    /// P4-1B: First-class source-level GPU compute `kernel name(params...) ... end` declaration.
+    /// P4-1B / P5-1B: First-class source-level GPU compute `kernel name(params...) ... end` declaration.
     KernelDef {
         name: String,
         params: Vec<crate::common::kernel_ir::KernelParam>,
+        shared: Vec<crate::common::kernel_ir::KernelSharedArray>,
         body: Vec<MirWitness>,
     },
     /// Wave 3 Stage 3C: Multi-dimensional zero-copy tensor slicing (`t[0..4, :, -1]`, `t[..., None]`).

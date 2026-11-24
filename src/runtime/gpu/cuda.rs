@@ -4171,8 +4171,8 @@ impl DeviceBackend for CudaDeviceBackend {
     fn launch_custom_kernel(
         &self,
         kernel: &crate::common::kernel_ir::KernelProgram,
-        grid: u32,
-        block: u32,
+        grid: [u32; 3],
+        block: [u32; 3],
         args: &[crate::runtime::gpu::kernel_compiler::KernelLaunchArg],
     ) -> MoraResult<bool> {
         use crate::runtime::gpu::kernel_compiler::{KernelLaunchArg, emit_ptx};
@@ -4277,12 +4277,12 @@ impl DeviceBackend for CudaDeviceBackend {
         let rc_launch = unsafe {
             (self.inner.api.cu_launch_kernel)(
                 func,
-                grid.max(1),
-                1,
-                1,
-                block.max(1),
-                1,
-                1,
+                grid[0].max(1),
+                grid[1].max(1),
+                grid[2].max(1),
+                block[0].max(1),
+                block[1].max(1),
+                block[2].max(1),
                 0,
                 ptr::null_mut(),
                 param_ptrs.as_mut_ptr(),

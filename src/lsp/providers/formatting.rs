@@ -408,12 +408,14 @@ fn needs_space(
         TokenType::RParen
         | TokenType::RBracket
         | TokenType::Comma
+        | TokenType::Semicolon
         | TokenType::Dot
         | TokenType::DotDot
         | TokenType::DotDotDot
         | TokenType::ColonColon
         | TokenType::Colon
         | TokenType::Question => return false,
+        TokenType::Greater if matches!(prev, TokenType::Greater) => return false,
         TokenType::RBrace => return false,
         TokenType::LParen => {
             if matches!(
@@ -527,6 +529,10 @@ fn is_unary_prefix_context(prev_prev: Option<&crate::lexer::TokenType>) -> bool 
             | TokenType::Greater
             | TokenType::LessEqual
             | TokenType::GreaterEqual
+            | TokenType::Shl
+            | TokenType::Caret
+            | TokenType::Amp
+            | TokenType::Semicolon
             | TokenType::Arrow
             | TokenType::FatArrow
             | TokenType::Pipe
@@ -777,6 +783,9 @@ fn token_text(tt: &crate::lexer::TokenType) -> String {
         TokenType::Less => "<".into(),
         TokenType::GreaterEqual => ">=".into(),
         TokenType::LessEqual => "<=".into(),
+        TokenType::Shl => "<<".into(),
+        TokenType::Caret => "^".into(),
+        TokenType::Semicolon => ";".into(),
         TokenType::Pipe => "|>".into(),
         TokenType::Or => "|".into(),
         TokenType::Bang => "!".into(),

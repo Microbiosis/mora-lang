@@ -64,6 +64,11 @@ pub enum BinaryOp {
     Less,
     GreaterEqual,
     LessEqual,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
 }
 
 /// 一元运算符（v0.91）

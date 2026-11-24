@@ -829,7 +829,7 @@ struct VulkanState {
     cmd_buf: VkCommandBuffer,
     mem_props: VkPhysicalDeviceMemoryProperties,
     /// P4-1B: Cached compiled custom SPIR-V 1.0 pipelines keyed by `(kernel_hash, local_size_x)`.
-    custom_pipes: HashMap<(u64, u32), VkComputePipe>,
+    custom_pipes: HashMap<(u64, [u32; 3]), VkComputePipe>,
 }
 
 struct VulkanDeviceInner {
@@ -2809,8 +2809,8 @@ impl DeviceBackend for VulkanDeviceBackend {
     fn launch_custom_kernel(
         &self,
         kernel: &crate::common::kernel_ir::KernelProgram,
-        grid: u32,
-        block: u32,
+        grid: [u32; 3],
+        block: [u32; 3],
         args: &[crate::runtime::gpu::kernel_compiler::KernelLaunchArg],
     ) -> MoraResult<bool> {
         use crate::runtime::gpu::kernel_compiler::{
@@ -2818,18 +2818,18 @@ impl DeviceBackend for VulkanDeviceBackend {
         };
 
         // Core Vulkan 1.0 logical device does not enable optional `shaderFloat64`;
-        // fall back cleanly to CPU executor for f64 kernels while accelerating all f32 kernels on GPU.
+        // fall back cleanly to CPU executor for f64 kernels while accelerating all f32/f16/bf16/u8/i32 kernels on GPU.
         if kernel.uses_f64() {
             return Ok(false);
         }
 
-        let local_size_x = block.max(1);
+        let local_size = [block[0].max(1), block[1].max(1), block[2].max(1)];
         let layout = vulkan_kernel_layout(kernel);
-        let cache_key = (kernel.content_hash(), local_size_x);
+        let cache_key = (kernel.content_hash(), local_size);
 
         let mut st = self.inner.state.lock();
         if !st.custom_pipes.contains_key(&cache_key) {
-            let words = emit_spirv_words(kernel, local_size_x)?;
+            let words = emit_spirv_words(kernel, local_size)?;
             let pipe =
                 VkComputePipe::create(&self.inner.api, st.vk_dev, &words, layout.total_bindings)
                     .ok_or_else(|| {
@@ -2879,7 +2879,15 @@ impl DeviceBackend for VulkanDeviceBackend {
                 .custom_pipes
                 .get(&cache_key)
                 .expect("custom pipeline cached");
-            Self::dispatch_pipe(&self.inner.api, &st, pipe, &buffers, grid.max(1), 1, 1)?;
+            Self::dispatch_pipe(
+                &self.inner.api,
+                &st,
+                pipe,
+                &buffers,
+                grid[0].max(1),
+                grid[1].max(1),
+                grid[2].max(1),
+            )?;
             Ok(())
         })();
 

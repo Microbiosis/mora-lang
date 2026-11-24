@@ -148,6 +148,10 @@ impl ParserV3 {
             TokenType::Less => Some(BinaryOp::Less),
             TokenType::GreaterEqual => Some(BinaryOp::GreaterEqual),
             TokenType::LessEqual => Some(BinaryOp::LessEqual),
+            TokenType::Amp => Some(BinaryOp::BitAnd),
+            TokenType::Or => Some(BinaryOp::BitOr),
+            TokenType::Caret => Some(BinaryOp::BitXor),
+            TokenType::Shl => Some(BinaryOp::Shl),
             _ => None,
         }
     }

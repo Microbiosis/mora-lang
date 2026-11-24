@@ -15,6 +15,10 @@ pub enum KernelParamType {
     I32,
     BufF32,
     BufF64,
+    BufF16,
+    BufBF16,
+    BufU8,
+    BufI32,
 }
 
 impl KernelParamType {
@@ -25,17 +29,38 @@ impl KernelParamType {
             Self::I32 => "i32",
             Self::BufF32 => "buf<f32>",
             Self::BufF64 => "buf<f64>",
+            Self::BufF16 => "buf<f16>",
+            Self::BufBF16 => "buf<bf16>",
+            Self::BufU8 => "buf<u8>",
+            Self::BufI32 => "buf<i32>",
         }
     }
 
     pub fn is_buffer(self) -> bool {
-        matches!(self, Self::BufF32 | Self::BufF64)
+        matches!(
+            self,
+            Self::BufF32 | Self::BufF64 | Self::BufF16 | Self::BufBF16 | Self::BufU8 | Self::BufI32
+        )
     }
 
     pub fn buffer_dtype(self) -> Option<DType> {
         match self {
             Self::BufF32 => Some(DType::F32),
             Self::BufF64 => Some(DType::F64),
+            Self::BufF16 => Some(DType::F16),
+            Self::BufBF16 => Some(DType::BF16),
+            Self::BufU8 => Some(DType::U8),
+            Self::BufI32 => Some(DType::I32),
+            _ => None,
+        }
+    }
+
+    /// Scalar register type used when loading from / storing into this buffer parameter.
+    pub(crate) fn buffer_scalar_type(self) -> Option<KernelScalarType> {
+        match self {
+            Self::BufF32 | Self::BufF16 | Self::BufBF16 => Some(KernelScalarType::F32),
+            Self::BufF64 => Some(KernelScalarType::F64),
+            Self::BufU8 | Self::BufI32 => Some(KernelScalarType::I32),
             _ => None,
         }
     }
@@ -45,7 +70,12 @@ impl KernelParamType {
             Self::F32 => Some(KernelScalarType::F32),
             Self::F64 => Some(KernelScalarType::F64),
             Self::I32 => Some(KernelScalarType::I32),
-            Self::BufF32 | Self::BufF64 => None,
+            Self::BufF32
+            | Self::BufF64
+            | Self::BufF16
+            | Self::BufBF16
+            | Self::BufU8
+            | Self::BufI32 => None,
         }
     }
 
@@ -56,6 +86,10 @@ impl KernelParamType {
             Self::I32 => 3,
             Self::BufF32 => 4,
             Self::BufF64 => 5,
+            Self::BufF16 => 6,
+            Self::BufBF16 => 7,
+            Self::BufU8 => 8,
+            Self::BufI32 => 9,
         }
     }
 
@@ -66,6 +100,10 @@ impl KernelParamType {
             3 => Ok(Self::I32),
             4 => Ok(Self::BufF32),
             5 => Ok(Self::BufF64),
+            6 => Ok(Self::BufF16),
+            7 => Ok(Self::BufBF16),
+            8 => Ok(Self::BufU8),
+            9 => Ok(Self::BufI32),
             other => Err(MoraError::Serialization(format!(
                 "invalid KernelParamType tag {other}"
             ))),
@@ -125,6 +163,14 @@ pub struct KernelParam {
     pub ty: KernelParamType,
 }
 
+/// P5-1B: Workgroup-shared memory array declared via `shared tile: [f32; 256]`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct KernelSharedArray {
+    pub name: String,
+    pub elem_ty: KernelScalarType,
+    pub len: u32,
+}
+
 /// Unary operations and scalar math/cast intrinsics inside a GPU kernel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KernelUnaryOp {
@@ -172,7 +218,7 @@ impl KernelUnaryOp {
     }
 }
 
-/// Binary arithmetic, comparison, logical, and min/max operations inside a GPU kernel.
+/// Binary arithmetic, bitwise, comparison, logical, and min/max operations inside a GPU kernel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KernelBinOp {
     Add,
@@ -190,6 +236,11 @@ pub enum KernelBinOp {
     Ne,
     And,
     Or,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
 }
 
 impl KernelBinOp {
@@ -210,6 +261,11 @@ impl KernelBinOp {
             Self::Ne => 13,
             Self::And => 14,
             Self::Or => 15,
+            Self::BitAnd => 16,
+            Self::BitOr => 17,
+            Self::BitXor => 18,
+            Self::Shl => 19,
+            Self::Shr => 20,
         }
     }
 
@@ -230,6 +286,11 @@ impl KernelBinOp {
             13 => Ok(Self::Ne),
             14 => Ok(Self::And),
             15 => Ok(Self::Or),
+            16 => Ok(Self::BitAnd),
+            17 => Ok(Self::BitOr),
+            18 => Ok(Self::BitXor),
+            19 => Ok(Self::Shl),
+            20 => Ok(Self::Shr),
             other => Err(MoraError::Serialization(format!(
                 "invalid KernelBinOp tag {other}"
             ))),
@@ -247,12 +308,27 @@ pub enum KernelExpr {
     Param(usize, KernelScalarType),
     Var(String, KernelScalarType),
     GlobalId,
+    GlobalIdY,
+    GlobalIdZ,
     BlockIdx,
+    BlockIdxY,
+    BlockIdxZ,
     ThreadIdx,
+    ThreadIdxY,
+    ThreadIdxZ,
     BlockDim,
+    BlockDimY,
+    BlockDimZ,
     GridDim,
+    GridDimY,
+    GridDimZ,
     Load {
         buf_param: usize,
+        index: Box<KernelExpr>,
+        elem_ty: KernelScalarType,
+    },
+    LoadShared {
+        shared_idx: usize,
         index: Box<KernelExpr>,
         elem_ty: KernelScalarType,
     },
@@ -274,15 +350,25 @@ impl KernelExpr {
         match self {
             Self::ConstI32(_)
             | Self::GlobalId
+            | Self::GlobalIdY
+            | Self::GlobalIdZ
             | Self::BlockIdx
+            | Self::BlockIdxY
+            | Self::BlockIdxZ
             | Self::ThreadIdx
+            | Self::ThreadIdxY
+            | Self::ThreadIdxZ
             | Self::BlockDim
-            | Self::GridDim => KernelScalarType::I32,
+            | Self::BlockDimY
+            | Self::BlockDimZ
+            | Self::GridDim
+            | Self::GridDimY
+            | Self::GridDimZ => KernelScalarType::I32,
             Self::ConstF32(_) => KernelScalarType::F32,
             Self::ConstF64(_) => KernelScalarType::F64,
             Self::ConstBool(_) => KernelScalarType::Bool,
             Self::Param(_, ty) | Self::Var(_, ty) => *ty,
-            Self::Load { elem_ty, .. } => *elem_ty,
+            Self::Load { elem_ty, .. } | Self::LoadShared { elem_ty, .. } => *elem_ty,
             Self::Unary { ty, .. } | Self::Binary { ty, .. } => *ty,
         }
     }
@@ -305,6 +391,12 @@ pub enum KernelStmt {
         index: KernelExpr,
         value: KernelExpr,
     },
+    StoreShared {
+        shared_idx: usize,
+        index: KernelExpr,
+        value: KernelExpr,
+    },
+    SyncThreads,
     If {
         cond: KernelExpr,
         then_body: Vec<KernelStmt>,
@@ -321,6 +413,7 @@ pub enum KernelStmt {
 pub struct KernelProgram {
     pub name: String,
     pub params: Vec<KernelParam>,
+    pub shared: Vec<KernelSharedArray>,
     pub body: Vec<KernelStmt>,
 }
 
@@ -336,12 +429,16 @@ impl KernelProgram {
         h
     }
 
-    /// Returns true if any parameter, local variable, or literal in this kernel uses `f64`.
+    /// Returns true if any parameter, shared array, local variable, or literal in this kernel uses `f64`.
     pub fn uses_f64(&self) -> bool {
         if self
             .params
             .iter()
             .any(|p| matches!(p.ty, KernelParamType::F64 | KernelParamType::BufF64))
+            || self
+                .shared
+                .iter()
+                .any(|s| s.elem_ty == KernelScalarType::F64)
         {
             return true;
         }
@@ -350,7 +447,9 @@ impl KernelProgram {
                 return true;
             }
             match e {
-                KernelExpr::Load { index, .. } => expr_uses_f64(index),
+                KernelExpr::Load { index, .. } | KernelExpr::LoadShared { index, .. } => {
+                    expr_uses_f64(index)
+                }
                 KernelExpr::Unary { arg, .. } => expr_uses_f64(arg),
                 KernelExpr::Binary { lhs, rhs, .. } => expr_uses_f64(lhs) || expr_uses_f64(rhs),
                 _ => false,
@@ -362,9 +461,11 @@ impl KernelProgram {
                     *ty == KernelScalarType::F64 || expr_uses_f64(expr)
                 }
                 KernelStmt::Assign { expr, .. } => expr_uses_f64(expr),
-                KernelStmt::Store { index, value, .. } => {
+                KernelStmt::Store { index, value, .. }
+                | KernelStmt::StoreShared { index, value, .. } => {
                     expr_uses_f64(index) || expr_uses_f64(value)
                 }
+                KernelStmt::SyncThreads => false,
                 KernelStmt::If {
                     cond,
                     then_body,
@@ -385,6 +486,12 @@ impl KernelProgram {
             write_str(&mut buf, &p.name);
             buf.push(p.ty.tag());
         }
+        write_u32(&mut buf, self.shared.len() as u32);
+        for s in &self.shared {
+            write_str(&mut buf, &s.name);
+            buf.push(s.elem_ty.tag());
+            write_u32(&mut buf, s.len);
+        }
         encode_stmts(&mut buf, &self.body);
         buf
     }
@@ -403,6 +510,18 @@ impl KernelProgram {
                 ty: pty,
             });
         }
+        let n_shared = read_u32(bytes, &mut cursor)? as usize;
+        let mut shared = Vec::with_capacity(n_shared);
+        for _ in 0..n_shared {
+            let sname = read_str(bytes, &mut cursor)?;
+            let elem_ty = KernelScalarType::from_tag(read_u8(bytes, &mut cursor)?)?;
+            let len = read_u32(bytes, &mut cursor)?;
+            shared.push(KernelSharedArray {
+                name: sname,
+                elem_ty,
+                len,
+            });
+        }
         let body = decode_stmts(bytes, &mut cursor)?;
         if cursor != bytes.len() {
             return Err(MoraError::Serialization(format!(
@@ -410,7 +529,12 @@ impl KernelProgram {
                 bytes.len() - cursor
             )));
         }
-        Ok(Self { name, params, body })
+        Ok(Self {
+            name,
+            params,
+            shared,
+            body,
+        })
     }
 }
 
@@ -514,6 +638,26 @@ fn encode_expr(buf: &mut Vec<u8>, expr: &KernelExpr) {
             encode_expr(buf, lhs);
             encode_expr(buf, rhs);
         }
+        KernelExpr::GlobalIdY => buf.push(15),
+        KernelExpr::GlobalIdZ => buf.push(16),
+        KernelExpr::BlockIdxY => buf.push(17),
+        KernelExpr::BlockIdxZ => buf.push(18),
+        KernelExpr::ThreadIdxY => buf.push(19),
+        KernelExpr::ThreadIdxZ => buf.push(20),
+        KernelExpr::BlockDimY => buf.push(21),
+        KernelExpr::BlockDimZ => buf.push(22),
+        KernelExpr::GridDimY => buf.push(23),
+        KernelExpr::GridDimZ => buf.push(24),
+        KernelExpr::LoadShared {
+            shared_idx,
+            index,
+            elem_ty,
+        } => {
+            buf.push(25);
+            write_u32(buf, *shared_idx as u32);
+            buf.push(elem_ty.tag());
+            encode_expr(buf, index);
+        }
     }
 }
 
@@ -581,6 +725,26 @@ fn decode_expr(bytes: &[u8], cursor: &mut usize) -> MoraResult<KernelExpr> {
             let rhs = Box::new(decode_expr(bytes, cursor)?);
             Ok(KernelExpr::Binary { op, lhs, rhs, ty })
         }
+        15 => Ok(KernelExpr::GlobalIdY),
+        16 => Ok(KernelExpr::GlobalIdZ),
+        17 => Ok(KernelExpr::BlockIdxY),
+        18 => Ok(KernelExpr::BlockIdxZ),
+        19 => Ok(KernelExpr::ThreadIdxY),
+        20 => Ok(KernelExpr::ThreadIdxZ),
+        21 => Ok(KernelExpr::BlockDimY),
+        22 => Ok(KernelExpr::BlockDimZ),
+        23 => Ok(KernelExpr::GridDimY),
+        24 => Ok(KernelExpr::GridDimZ),
+        25 => {
+            let shared_idx = read_u32(bytes, cursor)? as usize;
+            let elem_ty = KernelScalarType::from_tag(read_u8(bytes, cursor)?)?;
+            let index = Box::new(decode_expr(bytes, cursor)?);
+            Ok(KernelExpr::LoadShared {
+                shared_idx,
+                index,
+                elem_ty,
+            })
+        }
         other => Err(MoraError::Serialization(format!(
             "invalid KernelExpr tag {other}"
         ))),
@@ -626,6 +790,19 @@ fn encode_stmts(buf: &mut Vec<u8>, stmts: &[KernelStmt]) {
                 buf.push(5);
                 encode_expr(buf, cond);
                 encode_stmts(buf, body);
+            }
+            KernelStmt::StoreShared {
+                shared_idx,
+                index,
+                value,
+            } => {
+                buf.push(6);
+                write_u32(buf, *shared_idx as u32);
+                encode_expr(buf, index);
+                encode_expr(buf, value);
+            }
+            KernelStmt::SyncThreads => {
+                buf.push(7);
             }
         }
     }
@@ -673,6 +850,17 @@ fn decode_stmts(bytes: &[u8], cursor: &mut usize) -> MoraResult<Vec<KernelStmt>>
                 let body = decode_stmts(bytes, cursor)?;
                 KernelStmt::While { cond, body }
             }
+            6 => {
+                let shared_idx = read_u32(bytes, cursor)? as usize;
+                let index = decode_expr(bytes, cursor)?;
+                let value = decode_expr(bytes, cursor)?;
+                KernelStmt::StoreShared {
+                    shared_idx,
+                    index,
+                    value,
+                }
+            }
+            7 => KernelStmt::SyncThreads,
             other => {
                 return Err(MoraError::Serialization(format!(
                     "invalid KernelStmt tag {other}"

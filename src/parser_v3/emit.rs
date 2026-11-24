@@ -224,6 +224,10 @@ impl ParserV3 {
             Eq(BinaryOp),
             Pipe,
             Cmp(BinaryOp),
+            BitOr,
+            BitXor,
+            BitAnd,
+            Shift(BinaryOp),
             AddSub(BinaryOp),
             MulDivMod(BinaryOp),
         }
@@ -236,8 +240,12 @@ impl ParserV3 {
                     InfixOp::Eq(_) => 3,
                     InfixOp::Pipe => 4,
                     InfixOp::Cmp(_) => 5,
-                    InfixOp::AddSub(_) => 6,
-                    InfixOp::MulDivMod(_) => 7,
+                    InfixOp::BitOr => 6,
+                    InfixOp::BitXor => 7,
+                    InfixOp::BitAnd => 8,
+                    InfixOp::Shift(_) => 9,
+                    InfixOp::AddSub(_) => 10,
+                    InfixOp::MulDivMod(_) => 11,
                 }
             }
         }
@@ -279,11 +287,36 @@ impl ParserV3 {
                 },
                 InfixOp::Eq(bop)
                 | InfixOp::Cmp(bop)
+                | InfixOp::Shift(bop)
                 | InfixOp::AddSub(bop)
                 | InfixOp::MulDivMod(bop) => MirWitness {
                     kind: WitnessKind::Binary {
                         left: Box::new(lhs),
                         op: bop,
+                        right: Box::new(rhs),
+                    },
+                    span,
+                },
+                InfixOp::BitOr => MirWitness {
+                    kind: WitnessKind::Binary {
+                        left: Box::new(lhs),
+                        op: BinaryOp::BitOr,
+                        right: Box::new(rhs),
+                    },
+                    span,
+                },
+                InfixOp::BitXor => MirWitness {
+                    kind: WitnessKind::Binary {
+                        left: Box::new(lhs),
+                        op: BinaryOp::BitXor,
+                        right: Box::new(rhs),
+                    },
+                    span,
+                },
+                InfixOp::BitAnd => MirWitness {
+                    kind: WitnessKind::Binary {
+                        left: Box::new(lhs),
+                        op: BinaryOp::BitAnd,
                         right: Box::new(rhs),
                     },
                     span,
@@ -451,6 +484,22 @@ impl ParserV3 {
             if let Some(op) = this.consume_binary_op(&[TokenType::Equal, TokenType::NotEqual]) {
                 return Some(InfixOp::Eq(op));
             }
+            // Adjacent `>>` parses as bitwise right shift without breaking nested generic `>>` in types.
+            if let (Some(t1), Some(t2)) = (
+                this.tokens.get(this.current),
+                this.tokens.get(this.current + 1),
+            ) && t1.token_type == TokenType::Greater
+                && t2.token_type == TokenType::Greater
+                && t1.line == t2.line
+                && t2.column == t1.column + 1
+            {
+                this.advance();
+                this.advance();
+                return Some(InfixOp::Shift(BinaryOp::Shr));
+            }
+            if this.match_token_exact(TokenType::Shl) {
+                return Some(InfixOp::Shift(BinaryOp::Shl));
+            }
             if let Some(op) = this.consume_binary_op(&[
                 TokenType::Less,
                 TokenType::Greater,
@@ -458,6 +507,15 @@ impl ParserV3 {
                 TokenType::GreaterEqual,
             ]) {
                 return Some(InfixOp::Cmp(op));
+            }
+            if this.match_token_exact(TokenType::Or) {
+                return Some(InfixOp::BitOr);
+            }
+            if this.match_token_exact(TokenType::Caret) {
+                return Some(InfixOp::BitXor);
+            }
+            if this.match_token_exact(TokenType::Amp) {
+                return Some(InfixOp::BitAnd);
             }
             if let Some(op) = this.consume_binary_op(&[TokenType::Minus, TokenType::Plus]) {
                 return Some(InfixOp::AddSub(op));

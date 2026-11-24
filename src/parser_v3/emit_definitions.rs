@@ -1324,6 +1324,7 @@ impl ParserV3 {
         self.consume(TokenType::LParen, "Expected '(' after kernel name")?;
 
         let mut params: Vec<KernelParam> = Vec::new();
+        while self.match_token(&[TokenType::Newline]) {}
         while !self.check(&TokenType::RParen) && !self.is_at_end() {
             let pname = self.consume_plain_identifier("Expected kernel parameter name")?;
             if params.iter().any(|p| p.name == pname) {
@@ -1343,27 +1344,123 @@ impl ParserV3 {
                 name: pname,
                 ty: pty,
             });
+            while self.match_token(&[TokenType::Newline]) {}
             if !self.match_token(&[TokenType::Comma]) {
                 break;
             }
+            while self.match_token(&[TokenType::Newline]) {}
         }
+        while self.match_token(&[TokenType::Newline]) {}
         self.consume(TokenType::RParen, "Expected ')' after kernel parameters")?;
 
-        let body = self.in_nested_scope(|this| {
+        let (shared, body) = self.in_nested_scope(|this| {
             this.scope.in_kernel_body = true;
+            let mut shared: Vec<crate::common::kernel_ir::KernelSharedArray> = Vec::new();
             let mut stmts = Vec::new();
             while this.match_token(&[TokenType::Newline]) {}
             while !this.check(&TokenType::End) && !this.is_at_end() {
+                // P5-1B: Workgroup shared memory declaration: `shared tile: [f32; 256]`
+                let is_shared_decl = matches!(
+                    this.peek().map(|t| &t.token_type),
+                    Some(TokenType::Identifier(s)) if s == "shared"
+                ) && matches!(
+                    this.tokens.get(this.current + 1).map(|t| &t.token_type),
+                    Some(TokenType::Identifier(_))
+                ) && matches!(
+                    this.tokens.get(this.current + 2).map(|t| &t.token_type),
+                    Some(TokenType::Colon)
+                );
+                if is_shared_decl {
+                    this.advance(); // 'shared'
+                    let sname =
+                        this.consume_plain_identifier("Expected shared array name after 'shared'")?;
+                    if params.iter().any(|p| p.name == sname)
+                        || shared.iter().any(|s| s.name == sname)
+                    {
+                        let msg = format!(
+                            "Parse error: duplicate shared array '{}' in kernel '{}' at line {}",
+                            sname,
+                            name,
+                            this.current_line()
+                        );
+                        eprintln!("{msg}");
+                        this.diag = Some(msg);
+                        return None;
+                    }
+                    this.consume(TokenType::Colon, "Expected ':' after shared array name")?;
+                    this.consume(
+                        TokenType::LBracket,
+                        "Expected '[' in shared array type '[dtype; len]'",
+                    )?;
+                    let elem_ident =
+                        this.consume_identifier("Expected shared element dtype (f32/f64/i32)")?;
+                    let elem_ty = match elem_ident.to_lowercase().as_str() {
+                        "f32" => crate::common::kernel_ir::KernelScalarType::F32,
+                        "f64" | "float" => crate::common::kernel_ir::KernelScalarType::F64,
+                        "i32" | "int" => crate::common::kernel_ir::KernelScalarType::I32,
+                        other => {
+                            let msg = format!(
+                                "Parse error: unsupported shared array dtype '{}' for '{}.{}' (expected f32, f64, or i32) at line {}",
+                                other,
+                                name,
+                                sname,
+                                this.current_line()
+                            );
+                            eprintln!("{msg}");
+                            this.diag = Some(msg);
+                            return None;
+                        }
+                    };
+                    this.consume(
+                        TokenType::Semicolon,
+                        "Expected ';' between dtype and length in shared '[dtype; len]'",
+                    )?;
+                    let len_u32 = match this.peek().map(|t| &t.token_type).cloned() {
+                        Some(TokenType::Int(n)) | Some(TokenType::TypedInt(n, _))
+                            if n > 0 && n <= 65_536 =>
+                        {
+                            this.advance();
+                            n as u32
+                        }
+                        _ => {
+                            let msg = format!(
+                                "Parse error: shared array '{}.{}' length must be a positive integer constant (1..=65536) at line {}",
+                                name,
+                                sname,
+                                this.current_line()
+                            );
+                            eprintln!("{msg}");
+                            this.diag = Some(msg);
+                            return None;
+                        }
+                    };
+                    this.consume(
+                        TokenType::RBracket,
+                        "Expected ']' after shared array '[dtype; len]'",
+                    )?;
+                    shared.push(crate::common::kernel_ir::KernelSharedArray {
+                        name: sname,
+                        elem_ty,
+                        len: len_u32,
+                    });
+                    while this.match_token(&[TokenType::Newline]) {}
+                    continue;
+                }
                 let stmt = this.emit_statement_expr_w()?;
                 stmts.push(stmt);
                 while this.match_token(&[TokenType::Newline]) {}
             }
             this.consume(TokenType::End, "Expected 'end' after kernel body")?;
-            Some(stmts)
+            Some((shared, stmts))
         })?;
 
         Some(MirWitness {
-            kind: WitnessKind::KernelDef { name, params, body },
+            kind: WitnessKind::KernelDef {
+                name,
+                params,
+                shared,
+                body,
+            },
             span,
         })
     }
@@ -1382,14 +1479,20 @@ impl ParserV3 {
             "i32" | "int" => Some(KernelParamType::I32),
             "buf" | "buffer" => {
                 self.consume(TokenType::Less, "Expected '<' after 'buf' in kernel param")?;
-                let elem = self.consume_identifier("Expected buffer element dtype (f32/f64)")?;
+                let elem = self.consume_identifier(
+                    "Expected buffer element dtype (f32/f64/f16/bf16/u8/i32)",
+                )?;
                 self.consume(TokenType::Greater, "Expected '>' after buf<dtype>")?;
                 match elem.to_lowercase().as_str() {
                     "f32" => Some(KernelParamType::BufF32),
                     "f64" | "float" => Some(KernelParamType::BufF64),
+                    "f16" => Some(KernelParamType::BufF16),
+                    "bf16" => Some(KernelParamType::BufBF16),
+                    "u8" => Some(KernelParamType::BufU8),
+                    "i32" => Some(KernelParamType::BufI32),
                     other => {
                         let msg = format!(
-                            "Parse error: unsupported kernel buffer dtype '{}' for '{}.{}' (expected f32 or f64) at line {}",
+                            "Parse error: unsupported kernel buffer dtype '{}' for '{}.{}' (expected f32, f64, f16, bf16, u8, or i32) at line {}",
                             other,
                             kernel_name,
                             param_name,
@@ -1403,7 +1506,8 @@ impl ParserV3 {
             }
             "tensor" => {
                 if self.match_token(&[TokenType::Less]) {
-                    let elem = self.consume_identifier("Expected Tensor dtype (f32/f64)")?;
+                    let elem =
+                        self.consume_identifier("Expected Tensor dtype (f32/f64/f16/bf16/u8/i32)")?;
                     // Consume optional `, shape, device` until matching `>`.
                     let mut depth = 1usize;
                     while depth > 0 && !self.is_at_end() {
@@ -1424,9 +1528,13 @@ impl ParserV3 {
                     match elem.to_lowercase().as_str() {
                         "f32" => Some(KernelParamType::BufF32),
                         "f64" | "float" => Some(KernelParamType::BufF64),
+                        "f16" => Some(KernelParamType::BufF16),
+                        "bf16" => Some(KernelParamType::BufBF16),
+                        "u8" => Some(KernelParamType::BufU8),
+                        "i32" => Some(KernelParamType::BufI32),
                         other => {
                             let msg = format!(
-                                "Parse error: unsupported kernel Tensor dtype '{}' for '{}.{}' (expected f32 or f64) at line {}",
+                                "Parse error: unsupported kernel Tensor dtype '{}' for '{}.{}' (expected f32, f64, f16, bf16, u8, or i32) at line {}",
                                 other,
                                 kernel_name,
                                 param_name,
@@ -1443,7 +1551,7 @@ impl ParserV3 {
             }
             other => {
                 let msg = format!(
-                    "Parse error: unsupported kernel parameter type '{}' for '{}.{}' (expected f32, f64, i32, buf<f32>, or buf<f64>) at line {}",
+                    "Parse error: unsupported kernel parameter type '{}' for '{}.{}' (expected f32, f64, i32, buf<f32/f64/f16/bf16/u8/i32>) at line {}",
                     other,
                     kernel_name,
                     param_name,

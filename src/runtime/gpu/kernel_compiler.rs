@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use crate::common::kernel_ir::{
     KernelBinOp, KernelExpr, KernelParam, KernelParamType, KernelProgram, KernelScalarType,
-    KernelStmt, KernelUnaryOp,
+    KernelSharedArray, KernelStmt, KernelUnaryOp,
 };
 use crate::common::{BinaryOp, DType, Literal};
 use crate::error::{MoraError, MoraResult};
@@ -54,8 +54,8 @@ impl CompiledGpuKernel {
         emit_ptx(&self.program)
     }
 
-    pub fn emit_spirv_words(&self, local_size_x: u32) -> MoraResult<Vec<u32>> {
-        emit_spirv_words(&self.program, local_size_x)
+    pub fn emit_spirv_words(&self, local_size: [u32; 3]) -> MoraResult<Vec<u32>> {
+        emit_spirv_words(&self.program, local_size)
     }
 
     pub fn emit_msl(&self) -> String {
@@ -93,7 +93,10 @@ fn collect_written_buf_params(stmts: &[KernelStmt]) -> Vec<usize> {
                     visit(else_body, set);
                 }
                 KernelStmt::While { body, .. } => visit(body, set),
-                KernelStmt::Let { .. } | KernelStmt::Assign { .. } => {}
+                KernelStmt::Let { .. }
+                | KernelStmt::Assign { .. }
+                | KernelStmt::StoreShared { .. }
+                | KernelStmt::SyncThreads => {}
             }
         }
     }
@@ -111,36 +114,30 @@ struct KernelLowerCtx {
     kernel_name: String,
     scalar_params: HashMap<String, (usize, KernelScalarType)>,
     buf_params: HashMap<String, (usize, KernelScalarType)>,
+    shared_arrays: HashMap<String, (usize, KernelScalarType)>,
     locals: HashMap<String, KernelScalarType>,
 }
 
 impl KernelLowerCtx {
-    fn new(name: &str, params: &[KernelParam]) -> Self {
+    fn new(name: &str, params: &[KernelParam], shared: &[KernelSharedArray]) -> Self {
         let mut scalar_params = HashMap::new();
         let mut buf_params = HashMap::new();
         for (idx, p) in params.iter().enumerate() {
-            match p.ty {
-                KernelParamType::F32 => {
-                    scalar_params.insert(p.name.clone(), (idx, KernelScalarType::F32));
-                }
-                KernelParamType::F64 => {
-                    scalar_params.insert(p.name.clone(), (idx, KernelScalarType::F64));
-                }
-                KernelParamType::I32 => {
-                    scalar_params.insert(p.name.clone(), (idx, KernelScalarType::I32));
-                }
-                KernelParamType::BufF32 => {
-                    buf_params.insert(p.name.clone(), (idx, KernelScalarType::F32));
-                }
-                KernelParamType::BufF64 => {
-                    buf_params.insert(p.name.clone(), (idx, KernelScalarType::F64));
-                }
+            if let Some(st) = p.ty.scalar_type() {
+                scalar_params.insert(p.name.clone(), (idx, st));
+            } else if let Some(bst) = p.ty.buffer_scalar_type() {
+                buf_params.insert(p.name.clone(), (idx, bst));
             }
+        }
+        let mut shared_arrays = HashMap::new();
+        for (idx, s) in shared.iter().enumerate() {
+            shared_arrays.insert(s.name.clone(), (idx, s.elem_ty));
         }
         Self {
             kernel_name: name.to_string(),
             scalar_params,
             buf_params,
+            shared_arrays,
             locals: HashMap::new(),
         }
     }
@@ -216,6 +213,20 @@ impl KernelLowerCtx {
                 });
                 Ok(())
             }
+            WitnessKind::Call {
+                callee: WitnessCallee::Name(n) | WitnessCallee::Var(n),
+                args,
+                named_args,
+            } if n == "sync_threads" => {
+                if !args.is_empty() || !named_args.is_empty() {
+                    return Err(MoraError::Parse(format!(
+                        "kernel '{}': sync_threads() takes 0 arguments",
+                        self.kernel_name
+                    )));
+                }
+                out.push(KernelStmt::SyncThreads);
+                Ok(())
+            }
             WitnessKind::IndexAssign {
                 object,
                 index,
@@ -223,15 +234,26 @@ impl KernelLowerCtx {
             } => {
                 let WitnessKind::Variable(buf_name) = &object.kind else {
                     return Err(MoraError::Parse(format!(
-                        "kernel '{}': store target must be a buffer parameter name",
+                        "kernel '{}': store target must be a buffer parameter or shared array name",
                         self.kernel_name
                     )));
                 };
-                let Some(&(buf_param, elem_ty)) = self.buf_params.get(buf_name) else {
+                enum StoreTarget {
+                    Global(usize, KernelScalarType),
+                    Shared(usize, KernelScalarType),
+                }
+                let target = if let Some(&(buf_param, elem_ty)) = self.buf_params.get(buf_name) {
+                    StoreTarget::Global(buf_param, elem_ty)
+                } else if let Some(&(shared_idx, elem_ty)) = self.shared_arrays.get(buf_name) {
+                    StoreTarget::Shared(shared_idx, elem_ty)
+                } else {
                     return Err(MoraError::Parse(format!(
-                        "kernel '{}': '{}' is not a buffer parameter",
+                        "kernel '{}': '{}' is not a buffer parameter or shared array",
                         self.kernel_name, buf_name
                     )));
+                };
+                let elem_ty = match target {
+                    StoreTarget::Global(_, t) | StoreTarget::Shared(_, t) => t,
                 };
                 let idx_expr = self.lower_expr(index, Some(KernelScalarType::I32))?;
                 if idx_expr.ty() != KernelScalarType::I32 {
@@ -252,11 +274,18 @@ impl KernelLowerCtx {
                         val_expr.ty().canonical_name()
                     )));
                 }
-                out.push(KernelStmt::Store {
-                    buf_param,
-                    index: idx_expr,
-                    value: val_expr,
-                });
+                match target {
+                    StoreTarget::Global(buf_param, _) => out.push(KernelStmt::Store {
+                        buf_param,
+                        index: idx_expr,
+                        value: val_expr,
+                    }),
+                    StoreTarget::Shared(shared_idx, _) => out.push(KernelStmt::StoreShared {
+                        shared_idx,
+                        index: idx_expr,
+                        value: val_expr,
+                    }),
+                }
                 Ok(())
             }
             WitnessKind::If { cond, then, r#else } => {
@@ -422,9 +451,9 @@ impl KernelLowerCtx {
                 if let Some(&(idx, ty)) = self.scalar_params.get(name) {
                     return Ok(KernelExpr::Param(idx, ty));
                 }
-                if self.buf_params.contains_key(name) {
+                if self.buf_params.contains_key(name) || self.shared_arrays.contains_key(name) {
                     return Err(MoraError::Parse(format!(
-                        "kernel '{}': buffer parameter '{}' must be indexed as '{}[idx]'",
+                        "kernel '{}': buffer/shared array '{}' must be indexed as '{}[idx]'",
                         self.kernel_name, name, name
                     )));
                 }
@@ -518,14 +547,8 @@ impl KernelLowerCtx {
                         }
                         let WitnessKind::Variable(buf_name) = &args[0].kind else {
                             return Err(MoraError::Parse(format!(
-                                "kernel '{}': index target must be a buffer parameter",
+                                "kernel '{}': index target must be a buffer parameter or shared array",
                                 self.kernel_name
-                            )));
-                        };
-                        let Some(&(buf_param, elem_ty)) = self.buf_params.get(buf_name) else {
-                            return Err(MoraError::Parse(format!(
-                                "kernel '{}': '{}' is not a buffer parameter",
-                                self.kernel_name, buf_name
                             )));
                         };
                         let idx_expr = self.lower_expr(&args[1], Some(KernelScalarType::I32))?;
@@ -537,11 +560,26 @@ impl KernelLowerCtx {
                                 idx_expr.ty().canonical_name()
                             )));
                         }
-                        Ok(KernelExpr::Load {
-                            buf_param,
-                            index: Box::new(idx_expr),
-                            elem_ty,
-                        })
+                        if let Some(&(buf_param, elem_ty)) = self.buf_params.get(buf_name) {
+                            Ok(KernelExpr::Load {
+                                buf_param,
+                                index: Box::new(idx_expr),
+                                elem_ty,
+                            })
+                        } else if let Some(&(shared_idx, elem_ty)) =
+                            self.shared_arrays.get(buf_name)
+                        {
+                            Ok(KernelExpr::LoadShared {
+                                shared_idx,
+                                index: Box::new(idx_expr),
+                                elem_ty,
+                            })
+                        } else {
+                            Err(MoraError::Parse(format!(
+                                "kernel '{}': '{}' is not a buffer parameter or shared array",
+                                self.kernel_name, buf_name
+                            )))
+                        }
                     }
                     WitnessCallee::Name(n) | WitnessCallee::Var(n) => {
                         self.lower_intrinsic_call(n, args, expected)
@@ -587,11 +625,21 @@ impl KernelLowerCtx {
         expected: Option<KernelScalarType>,
     ) -> MoraResult<KernelExpr> {
         match name {
-            "global_id" if args.is_empty() => Ok(KernelExpr::GlobalId),
-            "block_idx" if args.is_empty() => Ok(KernelExpr::BlockIdx),
-            "thread_idx" if args.is_empty() => Ok(KernelExpr::ThreadIdx),
-            "block_dim" if args.is_empty() => Ok(KernelExpr::BlockDim),
-            "grid_dim" if args.is_empty() => Ok(KernelExpr::GridDim),
+            "global_id" | "global_id_x" if args.is_empty() => Ok(KernelExpr::GlobalId),
+            "global_id_y" if args.is_empty() => Ok(KernelExpr::GlobalIdY),
+            "global_id_z" if args.is_empty() => Ok(KernelExpr::GlobalIdZ),
+            "block_idx" | "block_idx_x" if args.is_empty() => Ok(KernelExpr::BlockIdx),
+            "block_idx_y" if args.is_empty() => Ok(KernelExpr::BlockIdxY),
+            "block_idx_z" if args.is_empty() => Ok(KernelExpr::BlockIdxZ),
+            "thread_idx" | "thread_idx_x" if args.is_empty() => Ok(KernelExpr::ThreadIdx),
+            "thread_idx_y" if args.is_empty() => Ok(KernelExpr::ThreadIdxY),
+            "thread_idx_z" if args.is_empty() => Ok(KernelExpr::ThreadIdxZ),
+            "block_dim" | "block_dim_x" if args.is_empty() => Ok(KernelExpr::BlockDim),
+            "block_dim_y" if args.is_empty() => Ok(KernelExpr::BlockDimY),
+            "block_dim_z" if args.is_empty() => Ok(KernelExpr::BlockDimZ),
+            "grid_dim" | "grid_dim_x" if args.is_empty() => Ok(KernelExpr::GridDim),
+            "grid_dim_y" if args.is_empty() => Ok(KernelExpr::GridDimY),
+            "grid_dim_z" if args.is_empty() => Ok(KernelExpr::GridDimZ),
             "exp" | "sqrt" | "tanh" if args.len() == 1 => {
                 let inner = self.lower_expr(&args[0], expected)?;
                 if !inner.ty().is_float() {
@@ -760,6 +808,11 @@ impl KernelLowerCtx {
             BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
                 expected
             }
+            BinaryOp::BitAnd
+            | BinaryOp::BitOr
+            | BinaryOp::BitXor
+            | BinaryOp::Shl
+            | BinaryOp::Shr => Some(KernelScalarType::I32),
             _ => None,
         };
         let (l, r) = self.lower_matched_pair(left, right, arith_hint)?;
@@ -778,6 +831,28 @@ impl KernelLowerCtx {
                     )));
                 }
                 (KernelBinOp::Rem, KernelScalarType::I32)
+            }
+            BinaryOp::BitAnd
+            | BinaryOp::BitOr
+            | BinaryOp::BitXor
+            | BinaryOp::Shl
+            | BinaryOp::Shr => {
+                if operand_ty != KernelScalarType::I32 {
+                    return Err(MoraError::Parse(format!(
+                        "kernel '{}': bitwise operator '{op:?}' requires i32 operands, got {}",
+                        self.kernel_name,
+                        operand_ty.canonical_name()
+                    )));
+                }
+                let bop = match op {
+                    BinaryOp::BitAnd => KernelBinOp::BitAnd,
+                    BinaryOp::BitOr => KernelBinOp::BitOr,
+                    BinaryOp::BitXor => KernelBinOp::BitXor,
+                    BinaryOp::Shl => KernelBinOp::Shl,
+                    BinaryOp::Shr => KernelBinOp::Shr,
+                    _ => unreachable!(),
+                };
+                (bop, KernelScalarType::I32)
             }
             BinaryOp::Less => (KernelBinOp::Lt, KernelScalarType::Bool),
             BinaryOp::LessEqual => (KernelBinOp::Le, KernelScalarType::Bool),
@@ -841,13 +916,15 @@ fn hint_to_kernel_scalar(
 pub(crate) fn lower_witness_kernel(
     name: &str,
     params: &[KernelParam],
+    shared: &[KernelSharedArray],
     body: &[MirWitness],
 ) -> MoraResult<KernelProgram> {
-    let mut ctx = KernelLowerCtx::new(name, params);
+    let mut ctx = KernelLowerCtx::new(name, params, shared);
     let stmts = ctx.lower_block(body)?;
     Ok(KernelProgram {
         name: name.to_string(),
         params: params.to_vec(),
+        shared: shared.to_vec(),
         body: stmts,
     })
 }
@@ -859,26 +936,34 @@ pub(crate) fn lower_witness_kernel(
 struct PtxEmitter {
     body: String,
     n_pred: u32,
+    n_b16: u32,
     n_s32: u32,
+    n_u32: u32,
     n_u64: u32,
     n_f32: u32,
     n_f64: u32,
     n_label: u32,
     param_regs: Vec<String>,
+    param_tys: Vec<KernelParamType>,
+    shared_decls: Vec<KernelSharedArray>,
     local_regs: HashMap<String, (KernelScalarType, String)>,
 }
 
 impl PtxEmitter {
-    fn new() -> Self {
+    fn new(params: &[KernelParam], shared: &[KernelSharedArray]) -> Self {
         Self {
             body: String::with_capacity(1024),
             n_pred: 1,
+            n_b16: 1,
             n_s32: 1,
+            n_u32: 1,
             n_u64: 1,
             n_f32: 1,
             n_f64: 1,
             n_label: 0,
             param_regs: Vec::new(),
+            param_tys: params.iter().map(|p| p.ty).collect(),
+            shared_decls: shared.to_vec(),
             local_regs: HashMap::new(),
         }
     }
@@ -889,10 +974,22 @@ impl PtxEmitter {
         format!("%p{id}")
     }
 
+    fn alloc_b16(&mut self) -> String {
+        let id = self.n_b16;
+        self.n_b16 += 1;
+        format!("%rs{id}")
+    }
+
     fn alloc_s32(&mut self) -> String {
         let id = self.n_s32;
         self.n_s32 += 1;
         format!("%r{id}")
+    }
+
+    fn alloc_u32(&mut self) -> String {
+        let id = self.n_u32;
+        self.n_u32 += 1;
+        format!("%ru{id}")
     }
 
     fn alloc_u64(&mut self) -> String {
@@ -966,16 +1063,81 @@ impl PtxEmitter {
                     let idx_reg = self.emit_expr(index);
                     let val_reg = self.emit_expr(value);
                     let base = self.param_regs[*buf_param].clone();
+                    let pty = self.param_tys[*buf_param];
                     let off = self.alloc_u64();
                     let ptr = self.alloc_u64();
-                    let (stride, st_op) = match value.ty() {
-                        KernelScalarType::F32 => (4, "st.global.f32"),
-                        KernelScalarType::F64 => (8, "st.global.f64"),
-                        _ => (4, "st.global.s32"),
+                    match pty {
+                        KernelParamType::BufF32 => {
+                            let _ = writeln!(self.body, "    mul.wide.s32 {off}, {idx_reg}, 4;");
+                            let _ = writeln!(self.body, "    add.u64 {ptr}, {base}, {off};");
+                            let _ = writeln!(self.body, "    st.global.f32 [{ptr}], {val_reg};");
+                        }
+                        KernelParamType::BufF64 => {
+                            let _ = writeln!(self.body, "    mul.wide.s32 {off}, {idx_reg}, 8;");
+                            let _ = writeln!(self.body, "    add.u64 {ptr}, {base}, {off};");
+                            let _ = writeln!(self.body, "    st.global.f64 [{ptr}], {val_reg};");
+                        }
+                        KernelParamType::BufI32 => {
+                            let _ = writeln!(self.body, "    mul.wide.s32 {off}, {idx_reg}, 4;");
+                            let _ = writeln!(self.body, "    add.u64 {ptr}, {base}, {off};");
+                            let _ = writeln!(self.body, "    st.global.s32 [{ptr}], {val_reg};");
+                        }
+                        KernelParamType::BufU8 => {
+                            let u_val = self.alloc_u32();
+                            let _ = writeln!(self.body, "    cvt.s64.s32 {off}, {idx_reg};");
+                            let _ = writeln!(self.body, "    add.u64 {ptr}, {base}, {off};");
+                            let _ = writeln!(self.body, "    mov.b32 {u_val}, {val_reg};");
+                            let _ = writeln!(self.body, "    st.global.u8 [{ptr}], {u_val};");
+                        }
+                        KernelParamType::BufF16 => {
+                            let h = self.alloc_b16();
+                            let _ = writeln!(self.body, "    mul.wide.s32 {off}, {idx_reg}, 2;");
+                            let _ = writeln!(self.body, "    add.u64 {ptr}, {base}, {off};");
+                            let _ = writeln!(self.body, "    cvt.rn.f16.f32 {h}, {val_reg};");
+                            let _ = writeln!(self.body, "    st.global.b16 [{ptr}], {h};");
+                        }
+                        KernelParamType::BufBF16 => {
+                            let bits = self.alloc_u32();
+                            let lsb = self.alloc_u32();
+                            let bias = self.alloc_u32();
+                            let rnd = self.alloc_u32();
+                            let out_u = self.alloc_u32();
+                            let _ = writeln!(self.body, "    mul.wide.s32 {off}, {idx_reg}, 2;");
+                            let _ = writeln!(self.body, "    add.u64 {ptr}, {base}, {off};");
+                            let _ = writeln!(self.body, "    mov.b32 {bits}, {val_reg};");
+                            let _ = writeln!(self.body, "    shr.u32 {lsb}, {bits}, 16;");
+                            let _ = writeln!(self.body, "    and.b32 {lsb}, {lsb}, 1;");
+                            let _ = writeln!(self.body, "    add.u32 {bias}, {lsb}, 32767;");
+                            let _ = writeln!(self.body, "    add.u32 {rnd}, {bits}, {bias};");
+                            let _ = writeln!(self.body, "    shr.u32 {out_u}, {rnd}, 16;");
+                            let _ = writeln!(self.body, "    st.global.u16 [{ptr}], {out_u};");
+                        }
+                        _ => {}
+                    }
+                }
+                KernelStmt::StoreShared {
+                    shared_idx,
+                    index,
+                    value,
+                } => {
+                    let idx_reg = self.emit_expr(index);
+                    let val_reg = self.emit_expr(value);
+                    let elem_ty = self.shared_decls[*shared_idx].elem_ty;
+                    let base = self.alloc_u64();
+                    let off = self.alloc_u64();
+                    let ptr = self.alloc_u64();
+                    let (stride, st_op) = match elem_ty {
+                        KernelScalarType::F32 => (4, "st.shared.f32"),
+                        KernelScalarType::F64 => (8, "st.shared.f64"),
+                        _ => (4, "st.shared.s32"),
                     };
+                    let _ = writeln!(self.body, "    mov.u64 {base}, _sh_{shared_idx};");
                     let _ = writeln!(self.body, "    mul.wide.s32 {off}, {idx_reg}, {stride};");
                     let _ = writeln!(self.body, "    add.u64 {ptr}, {base}, {off};");
                     let _ = writeln!(self.body, "    {st_op} [{ptr}], {val_reg};");
+                }
+                KernelStmt::SyncThreads => {
+                    let _ = writeln!(self.body, "    bar.sync 0;");
                 }
                 KernelStmt::If {
                     cond,
@@ -1113,51 +1275,139 @@ impl PtxEmitter {
                 .get(name)
                 .map(|(_, r)| r.clone())
                 .unwrap_or_else(|| "%r0".to_string()),
-            KernelExpr::GlobalId => {
+            KernelExpr::GlobalId | KernelExpr::GlobalIdY | KernelExpr::GlobalIdZ => {
+                let axis = match expr {
+                    KernelExpr::GlobalId => "x",
+                    KernelExpr::GlobalIdY => "y",
+                    _ => "z",
+                };
                 let b = self.alloc_s32();
                 let d = self.alloc_s32();
                 let t = self.alloc_s32();
                 let out = self.alloc_s32();
-                let _ = writeln!(self.body, "    mov.u32 {b}, %ctaid.x;");
-                let _ = writeln!(self.body, "    mov.u32 {d}, %ntid.x;");
-                let _ = writeln!(self.body, "    mov.u32 {t}, %tid.x;");
+                let _ = writeln!(self.body, "    mov.u32 {b}, %ctaid.{axis};");
+                let _ = writeln!(self.body, "    mov.u32 {d}, %ntid.{axis};");
+                let _ = writeln!(self.body, "    mov.u32 {t}, %tid.{axis};");
                 let _ = writeln!(self.body, "    mad.lo.s32 {out}, {b}, {d}, {t};");
                 out
             }
-            KernelExpr::BlockIdx => {
+            KernelExpr::BlockIdx | KernelExpr::BlockIdxY | KernelExpr::BlockIdxZ => {
+                let axis = match expr {
+                    KernelExpr::BlockIdx => "x",
+                    KernelExpr::BlockIdxY => "y",
+                    _ => "z",
+                };
                 let r = self.alloc_s32();
-                let _ = writeln!(self.body, "    mov.u32 {r}, %ctaid.x;");
+                let _ = writeln!(self.body, "    mov.u32 {r}, %ctaid.{axis};");
                 r
             }
-            KernelExpr::ThreadIdx => {
+            KernelExpr::ThreadIdx | KernelExpr::ThreadIdxY | KernelExpr::ThreadIdxZ => {
+                let axis = match expr {
+                    KernelExpr::ThreadIdx => "x",
+                    KernelExpr::ThreadIdxY => "y",
+                    _ => "z",
+                };
                 let r = self.alloc_s32();
-                let _ = writeln!(self.body, "    mov.u32 {r}, %tid.x;");
+                let _ = writeln!(self.body, "    mov.u32 {r}, %tid.{axis};");
                 r
             }
-            KernelExpr::BlockDim => {
+            KernelExpr::BlockDim | KernelExpr::BlockDimY | KernelExpr::BlockDimZ => {
+                let axis = match expr {
+                    KernelExpr::BlockDim => "x",
+                    KernelExpr::BlockDimY => "y",
+                    _ => "z",
+                };
                 let r = self.alloc_s32();
-                let _ = writeln!(self.body, "    mov.u32 {r}, %ntid.x;");
+                let _ = writeln!(self.body, "    mov.u32 {r}, %ntid.{axis};");
                 r
             }
-            KernelExpr::GridDim => {
+            KernelExpr::GridDim | KernelExpr::GridDimY | KernelExpr::GridDimZ => {
+                let axis = match expr {
+                    KernelExpr::GridDim => "x",
+                    KernelExpr::GridDimY => "y",
+                    _ => "z",
+                };
                 let r = self.alloc_s32();
-                let _ = writeln!(self.body, "    mov.u32 {r}, %nctaid.x;");
+                let _ = writeln!(self.body, "    mov.u32 {r}, %nctaid.{axis};");
                 r
             }
             KernelExpr::Load {
-                buf_param,
+                buf_param, index, ..
+            } => {
+                let idx_reg = self.emit_expr(index);
+                let base = self.param_regs[*buf_param].clone();
+                let pty = self.param_tys[*buf_param];
+                let off = self.alloc_u64();
+                let ptr = self.alloc_u64();
+                match pty {
+                    KernelParamType::BufF32 => {
+                        let dst = self.alloc_f32();
+                        let _ = writeln!(self.body, "    mul.wide.s32 {off}, {idx_reg}, 4;");
+                        let _ = writeln!(self.body, "    add.u64 {ptr}, {base}, {off};");
+                        let _ = writeln!(self.body, "    ld.global.f32 {dst}, [{ptr}];");
+                        dst
+                    }
+                    KernelParamType::BufF64 => {
+                        let dst = self.alloc_f64();
+                        let _ = writeln!(self.body, "    mul.wide.s32 {off}, {idx_reg}, 8;");
+                        let _ = writeln!(self.body, "    add.u64 {ptr}, {base}, {off};");
+                        let _ = writeln!(self.body, "    ld.global.f64 {dst}, [{ptr}];");
+                        dst
+                    }
+                    KernelParamType::BufI32 => {
+                        let dst = self.alloc_s32();
+                        let _ = writeln!(self.body, "    mul.wide.s32 {off}, {idx_reg}, 4;");
+                        let _ = writeln!(self.body, "    add.u64 {ptr}, {base}, {off};");
+                        let _ = writeln!(self.body, "    ld.global.s32 {dst}, [{ptr}];");
+                        dst
+                    }
+                    KernelParamType::BufU8 => {
+                        let u = self.alloc_u32();
+                        let dst = self.alloc_s32();
+                        let _ = writeln!(self.body, "    cvt.s64.s32 {off}, {idx_reg};");
+                        let _ = writeln!(self.body, "    add.u64 {ptr}, {base}, {off};");
+                        let _ = writeln!(self.body, "    ld.global.u8 {u}, [{ptr}];");
+                        let _ = writeln!(self.body, "    mov.b32 {dst}, {u};");
+                        dst
+                    }
+                    KernelParamType::BufF16 => {
+                        let h = self.alloc_b16();
+                        let dst = self.alloc_f32();
+                        let _ = writeln!(self.body, "    mul.wide.s32 {off}, {idx_reg}, 2;");
+                        let _ = writeln!(self.body, "    add.u64 {ptr}, {base}, {off};");
+                        let _ = writeln!(self.body, "    ld.global.b16 {h}, [{ptr}];");
+                        let _ = writeln!(self.body, "    cvt.f32.f16 {dst}, {h};");
+                        dst
+                    }
+                    KernelParamType::BufBF16 => {
+                        let u = self.alloc_u32();
+                        let sh = self.alloc_u32();
+                        let dst = self.alloc_f32();
+                        let _ = writeln!(self.body, "    mul.wide.s32 {off}, {idx_reg}, 2;");
+                        let _ = writeln!(self.body, "    add.u64 {ptr}, {base}, {off};");
+                        let _ = writeln!(self.body, "    ld.global.u16 {u}, [{ptr}];");
+                        let _ = writeln!(self.body, "    shl.b32 {sh}, {u}, 16;");
+                        let _ = writeln!(self.body, "    mov.b32 {dst}, {sh};");
+                        dst
+                    }
+                    _ => self.alloc_s32(),
+                }
+            }
+            KernelExpr::LoadShared {
+                shared_idx,
                 index,
                 elem_ty,
             } => {
                 let idx_reg = self.emit_expr(index);
-                let base = self.param_regs[*buf_param].clone();
+                let base = self.alloc_u64();
                 let off = self.alloc_u64();
                 let ptr = self.alloc_u64();
                 let (stride, ld_op, dst) = match elem_ty {
-                    KernelScalarType::F32 => (4, "ld.global.f32", self.alloc_f32()),
-                    KernelScalarType::F64 => (8, "ld.global.f64", self.alloc_f64()),
-                    _ => (4, "ld.global.s32", self.alloc_s32()),
+                    KernelScalarType::F32 => (4, "ld.shared.f32", self.alloc_f32()),
+                    KernelScalarType::F64 => (8, "ld.shared.f64", self.alloc_f64()),
+                    _ => (4, "ld.shared.s32", self.alloc_s32()),
                 };
+                let _ = writeln!(self.body, "    mov.u64 {base}, _sh_{shared_idx};");
                 let _ = writeln!(self.body, "    mul.wide.s32 {off}, {idx_reg}, {stride};");
                 let _ = writeln!(self.body, "    add.u64 {ptr}, {base}, {off};");
                 let _ = writeln!(self.body, "    {ld_op} {dst}, [{ptr}];");
@@ -1422,6 +1672,30 @@ impl PtxEmitter {
                         let _ = writeln!(self.body, "    or.pred {dst}, {l}, {r};");
                         dst
                     }
+                    KernelBinOp::BitAnd | KernelBinOp::BitOr | KernelBinOp::BitXor => {
+                        let dst = self.alloc_s32();
+                        let inst = match op {
+                            KernelBinOp::BitAnd => "and.b32",
+                            KernelBinOp::BitOr => "or.b32",
+                            KernelBinOp::BitXor => "xor.b32",
+                            _ => unreachable!(),
+                        };
+                        let _ = writeln!(self.body, "    {inst} {dst}, {l}, {r};");
+                        dst
+                    }
+                    KernelBinOp::Shl | KernelBinOp::Shr => {
+                        let amt = self.alloc_u32();
+                        let dst = self.alloc_s32();
+                        let _ = writeln!(self.body, "    mov.b32 {amt}, {r};");
+                        let _ = writeln!(self.body, "    and.b32 {amt}, {amt}, 31;");
+                        let inst = match op {
+                            KernelBinOp::Shl => "shl.b32",
+                            KernelBinOp::Shr => "shr.s32",
+                            _ => unreachable!(),
+                        };
+                        let _ = writeln!(self.body, "    {inst} {dst}, {l}, {amt};");
+                        dst
+                    }
                 }
             }
         }
@@ -1430,14 +1704,17 @@ impl PtxEmitter {
 
 /// Compile a typed [`KernelProgram`] to pure-ASCII CUDA PTX ISA 7.0 (`sm_50+`).
 pub(crate) fn emit_ptx(program: &KernelProgram) -> String {
-    let mut em = PtxEmitter::new();
+    let mut em = PtxEmitter::new(&program.params, &program.shared);
     let mut param_decls = Vec::with_capacity(program.params.len());
     for (idx, p) in program.params.iter().enumerate() {
         let pname = format!("param_{idx}");
         let (ptx_ty, ld_op, reg) = match p.ty {
-            KernelParamType::BufF32 | KernelParamType::BufF64 => {
-                (".u64", "ld.param.u64", em.alloc_u64())
-            }
+            KernelParamType::BufF32
+            | KernelParamType::BufF64
+            | KernelParamType::BufF16
+            | KernelParamType::BufBF16
+            | KernelParamType::BufU8
+            | KernelParamType::BufI32 => (".u64", "ld.param.u64", em.alloc_u64()),
             KernelParamType::F32 => (".f32", "ld.param.f32", em.alloc_f32()),
             KernelParamType::F64 => (".f64", "ld.param.f64", em.alloc_f64()),
             KernelParamType::I32 => (".u32", "ld.param.u32", em.alloc_s32()),
@@ -1458,8 +1735,22 @@ pub(crate) fn emit_ptx(program: &KernelProgram) -> String {
     let _ = writeln!(out, "{}", param_decls.join(",\n"));
     let _ = writeln!(out, ")");
     let _ = writeln!(out, "{{");
+    for (sidx, sh) in program.shared.iter().enumerate() {
+        let (align, stype) = match sh.elem_ty {
+            KernelScalarType::F64 => (8, ".f64"),
+            KernelScalarType::F32 => (4, ".f32"),
+            _ => (4, ".s32"),
+        };
+        let _ = writeln!(
+            out,
+            "    .shared .align {align} {stype} _sh_{sidx}[{}];",
+            sh.len
+        );
+    }
     let _ = writeln!(out, "    .reg .pred %p<{}>;", em.n_pred + 1);
+    let _ = writeln!(out, "    .reg .b16 %rs<{}>;", em.n_b16 + 1);
     let _ = writeln!(out, "    .reg .s32 %r<{}>;", em.n_s32 + 1);
+    let _ = writeln!(out, "    .reg .u32 %ru<{}>;", em.n_u32 + 1);
     let _ = writeln!(out, "    .reg .u64 %rd<{}>;", em.n_u64 + 1);
     let _ = writeln!(out, "    .reg .f32 %f<{}>;", em.n_f32 + 1);
     let _ = writeln!(out, "    .reg .f64 %fd<{}>;", em.n_f64 + 1);
@@ -1483,6 +1774,7 @@ const SPV_OP_TYPE_BOOL: u16 = 20;
 const SPV_OP_TYPE_INT: u16 = 21;
 const SPV_OP_TYPE_FLOAT: u16 = 22;
 const SPV_OP_TYPE_VECTOR: u16 = 23;
+const SPV_OP_TYPE_ARRAY: u16 = 28;
 const SPV_OP_TYPE_RUNTIME_ARRAY: u16 = 29;
 const SPV_OP_TYPE_STRUCT: u16 = 30;
 const SPV_OP_TYPE_POINTER: u16 = 32;
@@ -1498,6 +1790,7 @@ const SPV_OP_STORE: u16 = 62;
 const SPV_OP_ACCESS_CHAIN: u16 = 65;
 const SPV_OP_DECORATE: u16 = 71;
 const SPV_OP_MEMBER_DECORATE: u16 = 72;
+const SPV_OP_COMPOSITE_CONSTRUCT: u16 = 80;
 const SPV_OP_COMPOSITE_EXTRACT: u16 = 81;
 const SPV_OP_CONVERT_F_TO_S: u16 = 110;
 const SPV_OP_CONVERT_S_TO_F: u16 = 111;
@@ -1519,6 +1812,7 @@ const SPV_OP_LOGICAL_NOT_EQUAL: u16 = 165;
 const SPV_OP_LOGICAL_OR: u16 = 166;
 const SPV_OP_LOGICAL_AND: u16 = 167;
 const SPV_OP_LOGICAL_NOT: u16 = 168;
+const SPV_OP_SELECT: u16 = 169;
 const SPV_OP_IEQUAL: u16 = 170;
 const SPV_OP_INOT_EQUAL: u16 = 171;
 const SPV_OP_SGREATER_THAN: u16 = 173;
@@ -1531,8 +1825,16 @@ const SPV_OP_FORD_LESS_THAN: u16 = 184;
 const SPV_OP_FORD_GREATER_THAN: u16 = 186;
 const SPV_OP_FORD_LESS_THAN_EQUAL: u16 = 188;
 const SPV_OP_FORD_GREATER_THAN_EQUAL: u16 = 190;
+const SPV_OP_SHIFT_RIGHT_LOGICAL: u16 = 194;
+const SPV_OP_SHIFT_RIGHT_ARITHMETIC: u16 = 195;
 const SPV_OP_SHIFT_LEFT_LOGICAL: u16 = 196;
 const SPV_OP_BITWISE_OR: u16 = 197;
+const SPV_OP_BITWISE_XOR: u16 = 198;
+const SPV_OP_BITWISE_AND: u16 = 199;
+const SPV_OP_NOT: u16 = 200;
+const SPV_OP_CONTROL_BARRIER: u16 = 224;
+const SPV_OP_ATOMIC_AND: u16 = 240;
+const SPV_OP_ATOMIC_OR: u16 = 241;
 const SPV_OP_UCONVERT: u16 = 114;
 const SPV_OP_LOOP_MERGE: u16 = 246;
 const SPV_OP_SELECTION_MERGE: u16 = 247;
@@ -1550,9 +1852,12 @@ const GLSL_FMIN: u32 = 37;
 const GLSL_SMIN: u32 = 39;
 const GLSL_FMAX: u32 = 40;
 const GLSL_SMAX: u32 = 42;
+const GLSL_PACK_HALF_2X16: u32 = 58;
+const GLSL_UNPACK_HALF_2X16: u32 = 62;
 
 const SPV_SC_INPUT: u32 = 1;
 const SPV_SC_UNIFORM: u32 = 2;
+const SPV_SC_WORKGROUP: u32 = 4;
 const SPV_SC_FUNCTION: u32 = 7;
 
 const SPV_DEC_BUFFER_BLOCK: u32 = 3;
@@ -1579,7 +1884,12 @@ pub(crate) fn vulkan_kernel_layout(program: &KernelProgram) -> VulkanKernelLayou
     let mut next_word = 0u32;
     for (idx, p) in program.params.iter().enumerate() {
         match p.ty {
-            KernelParamType::BufF32 | KernelParamType::BufF64 => {
+            KernelParamType::BufF32
+            | KernelParamType::BufF64
+            | KernelParamType::BufF16
+            | KernelParamType::BufBF16
+            | KernelParamType::BufU8
+            | KernelParamType::BufI32 => {
                 buf_bindings.push((idx, next_binding));
                 next_binding += 1;
             }
@@ -1622,10 +1932,15 @@ struct SpvEmitter {
     ty_u64: u32,
     ty_f32: u32,
     ty_f64: u32,
+    ty_v3u32: u32,
+    ty_v2f32: u32,
     ty_ptr_fn_i32: u32,
     ty_ptr_fn_f32: u32,
     ty_ptr_fn_f64: u32,
     ty_ptr_fn_bool: u32,
+    ty_ptr_wg_i32: u32,
+    ty_ptr_wg_f32: u32,
+    ty_ptr_wg_f64: u32,
     ty_ptr_unif_u32: u32,
     ty_ptr_unif_f32: u32,
     ty_ptr_unif_f64: u32,
@@ -1642,9 +1957,10 @@ struct SpvEmitter {
     var_bid: u32,
     var_tid: u32,
     var_gdim: u32,
-    local_size_x: u32,
+    local_size: [u32; 3],
 
-    buf_vars: HashMap<usize, (u32, KernelScalarType)>,
+    buf_vars: HashMap<usize, (u32, KernelParamType)>,
+    shared_vars: Vec<(u32, KernelScalarType)>,
     scalar_var: Option<u32>,
     scalar_offsets: HashMap<usize, u32>,
     local_vars: HashMap<String, (KernelScalarType, u32)>,
@@ -1791,19 +2107,39 @@ impl SpvEmitter {
                 } => {
                     let idx_id = self.emit_expr(index);
                     let val_id = self.emit_expr(value);
-                    let &(buf_var, elem_ty) =
+                    let &(buf_var, pty) =
                         self.buf_vars.get(buf_param).expect("buf param registered");
+                    self.emit_buf_store(buf_var, pty, idx_id, val_id);
+                }
+                KernelStmt::StoreShared {
+                    shared_idx,
+                    index,
+                    value,
+                } => {
+                    let idx_id = self.emit_expr(index);
+                    let val_id = self.emit_expr(value);
+                    let (sh_var, elem_ty) = self.shared_vars[*shared_idx];
                     let ptr_ty = match elem_ty {
-                        KernelScalarType::F64 => self.ty_ptr_unif_f64,
-                        _ => self.ty_ptr_unif_f32,
+                        KernelScalarType::F64 => self.ty_ptr_wg_f64,
+                        KernelScalarType::F32 => self.ty_ptr_wg_f32,
+                        _ => self.ty_ptr_wg_i32,
                     };
                     let ptr = self.alloc_id();
                     Self::emit(
                         &mut self.code_words,
                         SPV_OP_ACCESS_CHAIN,
-                        &[ptr_ty, ptr, buf_var, self.c_u0, idx_id],
+                        &[ptr_ty, ptr, sh_var, idx_id],
                     );
                     Self::emit(&mut self.code_words, SPV_OP_STORE, &[ptr, val_id]);
+                }
+                KernelStmt::SyncThreads => {
+                    let c_wg = self.const_u32(2); // Scope::Workgroup
+                    let c_sem = self.const_u32(0x108); // AcquireRelease | WorkgroupMemory
+                    Self::emit(
+                        &mut self.code_words,
+                        SPV_OP_CONTROL_BARRIER,
+                        &[c_wg, c_wg, c_sem],
+                    );
                 }
                 KernelStmt::If {
                     cond,
@@ -1892,22 +2228,483 @@ impl SpvEmitter {
         val
     }
 
-    fn load_builtin_x_i32(&mut self, var_vec3: u32, ty_v3u32: u32) -> u32 {
+    fn load_builtin_axis_i32(&mut self, var_vec3: u32, axis: u32) -> u32 {
         let vec_val = self.alloc_id();
         Self::emit(
             &mut self.code_words,
             SPV_OP_LOAD,
-            &[ty_v3u32, vec_val, var_vec3],
+            &[self.ty_v3u32, vec_val, var_vec3],
         );
-        let ux = self.alloc_id();
+        let u = self.alloc_id();
         Self::emit(
             &mut self.code_words,
             SPV_OP_COMPOSITE_EXTRACT,
-            &[self.ty_u32, ux, vec_val, 0],
+            &[self.ty_u32, u, vec_val, axis],
         );
-        let ix = self.alloc_id();
-        Self::emit(&mut self.code_words, SPV_OP_BITCAST, &[self.ty_i32, ix, ux]);
-        ix
+        let i = self.alloc_id();
+        Self::emit(&mut self.code_words, SPV_OP_BITCAST, &[self.ty_i32, i, u]);
+        i
+    }
+
+    fn emit_buf_atomic_subword_store(
+        &mut self,
+        buf_var: u32,
+        word_idx: u32,
+        shift_bits: u32,
+        lane_mask: u32,
+        packed_u32: u32,
+    ) {
+        let c_mask_base = self.const_u32(lane_mask);
+        let c_scope_dev = self.const_u32(1); // Scope::Device
+        let c_sem_none = self.const_u32(0); // MemorySemantics::None
+        let mask_shifted = self.alloc_id();
+        let clear_mask = self.alloc_id();
+        let masked_val = self.alloc_id();
+        let ins_val = self.alloc_id();
+        let ptr = self.alloc_id();
+        let old_a = self.alloc_id();
+        let old_b = self.alloc_id();
+        Self::emit(
+            &mut self.code_words,
+            SPV_OP_SHIFT_LEFT_LOGICAL,
+            &[self.ty_u32, mask_shifted, c_mask_base, shift_bits],
+        );
+        Self::emit(
+            &mut self.code_words,
+            SPV_OP_NOT,
+            &[self.ty_u32, clear_mask, mask_shifted],
+        );
+        Self::emit(
+            &mut self.code_words,
+            SPV_OP_BITWISE_AND,
+            &[self.ty_u32, masked_val, packed_u32, c_mask_base],
+        );
+        Self::emit(
+            &mut self.code_words,
+            SPV_OP_SHIFT_LEFT_LOGICAL,
+            &[self.ty_u32, ins_val, masked_val, shift_bits],
+        );
+        Self::emit(
+            &mut self.code_words,
+            SPV_OP_ACCESS_CHAIN,
+            &[self.ty_ptr_unif_u32, ptr, buf_var, self.c_u0, word_idx],
+        );
+        Self::emit(
+            &mut self.code_words,
+            SPV_OP_ATOMIC_AND,
+            &[self.ty_u32, old_a, ptr, c_scope_dev, c_sem_none, clear_mask],
+        );
+        Self::emit(
+            &mut self.code_words,
+            SPV_OP_ATOMIC_OR,
+            &[self.ty_u32, old_b, ptr, c_scope_dev, c_sem_none, ins_val],
+        );
+    }
+
+    fn emit_buf_store(&mut self, buf_var: u32, pty: KernelParamType, idx_id: u32, val_id: u32) {
+        match pty {
+            KernelParamType::BufF32 => {
+                let ptr = self.alloc_id();
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_ACCESS_CHAIN,
+                    &[self.ty_ptr_unif_f32, ptr, buf_var, self.c_u0, idx_id],
+                );
+                Self::emit(&mut self.code_words, SPV_OP_STORE, &[ptr, val_id]);
+            }
+            KernelParamType::BufF64 => {
+                let ptr = self.alloc_id();
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_ACCESS_CHAIN,
+                    &[self.ty_ptr_unif_f64, ptr, buf_var, self.c_u0, idx_id],
+                );
+                Self::emit(&mut self.code_words, SPV_OP_STORE, &[ptr, val_id]);
+            }
+            KernelParamType::BufI32 => {
+                let uval = self.alloc_id();
+                let ptr = self.alloc_id();
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_BITCAST,
+                    &[self.ty_u32, uval, val_id],
+                );
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_ACCESS_CHAIN,
+                    &[self.ty_ptr_unif_u32, ptr, buf_var, self.c_u0, idx_id],
+                );
+                Self::emit(&mut self.code_words, SPV_OP_STORE, &[ptr, uval]);
+            }
+            KernelParamType::BufU8 => {
+                let c_u2 = self.const_u32(2);
+                let c_u3 = self.const_u32(3);
+                let idx_u = self.alloc_id();
+                let word_idx = self.alloc_id();
+                let lane = self.alloc_id();
+                let shift = self.alloc_id();
+                let uval = self.alloc_id();
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_BITCAST,
+                    &[self.ty_u32, idx_u, idx_id],
+                );
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_SHIFT_RIGHT_LOGICAL,
+                    &[self.ty_u32, word_idx, idx_u, c_u2],
+                );
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_BITWISE_AND,
+                    &[self.ty_u32, lane, idx_u, c_u3],
+                );
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_SHIFT_LEFT_LOGICAL,
+                    &[self.ty_u32, shift, lane, c_u3],
+                );
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_BITCAST,
+                    &[self.ty_u32, uval, val_id],
+                );
+                self.emit_buf_atomic_subword_store(buf_var, word_idx, shift, 0xFF, uval);
+            }
+            KernelParamType::BufF16 => {
+                let c_u1 = self.const_u32(1);
+                let c_u4 = self.const_u32(4);
+                let c_f0 = self.const_f32(0.0);
+                let v2 = self.alloc_id();
+                let packed = self.alloc_id();
+                let idx_u = self.alloc_id();
+                let word_idx = self.alloc_id();
+                let lane = self.alloc_id();
+                let shift = self.alloc_id();
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_COMPOSITE_CONSTRUCT,
+                    &[self.ty_v2f32, v2, val_id, c_f0],
+                );
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_EXT_INST,
+                    &[self.ty_u32, packed, self.glsl_ext, GLSL_PACK_HALF_2X16, v2],
+                );
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_BITCAST,
+                    &[self.ty_u32, idx_u, idx_id],
+                );
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_SHIFT_RIGHT_LOGICAL,
+                    &[self.ty_u32, word_idx, idx_u, c_u1],
+                );
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_BITWISE_AND,
+                    &[self.ty_u32, lane, idx_u, c_u1],
+                );
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_SHIFT_LEFT_LOGICAL,
+                    &[self.ty_u32, shift, lane, c_u4],
+                );
+                self.emit_buf_atomic_subword_store(buf_var, word_idx, shift, 0xFFFF, packed);
+            }
+            KernelParamType::BufBF16 => {
+                let c_u1 = self.const_u32(1);
+                let c_u4 = self.const_u32(4);
+                let c_u16 = self.const_u32(16);
+                let c_7fff = self.const_u32(0x7FFF);
+                let bits = self.alloc_id();
+                let hi16 = self.alloc_id();
+                let lsb = self.alloc_id();
+                let bias = self.alloc_id();
+                let rnd = self.alloc_id();
+                let bf_u = self.alloc_id();
+                let idx_u = self.alloc_id();
+                let word_idx = self.alloc_id();
+                let lane = self.alloc_id();
+                let shift = self.alloc_id();
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_BITCAST,
+                    &[self.ty_u32, bits, val_id],
+                );
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_SHIFT_RIGHT_LOGICAL,
+                    &[self.ty_u32, hi16, bits, c_u16],
+                );
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_BITWISE_AND,
+                    &[self.ty_u32, lsb, hi16, c_u1],
+                );
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_IADD,
+                    &[self.ty_u32, bias, lsb, c_7fff],
+                );
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_IADD,
+                    &[self.ty_u32, rnd, bits, bias],
+                );
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_SHIFT_RIGHT_LOGICAL,
+                    &[self.ty_u32, bf_u, rnd, c_u16],
+                );
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_BITCAST,
+                    &[self.ty_u32, idx_u, idx_id],
+                );
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_SHIFT_RIGHT_LOGICAL,
+                    &[self.ty_u32, word_idx, idx_u, c_u1],
+                );
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_BITWISE_AND,
+                    &[self.ty_u32, lane, idx_u, c_u1],
+                );
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_SHIFT_LEFT_LOGICAL,
+                    &[self.ty_u32, shift, lane, c_u4],
+                );
+                self.emit_buf_atomic_subword_store(buf_var, word_idx, shift, 0xFFFF, bf_u);
+            }
+            _ => {}
+        }
+    }
+
+    fn emit_buf_load(&mut self, buf_var: u32, pty: KernelParamType, idx_id: u32) -> u32 {
+        match pty {
+            KernelParamType::BufF32 => {
+                let ptr = self.alloc_id();
+                let val = self.alloc_id();
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_ACCESS_CHAIN,
+                    &[self.ty_ptr_unif_f32, ptr, buf_var, self.c_u0, idx_id],
+                );
+                Self::emit(&mut self.code_words, SPV_OP_LOAD, &[self.ty_f32, val, ptr]);
+                val
+            }
+            KernelParamType::BufF64 => {
+                let ptr = self.alloc_id();
+                let val = self.alloc_id();
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_ACCESS_CHAIN,
+                    &[self.ty_ptr_unif_f64, ptr, buf_var, self.c_u0, idx_id],
+                );
+                Self::emit(&mut self.code_words, SPV_OP_LOAD, &[self.ty_f64, val, ptr]);
+                val
+            }
+            KernelParamType::BufI32 => {
+                let ptr = self.alloc_id();
+                let uval = self.alloc_id();
+                let ival = self.alloc_id();
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_ACCESS_CHAIN,
+                    &[self.ty_ptr_unif_u32, ptr, buf_var, self.c_u0, idx_id],
+                );
+                Self::emit(&mut self.code_words, SPV_OP_LOAD, &[self.ty_u32, uval, ptr]);
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_BITCAST,
+                    &[self.ty_i32, ival, uval],
+                );
+                ival
+            }
+            KernelParamType::BufU8 => {
+                let c_u2 = self.const_u32(2);
+                let c_u3 = self.const_u32(3);
+                let c_ff = self.const_u32(0xFF);
+                let idx_u = self.alloc_id();
+                let word_idx = self.alloc_id();
+                let lane = self.alloc_id();
+                let shift = self.alloc_id();
+                let ptr = self.alloc_id();
+                let w = self.alloc_id();
+                let sh = self.alloc_id();
+                let b_u = self.alloc_id();
+                let b_i = self.alloc_id();
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_BITCAST,
+                    &[self.ty_u32, idx_u, idx_id],
+                );
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_SHIFT_RIGHT_LOGICAL,
+                    &[self.ty_u32, word_idx, idx_u, c_u2],
+                );
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_BITWISE_AND,
+                    &[self.ty_u32, lane, idx_u, c_u3],
+                );
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_SHIFT_LEFT_LOGICAL,
+                    &[self.ty_u32, shift, lane, c_u3],
+                );
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_ACCESS_CHAIN,
+                    &[self.ty_ptr_unif_u32, ptr, buf_var, self.c_u0, word_idx],
+                );
+                Self::emit(&mut self.code_words, SPV_OP_LOAD, &[self.ty_u32, w, ptr]);
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_SHIFT_RIGHT_LOGICAL,
+                    &[self.ty_u32, sh, w, shift],
+                );
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_BITWISE_AND,
+                    &[self.ty_u32, b_u, sh, c_ff],
+                );
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_BITCAST,
+                    &[self.ty_i32, b_i, b_u],
+                );
+                b_i
+            }
+            KernelParamType::BufF16 => {
+                let c_u1 = self.const_u32(1);
+                let idx_u = self.alloc_id();
+                let word_idx = self.alloc_id();
+                let lane = self.alloc_id();
+                let is_odd = self.alloc_id();
+                let ptr = self.alloc_id();
+                let w = self.alloc_id();
+                let pair = self.alloc_id();
+                let f0 = self.alloc_id();
+                let f1 = self.alloc_id();
+                let out = self.alloc_id();
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_BITCAST,
+                    &[self.ty_u32, idx_u, idx_id],
+                );
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_SHIFT_RIGHT_LOGICAL,
+                    &[self.ty_u32, word_idx, idx_u, c_u1],
+                );
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_BITWISE_AND,
+                    &[self.ty_u32, lane, idx_u, c_u1],
+                );
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_INOT_EQUAL,
+                    &[self.ty_bool, is_odd, lane, self.c_u0],
+                );
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_ACCESS_CHAIN,
+                    &[self.ty_ptr_unif_u32, ptr, buf_var, self.c_u0, word_idx],
+                );
+                Self::emit(&mut self.code_words, SPV_OP_LOAD, &[self.ty_u32, w, ptr]);
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_EXT_INST,
+                    &[self.ty_v2f32, pair, self.glsl_ext, GLSL_UNPACK_HALF_2X16, w],
+                );
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_COMPOSITE_EXTRACT,
+                    &[self.ty_f32, f0, pair, 0],
+                );
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_COMPOSITE_EXTRACT,
+                    &[self.ty_f32, f1, pair, 1],
+                );
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_SELECT,
+                    &[self.ty_f32, out, is_odd, f1, f0],
+                );
+                out
+            }
+            KernelParamType::BufBF16 => {
+                let c_u1 = self.const_u32(1);
+                let c_u16 = self.const_u32(16);
+                let c_hi = self.const_u32(0xFFFF_0000);
+                let idx_u = self.alloc_id();
+                let word_idx = self.alloc_id();
+                let lane = self.alloc_id();
+                let is_odd = self.alloc_id();
+                let ptr = self.alloc_id();
+                let w = self.alloc_id();
+                let lo_b = self.alloc_id();
+                let hi_b = self.alloc_id();
+                let fbits = self.alloc_id();
+                let out = self.alloc_id();
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_BITCAST,
+                    &[self.ty_u32, idx_u, idx_id],
+                );
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_SHIFT_RIGHT_LOGICAL,
+                    &[self.ty_u32, word_idx, idx_u, c_u1],
+                );
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_BITWISE_AND,
+                    &[self.ty_u32, lane, idx_u, c_u1],
+                );
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_INOT_EQUAL,
+                    &[self.ty_bool, is_odd, lane, self.c_u0],
+                );
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_ACCESS_CHAIN,
+                    &[self.ty_ptr_unif_u32, ptr, buf_var, self.c_u0, word_idx],
+                );
+                Self::emit(&mut self.code_words, SPV_OP_LOAD, &[self.ty_u32, w, ptr]);
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_SHIFT_LEFT_LOGICAL,
+                    &[self.ty_u32, lo_b, w, c_u16],
+                );
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_BITWISE_AND,
+                    &[self.ty_u32, hi_b, w, c_hi],
+                );
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_SELECT,
+                    &[self.ty_u32, fbits, is_odd, hi_b, lo_b],
+                );
+                Self::emit(
+                    &mut self.code_words,
+                    SPV_OP_BITCAST,
+                    &[self.ty_f32, out, fbits],
+                );
+                out
+            }
+            _ => self.const_i32(0),
+        }
     }
 
     fn emit_expr(&mut self, expr: &KernelExpr) -> u32 {
@@ -1978,41 +2775,47 @@ impl SpvEmitter {
                 Self::emit(&mut self.code_words, SPV_OP_LOAD, &[sty, res, var_id]);
                 res
             }
-            KernelExpr::GlobalId => {
-                let ty_v3 = self.var_gid_vec_ty();
-                self.load_builtin_x_i32(self.var_gid, ty_v3)
-            }
-            KernelExpr::BlockIdx => {
-                let ty_v3 = self.var_gid_vec_ty();
-                self.load_builtin_x_i32(self.var_bid, ty_v3)
-            }
-            KernelExpr::ThreadIdx => {
-                let ty_v3 = self.var_gid_vec_ty();
-                self.load_builtin_x_i32(self.var_tid, ty_v3)
-            }
-            KernelExpr::GridDim => {
-                let ty_v3 = self.var_gid_vec_ty();
-                self.load_builtin_x_i32(self.var_gdim, ty_v3)
-            }
-            KernelExpr::BlockDim => self.const_i32(self.local_size_x as i32),
+            KernelExpr::GlobalId => self.load_builtin_axis_i32(self.var_gid, 0),
+            KernelExpr::GlobalIdY => self.load_builtin_axis_i32(self.var_gid, 1),
+            KernelExpr::GlobalIdZ => self.load_builtin_axis_i32(self.var_gid, 2),
+            KernelExpr::BlockIdx => self.load_builtin_axis_i32(self.var_bid, 0),
+            KernelExpr::BlockIdxY => self.load_builtin_axis_i32(self.var_bid, 1),
+            KernelExpr::BlockIdxZ => self.load_builtin_axis_i32(self.var_bid, 2),
+            KernelExpr::ThreadIdx => self.load_builtin_axis_i32(self.var_tid, 0),
+            KernelExpr::ThreadIdxY => self.load_builtin_axis_i32(self.var_tid, 1),
+            KernelExpr::ThreadIdxZ => self.load_builtin_axis_i32(self.var_tid, 2),
+            KernelExpr::GridDim => self.load_builtin_axis_i32(self.var_gdim, 0),
+            KernelExpr::GridDimY => self.load_builtin_axis_i32(self.var_gdim, 1),
+            KernelExpr::GridDimZ => self.load_builtin_axis_i32(self.var_gdim, 2),
+            KernelExpr::BlockDim => self.const_i32(self.local_size[0] as i32),
+            KernelExpr::BlockDimY => self.const_i32(self.local_size[1] as i32),
+            KernelExpr::BlockDimZ => self.const_i32(self.local_size[2] as i32),
             KernelExpr::Load {
-                buf_param,
+                buf_param, index, ..
+            } => {
+                let idx_id = self.emit_expr(index);
+                let &(buf_var, pty) = self.buf_vars.get(buf_param).expect("buf registered");
+                self.emit_buf_load(buf_var, pty, idx_id)
+            }
+            KernelExpr::LoadShared {
+                shared_idx,
                 index,
                 elem_ty,
             } => {
                 let idx_id = self.emit_expr(index);
-                let &(buf_var, _) = self.buf_vars.get(buf_param).expect("buf registered");
+                let (sh_var, _) = self.shared_vars[*shared_idx];
                 let (ptr_ty, val_ty) = match elem_ty {
-                    KernelScalarType::F64 => (self.ty_ptr_unif_f64, self.ty_f64),
-                    _ => (self.ty_ptr_unif_f32, self.ty_f32),
+                    KernelScalarType::F64 => (self.ty_ptr_wg_f64, self.ty_f64),
+                    KernelScalarType::F32 => (self.ty_ptr_wg_f32, self.ty_f32),
+                    _ => (self.ty_ptr_wg_i32, self.ty_i32),
                 };
                 let ptr = self.alloc_id();
+                let val = self.alloc_id();
                 Self::emit(
                     &mut self.code_words,
                     SPV_OP_ACCESS_CHAIN,
-                    &[ptr_ty, ptr, buf_var, self.c_u0, idx_id],
+                    &[ptr_ty, ptr, sh_var, idx_id],
                 );
-                let val = self.alloc_id();
                 Self::emit(&mut self.code_words, SPV_OP_LOAD, &[val_ty, val, ptr]);
                 val
             }
@@ -2174,6 +2977,21 @@ impl SpvEmitter {
                             &[sty, dst, self.glsl_ext, inst, l, r],
                         );
                     }
+                    KernelBinOp::Shl | KernelBinOp::Shr => {
+                        let c_31 = self.const_i32(31);
+                        let masked = self.alloc_id();
+                        Self::emit(
+                            &mut self.code_words,
+                            SPV_OP_BITWISE_AND,
+                            &[self.ty_i32, masked, r, c_31],
+                        );
+                        let opcode = if matches!(op, KernelBinOp::Shl) {
+                            SPV_OP_SHIFT_LEFT_LOGICAL
+                        } else {
+                            SPV_OP_SHIFT_RIGHT_ARITHMETIC
+                        };
+                        Self::emit(&mut self.code_words, opcode, &[sty, dst, l, masked]);
+                    }
                     _ => {
                         let opcode = match (op, lty) {
                             (KernelBinOp::Add, KernelScalarType::I32) => SPV_OP_IADD,
@@ -2185,6 +3003,9 @@ impl SpvEmitter {
                             (KernelBinOp::Div, KernelScalarType::I32) => SPV_OP_SDIV,
                             (KernelBinOp::Div, _) => SPV_OP_FDIV,
                             (KernelBinOp::Rem, KernelScalarType::I32) => SPV_OP_SREM,
+                            (KernelBinOp::BitAnd, _) => SPV_OP_BITWISE_AND,
+                            (KernelBinOp::BitOr, _) => SPV_OP_BITWISE_OR,
+                            (KernelBinOp::BitXor, _) => SPV_OP_BITWISE_XOR,
                             (KernelBinOp::Lt, KernelScalarType::I32) => SPV_OP_SLESS_THAN,
                             (KernelBinOp::Lt, _) => SPV_OP_FORD_LESS_THAN,
                             (KernelBinOp::Le, KernelScalarType::I32) => SPV_OP_SLESS_THAN_EQUAL,
@@ -2210,16 +3031,18 @@ impl SpvEmitter {
             }
         }
     }
-
-    fn var_gid_vec_ty(&self) -> u32 {
-        // Stored in header_words[0] sentinel? No, we keep ty_v3u32 right after ty_f64.
-        self.ty_f64 + 1
-    }
 }
 
 /// Compile a typed [`KernelProgram`] into valid SPIR-V 1.0 `GLCompute` words.
-pub(crate) fn emit_spirv_words(program: &KernelProgram, local_size_x: u32) -> MoraResult<Vec<u32>> {
-    let local_size_x = local_size_x.max(1);
+pub(crate) fn emit_spirv_words(
+    program: &KernelProgram,
+    local_size: [u32; 3],
+) -> MoraResult<Vec<u32>> {
+    let local_size = [
+        local_size[0].max(1),
+        local_size[1].max(1),
+        local_size[2].max(1),
+    ];
     let uses_f64 = program.uses_f64();
     let layout = vulkan_kernel_layout(program);
 
@@ -2238,10 +3061,15 @@ pub(crate) fn emit_spirv_words(program: &KernelProgram, local_size_x: u32) -> Mo
         ty_u64: 0,
         ty_f32: 0,
         ty_f64: 0,
+        ty_v3u32: 0,
+        ty_v2f32: 0,
         ty_ptr_fn_i32: 0,
         ty_ptr_fn_f32: 0,
         ty_ptr_fn_f64: 0,
         ty_ptr_fn_bool: 0,
+        ty_ptr_wg_i32: 0,
+        ty_ptr_wg_f32: 0,
+        ty_ptr_wg_f64: 0,
         ty_ptr_unif_u32: 0,
         ty_ptr_unif_f32: 0,
         ty_ptr_unif_f64: 0,
@@ -2256,8 +3084,9 @@ pub(crate) fn emit_spirv_words(program: &KernelProgram, local_size_x: u32) -> Mo
         var_bid: 0,
         var_tid: 0,
         var_gdim: 0,
-        local_size_x,
+        local_size,
         buf_vars: HashMap::new(),
+        shared_vars: Vec::new(),
         scalar_var: None,
         scalar_offsets: layout.scalar_word_offsets.clone(),
         local_vars: HashMap::new(),
@@ -2275,7 +3104,7 @@ pub(crate) fn emit_spirv_words(program: &KernelProgram, local_size_x: u32) -> Mo
     SpvEmitter::emit(&mut em.header_words, SPV_OP_EXT_INST_IMPORT, &ext_ops);
     SpvEmitter::emit(&mut em.header_words, SPV_OP_MEMORY_MODEL, &[0, 1]); // Logical, GLSL450
 
-    // Core types (keep ty_v3u32 immediately after ty_f64 so var_gid_vec_ty() == ty_f64 + 1!)
+    // Core types
     em.ty_void = em.alloc_id();
     em.ty_bool = em.alloc_id();
     em.ty_i32 = em.alloc_id();
@@ -2283,14 +3112,17 @@ pub(crate) fn emit_spirv_words(program: &KernelProgram, local_size_x: u32) -> Mo
     em.ty_u64 = em.alloc_id();
     em.ty_f32 = em.alloc_id();
     em.ty_f64 = em.alloc_id();
-    let ty_v3u32 = em.alloc_id();
-    debug_assert_eq!(ty_v3u32, em.ty_f64 + 1);
+    em.ty_v3u32 = em.alloc_id();
+    em.ty_v2f32 = em.alloc_id();
     let ty_fn = em.alloc_id();
     let ty_ptr_in_v3u32 = em.alloc_id();
     em.ty_ptr_fn_i32 = em.alloc_id();
     em.ty_ptr_fn_f32 = em.alloc_id();
     em.ty_ptr_fn_f64 = em.alloc_id();
     em.ty_ptr_fn_bool = em.alloc_id();
+    em.ty_ptr_wg_i32 = em.alloc_id();
+    em.ty_ptr_wg_f32 = em.alloc_id();
+    em.ty_ptr_wg_f64 = em.alloc_id();
 
     SpvEmitter::emit(&mut em.type_const_words, SPV_OP_TYPE_VOID, &[em.ty_void]);
     SpvEmitter::emit(&mut em.type_const_words, SPV_OP_TYPE_BOOL, &[em.ty_bool]);
@@ -2326,7 +3158,12 @@ pub(crate) fn emit_spirv_words(program: &KernelProgram, local_size_x: u32) -> Mo
     SpvEmitter::emit(
         &mut em.type_const_words,
         SPV_OP_TYPE_VECTOR,
-        &[ty_v3u32, em.ty_u32, 3],
+        &[em.ty_v3u32, em.ty_u32, 3],
+    );
+    SpvEmitter::emit(
+        &mut em.type_const_words,
+        SPV_OP_TYPE_VECTOR,
+        &[em.ty_v2f32, em.ty_f32, 2],
     );
     SpvEmitter::emit(
         &mut em.type_const_words,
@@ -2336,7 +3173,7 @@ pub(crate) fn emit_spirv_words(program: &KernelProgram, local_size_x: u32) -> Mo
     SpvEmitter::emit(
         &mut em.type_const_words,
         SPV_OP_TYPE_POINTER,
-        &[ty_ptr_in_v3u32, SPV_SC_INPUT, ty_v3u32],
+        &[ty_ptr_in_v3u32, SPV_SC_INPUT, em.ty_v3u32],
     );
     SpvEmitter::emit(
         &mut em.type_const_words,
@@ -2360,6 +3197,25 @@ pub(crate) fn emit_spirv_words(program: &KernelProgram, local_size_x: u32) -> Mo
         SPV_OP_TYPE_POINTER,
         &[em.ty_ptr_fn_bool, SPV_SC_FUNCTION, em.ty_bool],
     );
+    if !program.shared.is_empty() {
+        SpvEmitter::emit(
+            &mut em.type_const_words,
+            SPV_OP_TYPE_POINTER,
+            &[em.ty_ptr_wg_i32, SPV_SC_WORKGROUP, em.ty_i32],
+        );
+        SpvEmitter::emit(
+            &mut em.type_const_words,
+            SPV_OP_TYPE_POINTER,
+            &[em.ty_ptr_wg_f32, SPV_SC_WORKGROUP, em.ty_f32],
+        );
+        if uses_f64 {
+            SpvEmitter::emit(
+                &mut em.type_const_words,
+                SPV_OP_TYPE_POINTER,
+                &[em.ty_ptr_wg_f64, SPV_SC_WORKGROUP, em.ty_f64],
+            );
+        }
+    }
 
     // Storage buffer runtime array + struct types
     let ty_arr_u32 = em.alloc_id();
@@ -2528,9 +3384,11 @@ pub(crate) fn emit_spirv_words(program: &KernelProgram, local_size_x: u32) -> Mo
     // Storage buffer variables for every buffer parameter
     for &(param_idx, binding) in &layout.buf_bindings {
         let var_id = em.alloc_id();
-        let (ptr_ty, elem_ty) = match program.params[param_idx].ty {
-            KernelParamType::BufF64 => (ty_ptr_struct_f64, KernelScalarType::F64),
-            _ => (ty_ptr_struct_f32, KernelScalarType::F32),
+        let pty = program.params[param_idx].ty;
+        let ptr_ty = match pty {
+            KernelParamType::BufF64 => ty_ptr_struct_f64,
+            KernelParamType::BufF32 => ty_ptr_struct_f32,
+            _ => ty_ptr_struct_u32,
         };
         SpvEmitter::emit(
             &mut em.type_const_words,
@@ -2547,7 +3405,32 @@ pub(crate) fn emit_spirv_words(program: &KernelProgram, local_size_x: u32) -> Mo
             SPV_OP_DECORATE,
             &[var_id, SPV_DEC_BINDING, binding],
         );
-        em.buf_vars.insert(param_idx, (var_id, elem_ty));
+        em.buf_vars.insert(param_idx, (var_id, pty));
+    }
+
+    // Workgroup shared memory arrays (`OpVariable StorageClass::Workgroup`)
+    for sh in &program.shared {
+        let c_len = em.const_u32(sh.len);
+        let elem_spv = em.spv_ty(sh.elem_ty);
+        let ty_arr = em.alloc_id();
+        let ty_ptr_arr = em.alloc_id();
+        let var_id = em.alloc_id();
+        SpvEmitter::emit(
+            &mut em.type_const_words,
+            SPV_OP_TYPE_ARRAY,
+            &[ty_arr, elem_spv, c_len],
+        );
+        SpvEmitter::emit(
+            &mut em.type_const_words,
+            SPV_OP_TYPE_POINTER,
+            &[ty_ptr_arr, SPV_SC_WORKGROUP, ty_arr],
+        );
+        SpvEmitter::emit(
+            &mut em.type_const_words,
+            SPV_OP_VARIABLE,
+            &[ty_ptr_arr, var_id, SPV_SC_WORKGROUP],
+        );
+        em.shared_vars.push((var_id, sh.elem_ty));
     }
 
     // Optional trailing scalar parameter buffer at binding = buf_bindings.len()
@@ -2575,7 +3458,7 @@ pub(crate) fn emit_spirv_words(program: &KernelProgram, local_size_x: u32) -> Mo
     let fn_main = em.alloc_id();
     let entry_label = em.alloc_id();
 
-    // EntryPoint & ExecutionMode
+    // EntryPoint & ExecutionMode (full 3D LocalSize)
     let mut ep_ops = vec![5u32, fn_main]; // GLCompute = 5
     SpvEmitter::push_str(&mut ep_ops, "main");
     ep_ops.extend_from_slice(&[em.var_gid, em.var_bid, em.var_tid, em.var_gdim]);
@@ -2583,7 +3466,7 @@ pub(crate) fn emit_spirv_words(program: &KernelProgram, local_size_x: u32) -> Mo
     SpvEmitter::emit(
         &mut em.header_words,
         SPV_OP_EXECUTION_MODE,
-        &[fn_main, 17, local_size_x, 1, 1], // LocalSize = 17
+        &[fn_main, 17, local_size[0], local_size[1], local_size[2]], // LocalSize = 17
     );
 
     // Emit structured function body
@@ -2625,13 +3508,39 @@ pub(crate) fn emit_msl(program: &KernelProgram) -> String {
     let _ = writeln!(out, "using namespace metal;");
     let _ = writeln!(out);
 
+    let has_bf16 = program
+        .params
+        .iter()
+        .any(|p| matches!(p.ty, KernelParamType::BufBF16));
+    if has_bf16 {
+        let _ = writeln!(out, "static inline float _mora_bf16_to_f32(ushort bits) {{");
+        let _ = writeln!(out, "    return as_type<float>(uint(bits) << 16u);");
+        let _ = writeln!(out, "}}");
+        let _ = writeln!(out, "static inline ushort _mora_f32_to_bf16(float x) {{");
+        let _ = writeln!(out, "    uint bits = as_type<uint>(x);");
+        let _ = writeln!(
+            out,
+            "    if ((bits & 0x7FFFFFFFu) > 0x7F800000u) return ushort((bits >> 16u) | 0x0040u);"
+        );
+        let _ = writeln!(out, "    uint lsb = (bits >> 16u) & 1u;");
+        let _ = writeln!(out, "    return ushort((bits + 0x7FFFu + lsb) >> 16u);");
+        let _ = writeln!(out, "}}");
+        let _ = writeln!(out);
+    }
+
     let mut scalar_fields = Vec::new();
     for (idx, p) in program.params.iter().enumerate() {
         match p.ty {
-            KernelParamType::F32 => scalar_fields.push((idx, "float", p.name.as_str())),
-            KernelParamType::F64 => scalar_fields.push((idx, "float", p.name.as_str())),
+            KernelParamType::F32 | KernelParamType::F64 => {
+                scalar_fields.push((idx, "float", p.name.as_str()));
+            }
             KernelParamType::I32 => scalar_fields.push((idx, "int", p.name.as_str())),
-            KernelParamType::BufF32 | KernelParamType::BufF64 => {}
+            KernelParamType::BufF32
+            | KernelParamType::BufF64
+            | KernelParamType::BufF16
+            | KernelParamType::BufBF16
+            | KernelParamType::BufU8
+            | KernelParamType::BufI32 => {}
         }
     }
     if !scalar_fields.is_empty() {
@@ -2646,17 +3555,27 @@ pub(crate) fn emit_msl(program: &KernelProgram) -> String {
     let mut sig = Vec::new();
     let mut buf_slot = 0u32;
     for p in &program.params {
-        match p.ty {
-            KernelParamType::BufF32 => {
-                sig.push(format!("device float* {} [[buffer({buf_slot})]]", p.name));
-                buf_slot += 1;
+        let decl = match p.ty {
+            KernelParamType::BufF32 | KernelParamType::BufF64 => {
+                Some(format!("device float* {} [[buffer({buf_slot})]]", p.name))
             }
-            KernelParamType::BufF64 => {
-                // Metal does not support 64-bit float in MSL; lower cleanly to float buffers.
-                sig.push(format!("device float* {} [[buffer({buf_slot})]]", p.name));
-                buf_slot += 1;
+            KernelParamType::BufF16 => {
+                Some(format!("device half* {} [[buffer({buf_slot})]]", p.name))
             }
-            _ => {}
+            KernelParamType::BufBF16 => {
+                Some(format!("device ushort* {} [[buffer({buf_slot})]]", p.name))
+            }
+            KernelParamType::BufU8 => {
+                Some(format!("device uchar* {} [[buffer({buf_slot})]]", p.name))
+            }
+            KernelParamType::BufI32 => {
+                Some(format!("device int* {} [[buffer({buf_slot})]]", p.name))
+            }
+            KernelParamType::F32 | KernelParamType::F64 | KernelParamType::I32 => None,
+        };
+        if let Some(d) = decl {
+            sig.push(d);
+            buf_slot += 1;
         }
     }
     if !scalar_fields.is_empty() {
@@ -2673,6 +3592,14 @@ pub(crate) fn emit_msl(program: &KernelProgram) -> String {
     let _ = writeln!(out, "kernel void {}(", program.name);
     let _ = writeln!(out, "    {}", sig.join(",\n    "));
     let _ = writeln!(out, ") {{");
+    for (sidx, sh) in program.shared.iter().enumerate() {
+        let mty = match sh.elem_ty {
+            KernelScalarType::I32 => "int",
+            KernelScalarType::F32 | KernelScalarType::F64 => "float",
+            KernelScalarType::Bool => "bool",
+        };
+        let _ = writeln!(out, "    threadgroup {mty} _sh_{sidx}[{}];", sh.len);
+    }
     emit_msl_stmts(&mut out, program, &program.body, 1);
     let _ = writeln!(out, "}}");
     out
@@ -2700,10 +3627,36 @@ fn emit_msl_stmts(out: &mut String, program: &KernelProgram, stmts: &[KernelStmt
                 index,
                 value,
             } => {
-                let bname = &program.params[*buf_param].name;
+                let p = &program.params[*buf_param];
+                let bname = &p.name;
                 let idx = emit_msl_expr(program, index);
                 let val = emit_msl_expr(program, value);
-                let _ = writeln!(out, "{pad}{bname}[{idx}] = {val};");
+                match p.ty {
+                    KernelParamType::BufF16 => {
+                        let _ = writeln!(out, "{pad}{bname}[{idx}] = half({val});");
+                    }
+                    KernelParamType::BufBF16 => {
+                        let _ = writeln!(out, "{pad}{bname}[{idx}] = _mora_f32_to_bf16({val});");
+                    }
+                    KernelParamType::BufU8 => {
+                        let _ = writeln!(out, "{pad}{bname}[{idx}] = uchar(({val}) & 255);");
+                    }
+                    _ => {
+                        let _ = writeln!(out, "{pad}{bname}[{idx}] = {val};");
+                    }
+                }
+            }
+            KernelStmt::StoreShared {
+                shared_idx,
+                index,
+                value,
+            } => {
+                let idx = emit_msl_expr(program, index);
+                let val = emit_msl_expr(program, value);
+                let _ = writeln!(out, "{pad}_sh_{shared_idx}[{idx}] = {val};");
+            }
+            KernelStmt::SyncThreads => {
+                let _ = writeln!(out, "{pad}threadgroup_barrier(mem_flags::mem_threadgroup);");
             }
             KernelStmt::If {
                 cond,
@@ -2740,18 +3693,36 @@ fn emit_msl_expr(program: &KernelProgram, expr: &KernelExpr) -> String {
         KernelExpr::Param(idx, _) => format!("_kp.{}", program.params[*idx].name),
         KernelExpr::Var(name, _) => name.clone(),
         KernelExpr::GlobalId => "int(_gid.x)".to_string(),
+        KernelExpr::GlobalIdY => "int(_gid.y)".to_string(),
+        KernelExpr::GlobalIdZ => "int(_gid.z)".to_string(),
         KernelExpr::BlockIdx => "int(_bid.x)".to_string(),
+        KernelExpr::BlockIdxY => "int(_bid.y)".to_string(),
+        KernelExpr::BlockIdxZ => "int(_bid.z)".to_string(),
         KernelExpr::ThreadIdx => "int(_tid.x)".to_string(),
+        KernelExpr::ThreadIdxY => "int(_tid.y)".to_string(),
+        KernelExpr::ThreadIdxZ => "int(_tid.z)".to_string(),
         KernelExpr::BlockDim => "int(_bdim.x)".to_string(),
+        KernelExpr::BlockDimY => "int(_bdim.y)".to_string(),
+        KernelExpr::BlockDimZ => "int(_bdim.z)".to_string(),
         KernelExpr::GridDim => "int(_gdim.x)".to_string(),
+        KernelExpr::GridDimY => "int(_gdim.y)".to_string(),
+        KernelExpr::GridDimZ => "int(_gdim.z)".to_string(),
         KernelExpr::Load {
             buf_param, index, ..
         } => {
-            format!(
-                "{}[{}]",
-                program.params[*buf_param].name,
-                emit_msl_expr(program, index)
-            )
+            let p = &program.params[*buf_param];
+            let idx = emit_msl_expr(program, index);
+            match p.ty {
+                KernelParamType::BufF16 => format!("float({}[{idx}])", p.name),
+                KernelParamType::BufBF16 => format!("_mora_bf16_to_f32({}[{idx}])", p.name),
+                KernelParamType::BufU8 => format!("int({}[{idx}])", p.name),
+                _ => format!("{}[{idx}]", p.name),
+            }
+        }
+        KernelExpr::LoadShared {
+            shared_idx, index, ..
+        } => {
+            format!("_sh_{shared_idx}[{}]", emit_msl_expr(program, index))
         }
         KernelExpr::Unary { op, arg, .. } => {
             let a = emit_msl_expr(program, arg);
@@ -2772,6 +3743,8 @@ fn emit_msl_expr(program: &KernelProgram, expr: &KernelExpr) -> String {
             match op {
                 KernelBinOp::Min => format!("min({l}, {r})"),
                 KernelBinOp::Max => format!("max({l}, {r})"),
+                KernelBinOp::Shl => format!("({l} << ({r} & 31))"),
+                KernelBinOp::Shr => format!("({l} >> ({r} & 31))"),
                 _ => {
                     let sym = match op {
                         KernelBinOp::Add => "+",
@@ -2787,7 +3760,15 @@ fn emit_msl_expr(program: &KernelProgram, expr: &KernelExpr) -> String {
                         KernelBinOp::Ne => "!=",
                         KernelBinOp::And => "&&",
                         KernelBinOp::Or => "||",
-                        KernelBinOp::Min | KernelBinOp::Max => unreachable!(),
+                        KernelBinOp::BitAnd => "&",
+                        KernelBinOp::BitOr => "|",
+                        KernelBinOp::BitXor => "^",
+                        KernelBinOp::Min
+                        | KernelBinOp::Max
+                        | KernelBinOp::Shl
+                        | KernelBinOp::Shr => {
+                            unreachable!()
+                        }
                     };
                     format!("({l} {sym} {r})")
                 }
@@ -2797,7 +3778,7 @@ fn emit_msl_expr(program: &KernelProgram, expr: &KernelExpr) -> String {
 }
 
 // ============================================================================
-// 5. Backend 4: Safe CPU Executor & Unified Host/GPU Dispatcher
+// 5. Backend 4: Safe CPU Workgroup Barrier Simulator & Unified Dispatcher
 // ============================================================================
 
 #[derive(Clone, Copy)]
@@ -2811,22 +3792,67 @@ enum CpuScalar {
 enum CpuParamBuf {
     F32(Vec<f32>),
     F64(Vec<f64>),
+    F16(Vec<u16>),
+    BF16(Vec<u16>),
+    U8(Vec<u8>),
+    I32(Vec<i32>),
     Scalar(CpuScalar),
 }
 
-/// Execute a [`CompiledGpuKernel`] on CPU or live GPU VRAM depending on buffer tensor placement.
+enum CpuSharedBuf {
+    F32(Vec<f32>),
+    F64(Vec<f64>),
+    I32(Vec<i32>),
+}
+
+#[derive(Clone, Copy)]
+struct CpuThreadCoords {
+    gid: [i32; 3],
+    bid: [i32; 3],
+    tid: [i32; 3],
+    bdim: [i32; 3],
+    gdim: [i32; 3],
+}
+
+enum CpuFrame<'a> {
+    Block {
+        stmts: &'a [KernelStmt],
+        pc: usize,
+    },
+    While {
+        cond: &'a KernelExpr,
+        body: &'a [KernelStmt],
+        in_body: bool,
+        iters: usize,
+    },
+}
+
+struct CpuThreadState<'a> {
+    coords: CpuThreadCoords,
+    locals: HashMap<String, CpuScalar>,
+    frames: Vec<CpuFrame<'a>>,
+    finished: bool,
+}
+
+enum ThreadPause {
+    Barrier,
+    Finished,
+}
+
+/// Execute a [`CompiledGpuKernel`] on CPU (cooperative workgroup barrier simulator) or live GPU VRAM
+/// depending on buffer tensor placement, with full 3D `grid` / `block` launch geometry.
 pub(crate) fn launch_compiled_kernel(
     kernel: &CompiledGpuKernel,
-    grid: u32,
-    block: u32,
+    grid: [u32; 3],
+    block: [u32; 3],
     args: &[crate::value::Value],
 ) -> MoraResult<()> {
     use crate::common::Device;
     use crate::value::Value;
 
-    if grid == 0 || block == 0 {
+    if grid.contains(&0) || block.contains(&0) {
         return Err(MoraError::Runtime(format!(
-            "kernel '{}': grid ({grid}) and block ({block}) must be positive integers",
+            "kernel '{}': grid ({grid:?}) and block ({block:?}) dimensions must all be positive",
             kernel.name()
         )));
     }
@@ -2844,7 +3870,12 @@ pub(crate) fn launch_compiled_kernel(
     let mut buf_tensors: Vec<(usize, Arc<crate::value::tensor::Tensor>)> = Vec::new();
     for (idx, (param, arg)) in kernel.params().iter().zip(args.iter()).enumerate() {
         match param.ty {
-            KernelParamType::BufF32 | KernelParamType::BufF64 => {
+            KernelParamType::BufF32
+            | KernelParamType::BufF64
+            | KernelParamType::BufF16
+            | KernelParamType::BufBF16
+            | KernelParamType::BufU8
+            | KernelParamType::BufI32 => {
                 let expected_dt = param.ty.buffer_dtype().expect("buffer dtype");
                 let Value::Tensor(t) = arg else {
                     return Err(MoraError::Runtime(format!(
@@ -2929,7 +3960,12 @@ pub(crate) fn launch_compiled_kernel(
         let mut all_vram = true;
         for (param, arg) in kernel.params().iter().zip(args.iter()) {
             match param.ty {
-                KernelParamType::BufF32 | KernelParamType::BufF64 => {
+                KernelParamType::BufF32
+                | KernelParamType::BufF64
+                | KernelParamType::BufF16
+                | KernelParamType::BufBF16
+                | KernelParamType::BufU8
+                | KernelParamType::BufI32 => {
                     let Value::Tensor(t) = arg else {
                         unreachable!();
                     };
@@ -2966,7 +4002,7 @@ pub(crate) fn launch_compiled_kernel(
         }
     }
 
-    // 3. CPU / emulated execution path (bounds-checked, zero unsafe).
+    // 3. CPU cooperative workgroup barrier simulator (bounds-checked, zero unsafe).
     let mut cpu_args: Vec<CpuParamBuf> = Vec::with_capacity(kernel.params().len());
     for (param, arg) in kernel.params().iter().zip(args.iter()) {
         match param.ty {
@@ -2974,16 +4010,77 @@ pub(crate) fn launch_compiled_kernel(
                 let Value::Tensor(t) = arg else {
                     unreachable!();
                 };
-                let f64s = t.to_flat_vec();
-                cpu_args.push(CpuParamBuf::F32(
-                    f64s.into_iter().map(|v| v as f32).collect(),
-                ));
+                let raw = t.copy_contiguous_raw_bytes()?;
+                let vals = raw
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .copied()
+                    .map(f32::from_le_bytes)
+                    .collect();
+                cpu_args.push(CpuParamBuf::F32(vals));
             }
             KernelParamType::BufF64 => {
                 let Value::Tensor(t) = arg else {
                     unreachable!();
                 };
-                cpu_args.push(CpuParamBuf::F64(t.to_flat_vec()));
+                let raw = t.copy_contiguous_raw_bytes()?;
+                let vals = raw
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .copied()
+                    .map(f64::from_le_bytes)
+                    .collect();
+                cpu_args.push(CpuParamBuf::F64(vals));
+            }
+            KernelParamType::BufF16 => {
+                let Value::Tensor(t) = arg else {
+                    unreachable!();
+                };
+                let raw = t.copy_contiguous_raw_bytes()?;
+                let vals = raw
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .copied()
+                    .map(u16::from_le_bytes)
+                    .collect();
+                cpu_args.push(CpuParamBuf::F16(vals));
+            }
+            KernelParamType::BufBF16 => {
+                let Value::Tensor(t) = arg else {
+                    unreachable!();
+                };
+                let raw = t.copy_contiguous_raw_bytes()?;
+                let vals = raw
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .copied()
+                    .map(u16::from_le_bytes)
+                    .collect();
+                cpu_args.push(CpuParamBuf::BF16(vals));
+            }
+            KernelParamType::BufU8 => {
+                let Value::Tensor(t) = arg else {
+                    unreachable!();
+                };
+                cpu_args.push(CpuParamBuf::U8(t.copy_contiguous_raw_bytes()?));
+            }
+            KernelParamType::BufI32 => {
+                let Value::Tensor(t) = arg else {
+                    unreachable!();
+                };
+                let raw = t.copy_contiguous_raw_bytes()?;
+                let vals = raw
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .copied()
+                    .map(i32::from_le_bytes)
+                    .collect();
+                cpu_args.push(CpuParamBuf::I32(vals));
             }
             KernelParamType::F32 => {
                 cpu_args.push(CpuParamBuf::Scalar(
@@ -2999,21 +4096,94 @@ pub(crate) fn launch_compiled_kernel(
         }
     }
 
-    for bid in 0..grid as i32 {
-        for tid in 0..block as i32 {
-            let gid = bid.wrapping_mul(block as i32).wrapping_add(tid);
-            let mut locals: HashMap<String, CpuScalar> = HashMap::new();
-            eval_cpu_stmts(
-                &kernel.program.body,
-                gid,
-                bid,
-                tid,
-                block as i32,
-                grid as i32,
-                &mut cpu_args,
-                &mut locals,
+    let bdim = [block[0] as i32, block[1] as i32, block[2] as i32];
+    let gdim = [grid[0] as i32, grid[1] as i32, grid[2] as i32];
+    let threads_per_block = (block[0] as usize)
+        .checked_mul(block[1] as usize)
+        .and_then(|v| v.checked_mul(block[2] as usize))
+        .ok_or_else(|| {
+            MoraError::Runtime(format!(
+                "kernel '{}': block dimensions {:?} overflow workgroup size",
                 kernel.name(),
-            )?;
+                block
+            ))
+        })?;
+
+    for bz in 0..grid[2] as i32 {
+        for by in 0..grid[1] as i32 {
+            for bx in 0..grid[0] as i32 {
+                let bid = [bx, by, bz];
+                let mut shared_bufs: Vec<CpuSharedBuf> = kernel
+                    .program
+                    .shared
+                    .iter()
+                    .map(|sh| match sh.elem_ty {
+                        KernelScalarType::F32 => CpuSharedBuf::F32(vec![0.0; sh.len as usize]),
+                        KernelScalarType::F64 => CpuSharedBuf::F64(vec![0.0; sh.len as usize]),
+                        _ => CpuSharedBuf::I32(vec![0; sh.len as usize]),
+                    })
+                    .collect();
+
+                let mut threads: Vec<CpuThreadState<'_>> = Vec::with_capacity(threads_per_block);
+                for tz in 0..block[2] as i32 {
+                    for ty in 0..block[1] as i32 {
+                        for tx in 0..block[0] as i32 {
+                            let tid = [tx, ty, tz];
+                            let gid = [
+                                bx.wrapping_mul(bdim[0]).wrapping_add(tx),
+                                by.wrapping_mul(bdim[1]).wrapping_add(ty),
+                                bz.wrapping_mul(bdim[2]).wrapping_add(tz),
+                            ];
+                            threads.push(CpuThreadState {
+                                coords: CpuThreadCoords {
+                                    gid,
+                                    bid,
+                                    tid,
+                                    bdim,
+                                    gdim,
+                                },
+                                locals: HashMap::new(),
+                                frames: vec![CpuFrame::Block {
+                                    stmts: &kernel.program.body,
+                                    pc: 0,
+                                }],
+                                finished: false,
+                            });
+                        }
+                    }
+                }
+
+                // Step all workgroup threads cooperatively in lockstep barrier phases.
+                loop {
+                    let mut any_barrier = false;
+                    let mut any_finished = false;
+                    for th in &mut threads {
+                        if th.finished {
+                            any_finished = true;
+                            continue;
+                        }
+                        match step_cpu_thread_until_barrier(
+                            th,
+                            &mut cpu_args,
+                            &mut shared_bufs,
+                            kernel.name(),
+                        )? {
+                            ThreadPause::Barrier => any_barrier = true,
+                            ThreadPause::Finished => any_finished = true,
+                        }
+                    }
+                    if any_barrier && any_finished {
+                        return Err(MoraError::Runtime(format!(
+                            "kernel '{}': divergent sync_threads() detected in workgroup {:?} — not all threads reached the barrier",
+                            kernel.name(),
+                            bid
+                        )));
+                    }
+                    if !any_barrier {
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -3028,6 +4198,30 @@ pub(crate) fn launch_compiled_kernel(
             }
             CpuParamBuf::F64(vals) => {
                 t.overwrite_contiguous_f64(vals)?;
+            }
+            CpuParamBuf::F16(bits) => {
+                let mut raw = Vec::with_capacity(bits.len() * 2);
+                for &b in bits {
+                    raw.extend_from_slice(&b.to_le_bytes());
+                }
+                t.overwrite_contiguous_raw(&raw, crate::common::DType::F16)?;
+            }
+            CpuParamBuf::BF16(bits) => {
+                let mut raw = Vec::with_capacity(bits.len() * 2);
+                for &b in bits {
+                    raw.extend_from_slice(&b.to_le_bytes());
+                }
+                t.overwrite_contiguous_raw(&raw, crate::common::DType::BF16)?;
+            }
+            CpuParamBuf::U8(bytes) => {
+                t.overwrite_contiguous_raw(bytes, crate::common::DType::U8)?;
+            }
+            CpuParamBuf::I32(vals) => {
+                let mut raw = Vec::with_capacity(vals.len() * 4);
+                for &v in vals {
+                    raw.extend_from_slice(&v.to_le_bytes());
+                }
+                t.overwrite_contiguous_raw(&raw, crate::common::DType::I32)?;
             }
             CpuParamBuf::Scalar(_) => {}
         }
@@ -3052,148 +4246,266 @@ fn value_to_i32(v: &crate::value::Value) -> i32 {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn eval_cpu_stmts(
-    stmts: &[KernelStmt],
-    gid: i32,
-    bid: i32,
-    tid: i32,
-    bdim: i32,
-    gdim: i32,
+fn step_cpu_thread_until_barrier<'a>(
+    th: &mut CpuThreadState<'a>,
     args: &mut [CpuParamBuf],
-    locals: &mut HashMap<String, CpuScalar>,
+    shared: &mut [CpuSharedBuf],
     kernel_name: &str,
-) -> MoraResult<()> {
-    for s in stmts {
-        match s {
-            KernelStmt::Let { name, expr, .. } => {
-                let v = eval_cpu_expr(expr, gid, bid, tid, bdim, gdim, args, locals, kernel_name)?;
-                locals.insert(name.clone(), v);
-            }
-            KernelStmt::Assign { name, expr } => {
-                let v = eval_cpu_expr(expr, gid, bid, tid, bdim, gdim, args, locals, kernel_name)?;
-                locals.insert(name.clone(), v);
-            }
-            KernelStmt::Store {
-                buf_param,
-                index,
-                value,
-            } => {
-                let CpuScalar::I32(idx) =
-                    eval_cpu_expr(index, gid, bid, tid, bdim, gdim, args, locals, kernel_name)?
-                else {
-                    return Err(MoraError::Runtime(format!(
-                        "kernel '{kernel_name}': non-i32 store index"
-                    )));
-                };
-                let val =
-                    eval_cpu_expr(value, gid, bid, tid, bdim, gdim, args, locals, kernel_name)?;
-                if idx < 0 {
-                    return Err(MoraError::Runtime(format!(
-                        "kernel '{kernel_name}': negative buffer store index {idx}"
-                    )));
+) -> MoraResult<ThreadPause> {
+    while let Some(frame) = th.frames.last_mut() {
+        match frame {
+            CpuFrame::Block { stmts, pc } => {
+                if *pc >= stmts.len() {
+                    th.frames.pop();
+                    continue;
                 }
-                let ui = idx as usize;
-                match (&mut args[*buf_param], val) {
-                    (CpuParamBuf::F32(buf), CpuScalar::F32(v)) => {
-                        if ui >= buf.len() {
+                let stmt = &stmts[*pc];
+                *pc += 1;
+                match stmt {
+                    KernelStmt::Let { name, expr, .. } | KernelStmt::Assign { name, expr } => {
+                        let v =
+                            eval_cpu_expr(expr, &th.coords, args, shared, &th.locals, kernel_name)?;
+                        th.locals.insert(name.clone(), v);
+                    }
+                    KernelStmt::Store {
+                        buf_param,
+                        index,
+                        value,
+                    } => {
+                        let CpuScalar::I32(idx) = eval_cpu_expr(
+                            index,
+                            &th.coords,
+                            args,
+                            shared,
+                            &th.locals,
+                            kernel_name,
+                        )?
+                        else {
                             return Err(MoraError::Runtime(format!(
-                                "kernel '{kernel_name}': store index {ui} out of bounds (len {})",
-                                buf.len()
+                                "kernel '{kernel_name}': non-i32 store index"
+                            )));
+                        };
+                        let val = eval_cpu_expr(
+                            value,
+                            &th.coords,
+                            args,
+                            shared,
+                            &th.locals,
+                            kernel_name,
+                        )?;
+                        if idx < 0 {
+                            return Err(MoraError::Runtime(format!(
+                                "kernel '{kernel_name}': negative buffer store index {idx}"
                             )));
                         }
-                        buf[ui] = v;
+                        let ui = idx as usize;
+                        match (&mut args[*buf_param], val) {
+                            (CpuParamBuf::F32(buf), CpuScalar::F32(v)) => {
+                                if ui >= buf.len() {
+                                    return Err(MoraError::Runtime(format!(
+                                        "kernel '{kernel_name}': store index {ui} out of bounds (len {})",
+                                        buf.len()
+                                    )));
+                                }
+                                buf[ui] = v;
+                            }
+                            (CpuParamBuf::F64(buf), CpuScalar::F64(v)) => {
+                                if ui >= buf.len() {
+                                    return Err(MoraError::Runtime(format!(
+                                        "kernel '{kernel_name}': store index {ui} out of bounds (len {})",
+                                        buf.len()
+                                    )));
+                                }
+                                buf[ui] = v;
+                            }
+                            (CpuParamBuf::F16(buf), CpuScalar::F32(v)) => {
+                                if ui >= buf.len() {
+                                    return Err(MoraError::Runtime(format!(
+                                        "kernel '{kernel_name}': store index {ui} out of bounds (len {})",
+                                        buf.len()
+                                    )));
+                                }
+                                buf[ui] = crate::common::dtype::f64_to_f16_bits(f64::from(v));
+                            }
+                            (CpuParamBuf::BF16(buf), CpuScalar::F32(v)) => {
+                                if ui >= buf.len() {
+                                    return Err(MoraError::Runtime(format!(
+                                        "kernel '{kernel_name}': store index {ui} out of bounds (len {})",
+                                        buf.len()
+                                    )));
+                                }
+                                buf[ui] = crate::common::dtype::f64_to_bf16_bits(f64::from(v));
+                            }
+                            (CpuParamBuf::U8(buf), CpuScalar::I32(v)) => {
+                                if ui >= buf.len() {
+                                    return Err(MoraError::Runtime(format!(
+                                        "kernel '{kernel_name}': store index {ui} out of bounds (len {})",
+                                        buf.len()
+                                    )));
+                                }
+                                buf[ui] = (v & 0xFF) as u8;
+                            }
+                            (CpuParamBuf::I32(buf), CpuScalar::I32(v)) => {
+                                if ui >= buf.len() {
+                                    return Err(MoraError::Runtime(format!(
+                                        "kernel '{kernel_name}': store index {ui} out of bounds (len {})",
+                                        buf.len()
+                                    )));
+                                }
+                                buf[ui] = v;
+                            }
+                            _ => {
+                                return Err(MoraError::Runtime(format!(
+                                    "kernel '{kernel_name}': mismatched store dtype"
+                                )));
+                            }
+                        }
                     }
-                    (CpuParamBuf::F64(buf), CpuScalar::F64(v)) => {
-                        if ui >= buf.len() {
+                    KernelStmt::StoreShared {
+                        shared_idx,
+                        index,
+                        value,
+                    } => {
+                        let CpuScalar::I32(idx) = eval_cpu_expr(
+                            index,
+                            &th.coords,
+                            args,
+                            shared,
+                            &th.locals,
+                            kernel_name,
+                        )?
+                        else {
                             return Err(MoraError::Runtime(format!(
-                                "kernel '{kernel_name}': store index {ui} out of bounds (len {})",
-                                buf.len()
+                                "kernel '{kernel_name}': non-i32 shared store index"
+                            )));
+                        };
+                        let val = eval_cpu_expr(
+                            value,
+                            &th.coords,
+                            args,
+                            shared,
+                            &th.locals,
+                            kernel_name,
+                        )?;
+                        if idx < 0 {
+                            return Err(MoraError::Runtime(format!(
+                                "kernel '{kernel_name}': negative shared store index {idx}"
                             )));
                         }
-                        buf[ui] = v;
+                        let ui = idx as usize;
+                        match (&mut shared[*shared_idx], val) {
+                            (CpuSharedBuf::F32(buf), CpuScalar::F32(v)) => {
+                                if ui >= buf.len() {
+                                    return Err(MoraError::Runtime(format!(
+                                        "kernel '{kernel_name}': shared store index {ui} out of bounds (len {})",
+                                        buf.len()
+                                    )));
+                                }
+                                buf[ui] = v;
+                            }
+                            (CpuSharedBuf::F64(buf), CpuScalar::F64(v)) => {
+                                if ui >= buf.len() {
+                                    return Err(MoraError::Runtime(format!(
+                                        "kernel '{kernel_name}': shared store index {ui} out of bounds (len {})",
+                                        buf.len()
+                                    )));
+                                }
+                                buf[ui] = v;
+                            }
+                            (CpuSharedBuf::I32(buf), CpuScalar::I32(v)) => {
+                                if ui >= buf.len() {
+                                    return Err(MoraError::Runtime(format!(
+                                        "kernel '{kernel_name}': shared store index {ui} out of bounds (len {})",
+                                        buf.len()
+                                    )));
+                                }
+                                buf[ui] = v;
+                            }
+                            _ => {
+                                return Err(MoraError::Runtime(format!(
+                                    "kernel '{kernel_name}': mismatched shared store dtype"
+                                )));
+                            }
+                        }
                     }
-                    _ => {
-                        return Err(MoraError::Runtime(format!(
-                            "kernel '{kernel_name}': mismatched store dtype"
-                        )));
+                    KernelStmt::SyncThreads => {
+                        return Ok(ThreadPause::Barrier);
+                    }
+                    KernelStmt::If {
+                        cond,
+                        then_body,
+                        else_body,
+                    } => {
+                        let CpuScalar::Bool(c) =
+                            eval_cpu_expr(cond, &th.coords, args, shared, &th.locals, kernel_name)?
+                        else {
+                            return Err(MoraError::Runtime(format!(
+                                "kernel '{kernel_name}': non-bool if condition"
+                            )));
+                        };
+                        let branch = if c { then_body } else { else_body };
+                        th.frames.push(CpuFrame::Block {
+                            stmts: branch,
+                            pc: 0,
+                        });
+                    }
+                    KernelStmt::While { cond, body } => {
+                        th.frames.push(CpuFrame::While {
+                            cond,
+                            body,
+                            in_body: false,
+                            iters: 0,
+                        });
                     }
                 }
             }
-            KernelStmt::If {
+            CpuFrame::While {
                 cond,
-                then_body,
-                else_body,
+                body,
+                in_body,
+                iters,
             } => {
+                if *in_body {
+                    *in_body = false;
+                }
+                *iters += 1;
+                if *iters > 10_000_000 {
+                    return Err(MoraError::Runtime(format!(
+                        "kernel '{kernel_name}': while loop exceeded 10M iterations on CPU"
+                    )));
+                }
+                let cond_ref = *cond;
+                let body_ref = *body;
                 let CpuScalar::Bool(c) =
-                    eval_cpu_expr(cond, gid, bid, tid, bdim, gdim, args, locals, kernel_name)?
+                    eval_cpu_expr(cond_ref, &th.coords, args, shared, &th.locals, kernel_name)?
                 else {
                     return Err(MoraError::Runtime(format!(
-                        "kernel '{kernel_name}': non-bool if condition"
+                        "kernel '{kernel_name}': non-bool while condition"
                     )));
                 };
                 if c {
-                    eval_cpu_stmts(
-                        then_body,
-                        gid,
-                        bid,
-                        tid,
-                        bdim,
-                        gdim,
-                        args,
-                        locals,
-                        kernel_name,
-                    )?;
+                    if let Some(CpuFrame::While { in_body, .. }) = th.frames.last_mut() {
+                        *in_body = true;
+                    }
+                    th.frames.push(CpuFrame::Block {
+                        stmts: body_ref,
+                        pc: 0,
+                    });
                 } else {
-                    eval_cpu_stmts(
-                        else_body,
-                        gid,
-                        bid,
-                        tid,
-                        bdim,
-                        gdim,
-                        args,
-                        locals,
-                        kernel_name,
-                    )?;
-                }
-            }
-            KernelStmt::While { cond, body } => {
-                let mut steps = 0usize;
-                loop {
-                    steps += 1;
-                    if steps > 10_000_000 {
-                        return Err(MoraError::Runtime(format!(
-                            "kernel '{kernel_name}': while loop exceeded 10M iterations on CPU"
-                        )));
-                    }
-                    let CpuScalar::Bool(c) =
-                        eval_cpu_expr(cond, gid, bid, tid, bdim, gdim, args, locals, kernel_name)?
-                    else {
-                        return Err(MoraError::Runtime(format!(
-                            "kernel '{kernel_name}': non-bool while condition"
-                        )));
-                    };
-                    if !c {
-                        break;
-                    }
-                    eval_cpu_stmts(body, gid, bid, tid, bdim, gdim, args, locals, kernel_name)?;
+                    th.frames.pop();
                 }
             }
         }
     }
-    Ok(())
+    th.finished = true;
+    Ok(ThreadPause::Finished)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn eval_cpu_expr(
     expr: &KernelExpr,
-    gid: i32,
-    bid: i32,
-    tid: i32,
-    bdim: i32,
-    gdim: i32,
+    coords: &CpuThreadCoords,
     args: &[CpuParamBuf],
+    shared: &[CpuSharedBuf],
     locals: &HashMap<String, CpuScalar>,
     kernel_name: &str,
 ) -> MoraResult<CpuScalar> {
@@ -3211,16 +4523,26 @@ fn eval_cpu_expr(
         KernelExpr::Var(name, _) => locals.get(name).copied().ok_or_else(|| {
             MoraError::Runtime(format!("kernel '{kernel_name}': undefined local '{name}'"))
         }),
-        KernelExpr::GlobalId => Ok(CpuScalar::I32(gid)),
-        KernelExpr::BlockIdx => Ok(CpuScalar::I32(bid)),
-        KernelExpr::ThreadIdx => Ok(CpuScalar::I32(tid)),
-        KernelExpr::BlockDim => Ok(CpuScalar::I32(bdim)),
-        KernelExpr::GridDim => Ok(CpuScalar::I32(gdim)),
+        KernelExpr::GlobalId => Ok(CpuScalar::I32(coords.gid[0])),
+        KernelExpr::GlobalIdY => Ok(CpuScalar::I32(coords.gid[1])),
+        KernelExpr::GlobalIdZ => Ok(CpuScalar::I32(coords.gid[2])),
+        KernelExpr::BlockIdx => Ok(CpuScalar::I32(coords.bid[0])),
+        KernelExpr::BlockIdxY => Ok(CpuScalar::I32(coords.bid[1])),
+        KernelExpr::BlockIdxZ => Ok(CpuScalar::I32(coords.bid[2])),
+        KernelExpr::ThreadIdx => Ok(CpuScalar::I32(coords.tid[0])),
+        KernelExpr::ThreadIdxY => Ok(CpuScalar::I32(coords.tid[1])),
+        KernelExpr::ThreadIdxZ => Ok(CpuScalar::I32(coords.tid[2])),
+        KernelExpr::BlockDim => Ok(CpuScalar::I32(coords.bdim[0])),
+        KernelExpr::BlockDimY => Ok(CpuScalar::I32(coords.bdim[1])),
+        KernelExpr::BlockDimZ => Ok(CpuScalar::I32(coords.bdim[2])),
+        KernelExpr::GridDim => Ok(CpuScalar::I32(coords.gdim[0])),
+        KernelExpr::GridDimY => Ok(CpuScalar::I32(coords.gdim[1])),
+        KernelExpr::GridDimZ => Ok(CpuScalar::I32(coords.gdim[2])),
         KernelExpr::Load {
             buf_param, index, ..
         } => {
             let CpuScalar::I32(idx) =
-                eval_cpu_expr(index, gid, bid, tid, bdim, gdim, args, locals, kernel_name)?
+                eval_cpu_expr(index, coords, args, shared, locals, kernel_name)?
             else {
                 return Err(MoraError::Runtime(format!(
                     "kernel '{kernel_name}': non-i32 load index"
@@ -3249,13 +4571,94 @@ fn eval_cpu_expr(
                         ))
                     })
                 }
+                CpuParamBuf::F16(buf) => buf
+                    .get(ui)
+                    .copied()
+                    .map(|b| CpuScalar::F32(crate::common::dtype::f16_bits_to_f64(b) as f32))
+                    .ok_or_else(|| {
+                        MoraError::Runtime(format!(
+                            "kernel '{kernel_name}': load index {ui} out of bounds (len {})",
+                            buf.len()
+                        ))
+                    }),
+                CpuParamBuf::BF16(buf) => buf
+                    .get(ui)
+                    .copied()
+                    .map(|b| CpuScalar::F32(crate::common::dtype::bf16_bits_to_f64(b) as f32))
+                    .ok_or_else(|| {
+                        MoraError::Runtime(format!(
+                            "kernel '{kernel_name}': load index {ui} out of bounds (len {})",
+                            buf.len()
+                        ))
+                    }),
+                CpuParamBuf::U8(buf) => buf
+                    .get(ui)
+                    .copied()
+                    .map(|b| CpuScalar::I32(i32::from(b)))
+                    .ok_or_else(|| {
+                        MoraError::Runtime(format!(
+                            "kernel '{kernel_name}': load index {ui} out of bounds (len {})",
+                            buf.len()
+                        ))
+                    }),
+                CpuParamBuf::I32(buf) => {
+                    buf.get(ui).copied().map(CpuScalar::I32).ok_or_else(|| {
+                        MoraError::Runtime(format!(
+                            "kernel '{kernel_name}': load index {ui} out of bounds (len {})",
+                            buf.len()
+                        ))
+                    })
+                }
                 CpuParamBuf::Scalar(_) => Err(MoraError::Runtime(format!(
                     "kernel '{kernel_name}': scalar param indexed as buffer"
                 ))),
             }
         }
+        KernelExpr::LoadShared {
+            shared_idx, index, ..
+        } => {
+            let CpuScalar::I32(idx) =
+                eval_cpu_expr(index, coords, args, shared, locals, kernel_name)?
+            else {
+                return Err(MoraError::Runtime(format!(
+                    "kernel '{kernel_name}': non-i32 shared load index"
+                )));
+            };
+            if idx < 0 {
+                return Err(MoraError::Runtime(format!(
+                    "kernel '{kernel_name}': negative shared load index {idx}"
+                )));
+            }
+            let ui = idx as usize;
+            match &shared[*shared_idx] {
+                CpuSharedBuf::F32(buf) => {
+                    buf.get(ui).copied().map(CpuScalar::F32).ok_or_else(|| {
+                        MoraError::Runtime(format!(
+                            "kernel '{kernel_name}': shared load index {ui} out of bounds (len {})",
+                            buf.len()
+                        ))
+                    })
+                }
+                CpuSharedBuf::F64(buf) => {
+                    buf.get(ui).copied().map(CpuScalar::F64).ok_or_else(|| {
+                        MoraError::Runtime(format!(
+                            "kernel '{kernel_name}': shared load index {ui} out of bounds (len {})",
+                            buf.len()
+                        ))
+                    })
+                }
+                CpuSharedBuf::I32(buf) => {
+                    buf.get(ui).copied().map(CpuScalar::I32).ok_or_else(|| {
+                        MoraError::Runtime(format!(
+                            "kernel '{kernel_name}': shared load index {ui} out of bounds (len {})",
+                            buf.len()
+                        ))
+                    })
+                }
+            }
+        }
         KernelExpr::Unary { op, arg, .. } => {
-            let v = eval_cpu_expr(arg, gid, bid, tid, bdim, gdim, args, locals, kernel_name)?;
+            let v = eval_cpu_expr(arg, coords, args, shared, locals, kernel_name)?;
             Ok(match (op, v) {
                 (KernelUnaryOp::Neg, CpuScalar::I32(x)) => CpuScalar::I32(x.wrapping_neg()),
                 (KernelUnaryOp::Neg, CpuScalar::F32(x)) => CpuScalar::F32(-x),
@@ -3283,8 +4686,8 @@ fn eval_cpu_expr(
             })
         }
         KernelExpr::Binary { op, lhs, rhs, .. } => {
-            let l = eval_cpu_expr(lhs, gid, bid, tid, bdim, gdim, args, locals, kernel_name)?;
-            let r = eval_cpu_expr(rhs, gid, bid, tid, bdim, gdim, args, locals, kernel_name)?;
+            let l = eval_cpu_expr(lhs, coords, args, shared, locals, kernel_name)?;
+            let r = eval_cpu_expr(rhs, coords, args, shared, locals, kernel_name)?;
             Ok(match (op, l, r) {
                 (KernelBinOp::Add, CpuScalar::I32(a), CpuScalar::I32(b)) => {
                     CpuScalar::I32(a.wrapping_add(b))
@@ -3366,6 +4769,19 @@ fn eval_cpu_expr(
                 }
                 (KernelBinOp::Or, CpuScalar::Bool(a), CpuScalar::Bool(b)) => {
                     CpuScalar::Bool(a || b)
+                }
+                (KernelBinOp::BitAnd, CpuScalar::I32(a), CpuScalar::I32(b)) => {
+                    CpuScalar::I32(a & b)
+                }
+                (KernelBinOp::BitOr, CpuScalar::I32(a), CpuScalar::I32(b)) => CpuScalar::I32(a | b),
+                (KernelBinOp::BitXor, CpuScalar::I32(a), CpuScalar::I32(b)) => {
+                    CpuScalar::I32(a ^ b)
+                }
+                (KernelBinOp::Shl, CpuScalar::I32(a), CpuScalar::I32(b)) => {
+                    CpuScalar::I32(a.wrapping_shl((b as u32) & 31))
+                }
+                (KernelBinOp::Shr, CpuScalar::I32(a), CpuScalar::I32(b)) => {
+                    CpuScalar::I32(a.wrapping_shr((b as u32) & 31))
                 }
                 _ => {
                     return Err(MoraError::Runtime(format!(

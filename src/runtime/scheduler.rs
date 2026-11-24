@@ -1378,11 +1378,10 @@ impl TaskScheduler {
         core: &CoreRuntime,
         ctx: &TaskContext,
     ) -> TaskHandle<Value> {
-        let mut isolated = core.clone();
-        isolated.autograd = crate::runtime::autograd::AutogradContext::new();
+        let mut isolated = core.fork_for_fiber();
         let pool = Arc::clone(&self.pool);
         self.spawn(ctx, move |task_ctx| async move {
-            isolated.task_context = Some(task_ctx.clone());
+            isolated.session.task_context = Some(task_ctx.clone());
             run_mora_fiber_loop(&mut isolated, &task_ctx, &pool, |rt| {
                 resolve_value_call_named(callee, args, Vec::new(), rt)
             })
@@ -1507,11 +1506,10 @@ impl TaskScheduler {
         core: &CoreRuntime,
         ctx: &TaskContext,
     ) -> Arc<MoraTaskHandle> {
-        let mut isolated = core.clone();
-        isolated.autograd = crate::runtime::autograd::AutogradContext::new();
+        let mut isolated = core.fork_for_fiber();
         let pool = Arc::clone(&self.pool);
         self.spawn_mora_fiber(ctx, move |task_ctx| async move {
-            isolated.task_context = Some(task_ctx.clone());
+            isolated.session.task_context = Some(task_ctx.clone());
             run_mora_fiber_loop(&mut isolated, &task_ctx, &pool, |rt| {
                 resolve_value_call_named(callee, args, named_args, rt)
             })
@@ -1529,11 +1527,10 @@ impl TaskScheduler {
         core: &CoreRuntime,
         ctx: &TaskContext,
     ) -> Arc<MoraTaskHandle> {
-        let mut isolated = core.clone();
-        isolated.autograd = crate::runtime::autograd::AutogradContext::new();
+        let mut isolated = core.fork_for_fiber();
         let pool = Arc::clone(&self.pool);
         self.spawn_mora_fiber(ctx, move |task_ctx| async move {
-            isolated.task_context = Some(task_ctx.clone());
+            isolated.session.task_context = Some(task_ctx.clone());
             run_mora_fiber_loop(&mut isolated, &task_ctx, &pool, |rt| {
                 resolve_method_call_named(
                     rt,

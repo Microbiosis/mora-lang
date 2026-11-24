@@ -1,0 +1,110 @@
+-- Pure-Mora standard library: Sandboxed OS & Path Capability Surface (`std/os`)
+--
+-- Exposes first-class sandbox-verified `checked_path` capabilities backed by the
+-- runtime's `FsContext` / `FsPolicy` (`Unrestricted` or `Confined`), isolated
+-- per-runtime `virtual_cwd` (zero global `chdir` races), environment lookups,
+-- host platform metadata, and parallel command execution.
+
+export task check_path(raw: string): checked_path ! io
+  return file.check_path(raw)
+end
+
+export task cwd(): string ! io
+  return file.cwd()
+end
+
+export task chdir(path: any): nil ! io
+  return file.chdir(path)
+end
+
+export task home_dir(): string ! io
+  return file.home_dir()
+end
+
+export task is_confined(): bool ! io
+  return file.is_confined()
+end
+
+export task env(key: string): any ! io
+  return file.env(key)
+end
+
+export task env_or(key: string, default_val: string): string ! io
+  let v = file.env(key)
+  if v == nil then
+    return default_val
+  end
+  return str(v)
+end
+
+export task platform(): string ! io
+  return file.os_name()
+end
+
+export task arch(): string ! io
+  return file.arch()
+end
+
+export task path_join(a: any, b: any): string ! io
+  return file.join(a, b)
+end
+
+export task abs_path(p: any): string ! io
+  return file.abs(p)
+end
+
+export task basename(p: string): string ! io
+  return file.basename(p)
+end
+
+export task dirname(p: string): string ! io
+  return file.dirname(p)
+end
+
+export task extname(p: string): string ! io
+  return file.extname(p)
+end
+
+export task exists(p: any): bool ! io
+  return file.exists(p)
+end
+
+export task is_file(p: any): bool ! io
+  return file.is_file(p)
+end
+
+export task is_dir(p: any): bool ! io
+  return file.is_dir(p)
+end
+
+export task list_dir(p: any): list<string> ! io
+  return file.list(p)
+end
+
+export task mkdir(p: any): nil ! io
+  return file.mkdir(p)
+end
+
+export task mkdir_all(p: any): nil ! io
+  return file.mkdir_all(p)
+end
+
+export task remove(p: any): nil ! io
+  return file.remove(p)
+end
+
+export task remove_all(p: any): nil ! io
+  return file.remove_all(p)
+end
+
+export task rename(src: any, dst: any): nil ! io
+  return file.rename(src, dst)
+end
+
+export task copy_file(src: any, dst: any): nil ! io
+  return file.copy(src, dst)
+end
+
+export task run_cmds(cmds: list<string>): list<dict<string, any>> ! io
+  return exec.parallel(cmds)
+end

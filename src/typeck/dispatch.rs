@@ -457,6 +457,8 @@ enum Ret {
     Nil,
     /// `Tensor<u8, [_], cpu>` —— 紧凑 64B 对齐字节缓冲区（`file.read_binary` 等）。
     ByteTensor,
+    /// `checked_path` —— 不可绕过的沙箱校验路径凭证（`file.check_path` / `std/os` / `std/io`）。
+    CheckedPath,
     /// `Type::List` —— 元素类型唯一，故是 1 元数组而非切片。
     List(&'static [Ret; 1]),
     /// `Type::Dict` —— `[键, 值]`。
@@ -481,6 +483,7 @@ impl Ret {
                 )]),
                 device: crate::typeck::DeviceType::Concrete(crate::common::Device::Cpu),
             },
+            Ret::CheckedPath => Type::CheckedPath,
             Ret::List([elem]) => Type::List(Box::new(elem.materialize())),
             Ret::Dict([k, v]) => Type::Dict(Box::new(k.materialize()), Box::new(v.materialize())),
             Ret::Union(xs) => Type::Union(xs.iter().map(|r| r.materialize()).collect()),
@@ -581,7 +584,11 @@ const FILE_METHODS: &[MethodGroup] = &[
         Ret::String,
     ),
     // 零参
-    MethodGroup::new(&["cwd", "home_dir"], 0, Ret::String),
+    MethodGroup::new(&["cwd", "home_dir", "os_name", "arch"], 0, Ret::String),
+    MethodGroup::new(&["is_confined"], 0, Ret::Bool),
+    // 沙箱路径凭证构造 & 环境变量读取
+    MethodGroup::new(&["check_path"], 1, Ret::CheckedPath),
+    MethodGroup::new(&["env"], 1, Ret::Union(&[Ret::String, Ret::Nil])),
     // `join` 是**变参**（运行期 `for arg in args`），最小 1 元
     MethodGroup::new(&["join"], 1, Ret::String),
     // Float —— `Ok(Value::Float(meta.len() as f64))`
@@ -1656,6 +1663,62 @@ fn method_signature_builtin(receiver: &Type, method: &str) -> Option<Signature> 
         (Type::TraceProfiler, "to_chrome_json") => Some(Signature::new(
             vec![("self".to_string(), Type::TraceProfiler)],
             Type::String,
+        )),
+        // ── v0.112.0 (G6): First-class sandboxed CheckedPath capability methods ──
+        (
+            Type::CheckedPath,
+            "as_str" | "to_str" | "basename" | "dirname" | "extname" | "read_text" | "read_bytes",
+        ) => Some(Signature::new(
+            vec![("self".to_string(), Type::CheckedPath)],
+            Type::String,
+        )),
+        (Type::CheckedPath, "join") => Some(Signature::variadic(
+            vec![
+                ("self".to_string(), Type::CheckedPath),
+                ("segment".to_string(), Type::String),
+            ],
+            Type::CheckedPath,
+        )),
+        (Type::CheckedPath, "exists" | "is_file" | "is_dir") => Some(Signature::new(
+            vec![("self".to_string(), Type::CheckedPath)],
+            Type::Bool,
+        )),
+        (Type::CheckedPath, "size") => Some(Signature::new(
+            vec![("self".to_string(), Type::CheckedPath)],
+            Type::Float,
+        )),
+        (Type::CheckedPath, "list") => Some(Signature::new(
+            vec![("self".to_string(), Type::CheckedPath)],
+            Type::List(Box::new(Type::String)),
+        )),
+        (Type::CheckedPath, "mkdir" | "mkdir_all" | "remove" | "remove_all" | "touch") => Some(
+            Signature::new(vec![("self".to_string(), Type::CheckedPath)], Type::Nil),
+        ),
+        (Type::CheckedPath, "write_text" | "append_text" | "write_bytes") => Some(Signature::new(
+            vec![
+                ("self".to_string(), Type::CheckedPath),
+                ("content".to_string(), Type::String),
+            ],
+            Type::Nil,
+        )),
+        (Type::CheckedPath, "read_binary") => Some(Signature::new(
+            vec![("self".to_string(), Type::CheckedPath)],
+            Ret::ByteTensor.materialize(),
+        )),
+        (Type::CheckedPath, "read_binary_range") => Some(Signature::new(
+            vec![
+                ("self".to_string(), Type::CheckedPath),
+                ("offset".to_string(), Type::Int),
+                ("len".to_string(), Type::Int),
+            ],
+            Ret::ByteTensor.materialize(),
+        )),
+        (Type::CheckedPath, "write_binary") => Some(Signature::new(
+            vec![
+                ("self".to_string(), Type::CheckedPath),
+                ("data".to_string(), Type::any_tensor()),
+            ],
+            Type::Nil,
         )),
         (Type::Tensor { .. }, "shape") => Some(Signature::new(
             vec![("self".to_string(), receiver.clone())],

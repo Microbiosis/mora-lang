@@ -190,6 +190,7 @@ pub(super) fn canonical_target_name_of(ty: &Type) -> Option<String> {
         Type::MemoryPool => Some("memory_pool".to_string()),
         Type::ProcessGroup => Some("process_group".to_string()),
         Type::TraceProfiler => Some("trace_profiler".to_string()),
+        Type::CheckedPath => Some("checked_path".to_string()),
         Type::GpuKernel(_) => Some("gpu_kernel".to_string()),
         _ => None,
     }

@@ -406,6 +406,8 @@ pub enum Type {
     ProcessGroup,
     /// P4-4: Nanosecond compute & service trace profiler (`profiler()` / `std/trace`).
     TraceProfiler,
+    /// v0.112.0 (G6): First-class sandbox-verified filesystem path capability (`checked_path`).
+    CheckedPath,
     /// Stage 3B: Distinct low-bitwidth / hardware-precision scalar type (`f32`, `f16`, `bf16`, `fp8`, `i32`, `i16`, `i8`, `i4`, `u64`, `u32`, `u16`, `u8`).
     /// Canonical 64-bit `i64` is `Type::Int` and `f64` is `Type::Float`.
     Scalar(crate::common::DType),
@@ -593,6 +595,7 @@ impl Type {
             Type::MemoryPool => "memory_pool".to_string(),
             Type::ProcessGroup => "process_group".to_string(),
             Type::TraceProfiler => "trace_profiler".to_string(),
+            Type::CheckedPath => "checked_path".to_string(),
             Type::ConstInt(n) => n.to_string(),
             Type::GpuKernel(params) => match params {
                 Some(ps) => {
@@ -648,6 +651,7 @@ impl Type {
             "memory_pool" | "memorypool" => Type::MemoryPool,
             "process_group" | "processgroup" => Type::ProcessGroup,
             "trace_profiler" | "traceprofiler" => Type::TraceProfiler,
+            "checked_path" | "checkedpath" => Type::CheckedPath,
             "gpu_kernel" | "gpukernel" | "kernel" => Type::GpuKernel(None),
             "tensor" | "Tensor" => Type::any_tensor(),
             "task" => Type::Task,

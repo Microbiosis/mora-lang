@@ -1,12 +1,16 @@
-//! v0.110.0: CoreRuntime — 语言执行必需的薄核心。
+//! v0.112.0: `CoreRuntime` — 彻底拆离为只读共享底座 [`EngineShared`]、
+//! 写时复制类型元数据注册表 [`TypeMetadataRegistry`] 与轻量纤程会话 [`ExecSession`]。
 //!
-//! 只保留语言执行真正需要的状态：执行环境、trait / struct / enum 注册表、
-//! inherent 与 trait impl 方法表、gensym 计数器、ambient random 状态、
-//! 自动微分上下文，以及 `mora build` 产出的预编译 `ControlProgram` 模块缓存。
-//! 进程级共享服务（`TaskScheduler` / `AsyncIoReactor` / `DagPlanCache`）统一挂在
-//! [`EngineShared`] 上，由 `CoreRuntime` 以 `Arc` 持有并在 clone 间共享；
-//! 文件系统隔离策略由 [`crate::runtime::fs::FsContext`] 承担，
-//! 协作取消与超时由可选的 [`crate::runtime::scheduler::TaskContext`] 承担。
+//! 架构分层：
+//! 1. [`EngineShared`]（`Arc` 共享）：进程级不可变运行时底座（`TaskScheduler` /
+//!    `AsyncIoReactor` / `DagPlanCache`）。
+//! 2. [`TypeMetadataRegistry`]（单一 `Arc` + CoW）：编译期/模块加载期产生的
+//!    trait / struct / enum 描述符、方法分派表与 `mora build` 预编译模块缓存；
+//!    `spawn` 派发纤程仅做一次 `Arc::clone`（不再逐项克隆 8 个独立 `Arc`）。
+//! 3. [`ExecSession`]（轻量按纤程独立持有）：每条纤程的可变执行会话（`gensym_counter` /
+//!    `random_state` / `task_context` / `fs_context` / `autograd`），通过
+//!    [`CoreRuntime::fork_for_fiber`] O(1) 隔离出新纤程并重置独立 `AutogradContext`。
+//! 4. `environment: Environment`：显式收窄为动态 `eval()` / REPL / 模块导出的符号边界。
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -80,40 +84,81 @@ impl Default for EngineShared {
 type TraitImplMethodMap = HashMap<(String, String, String), (Value, bool)>;
 type InherentMethodMap = HashMap<(String, String), (Value, bool)>;
 
-/// 语言执行必需的薄核心。
+/// Single copy-on-write immutable metadata bundle shared across spawned fibers via one `Arc`.
+#[derive(Clone, Default)]
+pub struct TypeMetadataRegistry {
+    /// Trait definitions (`trait_name` -> `TraitInfo`).
+    pub(crate) trait_registry: HashMap<String, TraitInfo>,
+    /// Nominal struct runtime descriptors (`StructName -> StructDefRuntime`).
+    pub(crate) struct_registry: HashMap<String, Arc<StructDefRuntime>>,
+    /// Nominal enum runtime descriptors (`EnumName -> EnumDefRuntime`).
+    pub(crate) enum_registry: HashMap<String, Arc<EnumDefRuntime>>,
+    /// Inherent `impl TargetType` methods `(target_type, method_name) -> (Value, has_self)`.
+    pub(crate) inherent_methods: InherentMethodMap,
+    /// Trait `impl Trait for TargetType` methods `(trait_name, target_type, method_name) -> (Value, has_self)`.
+    pub(crate) trait_impls: TraitImplMethodMap,
+    /// Registered `(trait_name, target_type)` impl pairs (supports empty default-only impls).
+    pub(crate) trait_impl_pairs: HashSet<(String, String)>,
+    /// Trait default method implementations `(trait_name, method_name) -> (Value, has_self)`.
+    pub(crate) trait_defaults: HashMap<(String, String), (Value, bool)>,
+    /// Precompiled & verified SSA `ControlProgram` modules embedded by `mora build` (`MORABC02`).
+    pub(crate) precompiled_modules: HashMap<String, Arc<crate::mir::control::ControlProgram>>,
+}
+
+/// Lightweight per-fiber mutable execution session cleanly separated from [`EngineShared`]
+/// and [`TypeMetadataRegistry`].
+#[derive(Clone)]
+pub struct ExecSession {
+    /// Per-fiber unique symbol counter (`gensym()`).
+    pub(crate) gensym_counter: usize,
+    /// Per-fiber ambient random state (pure value).
+    pub(crate) random_state: crate::runtime::random::Xoshiro256,
+    /// Optional cooperative cancellation and deadline context for VM tasks.
+    pub(crate) task_context: Option<TaskContext>,
+    /// Filesystem confinement policy and isolated virtual working directory.
+    pub(crate) fs_context: FsContext,
+    /// Per-fiber reverse-mode automatic differentiation tape stack (`grad` / `no_grad`).
+    pub(crate) autograd: AutogradContext,
+}
+
+impl Default for ExecSession {
+    fn default() -> Self {
+        Self {
+            gensym_counter: 0,
+            random_state: crate::runtime::random::Xoshiro256::from_time(),
+            task_context: None,
+            fs_context: FsContext::unrestricted(),
+            autograd: AutogradContext::new(),
+        }
+    }
+}
+
+impl ExecSession {
+    /// Fork a lightweight child session for a `spawn`ed fiber: preserves filesystem policy and
+    /// task context while starting with a fresh isolated `AutogradContext`.
+    pub(crate) fn fork_for_fiber(&self) -> Self {
+        Self {
+            gensym_counter: self.gensym_counter,
+            random_state: self.random_state,
+            task_context: self.task_context.clone(),
+            fs_context: self.fs_context.clone(),
+            autograd: AutogradContext::new(),
+        }
+    }
+}
+
+/// 语言执行必需的薄核心：由不可变 [`EngineShared`] + 单 `Arc` [`TypeMetadataRegistry`] +
+/// 轻量每纤程 [`ExecSession`] + 显式动态 `eval`/REPL/导出边界 `environment` 构成。
 #[derive(Clone)]
 pub struct CoreRuntime {
-    /// 当前执行环境（clone 时按值复制，绑定互不穿透）
-    pub(crate) environment: Environment,
-    /// trait 系统注册表（`trait_name` → `TraitInfo`）
-    pub(crate) trait_registry: Arc<HashMap<String, TraitInfo>>,
-    /// v0.87: gensym 计数器。每次 gensym() 调用递增，保证符号名唯一。
-    pub(crate) gensym_counter: usize,
-    /// v0.99: ambient random 状态（纯值）。
-    pub(crate) random_state: crate::runtime::random::Xoshiro256,
-    /// Immutable process-level shared services (`scheduler`, `reactor`).
+    /// Immutable process-level shared services (`scheduler`, `reactor`, `dag_cache`).
     pub(crate) shared: Arc<EngineShared>,
-    /// Wave 2 W2.4: Optional cooperative cancellation and deadline context for VM tasks.
-    pub(crate) task_context: Option<TaskContext>,
-    /// Wave 2 W2.5: Filesystem confinement policy and isolated virtual working directory.
-    pub(crate) fs_context: FsContext,
-    /// Wave 3 Stage 3C: Nominal struct runtime descriptors (`StructName -> StructDefRuntime`).
-    pub(crate) struct_registry: Arc<HashMap<String, Arc<StructDefRuntime>>>,
-    /// Wave 3 Stage 3C: Nominal enum runtime descriptors (`EnumName -> EnumDefRuntime`).
-    pub(crate) enum_registry: Arc<HashMap<String, Arc<EnumDefRuntime>>>,
-    /// Wave 3 Stage 3C: Inherent `impl TargetType` methods `(target_type, method_name) -> (Value, has_self)`.
-    pub(crate) inherent_methods: Arc<InherentMethodMap>,
-    /// Wave 3 Stage 3C: Trait `impl Trait for TargetType` methods `(trait_name, target_type, method_name) -> (Value, has_self)`.
-    pub(crate) trait_impls: Arc<TraitImplMethodMap>,
-    /// Wave 3 Stage 3C: Registered `(trait_name, target_type)` impl pairs (supports empty default-only impls).
-    pub(crate) trait_impl_pairs: Arc<HashSet<(String, String)>>,
-    /// Wave 3 Stage 3C: Trait default method implementations `(trait_name, method_name) -> (Value, has_self)`.
-    pub(crate) trait_defaults: Arc<HashMap<(String, String), (Value, bool)>>,
-    /// Wave 3 Stage 3C: Per-runtime reverse-mode automatic differentiation context (`grad` / `no_grad`).
-    pub(crate) autograd: AutogradContext,
-    /// Wave 4 P2-1: Precompiled & verified SSA `ControlProgram` modules embedded by `mora build`
-    /// (`MORABC02` bytecode / `.morac` packages) for O(1) zero-parse runtime `import`.
-    pub(crate) precompiled_modules: Arc<HashMap<String, Arc<crate::mir::control::ControlProgram>>>,
+    /// Single `Arc` copy-on-write type/method/module metadata bundle.
+    pub(crate) registry: Arc<TypeMetadataRegistry>,
+    /// Lightweight per-fiber execution session (`gensym`, `random`, `task_context`, `fs_context`, `autograd`).
+    pub(crate) session: ExecSession,
+    /// Explicit dynamic namespace strictly for `eval()`, REPL sessions, and module export bridges.
+    pub(crate) environment: Environment,
 }
 
 fn default_environment() -> Environment {
@@ -152,26 +197,26 @@ fn default_environment() -> Environment {
 impl Default for CoreRuntime {
     fn default() -> Self {
         Self {
-            environment: default_environment(),
-            trait_registry: Arc::new(HashMap::new()),
-            gensym_counter: 0,
-            random_state: crate::runtime::random::Xoshiro256::from_time(),
             shared: Arc::new(EngineShared::new()),
-            task_context: None,
-            fs_context: FsContext::unrestricted(),
-            struct_registry: Arc::new(HashMap::new()),
-            enum_registry: Arc::new(HashMap::new()),
-            inherent_methods: Arc::new(HashMap::new()),
-            trait_impls: Arc::new(HashMap::new()),
-            trait_impl_pairs: Arc::new(HashSet::new()),
-            trait_defaults: Arc::new(HashMap::new()),
-            autograd: AutogradContext::new(),
-            precompiled_modules: Arc::new(HashMap::new()),
+            registry: Arc::new(TypeMetadataRegistry::default()),
+            session: ExecSession::default(),
+            environment: default_environment(),
         }
     }
 }
 
 impl CoreRuntime {
+    /// Fork an isolated child runtime for a spawned fiber in O(1) (`EngineShared` + `TypeMetadataRegistry`
+    /// shared via two `Arc::clone`s; fresh `AutogradContext` in child [`ExecSession`]).
+    pub(crate) fn fork_for_fiber(&self) -> Self {
+        Self {
+            shared: Arc::clone(&self.shared),
+            registry: Arc::clone(&self.registry),
+            session: self.session.fork_for_fiber(),
+            environment: self.environment.clone(),
+        }
+    }
+
     /// 只读访问当前运行时环境（供测试与诊断检查内置绑定）。
     pub fn environment(&self) -> &Environment {
         &self.environment
@@ -200,24 +245,24 @@ impl CoreRuntime {
 
     /// Attach a cooperative cancellation and deadline [`TaskContext`] to this runtime.
     pub fn with_task_context(mut self, ctx: TaskContext) -> Self {
-        self.task_context = Some(ctx);
+        self.session.task_context = Some(ctx);
         self
     }
 
-    /// Configure a confined filesystem root for `file.*` operations and `import`.
+    /// Configure a confined filesystem root for `file.*`, `std/os`, `std/io`, and `import`.
     pub fn with_fs_root(mut self, root: impl AsRef<Path>) -> MoraResult<Self> {
-        self.fs_context = FsContext::confined(root)?;
+        self.session.fs_context = FsContext::confined(root)?;
         Ok(self)
     }
 
     /// Borrow this runtime's [`FsContext`].
     pub fn fs_context(&self) -> &FsContext {
-        &self.fs_context
+        &self.session.fs_context
     }
 
     /// Mutably borrow this runtime's [`FsContext`] (e.g. isolated `file.chdir`).
     pub fn fs_context_mut(&mut self) -> &mut FsContext {
-        &mut self.fs_context
+        &mut self.session.fs_context
     }
 
     /// Attach precompiled & verified SSA `ControlProgram` modules (used by `MORABC02` bundles/`.morac`).
@@ -225,13 +270,13 @@ impl CoreRuntime {
         mut self,
         modules: HashMap<String, Arc<crate::mir::control::ControlProgram>>,
     ) -> Self {
-        self.precompiled_modules = Arc::new(modules);
+        Arc::make_mut(&mut self.registry).precompiled_modules = modules;
         self
     }
 
     /// Check cooperative cancellation or deadline expiry if a [`TaskContext`] is attached.
     pub fn check_cancelled(&self) -> MoraResult<()> {
-        match &self.task_context {
+        match &self.session.task_context {
             Some(ctx) => ctx.status(),
             None => Ok(()),
         }
@@ -239,23 +284,23 @@ impl CoreRuntime {
 
     /// 注册 trait。
     pub fn register_trait(&mut self, name: String, info: TraitInfo) {
-        let mut map = (*self.trait_registry).clone();
-        map.insert(name, info);
-        self.trait_registry = Arc::new(map);
+        Arc::make_mut(&mut self.registry)
+            .trait_registry
+            .insert(name, info);
     }
 
     /// Register a nominal struct runtime descriptor.
     pub fn register_struct_def(&mut self, def: Arc<StructDefRuntime>) {
-        let mut map = (*self.struct_registry).clone();
-        map.insert(def.name.clone(), def);
-        self.struct_registry = Arc::new(map);
+        Arc::make_mut(&mut self.registry)
+            .struct_registry
+            .insert(def.name.clone(), def);
     }
 
     /// Register a nominal enum runtime descriptor.
     pub fn register_enum_def(&mut self, def: Arc<EnumDefRuntime>) {
-        let mut map = (*self.enum_registry).clone();
-        map.insert(def.name.clone(), def);
-        self.enum_registry = Arc::new(map);
+        Arc::make_mut(&mut self.registry)
+            .enum_registry
+            .insert(def.name.clone(), def);
     }
 
     /// Register an inherent `impl TargetType` method.
@@ -266,16 +311,16 @@ impl CoreRuntime {
         func: Value,
         has_self: bool,
     ) {
-        let mut map = (*self.inherent_methods).clone();
-        map.insert((target_type, method), (func, has_self));
-        self.inherent_methods = Arc::new(map);
+        Arc::make_mut(&mut self.registry)
+            .inherent_methods
+            .insert((target_type, method), (func, has_self));
     }
 
     /// Register a `(trait_name, target_type)` impl pair (supports empty default-only impls).
     pub fn register_trait_impl_pair(&mut self, trait_name: String, target_type: String) {
-        let mut set = (*self.trait_impl_pairs).clone();
-        set.insert((trait_name, target_type));
-        self.trait_impl_pairs = Arc::new(set);
+        Arc::make_mut(&mut self.registry)
+            .trait_impl_pairs
+            .insert((trait_name, target_type));
     }
 
     /// Register a trait `impl Trait for TargetType` method.
@@ -287,10 +332,11 @@ impl CoreRuntime {
         func: Value,
         has_self: bool,
     ) {
-        self.register_trait_impl_pair(trait_name.clone(), target_type.clone());
-        let mut map = (*self.trait_impls).clone();
-        map.insert((trait_name, target_type, method), (func, has_self));
-        self.trait_impls = Arc::new(map);
+        let reg = Arc::make_mut(&mut self.registry);
+        reg.trait_impl_pairs
+            .insert((trait_name.clone(), target_type.clone()));
+        reg.trait_impls
+            .insert((trait_name, target_type, method), (func, has_self));
     }
 
     /// Register a trait default method body.
@@ -301,9 +347,9 @@ impl CoreRuntime {
         func: Value,
         has_self: bool,
     ) {
-        let mut map = (*self.trait_defaults).clone();
-        map.insert((trait_name, method), (func, has_self));
-        self.trait_defaults = Arc::new(map);
+        Arc::make_mut(&mut self.registry)
+            .trait_defaults
+            .insert((trait_name, method), (func, has_self));
     }
 }
 
@@ -324,22 +370,26 @@ mod tests {
     #[test]
     fn default_core_empty_traits() {
         let core = CoreRuntime::default();
-        assert!(core.trait_registry.is_empty());
+        assert!(core.registry.trait_registry.is_empty());
     }
 
     #[test]
     fn register_trait_inserts() {
         let mut core = CoreRuntime::default();
         core.register_trait("T1".to_string(), make_trait_info());
-        assert!(core.trait_registry.contains_key("T1"));
+        assert!(core.registry.trait_registry.contains_key("T1"));
     }
 
     #[test]
-    fn clone_shares_arc_traits() {
+    fn fork_for_fiber_shares_engine_and_registry_with_isolated_session() {
         let mut core1 = CoreRuntime::default();
         core1.register_trait("T1".to_string(), make_trait_info());
-        let core2 = core1.clone();
-        assert!(core2.trait_registry.contains_key("T1"));
+        core1.session.gensym_counter = 5;
+        let core2 = core1.fork_for_fiber();
+        assert!(Arc::ptr_eq(&core1.shared, &core2.shared));
+        assert!(Arc::ptr_eq(&core1.registry, &core2.registry));
+        assert!(core2.registry.trait_registry.contains_key("T1"));
+        assert_eq!(core2.session.gensym_counter, 5);
     }
 
     #[test]
@@ -347,16 +397,13 @@ mod tests {
         let mut core = CoreRuntime::default();
         core.environment
             .define("test".to_string(), Value::Int(42), false);
-        core.gensym_counter = 5;
+        core.session.gensym_counter = 5;
         let cloned = core.clone();
-        // 克隆保留绑定
         assert!(matches!(
             cloned.environment.get("test"),
             Some(Value::Int(42))
         ));
-        // gensym 计数器按值复制（v0.95: 纯 usize，无锁）
-        assert_eq!(cloned.gensym_counter, 5);
-        // 纯值语义：克隆侧写不穿透原侧（无共享可变 cell）
+        assert_eq!(cloned.session.gensym_counter, 5);
         let mut cloned = cloned;
         cloned
             .environment

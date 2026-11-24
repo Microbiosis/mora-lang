@@ -1033,7 +1033,7 @@ impl Tensor {
         let numel = checked_numel(&shape)?;
         let mut data = Vec::with_capacity(numel);
         for _ in 0..numel {
-            data.push(core.random_state.next_gauss());
+            data.push(core.session.random_state.next_gauss());
         }
         Self::from_raw(data, shape, dtype, device, requires_grad)
     }
@@ -1054,7 +1054,7 @@ impl Tensor {
         let numel = checked_numel(&shape)?;
         let mut data = Vec::with_capacity(numel);
         for _ in 0..numel {
-            data.push(core.random_state.next_f64());
+            data.push(core.session.random_state.next_f64());
         }
         Self::from_raw(data, shape, dtype, device, requires_grad)
     }

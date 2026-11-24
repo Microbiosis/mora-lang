@@ -11,8 +11,10 @@
 
 use std::collections::VecDeque;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use crate::error::{MoraError, MoraResult};
+use crate::value::{HostObject, Value};
 
 /// 符号链接展开最大跳数，防止自指符号链接死循环。
 const MAX_SYMLINK_HOPS: usize = 40;
@@ -39,6 +41,136 @@ impl CheckedPath {
     /// 读取已验证的目标绝对路径（供宿主机文件 I/O 与模块加载使用）。
     pub fn as_path(&self) -> &Path {
         &self.resolved
+    }
+
+    /// UTF-8 (lossy) display representation of the canonical verified path.
+    pub(crate) fn display_string(&self) -> String {
+        self.resolved.to_string_lossy().to_string()
+    }
+}
+
+const CHECKED_PATH_METHODS: &[&str] = &[
+    "as_str",
+    "to_str",
+    "join",
+    "basename",
+    "dirname",
+    "extname",
+    "exists",
+    "is_file",
+    "is_dir",
+    "size",
+    "list",
+    "read_text",
+    "write_text",
+    "append_text",
+    "read_bytes",
+    "write_bytes",
+    "read_binary",
+    "read_binary_range",
+    "write_binary",
+    "mkdir",
+    "mkdir_all",
+    "remove",
+    "remove_all",
+    "touch",
+];
+
+impl HostObject for CheckedPath {
+    fn type_name(&self) -> &'static str {
+        "checked_path"
+    }
+
+    fn display(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.resolved.display())
+    }
+
+    fn methods(&self) -> &[&'static str] {
+        CHECKED_PATH_METHODS
+    }
+
+    fn call_method(
+        &self,
+        method: &str,
+        args: &[Value],
+        core: &mut crate::runtime::CoreRuntime,
+    ) -> MoraResult<Value> {
+        match method {
+            "as_str" | "to_str" => {
+                if !args.is_empty() {
+                    return Err(MoraError::Runtime(format!(
+                        "checked_path.{method}() expects 0 arguments, got {}",
+                        args.len()
+                    )));
+                }
+                Ok(Value::String(self.display_string()))
+            }
+            "basename" => Ok(Value::String(
+                self.resolved
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+            )),
+            "dirname" => Ok(Value::String(
+                self.resolved
+                    .parent()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+            )),
+            "extname" => Ok(Value::String(
+                self.resolved
+                    .extension()
+                    .map(|s| format!(".{}", s.to_string_lossy()))
+                    .unwrap_or_default(),
+            )),
+            "join" => {
+                if args.is_empty() {
+                    return Err(MoraError::Runtime(
+                        "checked_path.join(rel...) expects at least 1 string argument".to_string(),
+                    ));
+                }
+                let mut combined = self.resolved.clone();
+                for arg in args {
+                    match arg {
+                        Value::String(seg) => {
+                            if seg.contains('\0') {
+                                return Err(MoraError::Runtime(
+                                    "checked_path.join: invalid NUL byte in path".to_string(),
+                                ));
+                            }
+                            combined.push(seg);
+                        }
+                        other => {
+                            return Err(MoraError::Runtime(format!(
+                                "checked_path.join: segment must be a string, got {}",
+                                crate::flow::type_name(other)
+                            )));
+                        }
+                    }
+                }
+                let raw = combined.to_string_lossy().to_string();
+                let next = core.fs_context().resolve_path(&raw, "checked_path.join")?;
+                Ok(Value::External(Arc::new(next)))
+            }
+            _ => crate::runtime::builtins::file::call_file_method_on_checked(
+                core, self, method, args,
+            ),
+        }
+    }
+
+    fn to_json(&self) -> Option<Value> {
+        Some(Value::String(self.display_string()))
+    }
+
+    fn dyn_eq(&self, other: &dyn HostObject) -> bool {
+        other
+            .as_any()
+            .downcast_ref::<CheckedPath>()
+            .is_some_and(|rhs| self == rhs)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
@@ -126,6 +258,43 @@ impl FsContext {
         std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
             .map_err(|_| MoraError::Runtime(format!("{op}: HOME/USERPROFILE not set")))
+    }
+
+    /// Whether this runtime enforces a confined filesystem root sandbox.
+    pub(crate) fn is_confined(&self) -> bool {
+        matches!(self.policy, FsPolicy::Confined { .. })
+    }
+
+    /// Read a host environment variable (explicitly denied under [`FsPolicy::Confined`]).
+    pub(crate) fn env_var(&self, key: &str, op: &str) -> MoraResult<Option<String>> {
+        if matches!(self.policy, FsPolicy::Confined { .. }) {
+            return Err(MoraError::Runtime(format!(
+                "sandbox denied: {op} is disabled under confined FsPolicy"
+            )));
+        }
+        if key.is_empty() || key.contains('\0') || key.contains('=') {
+            return Err(MoraError::Runtime(format!(
+                "{op}: invalid environment variable key '{key}'"
+            )));
+        }
+        Ok(std::env::var(key).ok())
+    }
+
+    /// Re-validate an existing [`CheckedPath`] capability against this runtime's active [`FsPolicy`].
+    pub(crate) fn validate_checked_path(
+        &self,
+        checked: &CheckedPath,
+        op: &str,
+    ) -> MoraResult<CheckedPath> {
+        if let FsPolicy::Confined { root } = &self.policy
+            && !checked.as_path().starts_with(root)
+        {
+            return Err(MoraError::Runtime(format!(
+                "sandbox denied: {op} path '{}' escapes fs_root",
+                checked.as_path().display()
+            )));
+        }
+        Ok(checked.clone())
     }
 
     /// 解析并校验路径，返回不可伪造的 [`CheckedPath`] 凭证。

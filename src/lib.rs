@@ -48,6 +48,8 @@ pub fn resolve_std_module(spec: &str) -> Option<&'static str> {
         "std/nn/gguf" | "std/nn/gguf.mora" => Some(include_str!("../std/nn/gguf.mora")),
         "std/trace" | "std/trace.mora" => Some(include_str!("../std/trace.mora")),
         "std/json" | "std/json.mora" => Some(include_str!("../std/json.mora")),
+        "std/os" | "std/os.mora" => Some(include_str!("../std/os.mora")),
+        "std/io" | "std/io.mora" => Some(include_str!("../std/io.mora")),
         _ => None,
     }
 }

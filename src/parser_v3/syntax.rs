@@ -547,6 +547,7 @@ impl ParserV3 {
                     "memory_pool" | "memorypool" => Type::MemoryPool,
                     "process_group" | "processgroup" => Type::ProcessGroup,
                     "trace_profiler" | "traceprofiler" => Type::TraceProfiler,
+                    "checked_path" | "checkedpath" => Type::CheckedPath,
                     "gpu_kernel" | "gpukernel" => Type::GpuKernel(None),
                     "channel" => Type::Channel(Box::new(Type::Any)),
                     "task_handle" | "taskhandle" => Type::TaskHandle(Box::new(Type::Any)),

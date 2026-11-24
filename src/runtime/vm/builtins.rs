@@ -545,7 +545,7 @@ pub fn resolve_builtin_call_named(
             })?;
             let duration = crate::runtime::builtins::duration_from_ms(ms_val, "sleep")?;
             let reactor = Arc::clone(core.reactor());
-            let ctx = core.task_context.clone();
+            let ctx = core.session.task_context.clone();
             Ok(CallAction::AwaitFuture(Box::pin(async move {
                 reactor.sleep(duration, ctx.as_ref()).await?;
                 Ok(Value::Nil)
@@ -564,7 +564,7 @@ pub fn resolve_builtin_call_named(
                     crate::flow::type_name(&args[0])
                 )));
             };
-            if let Some(c) = core.task_context.as_ref() {
+            if let Some(c) = core.session.task_context.as_ref() {
                 c.status()?;
             }
             let addr = addr.clone();
@@ -604,7 +604,7 @@ pub fn resolve_builtin_call_named(
                 }
             };
             let addr = addr.clone();
-            let eff_ctx = explicit_ctx.or_else(|| core.task_context.clone());
+            let eff_ctx = explicit_ctx.or_else(|| core.session.task_context.clone());
             Ok(CallAction::AwaitFuture(Box::pin(async move {
                 let stream = crate::runtime::reactor::MoraTcpStream::connect(
                     &addr,
@@ -653,7 +653,7 @@ pub fn resolve_builtin_call_named(
                 }
             };
             let alpn_protocols = parse_tls_alpn_opt(cfg_map.get("alpn"), "tls_listen")?;
-            if let Some(c) = core.task_context.as_ref() {
+            if let Some(c) = core.session.task_context.as_ref() {
                 c.status()?;
             }
             let cfg = crate::runtime::tls::TlsServerConfig {
@@ -763,7 +763,7 @@ pub fn resolve_builtin_call_named(
                 }
             };
             let addr = addr.clone();
-            let eff_ctx = explicit_ctx.or_else(|| core.task_context.clone());
+            let eff_ctx = explicit_ctx.or_else(|| core.session.task_context.clone());
             let cfg = crate::runtime::tls::TlsClientConfig {
                 server_name,
                 ca_pem,
@@ -804,7 +804,7 @@ pub fn resolve_builtin_call_named(
                     tangents_raw.len()
                 )));
             }
-            let tape_id = core.autograd.push_tape();
+            let tape_id = core.session.autograd.push_tape();
             let mut leaf_nodes = Vec::with_capacity(primals.len());
             let mut leaf_tangents = Vec::with_capacity(primals.len());
             let mut tracked_args = Vec::with_capacity(primals.len());
@@ -840,26 +840,26 @@ pub fn resolve_builtin_call_named(
                 match (p, t) {
                     (Value::Tensor(pt), Value::Tensor(tt)) => {
                         if !pt.dtype.is_float() {
-                            core.autograd.pop_tape(tape_id);
+                            core.session.autograd.pop_tape(tape_id);
                             return Err(MoraError::Runtime(format!(
                                 "jvp: cannot differentiate non-floating-point Tensor<{}>",
                                 pt.dtype
                             )));
                         }
                         if pt.shape != tt.shape {
-                            core.autograd.pop_tape(tape_id);
+                            core.session.autograd.pop_tape(tape_id);
                             return Err(MoraError::Runtime(format!(
                                 "jvp: primal shape {:?} != tangent shape {:?} at input #{i}",
                                 pt.shape, tt.shape
                             )));
                         }
-                        let Some((_, leaf_idx)) = core.autograd.register_leaf(
+                        let Some((_, leaf_idx)) = core.session.autograd.register_leaf(
                             tape_id,
                             pt.shape.clone(),
                             pt.dtype,
                             pt.device.clone(),
                         ) else {
-                            core.autograd.pop_tape(tape_id);
+                            core.session.autograd.pop_tape(tape_id);
                             return Err(MoraError::Runtime(
                                 "jvp: failed to allocate autograd leaf".to_string(),
                             ));
@@ -873,20 +873,20 @@ pub fn resolve_builtin_call_named(
                         let (_, _, _, t_val) = match promote_scalar(&tv) {
                             Ok(x) => x,
                             Err(e) => {
-                                core.autograd.pop_tape(tape_id);
+                                core.session.autograd.pop_tape(tape_id);
                                 return Err(e);
                             }
                         };
                         if i == 0 {
                             scalar_out_dtype = Some(pt.dtype);
                         }
-                        let Some((_, leaf_idx)) = core.autograd.register_leaf(
+                        let Some((_, leaf_idx)) = core.session.autograd.register_leaf(
                             tape_id,
                             Vec::new(),
                             pt.dtype,
                             pt.device.clone(),
                         ) else {
-                            core.autograd.pop_tape(tape_id);
+                            core.session.autograd.pop_tape(tape_id);
                             return Err(MoraError::Runtime(
                                 "jvp: failed to allocate scalar autograd leaf".to_string(),
                             ));
@@ -907,20 +907,20 @@ pub fn resolve_builtin_call_named(
                         let (_, _, _, p_val) = match promote_scalar(&pv) {
                             Ok(x) => x,
                             Err(e) => {
-                                core.autograd.pop_tape(tape_id);
+                                core.session.autograd.pop_tape(tape_id);
                                 return Err(e);
                             }
                         };
                         if i == 0 {
                             scalar_out_dtype = Some(tt.dtype);
                         }
-                        let Some((_, leaf_idx)) = core.autograd.register_leaf(
+                        let Some((_, leaf_idx)) = core.session.autograd.register_leaf(
                             tape_id,
                             Vec::new(),
                             tt.dtype,
                             tt.device.clone(),
                         ) else {
-                            core.autograd.pop_tape(tape_id);
+                            core.session.autograd.pop_tape(tape_id);
                             return Err(MoraError::Runtime(
                                 "jvp: failed to allocate scalar autograd leaf".to_string(),
                             ));
@@ -942,27 +942,27 @@ pub fn resolve_builtin_call_named(
                         let (p_shape, p_dt, p_dev, p_val) = match promote_scalar(&pv) {
                             Ok(x) => x,
                             Err(e) => {
-                                core.autograd.pop_tape(tape_id);
+                                core.session.autograd.pop_tape(tape_id);
                                 return Err(e);
                             }
                         };
                         let (_, _, _, t_val) = match promote_scalar(&tv) {
                             Ok(x) => x,
                             Err(e) => {
-                                core.autograd.pop_tape(tape_id);
+                                core.session.autograd.pop_tape(tape_id);
                                 return Err(e);
                             }
                         };
                         if i == 0 {
                             scalar_out_dtype = Some(p_dt);
                         }
-                        let Some((_, leaf_idx)) = core.autograd.register_leaf(
+                        let Some((_, leaf_idx)) = core.session.autograd.register_leaf(
                             tape_id,
                             p_shape.clone(),
                             p_dt,
                             p_dev.clone(),
                         ) else {
-                            core.autograd.pop_tape(tape_id);
+                            core.session.autograd.pop_tape(tape_id);
                             return Err(MoraError::Runtime(
                                 "jvp: failed to allocate scalar autograd leaf".to_string(),
                             ));
@@ -1021,7 +1021,7 @@ pub fn resolve_builtin_call_named(
                     "trace_dag: requires at least 1 input tensor".to_string(),
                 ));
             }
-            let tape_id = core.autograd.push_tape();
+            let tape_id = core.session.autograd.push_tape();
             let mut leaf_nodes = Vec::with_capacity(raw_inputs.len());
             let mut tracked_args = Vec::with_capacity(raw_inputs.len());
             for (i, inp) in raw_inputs.into_iter().enumerate() {
@@ -1042,20 +1042,20 @@ pub fn resolve_builtin_call_named(
                         true,
                     )?,
                     other => {
-                        core.autograd.pop_tape(tape_id);
+                        core.session.autograd.pop_tape(tape_id);
                         return Err(MoraError::Runtime(format!(
                             "trace_dag: example input #{i} must be Tensor or numeric scalar, got {}",
                             crate::flow::dynamic_type_name(&other)
                         )));
                     }
                 };
-                let Some((_, leaf_idx)) = core.autograd.register_leaf(
+                let Some((_, leaf_idx)) = core.session.autograd.register_leaf(
                     tape_id,
                     t.shape.clone(),
                     t.dtype,
                     t.device.clone(),
                 ) else {
-                    core.autograd.pop_tape(tape_id);
+                    core.session.autograd.pop_tape(tape_id);
                     return Err(MoraError::Runtime(
                         "trace_dag: failed to allocate input leaf".to_string(),
                     ));
@@ -1221,7 +1221,7 @@ pub fn resolve_builtin_call_named(
                     )));
                 }
             };
-            let eff_ctx = core.task_context.clone();
+            let eff_ctx = core.session.task_context.clone();
             Ok(CallAction::AwaitFuture(Box::pin(async move {
                 let pg = crate::runtime::distributed::ProcessGroup::connect_tcp_ring(
                     rank,
@@ -1458,6 +1458,7 @@ pub(crate) fn resolve_operator_impl(
         _ => return None,
     };
     let (func, has_self) = core
+        .registry
         .trait_impls
         .iter()
         .find(|((tr, tgt, m), (_, hs))| {
@@ -1490,7 +1491,7 @@ pub fn resolve_method_call_named(
                 t,
                 method,
                 &args,
-                Some(&mut core.autograd),
+                Some(&mut core.session.autograd),
             ) {
                 Ok(v) => return Ok(CallAction::Done(v)),
                 Err(e) if e.message().contains("Tensor has no method") => {
@@ -1536,6 +1537,7 @@ pub fn resolve_method_call_named(
                 }
                 _ => {
                     if let Some((func, has_self)) = core
+                        .registry
                         .inherent_methods
                         .get(&(def.name.clone(), method.to_string()))
                         .cloned()
@@ -1678,7 +1680,7 @@ pub fn resolve_method_call_named(
         return crate::runtime::builtins::math::call_math_method_tracked(
             method,
             &args,
-            Some(&mut core.autograd),
+            Some(&mut core.session.autograd),
         )
         .map(CallAction::Done);
     }
@@ -1851,7 +1853,7 @@ fn resolve_channel_method(
                 MoraError::Runtime("channel.send() requires 1 value argument".to_string())
             })?;
             let ch = Arc::clone(ch);
-            let ctx = core.task_context.clone();
+            let ctx = core.session.task_context.clone();
             Ok(CallAction::AwaitFuture(Box::pin(async move {
                 ch.send_async(val, ctx.as_ref()).await?;
                 Ok(Value::Nil)
@@ -1875,7 +1877,7 @@ fn resolve_channel_method(
                 ));
             };
             let ch = Arc::clone(ch);
-            let outer_ctx = core.task_context.clone();
+            let outer_ctx = core.session.task_context.clone();
             Ok(CallAction::AwaitFuture(Box::pin(async move {
                 match outer_ctx.as_ref() {
                     Some(outer) => {
@@ -1902,7 +1904,7 @@ fn resolve_channel_method(
         }
         "recv" => {
             let ch = Arc::clone(ch);
-            let ctx = core.task_context.clone();
+            let ctx = core.session.task_context.clone();
             Ok(CallAction::AwaitFuture(Box::pin(async move {
                 ch.recv_async(ctx.as_ref()).await
             })))
@@ -1918,7 +1920,7 @@ fn resolve_channel_method(
                 ));
             };
             let ch = Arc::clone(ch);
-            let outer_ctx = core.task_context.clone();
+            let outer_ctx = core.session.task_context.clone();
             Ok(CallAction::AwaitFuture(Box::pin(async move {
                 match outer_ctx.as_ref() {
                     Some(outer) => {
@@ -1959,7 +1961,7 @@ fn resolve_task_handle_method(
     match method {
         "join" => {
             let handle = Arc::clone(handle);
-            let ctx = core.task_context.clone();
+            let ctx = core.session.task_context.clone();
             Ok(CallAction::AwaitFuture(Box::pin(async move {
                 handle.join_async(ctx.as_ref()).await
             })))
@@ -2062,7 +2064,7 @@ fn resolve_tcp_listener_method(
                 )));
             }
             let explicit_ctx = parse_optional_tcp_ctx(args.first(), "tcp_listener.accept")?;
-            let eff_ctx = explicit_ctx.or_else(|| core.task_context.clone());
+            let eff_ctx = explicit_ctx.or_else(|| core.session.task_context.clone());
             let listener = Arc::clone(listener);
             Ok(CallAction::AwaitFuture(Box::pin(async move {
                 let stream = listener.accept(eff_ctx.as_ref()).await?;
@@ -2121,7 +2123,7 @@ fn resolve_tcp_stream_method(
             }
             let max_bytes = parse_tcp_max_bytes(args.first(), 65536, "tcp_stream.read")?;
             let explicit_ctx = parse_optional_tcp_ctx(args.get(1), "tcp_stream.read")?;
-            let eff_ctx = explicit_ctx.or_else(|| core.task_context.clone());
+            let eff_ctx = explicit_ctx.or_else(|| core.session.task_context.clone());
             let stream = Arc::clone(stream);
             Ok(CallAction::AwaitFuture(Box::pin(async move {
                 let bytes = stream.read_bytes(max_bytes, eff_ctx.as_ref()).await?;
@@ -2140,7 +2142,7 @@ fn resolve_tcp_stream_method(
             }
             let max_bytes = parse_tcp_max_bytes(args.first(), 65536, "tcp_stream.read_bytes")?;
             let explicit_ctx = parse_optional_tcp_ctx(args.get(1), "tcp_stream.read_bytes")?;
-            let eff_ctx = explicit_ctx.or_else(|| core.task_context.clone());
+            let eff_ctx = explicit_ctx.or_else(|| core.session.task_context.clone());
             let stream = Arc::clone(stream);
             Ok(CallAction::AwaitFuture(Box::pin(async move {
                 let bytes = stream.read_bytes(max_bytes, eff_ctx.as_ref()).await?;
@@ -2157,7 +2159,7 @@ fn resolve_tcp_stream_method(
             }
             let max_bytes = parse_tcp_max_bytes(args.first(), 65536, "tcp_stream.read_line")?;
             let explicit_ctx = parse_optional_tcp_ctx(args.get(1), "tcp_stream.read_line")?;
-            let eff_ctx = explicit_ctx.or_else(|| core.task_context.clone());
+            let eff_ctx = explicit_ctx.or_else(|| core.session.task_context.clone());
             let stream = Arc::clone(stream);
             Ok(CallAction::AwaitFuture(Box::pin(async move {
                 let bytes = stream.read_line_bytes(max_bytes, eff_ctx.as_ref()).await?;
@@ -2181,7 +2183,7 @@ fn resolve_tcp_stream_method(
                 )));
             };
             let explicit_ctx = parse_optional_tcp_ctx(args.get(1), "tcp_stream.write")?;
-            let eff_ctx = explicit_ctx.or_else(|| core.task_context.clone());
+            let eff_ctx = explicit_ctx.or_else(|| core.session.task_context.clone());
             let stream = Arc::clone(stream);
             let payload = data.as_bytes().to_vec();
             Ok(CallAction::AwaitFuture(Box::pin(async move {
@@ -2220,7 +2222,7 @@ fn resolve_tcp_stream_method(
                 }
             }
             let explicit_ctx = parse_optional_tcp_ctx(args.get(1), "tcp_stream.write_bytes")?;
-            let eff_ctx = explicit_ctx.or_else(|| core.task_context.clone());
+            let eff_ctx = explicit_ctx.or_else(|| core.session.task_context.clone());
             let stream = Arc::clone(stream);
             Ok(CallAction::AwaitFuture(Box::pin(async move {
                 let n = stream.write_bytes(&raw, eff_ctx.as_ref()).await?;
@@ -2342,7 +2344,7 @@ fn resolve_tls_listener_method(
                 )));
             }
             let explicit_ctx = parse_optional_tcp_ctx(args.first(), "tls_listener.accept")?;
-            let eff_ctx = explicit_ctx.or_else(|| core.task_context.clone());
+            let eff_ctx = explicit_ctx.or_else(|| core.session.task_context.clone());
             let listener = Arc::clone(listener);
             Ok(CallAction::AwaitFuture(Box::pin(async move {
                 let stream = listener.accept(eff_ctx.as_ref()).await?;
@@ -2401,7 +2403,7 @@ fn resolve_tls_stream_method(
             }
             let max_bytes = parse_tcp_max_bytes(args.first(), 65536, "tls_stream.read")?;
             let explicit_ctx = parse_optional_tcp_ctx(args.get(1), "tls_stream.read")?;
-            let eff_ctx = explicit_ctx.or_else(|| core.task_context.clone());
+            let eff_ctx = explicit_ctx.or_else(|| core.session.task_context.clone());
             let stream = Arc::clone(stream);
             Ok(CallAction::AwaitFuture(Box::pin(async move {
                 let bytes = stream.read_bytes(max_bytes, eff_ctx.as_ref()).await?;
@@ -2420,7 +2422,7 @@ fn resolve_tls_stream_method(
             }
             let max_bytes = parse_tcp_max_bytes(args.first(), 65536, "tls_stream.read_bytes")?;
             let explicit_ctx = parse_optional_tcp_ctx(args.get(1), "tls_stream.read_bytes")?;
-            let eff_ctx = explicit_ctx.or_else(|| core.task_context.clone());
+            let eff_ctx = explicit_ctx.or_else(|| core.session.task_context.clone());
             let stream = Arc::clone(stream);
             Ok(CallAction::AwaitFuture(Box::pin(async move {
                 let bytes = stream.read_bytes(max_bytes, eff_ctx.as_ref()).await?;
@@ -2437,7 +2439,7 @@ fn resolve_tls_stream_method(
             }
             let max_bytes = parse_tcp_max_bytes(args.first(), 65536, "tls_stream.read_line")?;
             let explicit_ctx = parse_optional_tcp_ctx(args.get(1), "tls_stream.read_line")?;
-            let eff_ctx = explicit_ctx.or_else(|| core.task_context.clone());
+            let eff_ctx = explicit_ctx.or_else(|| core.session.task_context.clone());
             let stream = Arc::clone(stream);
             Ok(CallAction::AwaitFuture(Box::pin(async move {
                 let bytes = stream.read_line_bytes(max_bytes, eff_ctx.as_ref()).await?;
@@ -2461,7 +2463,7 @@ fn resolve_tls_stream_method(
                 )));
             };
             let explicit_ctx = parse_optional_tcp_ctx(args.get(1), "tls_stream.write")?;
-            let eff_ctx = explicit_ctx.or_else(|| core.task_context.clone());
+            let eff_ctx = explicit_ctx.or_else(|| core.session.task_context.clone());
             let stream = Arc::clone(stream);
             let payload = data.as_bytes().to_vec();
             Ok(CallAction::AwaitFuture(Box::pin(async move {
@@ -2500,7 +2502,7 @@ fn resolve_tls_stream_method(
                 }
             }
             let explicit_ctx = parse_optional_tcp_ctx(args.get(1), "tls_stream.write_bytes")?;
-            let eff_ctx = explicit_ctx.or_else(|| core.task_context.clone());
+            let eff_ctx = explicit_ctx.or_else(|| core.session.task_context.clone());
             let stream = Arc::clone(stream);
             Ok(CallAction::AwaitFuture(Box::pin(async move {
                 let n = stream.write_bytes(&raw, eff_ctx.as_ref()).await?;
@@ -3614,7 +3616,7 @@ fn resolve_process_group_method(
             };
             let op = crate::runtime::distributed::ReduceOp::parse(op_name)?;
             let pg = Arc::clone(pg);
-            let eff_ctx = core.task_context.clone();
+            let eff_ctx = core.session.task_context.clone();
             Ok(CallAction::AwaitFuture(Box::pin(async move {
                 let out = pg.all_reduce(t, op, eff_ctx.as_ref()).await?;
                 Ok(Value::Tensor(out))
@@ -3645,7 +3647,7 @@ fn resolve_process_group_method(
             };
             let op = crate::runtime::distributed::ReduceOp::parse(op_name)?;
             let pg = Arc::clone(pg);
-            let eff_ctx = core.task_context.clone();
+            let eff_ctx = core.session.task_context.clone();
             Ok(CallAction::AwaitFuture(Box::pin(async move {
                 let out = pg.reduce_scatter(t, op, eff_ctx.as_ref()).await?;
                 Ok(Value::Tensor(out))
@@ -3665,7 +3667,7 @@ fn resolve_process_group_method(
                 )));
             };
             let pg = Arc::clone(pg);
-            let eff_ctx = core.task_context.clone();
+            let eff_ctx = core.session.task_context.clone();
             Ok(CallAction::AwaitFuture(Box::pin(async move {
                 let out = pg.all_gather(t, eff_ctx.as_ref()).await?;
                 Ok(Value::Tensor(out))
@@ -3693,7 +3695,7 @@ fn resolve_process_group_method(
                 }
             };
             let pg = Arc::clone(pg);
-            let eff_ctx = core.task_context.clone();
+            let eff_ctx = core.session.task_context.clone();
             Ok(CallAction::AwaitFuture(Box::pin(async move {
                 let out = pg.broadcast(t, root, eff_ctx.as_ref()).await?;
                 Ok(Value::Tensor(out))
@@ -3706,7 +3708,7 @@ fn resolve_process_group_method(
                 ));
             }
             let pg = Arc::clone(pg);
-            let eff_ctx = core.task_context.clone();
+            let eff_ctx = core.session.task_context.clone();
             Ok(CallAction::AwaitFuture(Box::pin(async move {
                 pg.barrier(eff_ctx.as_ref()).await?;
                 Ok(Value::Nil)
@@ -3960,7 +3962,7 @@ pub fn resolve_value_call_named(
                         )));
                     }
                 }
-                let tape_id = core.autograd.push_tape();
+                let tape_id = core.session.autograd.push_tape();
                 let mut leaf_nodes: Vec<usize> = Vec::with_capacity(argnums.len());
                 let mut scalar_flags: Vec<Option<crate::common::DType>> =
                     Vec::with_capacity(argnums.len());
@@ -3970,19 +3972,19 @@ pub fn resolve_value_call_named(
                     match tracked_args[idx].clone() {
                         Value::Tensor(t) => {
                             if !t.dtype.is_float() {
-                                core.autograd.pop_tape(tape_id);
+                                core.session.autograd.pop_tape(tape_id);
                                 return Err(MoraError::Runtime(format!(
                                     "grad: cannot differentiate with respect to non-floating-point Tensor<{}>",
                                     t.dtype
                                 )));
                             }
-                            let Some((_, leaf_idx)) = core.autograd.register_leaf(
+                            let Some((_, leaf_idx)) = core.session.autograd.register_leaf(
                                 tape_id,
                                 t.shape.clone(),
                                 t.dtype,
                                 t.device.clone(),
                             ) else {
-                                core.autograd.pop_tape(tape_id);
+                                core.session.autograd.pop_tape(tape_id);
                                 return Err(MoraError::Runtime(
                                     "grad: failed to allocate autograd leaf".to_string(),
                                 ));
@@ -3993,13 +3995,13 @@ pub fn resolve_value_call_named(
                                 Value::Tensor(t.with_pushed_grad_node((tape_id, leaf_idx)));
                         }
                         Value::Float(f) => {
-                            let Some((_, leaf_idx)) = core.autograd.register_leaf(
+                            let Some((_, leaf_idx)) = core.session.autograd.register_leaf(
                                 tape_id,
                                 Vec::new(),
                                 crate::common::DType::F64,
                                 crate::common::Device::Cpu,
                             ) else {
-                                core.autograd.pop_tape(tape_id);
+                                core.session.autograd.pop_tape(tape_id);
                                 return Err(MoraError::Runtime(
                                     "grad: failed to allocate scalar autograd leaf".to_string(),
                                 ));
@@ -4018,13 +4020,13 @@ pub fn resolve_value_call_named(
                         }
                         Value::Scalar(s) if s.dtype().is_float() => {
                             let dt = s.dtype();
-                            let Some((_, leaf_idx)) = core.autograd.register_leaf(
+                            let Some((_, leaf_idx)) = core.session.autograd.register_leaf(
                                 tape_id,
                                 Vec::new(),
                                 dt,
                                 crate::common::Device::Cpu,
                             ) else {
-                                core.autograd.pop_tape(tape_id);
+                                core.session.autograd.pop_tape(tape_id);
                                 return Err(MoraError::Runtime(
                                     "grad: failed to allocate scalar autograd leaf".to_string(),
                                 ));
@@ -4042,7 +4044,7 @@ pub fn resolve_value_call_named(
                                 Value::Tensor(t.with_pushed_grad_node((tape_id, leaf_idx)));
                         }
                         other => {
-                            core.autograd.pop_tape(tape_id);
+                            core.session.autograd.pop_tape(tape_id);
                             return Err(MoraError::Runtime(format!(
                                 "grad: argument {idx} must be a floating-point tensor or float scalar, got {}",
                                 crate::flow::dynamic_type_name(&other)
@@ -4174,7 +4176,7 @@ pub fn resolve_dyn_call_named(
 
     // Associated calls `Type::member(...)` for nominal structs, enums, and inherent impls.
     if let Some((type_name, member)) = name.split_once("::") {
-        if let Some(sdef) = core.struct_registry.get(type_name).cloned() {
+        if let Some(sdef) = core.registry.struct_registry.get(type_name).cloned() {
             match member {
                 "new" => return construct_struct_instance(sdef, args, named_args),
                 "from_dict" => {
@@ -4199,7 +4201,7 @@ pub fn resolve_dyn_call_named(
                 _ => {}
             }
         }
-        if let Some(edef) = core.enum_registry.get(type_name).cloned() {
+        if let Some(edef) = core.registry.enum_registry.get(type_name).cloned() {
             if member == "variants" {
                 if !args.is_empty() || !named_args.is_empty() {
                     return Err(MoraError::Runtime(format!(
@@ -4225,6 +4227,7 @@ pub fn resolve_dyn_call_named(
             }
         }
         if let Some((func, has_self)) = core
+            .registry
             .inherent_methods
             .get(&(type_name.to_string(), member.to_string()))
             .cloned()
@@ -4248,7 +4251,7 @@ pub fn resolve_dyn_call_named(
     }
 
     if let Some(trait_name) = name.strip_suffix("::new")
-        && core.trait_registry.contains_key(trait_name)
+        && core.registry.trait_registry.contains_key(trait_name)
     {
         let for_type = match args.first() {
             Some(Value::String(s)) => s.clone(),

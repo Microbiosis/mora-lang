@@ -93,10 +93,11 @@ pub(crate) fn resolve_trait_method_call(
         }
     };
 
-    let search_chain = collect_parent_traits(&core.trait_registry, &trait_name);
+    let search_chain = collect_parent_traits(&core.registry.trait_registry, &trait_name);
     for tname in &search_chain {
         let tname_str: &str = tname;
         let has_self = core
+            .registry
             .trait_registry
             .get(tname_str)
             .and_then(|info| info.methods.iter().find(|m| m.name == method))
@@ -105,7 +106,8 @@ pub(crate) fn resolve_trait_method_call(
 
         // Stage 3C: Check compiled source-level `impl Trait for Type` registry first (case-insensitive for built-in names like String/string, plus `number` matching int/float).
         let lookup_impl = |ty_key: &str| -> Option<(Value, bool)> {
-            core.trait_impls
+            core.registry
+                .trait_impls
                 .get(&(
                     tname_str.to_string(),
                     ty_key.to_string(),
@@ -114,7 +116,8 @@ pub(crate) fn resolve_trait_method_call(
                 .cloned()
                 .or_else(|| {
                     let lower = ty_key.to_lowercase();
-                    core.trait_impls
+                    core.registry
+                        .trait_impls
                         .iter()
                         .find(|((tr, tgt, m), _)| {
                             tr == tname_str
@@ -150,6 +153,7 @@ pub(crate) fn resolve_trait_method_call(
         }
 
         if let Some((task, def_has_self)) = core
+            .registry
             .trait_defaults
             .get(&(tname_str.to_string(), method.to_string()))
             .cloned()
@@ -202,11 +206,13 @@ pub(crate) fn resolve_concrete_impl_method(
 
     // 1. Inherent `impl TargetType` methods
     let inherent = core
+        .registry
         .inherent_methods
         .get(&(type_key.clone(), method.to_string()))
         .cloned()
         .or_else(|| {
-            core.inherent_methods
+            core.registry
+                .inherent_methods
                 .iter()
                 .find(|((tgt, m), _)| m == method && target_matches(tgt))
                 .map(|(_, v)| v.clone())
@@ -223,6 +229,7 @@ pub(crate) fn resolve_concrete_impl_method(
 
     // 2. Trait `impl Trait for TargetType` methods
     let trait_direct = core
+        .registry
         .trait_impls
         .iter()
         .find(|((_, tgt, m), _)| m == method && target_matches(tgt))
@@ -239,20 +246,23 @@ pub(crate) fn resolve_concrete_impl_method(
 
     // 3. Default method on any trait implemented by `TargetType` (or its parent traits)
     let mut implemented_traits: Vec<String> = Vec::new();
-    for (tr, tgt) in core.trait_impl_pairs.iter() {
+    for (tr, tgt) in core.registry.trait_impl_pairs.iter() {
         if target_matches(tgt) && !implemented_traits.contains(tr) {
             implemented_traits.push(tr.clone());
         }
     }
-    for (tr, tgt, _) in core.trait_impls.keys() {
+    for (tr, tgt, _) in core.registry.trait_impls.keys() {
         if target_matches(tgt) && !implemented_traits.contains(tr) {
             implemented_traits.push(tr.clone());
         }
     }
     for tr in implemented_traits {
-        for anc in collect_parent_traits(&core.trait_registry, &tr) {
-            if let Some((func, has_self)) =
-                core.trait_defaults.get(&(anc, method.to_string())).cloned()
+        for anc in collect_parent_traits(&core.registry.trait_registry, &tr) {
+            if let Some((func, has_self)) = core
+                .registry
+                .trait_defaults
+                .get(&(anc, method.to_string()))
+                .cloned()
             {
                 let mut all_args = if has_self {
                     vec![receiver.clone()]
@@ -276,7 +286,7 @@ pub(crate) fn construct_trait_instance_core(
     for_generics: &[String],
     call_site: Span,
 ) -> MoraResult<Value> {
-    let method_names = collect_required_methods(&core.trait_registry, trait_name);
+    let method_names = collect_required_methods(&core.registry.trait_registry, trait_name);
     for m in method_names {
         let impl_name = impl_method_key(trait_name, trait_generics, for_type, for_generics, m);
         let default_name = default_impl_method_key(trait_name, trait_generics, m);

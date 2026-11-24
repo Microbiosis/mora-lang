@@ -339,10 +339,7 @@ pub fn run_test(args: &[String], initial_opt: Option<OptLevel>) -> i32 {
                         error: Some(error),
                     },
                     ScheduledCase::TopLevel { name, prog } => {
-                        let mut core = CoreRuntime {
-                            task_context: Some(task_ctx),
-                            ..Default::default()
-                        };
+                        let mut core = CoreRuntime::default().with_task_context(task_ctx);
                         let err = execute_program(prog, &mut core)
                             .err()
                             .map(|e| e.to_string());
@@ -353,10 +350,7 @@ pub fn run_test(args: &[String], initial_opt: Option<OptLevel>) -> i32 {
                         }
                     }
                     ScheduledCase::Task { name, prog, fn_id } => {
-                        let mut core = CoreRuntime {
-                            task_context: Some(task_ctx),
-                            ..Default::default()
-                        };
+                        let mut core = CoreRuntime::default().with_task_context(task_ctx);
                         let err = match execute_program(Arc::clone(&prog), &mut core) {
                             Ok((_top, globals)) => run_task_by_id(prog, fn_id, globals, &mut core)
                                 .err()

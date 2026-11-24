@@ -829,6 +829,7 @@ impl HMInference {
             "memory_pool" | "memorypool" => Type::MemoryPool,
             "process_group" | "processgroup" => Type::ProcessGroup,
             "trace_profiler" | "traceprofiler" => Type::TraceProfiler,
+            "checked_path" | "checkedpath" => Type::CheckedPath,
             "gpu_kernel" | "gpukernel" => Type::GpuKernel(None),
             "list" => Type::List(Box::new(gen_tys.into_iter().next().unwrap_or(Type::Any))),
             "dict" => {

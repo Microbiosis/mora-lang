@@ -3555,6 +3555,14 @@ impl HMInference {
                     add(ambient::ASYNC_LABEL);
                 }
             }
+            Type::CheckedPath => {
+                if !matches!(
+                    method,
+                    "as_str" | "to_str" | "basename" | "dirname" | "extname"
+                ) {
+                    add(ambient::IO_LABEL);
+                }
+            }
             Type::Channel(_) => {
                 if matches!(method, "send" | "recv" | "send_ctx" | "recv_ctx") {
                     add(ambient::ASYNC_LABEL);

@@ -235,7 +235,7 @@ fn exec_parallel(core: &mut CoreRuntime, args: &[Value]) -> MoraResult<Value> {
         None
     };
 
-    let task_ctx = core.task_context.clone();
+    let task_ctx = core.session.task_context.clone();
     if let Some(ref c) = task_ctx {
         c.status()?;
     }

@@ -628,8 +628,8 @@ pub(crate) fn call_builtin_gensym_core(
             "gensym() expects no arguments".to_string(),
         ));
     }
-    let n = core.gensym_counter;
-    core.gensym_counter += 1;
+    let n = core.session.gensym_counter;
+    core.session.gensym_counter += 1;
     Ok(Value::String(format!("g{n}")))
 }
 
@@ -679,8 +679,10 @@ pub(crate) fn call_builtin_sleep_core(core: &mut CoreRuntime, args: &[Value]) ->
         ));
     };
     let duration = crate::runtime::builtins::duration_from_ms(ms_val, "sleep")?;
-    core.scheduler()
-        .block_on(core.reactor().sleep(duration, core.task_context.as_ref()))?;
+    core.scheduler().block_on(
+        core.reactor()
+            .sleep(duration, core.session.task_context.as_ref()),
+    )?;
     Ok(Value::Nil)
 }
 

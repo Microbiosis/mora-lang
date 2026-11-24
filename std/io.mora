@@ -1,0 +1,180 @@
+-- Pure-Mora standard library: Sandboxed Async File & Buffered Stream I/O (`std/io`)
+--
+-- Builds on first-class `checked_path` capabilities and the native `AsyncIoReactor`
+-- blocking pool. Provides text/lines/hex/binary helpers, streaming chunked file
+-- reader/writer handles (`BufReader` / `BufWriter`), and non-blocking async
+-- `spawn`-backed I/O tasks (`read_text_async` / `write_text_async`).
+
+export task open_path(raw: string): checked_path ! io
+  return file.check_path(raw)
+end
+
+export task read_text(path: any): string ! io
+  return file.read_text(path)
+end
+
+export task write_text(path: any, content: string): nil ! io
+  return file.write_text(path, content)
+end
+
+export task append_text(path: any, content: string): nil ! io
+  return file.append_text(path, content)
+end
+
+export task read_lines(path: any): list<string> ! io
+  let raw = file.read_text(path)
+  if raw.len() == 0 then
+    return []
+  end
+  return raw.split("\n")
+end
+
+export task write_lines(path: any, lines: list<string>): nil ! io
+  let out = ""
+  let i = 0
+  let n = lines.len()
+  while i < n
+    if i > 0 then
+      assign out = out + "\n"
+    end
+    assign out = out + lines[i]
+    assign i = i + 1
+  end
+  return file.write_text(path, out)
+end
+
+export task read_bytes_hex(path: any): string ! io
+  return file.read_bytes(path)
+end
+
+export task write_bytes_hex(path: any, hex: string): nil ! io
+  return file.write_bytes(path, hex)
+end
+
+export task read_binary(path: any): Tensor<u8, [_], cpu> ! io
+  return file.read_binary(path)
+end
+
+export task read_binary_range(path: any, offset: int, length: int): Tensor<u8, [_], cpu> ! io
+  return file.read_binary_range(path, offset, length)
+end
+
+export task write_binary(path: any, data: any): nil ! io
+  return file.write_binary(path, data)
+end
+
+export task file_size(path: any): int ! io
+  return int(file.size(path))
+end
+
+export task copy_stream(src_path: any, dst_path: any): int ! io
+  let src = file.check_path(src_path)
+  let dst = file.check_path(dst_path)
+  file.copy(src, dst)
+  return int(dst.size())
+end
+
+export task read_text_async(path: any): task_handle<string> ! io, async
+  let checked = file.check_path(path)
+  return spawn fn() checked.read_text() end
+end
+
+export task write_text_async(path: any, content: string): task_handle<nil> ! io, async
+  let checked = file.check_path(path)
+  return spawn fn() checked.write_text(content) end
+end
+
+export struct BufReader
+  path: checked_path
+  total_bytes: int
+  cursor: int = 0
+  chunk_size: int = 4096
+end
+
+export struct ReadChunk
+  data: any
+  next: BufReader
+  bytes_read: int
+  eof: bool
+end
+
+export task buf_reader(path: any, chunk_size: int = 4096): BufReader ! io
+  let checked = file.check_path(path)
+  let total = int(checked.size())
+  return BufReader(path=checked, total_bytes=total, cursor=0, chunk_size=chunk_size)
+end
+
+impl BufReader
+  task remaining(self): int ! pure
+    let rem = self.total_bytes - self.cursor
+    if rem < 0 then
+      return 0
+    end
+    return rem
+  end
+
+  task eof(self): bool ! pure
+    return self.cursor >= self.total_bytes
+  end
+
+  task read_chunk(self, max_bytes: int = 0): ReadChunk ! io
+    let want = max_bytes
+    if want <= 0 then
+      assign want = self.chunk_size
+    end
+    let rem = self.total_bytes - self.cursor
+    if rem <= 0 then
+      return ReadChunk(data=nil, next=self, bytes_read=0, eof=true)
+    end
+    let take = want
+    if take > rem then
+      assign take = rem
+    end
+    let chunk = self.path.read_binary_range(self.cursor, take)
+    let next_cursor = self.cursor + take
+    let next_reader = BufReader(path=self.path, total_bytes=self.total_bytes, cursor=next_cursor, chunk_size=self.chunk_size)
+    return ReadChunk(data=chunk, next=next_reader, bytes_read=take, eof=next_cursor >= self.total_bytes)
+  end
+
+  task read_all_text(self): string ! io
+    return self.path.read_text()
+  end
+end
+
+export struct BufWriter
+  path: checked_path
+  chunks: list<string>
+end
+
+export task buf_writer(path: any): BufWriter ! io
+  let checked = file.check_path(path)
+  return BufWriter(path=checked, chunks=[])
+end
+
+impl BufWriter
+  task write(self, text: string): BufWriter ! pure
+    let next = self.chunks.push(text)
+    return BufWriter(path=self.path, chunks=next)
+  end
+
+  task writeln(self, line: string): BufWriter ! pure
+    let next = self.chunks.push(line + "\n")
+    return BufWriter(path=self.path, chunks=next)
+  end
+
+  task buffered_chunks(self): int ! pure
+    return self.chunks.len()
+  end
+
+  task flush(self): BufWriter ! io
+    let combined = ""
+    let i = 0
+    let n = self.chunks.len()
+    while i < n
+      assign combined = combined + self.chunks[i]
+      assign i = i + 1
+    end
+    self.path.write_text(combined)
+    return BufWriter(path=self.path, chunks=[])
+  end
+end

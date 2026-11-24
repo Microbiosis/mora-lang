@@ -313,7 +313,7 @@ impl<'a> VmEngine<'a> {
                     continue;
                 }
                 CallFrame::NoGradGuard => {
-                    self.core.autograd.exit_no_grad();
+                    self.core.session.autograd.exit_no_grad();
                     continue;
                 }
                 CallFrame::DeferDrain {
@@ -533,10 +533,17 @@ impl<'a> VmEngine<'a> {
                 scalar_flags,
                 return_value,
             } => {
-                let tape = self.core.autograd.pop_tape(tape_id).ok_or_else(|| {
-                    MoraError::Runtime("autograd: active tape missing on completion".to_string())
-                })?;
-                let higher_order = self.core.autograd.is_recording();
+                let tape = self
+                    .core
+                    .session
+                    .autograd
+                    .pop_tape(tape_id)
+                    .ok_or_else(|| {
+                        MoraError::Runtime(
+                            "autograd: active tape missing on completion".to_string(),
+                        )
+                    })?;
+                let higher_order = self.core.session.autograd.is_recording();
                 let (display_val, grad_tensors) = match &reply {
                     Value::Tensor(t) => {
                         if t.numel() != 1 {
@@ -562,7 +569,7 @@ impl<'a> VmEngine<'a> {
                                 tape.backward_tracked(
                                     out_idx,
                                     &leaf_nodes,
-                                    &mut self.core.autograd,
+                                    &mut self.core.session.autograd,
                                 )?
                             } else {
                                 tape.backward(out_idx, &leaf_nodes)?
@@ -618,10 +625,15 @@ impl<'a> VmEngine<'a> {
                 leaf_tangents,
                 scalar_out_dtype,
             } => {
-                let tape = self.core.autograd.pop_tape(tape_id).ok_or_else(|| {
-                    MoraError::Runtime("jvp: active tape missing on completion".to_string())
-                })?;
-                let higher_order = self.core.autograd.is_recording();
+                let tape = self
+                    .core
+                    .session
+                    .autograd
+                    .pop_tape(tape_id)
+                    .ok_or_else(|| {
+                        MoraError::Runtime("jvp: active tape missing on completion".to_string())
+                    })?;
+                let higher_order = self.core.session.autograd.is_recording();
                 let (primal_val, tangent_val) = match &reply {
                     Value::Tensor(t) => {
                         let tangent_t = if let Some(out_idx) = t.node_on_tape(tape_id) {
@@ -630,7 +642,7 @@ impl<'a> VmEngine<'a> {
                                     out_idx,
                                     &leaf_nodes,
                                     &leaf_tangents,
-                                    &mut self.core.autograd,
+                                    &mut self.core.session.autograd,
                                 )?
                             } else {
                                 tape.forward_jvp(out_idx, &leaf_nodes, &leaf_tangents)?
@@ -681,9 +693,16 @@ impl<'a> VmEngine<'a> {
                 tape_id,
                 leaf_nodes,
             } => {
-                let tape = self.core.autograd.pop_tape(tape_id).ok_or_else(|| {
-                    MoraError::Runtime("trace_dag: active tape missing on completion".to_string())
-                })?;
+                let tape = self
+                    .core
+                    .session
+                    .autograd
+                    .pop_tape(tape_id)
+                    .ok_or_else(|| {
+                        MoraError::Runtime(
+                            "trace_dag: active tape missing on completion".to_string(),
+                        )
+                    })?;
                 let Value::Tensor(t) = &reply else {
                     return Err(MoraError::Runtime(format!(
                         "trace_dag: traced function must return a Tensor, got {}",
@@ -885,6 +904,7 @@ impl<'a> VmEngine<'a> {
                     }
                     let val = self
                         .core
+                        .session
                         .random_state
                         .dispatch_op(label, &args)
                         .map_err(|reason| reason.with_prefix(&format!("random.{method}: ")))?;
@@ -977,14 +997,14 @@ impl<'a> VmEngine<'a> {
                     }
                 }
                 CallFrame::NoGradGuard => {
-                    self.core.autograd.exit_no_grad();
+                    self.core.session.autograd.exit_no_grad();
                 }
                 CallFrame::Combinator(
                     CombinatorFrame::AutogradEval { tape_id, .. }
                     | CombinatorFrame::JvpEval { tape_id, .. }
                     | CombinatorFrame::TraceDagEval { tape_id, .. },
                 ) => {
-                    let _ = self.core.autograd.pop_tape(tape_id);
+                    let _ = self.core.session.autograd.pop_tape(tape_id);
                 }
                 CallFrame::Script(mut sf) => {
                     if let Some((fn_id, upvalues)) = sf.defers.pop() {
@@ -1158,7 +1178,7 @@ impl<'a> VmEngine<'a> {
         };
         for f in &drained {
             if matches!(f, CallFrame::NoGradGuard) {
-                self.core.autograd.exit_no_grad();
+                self.core.session.autograd.exit_no_grad();
             }
         }
         let cont = Arc::new(CapturedContinuation {
@@ -1184,7 +1204,7 @@ impl<'a> VmEngine<'a> {
         let mut restored = cont.frames.clone();
         for f in &restored {
             if matches!(f, CallFrame::NoGradGuard) {
-                self.core.autograd.enter_no_grad();
+                self.core.session.autograd.enter_no_grad();
             }
         }
         if let Some(last) = restored.last_mut() {
@@ -1287,7 +1307,7 @@ impl<'a> VmEngine<'a> {
             .iter()
             .zip(parent_resolved.iter())
             .map(|((_sym, fn_id, _caps), p_uvs)| {
-                let w_core = self.core.clone();
+                let w_core = self.core.fork_for_fiber();
                 let w_prog = Arc::clone(&pf.program);
                 let w_globals = clone_isolated_globals(&base_globals_vals);
                 let mut w_cell_map: HashMap<usize, UpvalueCell> = HashMap::new();
@@ -1311,7 +1331,7 @@ impl<'a> VmEngine<'a> {
             .collect();
 
         let scheduler = Arc::clone(self.core.scheduler());
-        let results = scheduler.run_indexed_batch(jobs, self.core.task_context.as_ref())?;
+        let results = scheduler.run_indexed_batch(jobs, self.core.session.task_context.as_ref())?;
 
         let strategies = self.core.environment.merge_strategies().cloned();
         for (w_core, w_globals, w_cells) in results {
@@ -1509,7 +1529,12 @@ impl<'a> VmEngine<'a> {
                             return ScriptStep::Suspended;
                         }
                         if ambient::is_ambient_label(&effect_name) {
-                            match self.core.random_state.dispatch_op(&effect_name, &arg_vals) {
+                            match self
+                                .core
+                                .session
+                                .random_state
+                                .dispatch_op(&effect_name, &arg_vals)
+                            {
                                 Ok(v) => {
                                     frame.receive_reply(v);
                                     continue;
@@ -1666,7 +1691,7 @@ impl<'a> VmEngine<'a> {
                     }
                     StepOutcome::Yielded
                 } else {
-                    match self.core.random_state.dispatch_op(label, &args) {
+                    match self.core.session.random_state.dispatch_op(label, &args) {
                         Ok(val) => {
                             frame.set_val(dst, val);
                             StepOutcome::NextInst
@@ -1751,7 +1776,7 @@ impl<'a> VmEngine<'a> {
                                 Err(e) => StepOutcome::Err(e),
                             };
                         }
-                        match eval_unary_neg_tracked(&v, Some(&mut self.core.autograd)) {
+                        match eval_unary_neg_tracked(&v, Some(&mut self.core.session.autograd)) {
                             Ok(negated) => {
                                 frame.set_val(dst, negated);
                                 StepOutcome::NextInst
@@ -1875,7 +1900,7 @@ impl<'a> VmEngine<'a> {
                         Err(e) => StepOutcome::Err(e),
                     };
                 }
-                match eval_binary_tracked(l, &op, r, Some(&mut self.core.autograd)) {
+                match eval_binary_tracked(l, &op, r, Some(&mut self.core.session.autograd)) {
                     Ok(v) => {
                         frame.set_val(dst, v);
                         StepOutcome::NextInst
@@ -2025,7 +2050,8 @@ impl<'a> VmEngine<'a> {
             ControlInst::Index(dst, obj, idx) => {
                 let obj_val = frame.get_val(obj);
                 let idx_val = frame.get_val(idx);
-                match index_value_tracked(&obj_val, &idx_val, Some(&mut self.core.autograd)) {
+                match index_value_tracked(&obj_val, &idx_val, Some(&mut self.core.session.autograd))
+                {
                     Ok(v) => {
                         frame.set_val(dst, v);
                         StepOutcome::NextInst
@@ -2090,7 +2116,7 @@ impl<'a> VmEngine<'a> {
                     }
                 }
                 let sliced = match &target_val {
-                    Value::Tensor(t) => t.slice_nd(&rt_axes, Some(&mut self.core.autograd)),
+                    Value::Tensor(t) => t.slice_nd(&rt_axes, Some(&mut self.core.session.autograd)),
                     other => slice_sequence_value(other, &rt_axes),
                 };
                 match sliced {
@@ -2156,13 +2182,14 @@ impl<'a> VmEngine<'a> {
                         let name = frame.program.symbols.resolve(*sym);
                         if let Some((type_name, member)) = name.split_once("::") {
                             if member == "new"
-                                && let Some(def) = self.core.struct_registry.get(type_name).cloned()
+                                && let Some(def) =
+                                    self.core.registry.struct_registry.get(type_name).cloned()
                             {
                                 super::builtins::construct_struct_instance_with_consts(
                                     def, const_vals, arg_vals, named_vals,
                                 )
                             } else if let Some(edef) =
-                                self.core.enum_registry.get(type_name).cloned()
+                                self.core.registry.enum_registry.get(type_name).cloned()
                                 && edef.variants.iter().any(|(v, _)| v == member)
                             {
                                 super::builtins::construct_enum_variant_with_consts(
@@ -2171,7 +2198,9 @@ impl<'a> VmEngine<'a> {
                             } else {
                                 self.resolve_callee_named(frame, &target, arg_vals, named_vals)
                             }
-                        } else if let Some(def) = self.core.struct_registry.get(name).cloned() {
+                        } else if let Some(def) =
+                            self.core.registry.struct_registry.get(name).cloned()
+                        {
                             super::builtins::construct_struct_instance_with_consts(
                                 def, const_vals, arg_vals, named_vals,
                             )
@@ -2458,7 +2487,7 @@ impl<'a> VmEngine<'a> {
                     Ok(f) => f,
                     Err(e) => return StepOutcome::Err(e),
                 };
-                self.core.autograd.enter_no_grad();
+                self.core.session.autograd.enter_no_grad();
                 frame.pc += 1;
                 frame.resume_dst = Some(dst);
                 self.push_script_frame_suspending(frame);
@@ -2468,7 +2497,7 @@ impl<'a> VmEngine<'a> {
             }
             ControlInst::Import { path } => {
                 let child_prog = if let Some(precompiled) =
-                    self.core.precompiled_modules.get(&path).cloned()
+                    self.core.registry.precompiled_modules.get(&path).cloned()
                 {
                     precompiled
                 } else {
@@ -2479,7 +2508,7 @@ impl<'a> VmEngine<'a> {
                             Ok(p) => p,
                             Err(e) => return StepOutcome::Err(e),
                         };
-                        let ctx = self.core.task_context.as_ref();
+                        let ctx = self.core.session.task_context.as_ref();
                         match self.core.reactor().run_fs(ctx, move || {
                             std::fs::read_to_string(checked.as_path()).map_err(MoraError::from)
                         }) {
@@ -2901,6 +2930,7 @@ impl<'a> VmEngine<'a> {
         }
         let base_ctx = self
             .core
+            .session
             .task_context
             .clone()
             .unwrap_or_else(crate::runtime::scheduler::TaskContext::root);
@@ -3043,8 +3073,8 @@ impl<'a> VmEngine<'a> {
             }
         }
 
-        let start_hint = self.core.random_state.next_u64() as usize;
-        let ctx = self.core.task_context.clone();
+        let start_hint = self.core.session.random_state.next_u64() as usize;
+        let ctx = self.core.session.task_context.clone();
         let select_state = SelectResumeState {
             program: Arc::clone(&frame.program),
             globals: Arc::clone(&frame.globals),

@@ -1618,6 +1618,39 @@ fn method_signature_builtin(receiver: &Type, method: &str) -> Option<Signature> 
             2,
             Type::any_tensor(),
         )),
+        (Type::ProcessGroup, "all_reduce_async") => Some(Signature::with_min_arity(
+            vec![
+                ("self".to_string(), Type::ProcessGroup),
+                ("tensor".to_string(), Type::any_tensor()),
+                ("op".to_string(), Type::Union(vec![Type::String, Type::Nil])),
+            ],
+            2,
+            Type::TaskHandle(Box::new(Type::any_tensor())),
+        )),
+        (Type::ProcessGroup, "send") => Some(Signature::new(
+            vec![
+                ("self".to_string(), Type::ProcessGroup),
+                ("tensor".to_string(), Type::any_tensor()),
+                ("dst_rank".to_string(), Type::Int),
+            ],
+            Type::Nil,
+        )),
+        (Type::ProcessGroup, "recv") => Some(Signature::new(
+            vec![
+                ("self".to_string(), Type::ProcessGroup),
+                ("src_rank".to_string(), Type::Int),
+            ],
+            Type::any_tensor(),
+        )),
+        (Type::ProcessGroup, "split") => Some(Signature::with_min_arity(
+            vec![
+                ("self".to_string(), Type::ProcessGroup),
+                ("color".to_string(), Type::Int),
+                ("key".to_string(), Type::Union(vec![Type::Int, Type::Nil])),
+            ],
+            2,
+            Type::ProcessGroup,
+        )),
         (Type::ProcessGroup, "all_gather") => Some(Signature::new(
             vec![
                 ("self".to_string(), Type::ProcessGroup),

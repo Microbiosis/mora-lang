@@ -11,7 +11,7 @@
 //!   `Device::Metal`) across collective outputs, and records nanosecond spans into
 //!   [`crate::runtime::profiler`] when tracing is active.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -63,7 +63,12 @@ struct CollectiveStats {
     broadcast_calls: AtomicU64,
     reduce_scatter_calls: AtomicU64,
     barrier_calls: AtomicU64,
+    send_calls: AtomicU64,
+    recv_calls: AtomicU64,
+    split_calls: AtomicU64,
     bytes_transferred: AtomicU64,
+    wire_bytes_sent: AtomicU64,
+    wire_bytes_recv: AtomicU64,
 }
 
 // ── 1. In-Process Shared Multi-Rank Collective Coordinator (Async, Zero Thread Blocking) ──
@@ -106,12 +111,19 @@ struct GenBucket {
     failed: Option<String>,
 }
 
+type P2pMailboxMap = HashMap<(usize, usize), VecDeque<Arc<Tensor>>>;
+
 #[derive(Debug)]
 struct InProcCollectiveState {
     world_size: usize,
     /// Per-generation staging table keyed by collective sequence number.
     gens: Mutex<HashMap<u64, GenBucket>>,
     notify: AsyncNotify,
+    /// P5-3: VRAM-preserving cooperative P2P FIFO mailboxes keyed by `(src_rank, dst_rank)`.
+    p2p_queues: Mutex<P2pMailboxMap>,
+    p2p_notify: AsyncNotify,
+    /// P5-3: Deterministic shared sub-group registry keyed by `(split_seq, color)`.
+    split_groups: Mutex<HashMap<(u64, i64), Arc<InProcCollectiveState>>>,
 }
 
 impl InProcCollectiveState {
@@ -120,7 +132,61 @@ impl InProcCollectiveState {
             world_size,
             gens: Mutex::new(HashMap::new()),
             notify: AsyncNotify::new(),
+            p2p_queues: Mutex::new(HashMap::new()),
+            p2p_notify: AsyncNotify::new(),
+            split_groups: Mutex::new(HashMap::new()),
         })
+    }
+
+    fn p2p_send(&self, src_rank: usize, dst_rank: usize, tensor: Arc<Tensor>) {
+        let mut qs = self.p2p_queues.lock();
+        qs.entry((src_rank, dst_rank))
+            .or_default()
+            .push_back(tensor);
+        drop(qs);
+        self.p2p_notify.notify_waiters();
+    }
+
+    async fn p2p_recv(
+        &self,
+        src_rank: usize,
+        dst_rank: usize,
+        ctx: Option<&TaskContext>,
+    ) -> MoraResult<Arc<Tensor>> {
+        loop {
+            if let Some(c) = ctx {
+                c.status()?;
+            }
+            let notified = self.p2p_notify.notified();
+            {
+                let mut qs = self.p2p_queues.lock();
+                if let Some(q) = qs.get_mut(&(src_rank, dst_rank))
+                    && let Some(t) = q.pop_front()
+                {
+                    return Ok(t);
+                }
+            }
+            match ctx {
+                Some(c) => match crate::runtime::scheduler::race2(c.cancelled(), notified).await {
+                    crate::runtime::scheduler::Select2::First(err) => return Err(err),
+                    crate::runtime::scheduler::Select2::Second(()) => {}
+                },
+                None => notified.await,
+            }
+        }
+    }
+
+    fn get_or_create_split_group(
+        &self,
+        seq: u64,
+        color: i64,
+        new_world_size: usize,
+    ) -> Arc<InProcCollectiveState> {
+        let mut map = self.split_groups.lock();
+        Arc::clone(
+            map.entry((seq, color))
+                .or_insert_with(|| InProcCollectiveState::new(new_world_size)),
+        )
     }
 
     async fn exchange(
@@ -195,9 +261,14 @@ impl InProcCollectiveState {
     }
 }
 
-// ── 2. Live TCP Ring Collective Transport (`AsyncIoReactor` TCP Sockets) ──
+// ── 2. Live TCP Ring Collective & Direct P2P Transport (`AsyncIoReactor` TCP Sockets) ──
 
 const TCP_RING_MAGIC: u32 = 0x4D50_4752; // "MPGR"
+const TCP_CHUNK_MAGIC: u32 = 0x4D50_4743; // "MPGC" (2-phase Scatter-Reduce / AllGather chunk)
+const TCP_P2P_MAGIC: u32 = 0x4D50_4750; // "MPGP" (direct point-to-point tensor packet)
+
+const CONN_KIND_RING: u8 = 0x01;
+const CONN_KIND_P2P: u8 = 0x02;
 
 #[derive(Debug)]
 struct TcpRingState {
@@ -205,12 +276,18 @@ struct TcpRingState {
     next_stream: Arc<MoraTcpStream>,
     /// Incoming ring edge `(rank + world_size - 1) % world_size -> rank`.
     prev_stream: Arc<MoraTcpStream>,
-    /// Keep listener alive until shutdown.
-    _listener: Arc<MoraTcpListener>,
+    /// Peer address table (`addrs[r]` is rank `r`'s bound listener address for direct P2P & `split`).
+    addrs: Vec<String>,
+    /// Listener kept alive for incoming direct P2P connections.
+    listener: Arc<MoraTcpListener>,
     /// Async-safe lock serializing collective frames on this rank handle without holding
     /// a non-`Send` `MutexGuard` across `.await`.
     io_busy: Mutex<bool>,
     io_notify: AsyncNotify,
+    /// Async-safe lock serializing `listener.accept()` for incoming P2P frames.
+    p2p_accept_busy: Mutex<bool>,
+    p2p_inbox: Mutex<HashMap<usize, VecDeque<TensorPayload>>>,
+    p2p_notify: AsyncNotify,
 }
 
 impl TcpRingState {
@@ -232,6 +309,402 @@ impl TcpRingState {
         *self.io_busy.lock() = false;
         self.io_notify.notify_one();
     }
+
+    /// P5-3: Bandwidth-optimal 2-phase Ring AllReduce (Scatter-Reduce + AllGather) on TCP sockets.
+    /// Each rank sends & receives exactly `2 * (W - 1) / W * S` payload bytes instead of `(W - 1) * S`.
+    #[allow(clippy::too_many_arguments)]
+    async fn ring_all_reduce_2phase(
+        &self,
+        rank: usize,
+        world_size: usize,
+        seq: u64,
+        mut buf: Vec<f64>,
+        dtype: DType,
+        op: ReduceOp,
+        ctx: Option<&TaskContext>,
+    ) -> MoraResult<(Vec<f64>, u64, u64)> {
+        let n = buf.len();
+        let chunk_range = |c: usize| -> (usize, usize) {
+            let base = n / world_size;
+            let rem = n % world_size;
+            let start = c * base + c.min(rem);
+            let len = base + usize::from(c < rem);
+            (start, start + len)
+        };
+
+        let mut total_sent: u64 = 0;
+        let mut total_recv: u64 = 0;
+
+        // Phase 1: Scatter-Reduce (`world_size - 1` hops of `1/W` chunks)
+        for step in 0..(world_size - 1) {
+            let send_chunk = (rank + world_size - step) % world_size;
+            let recv_chunk = (rank + world_size - step - 1) % world_size;
+            let (s0, s1) = chunk_range(send_chunk);
+            let encoded = encode_chunk_frame(send_chunk, seq, dtype, &buf[s0..s1]);
+            total_sent = total_sent.saturating_add(encoded.len() as u64);
+
+            let next = Arc::clone(&self.next_stream);
+            let prev = Arc::clone(&self.prev_stream);
+            let ctx_s = ctx.cloned();
+            let ctx_r = ctx.cloned();
+            let send_fut = async move { write_all_stream(&next, &encoded, ctx_s.as_ref()).await };
+            let recv_fut = async move { recv_chunk_frame(&prev, seq, ctx_r.as_ref()).await };
+            let (s_res, r_res) = join2(send_fut, recv_fut).await;
+            s_res?;
+            let (got_chunk, recv_vals, recv_bytes) = r_res?;
+            total_recv = total_recv.saturating_add(recv_bytes);
+            if got_chunk != recv_chunk {
+                return Err(MoraError::Io(format!(
+                    "tcp_process_group 2-phase scatter-reduce: expected chunk {recv_chunk}, got {got_chunk}"
+                )));
+            }
+            let (r0, r1) = chunk_range(recv_chunk);
+            if recv_vals.len() != r1 - r0 {
+                return Err(MoraError::Io(format!(
+                    "tcp_process_group 2-phase scatter-reduce: chunk length mismatch ({} vs {})",
+                    recv_vals.len(),
+                    r1 - r0
+                )));
+            }
+            let dst = &mut buf[r0..r1];
+            match op {
+                ReduceOp::Sum | ReduceOp::Mean => {
+                    for (d, v) in dst.iter_mut().zip(recv_vals) {
+                        *d += v;
+                    }
+                }
+                ReduceOp::Max => {
+                    for (d, v) in dst.iter_mut().zip(recv_vals) {
+                        if v > *d || v.is_nan() {
+                            *d = v;
+                        }
+                    }
+                }
+                ReduceOp::Min => {
+                    for (d, v) in dst.iter_mut().zip(recv_vals) {
+                        if v < *d || v.is_nan() {
+                            *d = v;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Normalize completed chunk `(rank + 1) % world_size` once before AllGather for bit-exact Mean.
+        if op == ReduceOp::Mean {
+            let owned = (rank + 1) % world_size;
+            let (o0, o1) = chunk_range(owned);
+            let denom = world_size as f64;
+            for d in &mut buf[o0..o1] {
+                *d /= denom;
+            }
+        }
+
+        // Phase 2: AllGather (`world_size - 1` hops of completed `1/W` chunks)
+        let gather_seq = seq ^ 0x8000_0000_0000_0000;
+        for step in 0..(world_size - 1) {
+            let send_chunk = (rank + 1 + world_size - step) % world_size;
+            let recv_chunk = (rank + world_size - step) % world_size;
+            let (s0, s1) = chunk_range(send_chunk);
+            let encoded = encode_chunk_frame(send_chunk, gather_seq, dtype, &buf[s0..s1]);
+            total_sent = total_sent.saturating_add(encoded.len() as u64);
+
+            let next = Arc::clone(&self.next_stream);
+            let prev = Arc::clone(&self.prev_stream);
+            let ctx_s = ctx.cloned();
+            let ctx_r = ctx.cloned();
+            let send_fut = async move { write_all_stream(&next, &encoded, ctx_s.as_ref()).await };
+            let recv_fut = async move { recv_chunk_frame(&prev, gather_seq, ctx_r.as_ref()).await };
+            let (s_res, r_res) = join2(send_fut, recv_fut).await;
+            s_res?;
+            let (got_chunk, recv_vals, recv_bytes) = r_res?;
+            total_recv = total_recv.saturating_add(recv_bytes);
+            if got_chunk != recv_chunk {
+                return Err(MoraError::Io(format!(
+                    "tcp_process_group 2-phase allgather: expected chunk {recv_chunk}, got {got_chunk}"
+                )));
+            }
+            let (r0, r1) = chunk_range(recv_chunk);
+            if recv_vals.len() != r1 - r0 {
+                return Err(MoraError::Io(format!(
+                    "tcp_process_group 2-phase allgather: chunk length mismatch ({} vs {})",
+                    recv_vals.len(),
+                    r1 - r0
+                )));
+            }
+            buf[r0..r1].copy_from_slice(&recv_vals);
+        }
+
+        if dtype != DType::F64 {
+            for d in &mut buf {
+                *d = quantize_for_dtype(*d, dtype);
+            }
+        }
+        Ok((buf, total_sent, total_recv))
+    }
+
+    async fn p2p_send(
+        &self,
+        src_rank: usize,
+        dst_rank: usize,
+        payload: &TensorPayload,
+        ctx: Option<&TaskContext>,
+    ) -> MoraResult<u64> {
+        let addr = self.addrs.get(dst_rank).ok_or_else(|| {
+            MoraError::Runtime(format!(
+                "tcp_process_group.send: dst_rank {dst_rank} out of bounds"
+            ))
+        })?;
+        let mut stream_opt = None;
+        for attempt in 0..100usize {
+            if let Some(c) = ctx {
+                c.status()?;
+            }
+            match MoraTcpStream::connect(addr, Some(Duration::from_secs(2)), ctx).await {
+                Ok(s) => {
+                    stream_opt = Some(s);
+                    break;
+                }
+                Err(e) if attempt + 1 >= 100 => {
+                    return Err(MoraError::Io(format!(
+                        "tcp_process_group.send(rank={src_rank}->{dst_rank}): failed to connect to {addr}: {e}"
+                    )));
+                }
+                Err(_) => sleep(Duration::from_millis(5)).await,
+            }
+        }
+        let stream = stream_opt.expect("connected");
+        let frame = encode_p2p_frame(src_rank, payload);
+        let mut wire = Vec::with_capacity(1 + frame.len());
+        wire.push(CONN_KIND_P2P);
+        wire.extend_from_slice(&frame);
+        write_all_stream(&stream, &wire, ctx).await?;
+        Ok(wire.len() as u64)
+    }
+
+    async fn p2p_recv(
+        &self,
+        src_rank: usize,
+        ctx: Option<&TaskContext>,
+    ) -> MoraResult<(TensorPayload, u64)> {
+        loop {
+            if let Some(c) = ctx {
+                c.status()?;
+            }
+            // Fast path: check already-buffered incoming P2P frames first.
+            {
+                let mut inbox = self.p2p_inbox.lock();
+                if let Some(q) = inbox.get_mut(&src_rank)
+                    && let Some(payload) = q.pop_front()
+                {
+                    let bytes = payload.byte_len();
+                    return Ok((payload, bytes));
+                }
+            }
+            // Try to become the cooperative acceptor on `self.listener`; if another fiber is
+            // already accepting, wait on `p2p_notify`.
+            let became_acceptor = {
+                let mut busy = self.p2p_accept_busy.lock();
+                if !*busy {
+                    *busy = true;
+                    true
+                } else {
+                    false
+                }
+            };
+            if became_acceptor {
+                let accept_res = self.listener.accept(ctx).await;
+                let frame_res = match accept_res {
+                    Ok(stream) => {
+                        let kind = read_exact_stream(&stream, 1, ctx).await;
+                        match kind {
+                            Ok(k) if k[0] == CONN_KIND_P2P => recv_p2p_frame(&stream, ctx).await,
+                            Ok(k) => Err(MoraError::Io(format!(
+                                "tcp_process_group.recv: unexpected connection kind {:#x}",
+                                k[0]
+                            ))),
+                            Err(e) => Err(e),
+                        }
+                    }
+                    Err(e) => Err(e),
+                };
+                *self.p2p_accept_busy.lock() = false;
+                match frame_res {
+                    Ok((from_rank, payload, wire_bytes)) => {
+                        if from_rank == src_rank {
+                            self.p2p_notify.notify_waiters();
+                            return Ok((payload, wire_bytes));
+                        }
+                        self.p2p_inbox
+                            .lock()
+                            .entry(from_rank)
+                            .or_default()
+                            .push_back(payload);
+                        self.p2p_notify.notify_waiters();
+                    }
+                    Err(e) => {
+                        self.p2p_notify.notify_waiters();
+                        return Err(e);
+                    }
+                }
+            } else {
+                let notified = self.p2p_notify.notified();
+                // Re-check inbox before sleeping so we never miss a wakeup.
+                {
+                    let mut inbox = self.p2p_inbox.lock();
+                    if let Some(q) = inbox.get_mut(&src_rank)
+                        && let Some(payload) = q.pop_front()
+                    {
+                        let bytes = payload.byte_len();
+                        return Ok((payload, bytes));
+                    }
+                }
+                match ctx {
+                    Some(c) => {
+                        match crate::runtime::scheduler::race2(c.cancelled(), notified).await {
+                            crate::runtime::scheduler::Select2::First(err) => return Err(err),
+                            crate::runtime::scheduler::Select2::Second(()) => {}
+                        }
+                    }
+                    None => notified.await,
+                }
+            }
+        }
+    }
+}
+
+fn encode_chunk_frame(chunk_idx: usize, seq: u64, dtype: DType, vals: &[f64]) -> Vec<u8> {
+    let elem_bytes = if dtype == DType::F32 { 4 } else { 8 };
+    let mut buf = Vec::with_capacity(21 + vals.len() * elem_bytes);
+    buf.extend_from_slice(&TCP_CHUNK_MAGIC.to_le_bytes());
+    buf.extend_from_slice(&(chunk_idx as u32).to_le_bytes());
+    buf.extend_from_slice(&seq.to_le_bytes());
+    buf.push(dtype_to_u8(dtype));
+    buf.extend_from_slice(&(vals.len() as u32).to_le_bytes());
+    if dtype == DType::F32 {
+        for &v in vals {
+            buf.extend_from_slice(&(v as f32).to_le_bytes());
+        }
+    } else {
+        for &v in vals {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    buf
+}
+
+async fn recv_chunk_frame(
+    stream: &MoraTcpStream,
+    expected_seq: u64,
+    ctx: Option<&TaskContext>,
+) -> MoraResult<(usize, Vec<f64>, u64)> {
+    let hdr = read_exact_stream(stream, 21, ctx).await?;
+    let magic = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+    if magic != TCP_CHUNK_MAGIC {
+        return Err(MoraError::Io(format!(
+            "tcp_process_group: bad chunk frame magic {magic:#x}"
+        )));
+    }
+    let chunk_idx = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
+    let seq = u64::from_le_bytes([
+        hdr[8], hdr[9], hdr[10], hdr[11], hdr[12], hdr[13], hdr[14], hdr[15],
+    ]);
+    if seq != expected_seq {
+        return Err(MoraError::Io(format!(
+            "tcp_process_group: chunk seq mismatch (expected {expected_seq}, got {seq})"
+        )));
+    }
+    let dtype = u8_to_dtype(hdr[16])?;
+    let count = u32::from_le_bytes([hdr[17], hdr[18], hdr[19], hdr[20]]) as usize;
+    let elem_bytes = if dtype == DType::F32 { 4 } else { 8 };
+    let body = read_exact_stream(stream, count * elem_bytes, ctx).await?;
+    let vals: Vec<f64> = if dtype == DType::F32 {
+        body.as_chunks::<4>()
+            .0
+            .iter()
+            .copied()
+            .map(|c| f64::from(f32::from_le_bytes(c)))
+            .collect()
+    } else {
+        body.as_chunks::<8>()
+            .0
+            .iter()
+            .copied()
+            .map(f64::from_le_bytes)
+            .collect()
+    };
+    Ok((chunk_idx, vals, (21 + body.len()) as u64))
+}
+
+fn encode_p2p_frame(src_rank: usize, payload: &TensorPayload) -> Vec<u8> {
+    let elem_bytes = if payload.dtype == DType::F32 { 4 } else { 8 };
+    let header_len = 4 + 4 + 1 + 4 + payload.shape.len() * 8 + 8;
+    let mut buf = Vec::with_capacity(header_len + payload.data.len() * elem_bytes);
+    buf.extend_from_slice(&TCP_P2P_MAGIC.to_le_bytes());
+    buf.extend_from_slice(&(src_rank as u32).to_le_bytes());
+    buf.push(dtype_to_u8(payload.dtype));
+    buf.extend_from_slice(&(payload.shape.len() as u32).to_le_bytes());
+    for &d in &payload.shape {
+        buf.extend_from_slice(&(d as u64).to_le_bytes());
+    }
+    buf.extend_from_slice(&(payload.data.len() as u64).to_le_bytes());
+    if payload.dtype == DType::F32 {
+        for &v in &payload.data {
+            buf.extend_from_slice(&(v as f32).to_le_bytes());
+        }
+    } else {
+        for &v in &payload.data {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    buf
+}
+
+async fn recv_p2p_frame(
+    stream: &MoraTcpStream,
+    ctx: Option<&TaskContext>,
+) -> MoraResult<(usize, TensorPayload, u64)> {
+    let hdr = read_exact_stream(stream, 13, ctx).await?;
+    let magic = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+    if magic != TCP_P2P_MAGIC {
+        return Err(MoraError::Io(format!(
+            "tcp_process_group: bad p2p frame magic {magic:#x}"
+        )));
+    }
+    let src_rank = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
+    let dtype = u8_to_dtype(hdr[8])?;
+    let ndim = u32::from_le_bytes([hdr[9], hdr[10], hdr[11], hdr[12]]) as usize;
+    let shape_bytes = read_exact_stream(stream, ndim * 8 + 8, ctx).await?;
+    let mut shape = Vec::with_capacity(ndim);
+    for c in shape_bytes[..ndim * 8].as_chunks::<8>().0 {
+        shape.push(u64::from_le_bytes(*c) as usize);
+    }
+    let numel = u64::from_le_bytes(
+        shape_bytes[ndim * 8..ndim * 8 + 8]
+            .try_into()
+            .expect("8 bytes"),
+    ) as usize;
+    let elem_bytes = if dtype == DType::F32 { 4 } else { 8 };
+    let data_bytes = read_exact_stream(stream, numel * elem_bytes, ctx).await?;
+    let data: Vec<f64> = if dtype == DType::F32 {
+        data_bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .copied()
+            .map(|c| f64::from(f32::from_le_bytes(c)))
+            .collect()
+    } else {
+        data_bytes
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .copied()
+            .map(f64::from_le_bytes)
+            .collect()
+    };
+    let wire_bytes = (1 + 13 + shape_bytes.len() + data_bytes.len()) as u64;
+    Ok((src_rank, TensorPayload { data, shape, dtype }, wire_bytes))
 }
 
 fn dtype_to_u8(dt: DType) -> u8 {
@@ -571,8 +1044,17 @@ impl ProcessGroup {
             )));
         }
         let listener = MoraTcpListener::bind(&addrs[rank]).await?;
+        Self::connect_tcp_ring_with_listener(rank, world_size, addrs, listener, ctx).await
+    }
+
+    async fn connect_tcp_ring_with_listener(
+        rank: usize,
+        world_size: usize,
+        addrs: Vec<String>,
+        listener: Arc<MoraTcpListener>,
+        ctx: Option<&TaskContext>,
+    ) -> MoraResult<Arc<Self>> {
         if world_size == 1 {
-            // Single-rank loopback dummy connection not needed; self-transport short-circuits!
             return Ok(Arc::new(Self {
                 rank: 0,
                 world_size: 1,
@@ -587,8 +1069,26 @@ impl ProcessGroup {
         let ctx_a = ctx.cloned();
         let ctx_c = ctx.cloned();
 
-        // Concurrently accept predecessor while retrying connection to successor until all peers bind!
-        let accept_fut = async move { accept_listener.accept(ctx_a.as_ref()).await };
+        // Concurrently accept ring predecessor (stashing any early incoming P2P frames cleanly!)
+        // while connecting to ring successor with the `CONN_KIND_RING` 1-byte connection tag.
+        let accept_fut = async move {
+            let mut early_p2p: HashMap<usize, VecDeque<TensorPayload>> = HashMap::new();
+            loop {
+                let stream = accept_listener.accept(ctx_a.as_ref()).await?;
+                let kind = read_exact_stream(&stream, 1, ctx_a.as_ref()).await?;
+                if kind[0] == CONN_KIND_RING {
+                    return Ok::<_, MoraError>((stream, early_p2p));
+                } else if kind[0] == CONN_KIND_P2P {
+                    let (src_r, payload, _) = recv_p2p_frame(&stream, ctx_a.as_ref()).await?;
+                    early_p2p.entry(src_r).or_default().push_back(payload);
+                } else {
+                    return Err(MoraError::Io(format!(
+                        "tcp_process_group(rank={rank}): unexpected handshake byte {:#x}",
+                        kind[0]
+                    )));
+                }
+            }
+        };
         let connect_fut = async move {
             let mut attempts = 0usize;
             loop {
@@ -602,7 +1102,10 @@ impl ProcessGroup {
                 )
                 .await
                 {
-                    Ok(stream) => return Ok(stream),
+                    Ok(stream) => {
+                        write_all_stream(&stream, &[CONN_KIND_RING], ctx_c.as_ref()).await?;
+                        return Ok(stream);
+                    }
                     Err(e) => {
                         attempts += 1;
                         if attempts >= 200 {
@@ -617,7 +1120,7 @@ impl ProcessGroup {
         };
 
         let (prev_res, next_res) = join2(accept_fut, connect_fut).await;
-        let prev_stream = prev_res?;
+        let (prev_stream, early_p2p) = prev_res?;
         let next_stream = next_res?;
 
         Ok(Arc::new(Self {
@@ -626,9 +1129,13 @@ impl ProcessGroup {
             transport: Transport::TcpRing(Arc::new(TcpRingState {
                 next_stream,
                 prev_stream,
-                _listener: listener,
+                addrs,
+                listener,
                 io_busy: Mutex::new(false),
                 io_notify: AsyncNotify::new(),
+                p2p_accept_busy: Mutex::new(false),
+                p2p_inbox: Mutex::new(early_p2p),
+                p2p_notify: AsyncNotify::new(),
             })),
             next_seq: AtomicU64::new(1),
             stats: Arc::new(CollectiveStats::default()),
@@ -675,8 +1182,28 @@ impl ProcessGroup {
             self.stats.barrier_calls.load(Ordering::Relaxed) as i64,
         );
         m.insert(
+            "send_calls".to_string(),
+            self.stats.send_calls.load(Ordering::Relaxed) as i64,
+        );
+        m.insert(
+            "recv_calls".to_string(),
+            self.stats.recv_calls.load(Ordering::Relaxed) as i64,
+        );
+        m.insert(
+            "split_calls".to_string(),
+            self.stats.split_calls.load(Ordering::Relaxed) as i64,
+        );
+        m.insert(
             "bytes_transferred".to_string(),
             self.stats.bytes_transferred.load(Ordering::Relaxed) as i64,
+        );
+        m.insert(
+            "wire_bytes_sent".to_string(),
+            self.stats.wire_bytes_sent.load(Ordering::Relaxed) as i64,
+        );
+        m.insert(
+            "wire_bytes_recv".to_string(),
+            self.stats.wire_bytes_recv.load(Ordering::Relaxed) as i64,
         );
         m
     }
@@ -706,6 +1233,12 @@ impl ProcessGroup {
                 self.stats
                     .bytes_transferred
                     .fetch_add(bytes, Ordering::Relaxed);
+                self.stats
+                    .wire_bytes_sent
+                    .fetch_add(bytes, Ordering::Relaxed);
+                self.stats
+                    .wire_bytes_recv
+                    .fetch_add(bytes, Ordering::Relaxed);
                 Ok(all)
             }
         }
@@ -713,6 +1246,9 @@ impl ProcessGroup {
 
     /// Collective `all_reduce(tensor, op)`: reduces elementwise across all ranks and returns
     /// identical result tensor preserving `DType` and GPU/CPU `Device`.
+    ///
+    /// On `TcpRing` with `numel >= world_size >= 2`, executes true **2-phase bandwidth-optimal
+    /// Scatter-Reduce + AllGather** (`2 * (W - 1) / W * S` wire bytes per rank).
     pub(crate) async fn all_reduce(
         &self,
         tensor: Arc<Tensor>,
@@ -732,10 +1268,220 @@ impl ProcessGroup {
         let dtype = tensor.dtype;
         let shape = tensor.shape.clone();
         let local = TensorPayload::from_tensor(&tensor);
+
+        if let Transport::TcpRing(ring) = &self.transport
+            && self.world_size >= 2
+            && local.data.len() >= self.world_size
+        {
+            let seq = self.next_seq.fetch_add(1, Ordering::AcqRel);
+            ring.acquire_io().await;
+            let res = ring
+                .ring_all_reduce_2phase(self.rank, self.world_size, seq, local.data, dtype, op, ctx)
+                .await;
+            ring.release_io();
+            let (reduced_data, sent_bytes, recv_bytes) = res?;
+            self.stats
+                .bytes_transferred
+                .fetch_add(sent_bytes, Ordering::Relaxed);
+            self.stats
+                .wire_bytes_sent
+                .fetch_add(sent_bytes, Ordering::Relaxed);
+            self.stats
+                .wire_bytes_recv
+                .fetch_add(recv_bytes, Ordering::Relaxed);
+            self.stats.all_reduce_calls.fetch_add(1, Ordering::Relaxed);
+            return TensorPayload {
+                data: reduced_data,
+                shape,
+                dtype,
+            }
+            .into_tensor_on_device(&dev);
+        }
+
         let all = self.exchange_payloads(local, ctx).await?;
         let reduced = reduce_payloads(&all, &shape, dtype, op)?;
         self.stats.all_reduce_calls.fetch_add(1, Ordering::Relaxed);
         reduced.into_tensor_on_device(&dev)
+    }
+
+    /// P5-3: Point-to-point cooperative non-blocking `send(tensor, dst_rank)` for Pipeline Parallelism.
+    pub(crate) async fn send(
+        &self,
+        tensor: Arc<Tensor>,
+        dst_rank: usize,
+        ctx: Option<&TaskContext>,
+    ) -> MoraResult<()> {
+        if dst_rank >= self.world_size || dst_rank == self.rank {
+            return Err(MoraError::Runtime(format!(
+                "ProcessGroup.send: invalid dst_rank {dst_rank} from rank {} (world_size={})",
+                self.rank, self.world_size
+            )));
+        }
+        let _trace = TraceScope::enter(
+            "distributed",
+            format!("p2p_send({}->{dst_rank})", self.rank),
+            vec![
+                ("rank".to_string(), self.rank.to_string()),
+                ("dst_rank".to_string(), dst_rank.to_string()),
+                ("backend".to_string(), self.backend_name().to_string()),
+            ],
+        );
+        match &self.transport {
+            Transport::InProc(st) => {
+                let bytes = tensor.nbytes() as u64;
+                st.p2p_send(self.rank, dst_rank, tensor);
+                self.stats
+                    .bytes_transferred
+                    .fetch_add(bytes, Ordering::Relaxed);
+            }
+            Transport::TcpRing(ring) => {
+                let payload = TensorPayload::from_tensor(&tensor);
+                let sent = ring.p2p_send(self.rank, dst_rank, &payload, ctx).await?;
+                self.stats
+                    .bytes_transferred
+                    .fetch_add(sent, Ordering::Relaxed);
+                self.stats
+                    .wire_bytes_sent
+                    .fetch_add(sent, Ordering::Relaxed);
+            }
+        }
+        self.stats.send_calls.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// P5-3: Point-to-point cooperative `recv(src_rank)` honoring `TaskContext` cancellation.
+    pub(crate) async fn recv(
+        &self,
+        src_rank: usize,
+        ctx: Option<&TaskContext>,
+    ) -> MoraResult<Arc<Tensor>> {
+        if src_rank >= self.world_size || src_rank == self.rank {
+            return Err(MoraError::Runtime(format!(
+                "ProcessGroup.recv: invalid src_rank {src_rank} on rank {} (world_size={})",
+                self.rank, self.world_size
+            )));
+        }
+        let _trace = TraceScope::enter(
+            "distributed",
+            format!("p2p_recv({src_rank}->{})", self.rank),
+            vec![
+                ("rank".to_string(), self.rank.to_string()),
+                ("src_rank".to_string(), src_rank.to_string()),
+                ("backend".to_string(), self.backend_name().to_string()),
+            ],
+        );
+        let out = match &self.transport {
+            Transport::InProc(st) => st.p2p_recv(src_rank, self.rank, ctx).await?,
+            Transport::TcpRing(ring) => {
+                let (payload, recv_bytes) = ring.p2p_recv(src_rank, ctx).await?;
+                self.stats
+                    .wire_bytes_recv
+                    .fetch_add(recv_bytes, Ordering::Relaxed);
+                payload.into_tensor_on_device(&Device::Cpu)?
+            }
+        };
+        self.stats.recv_calls.fetch_add(1, Ordering::Relaxed);
+        Ok(out)
+    }
+
+    /// P5-3: Collective `split(color, key) -> ProcessGroup` partitioning the world into orthogonal
+    /// sub-communicators (e.g. 2D Tensor-Parallel × Data-Parallel meshes) with deterministic
+    /// rank ordering by `(key, old_rank)`.
+    pub(crate) async fn split(
+        &self,
+        color: i64,
+        key: i64,
+        ctx: Option<&TaskContext>,
+    ) -> MoraResult<Arc<Self>> {
+        let _trace = TraceScope::enter(
+            "distributed",
+            format!("split(color={color})"),
+            vec![
+                ("rank".to_string(), self.rank.to_string()),
+                ("world_size".to_string(), self.world_size.to_string()),
+                ("color".to_string(), color.to_string()),
+            ],
+        );
+        let split_seq = self.next_seq.load(Ordering::Acquire);
+        let meta = TensorPayload {
+            data: vec![f64::from_bits(color as u64), f64::from_bits(key as u64)],
+            shape: vec![2],
+            dtype: DType::F64,
+        };
+        let all_meta = self.exchange_payloads(meta, ctx).await?;
+        let mut members: Vec<(i64, usize)> = Vec::new();
+        for (r, p) in all_meta.iter().enumerate() {
+            let p_color = p.data[0].to_bits() as i64;
+            let p_key = p.data[1].to_bits() as i64;
+            if p_color == color {
+                members.push((p_key, r));
+            }
+        }
+        members.sort_by_key(|&(k, old_r)| (k, old_r));
+        let new_world_size = members.len();
+        let new_rank = members
+            .iter()
+            .position(|&(_, old_r)| old_r == self.rank)
+            .expect("self rank always in its own color group");
+
+        self.stats.split_calls.fetch_add(1, Ordering::Relaxed);
+
+        match &self.transport {
+            Transport::InProc(st) => {
+                let sub_state = st.get_or_create_split_group(split_seq, color, new_world_size);
+                Ok(Arc::new(Self {
+                    rank: new_rank,
+                    world_size: new_world_size,
+                    transport: Transport::InProc(sub_state),
+                    next_seq: AtomicU64::new(1),
+                    stats: Arc::new(CollectiveStats::default()),
+                }))
+            }
+            Transport::TcpRing(ring) => {
+                // Bind an ephemeral port on the same host IP as our parent listener, exchange
+                // assigned ports across the parent world, and connect an independent TCP sub-ring!
+                let host = ring
+                    .addrs
+                    .get(self.rank)
+                    .and_then(|a| a.rsplit_once(':').map(|(h, _)| h))
+                    .unwrap_or("127.0.0.1");
+                let sub_listener = MoraTcpListener::bind(&format!("{host}:0")).await?;
+                let local_port: u16 = sub_listener
+                    .local_addr()
+                    .rsplit_once(':')
+                    .and_then(|(_, p)| p.parse().ok())
+                    .ok_or_else(|| {
+                        MoraError::Io(format!(
+                            "tcp_process_group.split: cannot parse local port from {}",
+                            sub_listener.local_addr()
+                        ))
+                    })?;
+                let port_payload = TensorPayload {
+                    data: vec![f64::from(local_port)],
+                    shape: vec![1],
+                    dtype: DType::F64,
+                };
+                let all_ports = self.exchange_payloads(port_payload, ctx).await?;
+                let mut sub_addrs = Vec::with_capacity(new_world_size);
+                for &(_, old_r) in &members {
+                    let h = ring
+                        .addrs
+                        .get(old_r)
+                        .and_then(|a| a.rsplit_once(':').map(|(h, _)| h))
+                        .unwrap_or("127.0.0.1");
+                    let p = all_ports[old_r].data[0] as u16;
+                    sub_addrs.push(format!("{h}:{p}"));
+                }
+                Self::connect_tcp_ring_with_listener(
+                    new_rank,
+                    new_world_size,
+                    sub_addrs,
+                    sub_listener,
+                    ctx,
+                )
+                .await
+            }
+        }
     }
 
     /// Collective `all_gather(tensor)`: gathers rank tensors in rank order `0..world_size`

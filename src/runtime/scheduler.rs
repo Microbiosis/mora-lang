@@ -1545,6 +1545,20 @@ impl TaskScheduler {
         })
     }
 
+    /// P5-3: Spawn an arbitrary native async Rust future onto the cooperative M:N scheduler
+    /// returning a first-class cloneable [`MoraTaskHandle`] (used by `ProcessGroup.all_reduce_async`).
+    pub(crate) fn spawn_native_future<F, Fut>(
+        &self,
+        ctx: &TaskContext,
+        build: F,
+    ) -> Arc<MoraTaskHandle>
+    where
+        F: FnOnce(TaskContext) -> Fut + Send + 'static,
+        Fut: Future<Output = MoraResult<Value>> + Send + 'static,
+    {
+        self.spawn_mora_fiber(ctx, build)
+    }
+
     fn spawn_mora_fiber<F, Fut>(&self, ctx: &TaskContext, build: F) -> Arc<MoraTaskHandle>
     where
         F: FnOnce(TaskContext) -> Fut + Send + 'static,

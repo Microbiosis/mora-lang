@@ -3603,7 +3603,15 @@ impl HMInference {
             Type::ProcessGroup => {
                 if matches!(
                     method,
-                    "all_reduce" | "all_gather" | "broadcast" | "reduce_scatter" | "barrier"
+                    "all_reduce"
+                        | "all_reduce_async"
+                        | "all_gather"
+                        | "broadcast"
+                        | "reduce_scatter"
+                        | "send"
+                        | "recv"
+                        | "split"
+                        | "barrier"
                 ) {
                     add(ambient::ASYNC_LABEL);
                 }

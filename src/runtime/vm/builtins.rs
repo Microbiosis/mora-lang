@@ -3773,6 +3773,126 @@ fn resolve_process_group_method(
                 Ok(Value::Tensor(out))
             })))
         }
+        "all_reduce_async" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(MoraError::Runtime(format!(
+                    "process_group.all_reduce_async(tensor, op?) expects 1..=2 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let Value::Tensor(t) = args[0].clone() else {
+                return Err(MoraError::Runtime(format!(
+                    "process_group.all_reduce_async: first argument must be Tensor, got {}",
+                    crate::flow::type_name(&args[0])
+                )));
+            };
+            let op_name = match args.get(1) {
+                None | Some(Value::Nil) => "sum",
+                Some(Value::String(s)) => s.as_str(),
+                Some(other) => {
+                    return Err(MoraError::Runtime(format!(
+                        "process_group.all_reduce_async: 'op' must be string, got {}",
+                        crate::flow::type_name(other)
+                    )));
+                }
+            };
+            let op = crate::runtime::distributed::ReduceOp::parse(op_name)?;
+            let pg = Arc::clone(pg);
+            let parent_ctx = core
+                .session
+                .task_context
+                .clone()
+                .unwrap_or_else(crate::runtime::scheduler::TaskContext::root);
+            let handle = core.shared.scheduler.spawn_native_future(
+                &parent_ctx,
+                move |child_ctx| async move {
+                    let out = pg.all_reduce(t, op, Some(&child_ctx)).await?;
+                    Ok(Value::Tensor(out))
+                },
+            );
+            Ok(CallAction::Done(Value::TaskHandle(handle)))
+        }
+        "send" => {
+            if args.len() != 2 {
+                return Err(MoraError::Runtime(format!(
+                    "process_group.send(tensor, dst_rank) expects 2 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let Value::Tensor(t) = args[0].clone() else {
+                return Err(MoraError::Runtime(format!(
+                    "process_group.send: first argument must be Tensor, got {}",
+                    crate::flow::type_name(&args[0])
+                )));
+            };
+            let dst_rank = match &args[1] {
+                Value::Int(n) if *n >= 0 => *n as usize,
+                other => {
+                    return Err(MoraError::Runtime(format!(
+                        "process_group.send: 'dst_rank' must be a non-negative integer, got {other}"
+                    )));
+                }
+            };
+            let pg = Arc::clone(pg);
+            let eff_ctx = core.session.task_context.clone();
+            Ok(CallAction::AwaitFuture(Box::pin(async move {
+                pg.send(t, dst_rank, eff_ctx.as_ref()).await?;
+                Ok(Value::Nil)
+            })))
+        }
+        "recv" => {
+            if args.len() != 1 {
+                return Err(MoraError::Runtime(format!(
+                    "process_group.recv(src_rank) expects 1 argument, got {}",
+                    args.len()
+                )));
+            }
+            let src_rank = match &args[0] {
+                Value::Int(n) if *n >= 0 => *n as usize,
+                other => {
+                    return Err(MoraError::Runtime(format!(
+                        "process_group.recv: 'src_rank' must be a non-negative integer, got {other}"
+                    )));
+                }
+            };
+            let pg = Arc::clone(pg);
+            let eff_ctx = core.session.task_context.clone();
+            Ok(CallAction::AwaitFuture(Box::pin(async move {
+                let out = pg.recv(src_rank, eff_ctx.as_ref()).await?;
+                Ok(Value::Tensor(out))
+            })))
+        }
+        "split" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(MoraError::Runtime(format!(
+                    "process_group.split(color, key?) expects 1..=2 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let color = match &args[0] {
+                Value::Int(n) => *n,
+                other => {
+                    return Err(MoraError::Runtime(format!(
+                        "process_group.split: 'color' must be int, got {other}"
+                    )));
+                }
+            };
+            let key = match args.get(1) {
+                None | Some(Value::Nil) => pg.rank() as i64,
+                Some(Value::Int(n)) => *n,
+                Some(other) => {
+                    return Err(MoraError::Runtime(format!(
+                        "process_group.split: 'key' must be int, got {other}"
+                    )));
+                }
+            };
+            let pg = Arc::clone(pg);
+            let eff_ctx = core.session.task_context.clone();
+            Ok(CallAction::AwaitFuture(Box::pin(async move {
+                let sub = pg.split(color, key, eff_ctx.as_ref()).await?;
+                Ok(Value::ProcessGroup(sub))
+            })))
+        }
         "barrier" => {
             if !args.is_empty() {
                 return Err(MoraError::Runtime(

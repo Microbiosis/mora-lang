@@ -41,9 +41,8 @@ use super::builtins::{
 use super::continuation::{
     CallFrame, CapturedContinuation, CapturedFrames, CombinatorFrame, HandleBarrierState,
     ModuleGlobals, ParallelFrame, RegSlot, ScriptFrame, SelectResumeState, TransactionState,
-    UpvalueCell, UpvalueValue, clone_isolated_globals, clone_worker_upvalues, materialize_frame,
-    materialize_frame_named, materialize_handler_frame, resolve_captures, restore_globals,
-    snapshot_globals,
+    UpvalueCell, UpvalueValue, clone_worker_upvalues, materialize_frame, materialize_frame_named,
+    materialize_handler_frame, resolve_captures, restore_globals, snapshot_globals,
 };
 use super::value_ops::{
     eval_assert, eval_quasiquote, index_assign_value, index_value_tracked, make_dyn_trait,
@@ -382,7 +381,14 @@ impl<'a> VmEngine<'a> {
                         }
                     }
                     self.core.environment = saved_env;
+                    let parent_globals = self.frames.iter().rev().find_map(|f| match f {
+                        CallFrame::Script(sf) => Some(Arc::clone(&sf.globals)),
+                        _ => None,
+                    });
                     for (name, v) in exports {
+                        if let Some(pg) = &parent_globals {
+                            pg.insert_import(name.clone(), v.clone());
+                        }
                         self.core.environment.define(name, v, false);
                     }
                     val = Value::Nil;
@@ -530,7 +536,7 @@ impl<'a> VmEngine<'a> {
             CombinatorFrame::AutogradEval {
                 tape_id,
                 leaf_nodes,
-                scalar_flags,
+                tree_specs,
                 return_value,
             } => {
                 let tape = self
@@ -589,24 +595,10 @@ impl<'a> VmEngine<'a> {
                         )));
                     }
                 };
-                let mut grad_vals = Vec::with_capacity(grad_tensors.len());
-                for (gt, scalar_flag) in grad_tensors.into_iter().zip(scalar_flags) {
-                    if let Some(dt) = scalar_flag
-                        && !higher_order
-                    {
-                        let v = gt.get_linear(0);
-                        if dt == DType::F64 {
-                            grad_vals.push(Value::Float(v));
-                        } else {
-                            grad_vals.push(
-                                ScalarValue::from_f64_quantized(v, dt)
-                                    .map(Value::Scalar)
-                                    .unwrap_or(Value::Float(v)),
-                            );
-                        }
-                    } else {
-                        grad_vals.push(Value::Tensor(gt));
-                    }
+                let mut grad_iter = grad_tensors.into_iter();
+                let mut grad_vals = Vec::with_capacity(tree_specs.len());
+                for spec in &tree_specs {
+                    grad_vals.push(reconstruct_grad_tree(spec, &mut grad_iter, higher_order)?);
                 }
                 let grad_result = if grad_vals.len() == 1 {
                     grad_vals.pop().expect("grad_vals has length 1")
@@ -1144,19 +1136,20 @@ impl<'a> VmEngine<'a> {
     }
 
     fn lookup_visible_binding(&self, name: &str) -> Option<Value> {
-        if let Some(v) = self.core.environment.get(name) {
-            return Some(v);
-        }
-        let caller = self.frames.iter().rev().find_map(|f| match f {
+        if let Some(caller) = self.frames.iter().rev().find_map(|f| match f {
             CallFrame::Script(sf) => Some(sf),
             _ => None,
-        })?;
-        for (idx, meta) in caller.program.globals.iter().enumerate() {
-            if meta.name == name {
-                return Some(caller.globals[idx].lock().0.clone());
+        }) {
+            for (idx, meta) in caller.program.globals.iter().enumerate() {
+                if meta.name == name {
+                    return Some(caller.globals[idx].lock().0.clone());
+                }
+            }
+            if let Some(v) = caller.globals.get_import(name) {
+                return Some(v);
             }
         }
-        None
+        self.core.environment.get(name)
     }
 
     fn find_barrier(&self, effect_name: &str) -> Option<usize> {
@@ -1277,6 +1270,7 @@ impl<'a> VmEngine<'a> {
         )],
     ) -> MoraResult<()> {
         let base_globals_vals = snapshot_globals(&pf.globals);
+        let base_imports = pf.globals.snapshot_imports();
 
         // Pre-resolve shared upvalues in parent before spawning worker tasks.
         let mut parent_resolved: Vec<Vec<UpvalueValue>> = Vec::with_capacity(workers.len());
@@ -1309,7 +1303,10 @@ impl<'a> VmEngine<'a> {
             .map(|((_sym, fn_id, _caps), p_uvs)| {
                 let w_core = self.core.fork_for_fiber();
                 let w_prog = Arc::clone(&pf.program);
-                let w_globals = clone_isolated_globals(&base_globals_vals);
+                let w_globals = super::continuation::clone_isolated_globals_with_imports(
+                    &base_globals_vals,
+                    base_imports.clone(),
+                );
                 let mut w_cell_map: HashMap<usize, UpvalueCell> = HashMap::new();
                 let w_uvs = clone_worker_upvalues(p_uvs, w_prog.func(*fn_id), &mut w_cell_map);
                 let fn_id = *fn_id;
@@ -2026,10 +2023,10 @@ impl<'a> VmEngine<'a> {
             }
             ControlInst::LoadDyn(dst, sym) => {
                 let name = frame.program.symbols.resolve(sym);
-                let val = self
-                    .core
-                    .environment
-                    .get(name)
+                let val = frame
+                    .globals
+                    .get_import(name)
+                    .or_else(|| self.core.environment.get(name))
                     .or_else(|| BuiltinKind::from_name(name).map(Value::Builtin))
                     .unwrap_or(Value::Nil);
                 frame.set_val(dst, val);
@@ -3222,5 +3219,54 @@ fn slice_sequence_value(target: &Value, axes: &[RuntimeSliceAxis]) -> MoraResult
             "cannot slice value of type {}",
             crate::flow::type_name(target)
         ))),
+    }
+}
+
+/// P5-4: Reconstruct a PyTree gradient container (`Tensor`, scalar float, `list`, or `dict`)
+/// matching the [`GradTreeSpec`] recorded when entering `grad` / `value_and_grad`.
+fn reconstruct_grad_tree(
+    spec: &crate::runtime::vm::continuation::GradTreeSpec,
+    grads: &mut impl Iterator<Item = Arc<crate::value::tensor::Tensor>>,
+    higher_order: bool,
+) -> MoraResult<Value> {
+    use crate::runtime::vm::continuation::GradTreeSpec;
+    match spec {
+        GradTreeSpec::TensorLeaf => {
+            let gt = grads.next().ok_or_else(|| {
+                MoraError::Runtime("autograd: missing gradient tensor for PyTree leaf".to_string())
+            })?;
+            Ok(Value::Tensor(gt))
+        }
+        GradTreeSpec::ScalarLeaf(dt) => {
+            let gt = grads.next().ok_or_else(|| {
+                MoraError::Runtime("autograd: missing gradient tensor for scalar leaf".to_string())
+            })?;
+            if !higher_order {
+                let v = gt.get_linear(0);
+                if *dt == DType::F64 {
+                    Ok(Value::Float(v))
+                } else {
+                    Ok(ScalarValue::from_f64_quantized(v, *dt)
+                        .map(Value::Scalar)
+                        .unwrap_or(Value::Float(v)))
+                }
+            } else {
+                Ok(Value::Tensor(gt))
+            }
+        }
+        GradTreeSpec::List(children) => {
+            let mut out = Vec::with_capacity(children.len());
+            for c in children {
+                out.push(reconstruct_grad_tree(c, grads, higher_order)?);
+            }
+            Ok(Value::List(out.into()))
+        }
+        GradTreeSpec::Dict(entries) => {
+            let mut out = HashMap::with_capacity(entries.len());
+            for (k, c) in entries {
+                out.insert(k.clone(), reconstruct_grad_tree(c, grads, higher_order)?);
+            }
+            Ok(Value::Dict(out))
+        }
     }
 }

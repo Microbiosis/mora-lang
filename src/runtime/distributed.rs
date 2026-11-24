@@ -280,9 +280,11 @@ struct TcpRingState {
     addrs: Vec<String>,
     /// Listener kept alive for incoming direct P2P connections.
     listener: Arc<MoraTcpListener>,
-    /// Async-safe lock serializing collective frames on this rank handle without holding
-    /// a non-`Send` `MutexGuard` across `.await`.
-    io_busy: Mutex<bool>,
+    /// Async-safe lock + strict launch-order sequencer serializing collective frames on this
+    /// rank handle without holding a non-`Send` `MutexGuard` across `.await`.
+    /// Tuple `(busy, next_expected_seq)` ensures multiple pipelined `all_reduce_async` futures
+    /// always transmit frames on the TCP stream in exact launch order.
+    io_state: Mutex<(bool, u64)>,
     io_notify: AsyncNotify,
     /// Async-safe lock serializing `listener.accept()` for incoming P2P frames.
     p2p_accept_busy: Mutex<bool>,
@@ -291,13 +293,13 @@ struct TcpRingState {
 }
 
 impl TcpRingState {
-    async fn acquire_io(&self) {
+    async fn acquire_io(&self, seq: u64) {
         loop {
             let notified = self.io_notify.notified();
             {
-                let mut busy = self.io_busy.lock();
-                if !*busy {
-                    *busy = true;
+                let mut st = self.io_state.lock();
+                if !st.0 && st.1 == seq {
+                    st.0 = true;
                     return;
                 }
             }
@@ -306,8 +308,12 @@ impl TcpRingState {
     }
 
     fn release_io(&self) {
-        *self.io_busy.lock() = false;
-        self.io_notify.notify_one();
+        {
+            let mut st = self.io_state.lock();
+            st.0 = false;
+            st.1 = st.1.wrapping_add(1);
+        }
+        self.io_notify.notify_waiters();
     }
 
     /// P5-3: Bandwidth-optimal 2-phase Ring AllReduce (Scatter-Reduce + AllGather) on TCP sockets.
@@ -1131,7 +1137,7 @@ impl ProcessGroup {
                 prev_stream,
                 addrs,
                 listener,
-                io_busy: Mutex::new(false),
+                io_state: Mutex::new((false, 1)),
                 io_notify: AsyncNotify::new(),
                 p2p_accept_busy: Mutex::new(false),
                 p2p_inbox: Mutex::new(early_p2p),
@@ -1208,12 +1214,19 @@ impl ProcessGroup {
         m
     }
 
-    async fn exchange_payloads(
+    /// Synchronously reserve the next monotonic collective sequence ID in caller stream order.
+    /// Used by `all_reduce_async` so pipelined non-blocking collectives always match across ranks
+    /// even when spawned concurrently on multi-threaded scheduler workers.
+    pub(crate) fn allocate_seq(&self) -> u64 {
+        self.next_seq.fetch_add(1, Ordering::AcqRel)
+    }
+
+    async fn exchange_payloads_with_seq(
         &self,
+        seq: u64,
         local: TensorPayload,
         ctx: Option<&TaskContext>,
     ) -> MoraResult<Vec<TensorPayload>> {
-        let seq = self.next_seq.fetch_add(1, Ordering::AcqRel);
         match &self.transport {
             Transport::InProc(st) => {
                 let bytes = local.byte_len();
@@ -1224,7 +1237,7 @@ impl ProcessGroup {
                 Ok(all)
             }
             Transport::TcpRing(ring) => {
-                ring.acquire_io().await;
+                ring.acquire_io(seq).await;
                 let res = ring
                     .ring_exchange_all(self.rank, self.world_size, seq, local, ctx)
                     .await;
@@ -1244,6 +1257,15 @@ impl ProcessGroup {
         }
     }
 
+    async fn exchange_payloads(
+        &self,
+        local: TensorPayload,
+        ctx: Option<&TaskContext>,
+    ) -> MoraResult<Vec<TensorPayload>> {
+        let seq = self.allocate_seq();
+        self.exchange_payloads_with_seq(seq, local, ctx).await
+    }
+
     /// Collective `all_reduce(tensor, op)`: reduces elementwise across all ranks and returns
     /// identical result tensor preserving `DType` and GPU/CPU `Device`.
     ///
@@ -1251,6 +1273,18 @@ impl ProcessGroup {
     /// Scatter-Reduce + AllGather** (`2 * (W - 1) / W * S` wire bytes per rank).
     pub(crate) async fn all_reduce(
         &self,
+        tensor: Arc<Tensor>,
+        op: ReduceOp,
+        ctx: Option<&TaskContext>,
+    ) -> MoraResult<Arc<Tensor>> {
+        let seq = self.allocate_seq();
+        self.all_reduce_with_seq(seq, tensor, op, ctx).await
+    }
+
+    /// Launch-ordered `all_reduce` taking a pre-allocated collective sequence ID `seq`.
+    pub(crate) async fn all_reduce_with_seq(
+        &self,
+        seq: u64,
         tensor: Arc<Tensor>,
         op: ReduceOp,
         ctx: Option<&TaskContext>,
@@ -1273,8 +1307,7 @@ impl ProcessGroup {
             && self.world_size >= 2
             && local.data.len() >= self.world_size
         {
-            let seq = self.next_seq.fetch_add(1, Ordering::AcqRel);
-            ring.acquire_io().await;
+            ring.acquire_io(seq).await;
             let res = ring
                 .ring_all_reduce_2phase(self.rank, self.world_size, seq, local.data, dtype, op, ctx)
                 .await;
@@ -1298,7 +1331,7 @@ impl ProcessGroup {
             .into_tensor_on_device(&dev);
         }
 
-        let all = self.exchange_payloads(local, ctx).await?;
+        let all = self.exchange_payloads_with_seq(seq, local, ctx).await?;
         let reduced = reduce_payloads(&all, &shape, dtype, op)?;
         self.stats.all_reduce_calls.fetch_add(1, Ordering::Relaxed);
         reduced.into_tensor_on_device(&dev)

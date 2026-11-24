@@ -1,9 +1,11 @@
 //! v0.110.0: CLI 共享编译/路径辅助与 REPL 入口。
 //! main.rs 保留 dispatch + 执行入口。
 
+pub mod bench;
 pub mod bundle;
 pub mod fmt;
 pub mod install;
+pub mod profile;
 pub mod repl;
 pub mod test_runner;
 pub mod vendor;

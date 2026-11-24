@@ -3798,6 +3798,7 @@ fn resolve_process_group_method(
             };
             let op = crate::runtime::distributed::ReduceOp::parse(op_name)?;
             let pg = Arc::clone(pg);
+            let seq = pg.allocate_seq();
             let parent_ctx = core
                 .session
                 .task_context
@@ -3806,7 +3807,7 @@ fn resolve_process_group_method(
             let handle = core.shared.scheduler.spawn_native_future(
                 &parent_ctx,
                 move |child_ctx| async move {
-                    let out = pg.all_reduce(t, op, Some(&child_ctx)).await?;
+                    let out = pg.all_reduce_with_seq(seq, t, op, Some(&child_ctx)).await?;
                     Ok(Value::Tensor(out))
                 },
             );
@@ -4156,91 +4157,25 @@ pub fn resolve_value_call_named(
                 }
                 let tape_id = core.session.autograd.push_tape();
                 let mut leaf_nodes: Vec<usize> = Vec::with_capacity(argnums.len());
-                let mut scalar_flags: Vec<Option<crate::common::DType>> =
+                let mut tree_specs: Vec<crate::runtime::vm::continuation::GradTreeSpec> =
                     Vec::with_capacity(argnums.len());
                 let mut tracked_args = args;
 
                 for &idx in &argnums {
-                    match tracked_args[idx].clone() {
-                        Value::Tensor(t) => {
-                            if !t.dtype.is_float() {
-                                core.session.autograd.pop_tape(tape_id);
-                                return Err(MoraError::Runtime(format!(
-                                    "grad: cannot differentiate with respect to non-floating-point Tensor<{}>",
-                                    t.dtype
-                                )));
-                            }
-                            let Some((_, leaf_idx)) = core.session.autograd.register_leaf(
-                                tape_id,
-                                t.shape.clone(),
-                                t.dtype,
-                                t.device.clone(),
-                            ) else {
-                                core.session.autograd.pop_tape(tape_id);
-                                return Err(MoraError::Runtime(
-                                    "grad: failed to allocate autograd leaf".to_string(),
-                                ));
-                            };
-                            leaf_nodes.push(leaf_idx);
-                            scalar_flags.push(None);
-                            tracked_args[idx] =
-                                Value::Tensor(t.with_pushed_grad_node((tape_id, leaf_idx)));
+                    match register_grad_tree(
+                        core,
+                        tape_id,
+                        idx,
+                        tracked_args[idx].clone(),
+                        &mut leaf_nodes,
+                    ) {
+                        Ok((tracked, spec)) => {
+                            tracked_args[idx] = tracked;
+                            tree_specs.push(spec);
                         }
-                        Value::Float(f) => {
-                            let Some((_, leaf_idx)) = core.session.autograd.register_leaf(
-                                tape_id,
-                                Vec::new(),
-                                crate::common::DType::F64,
-                                crate::common::Device::Cpu,
-                            ) else {
-                                core.session.autograd.pop_tape(tape_id);
-                                return Err(MoraError::Runtime(
-                                    "grad: failed to allocate scalar autograd leaf".to_string(),
-                                ));
-                            };
-                            leaf_nodes.push(leaf_idx);
-                            scalar_flags.push(Some(crate::common::DType::F64));
-                            let t = crate::value::tensor::Tensor::from_raw(
-                                vec![f],
-                                Vec::new(),
-                                crate::common::DType::F64,
-                                crate::common::Device::Cpu,
-                                true,
-                            )?;
-                            tracked_args[idx] =
-                                Value::Tensor(t.with_pushed_grad_node((tape_id, leaf_idx)));
-                        }
-                        Value::Scalar(s) if s.dtype().is_float() => {
-                            let dt = s.dtype();
-                            let Some((_, leaf_idx)) = core.session.autograd.register_leaf(
-                                tape_id,
-                                Vec::new(),
-                                dt,
-                                crate::common::Device::Cpu,
-                            ) else {
-                                core.session.autograd.pop_tape(tape_id);
-                                return Err(MoraError::Runtime(
-                                    "grad: failed to allocate scalar autograd leaf".to_string(),
-                                ));
-                            };
-                            leaf_nodes.push(leaf_idx);
-                            scalar_flags.push(Some(dt));
-                            let t = crate::value::tensor::Tensor::from_raw(
-                                vec![s.as_f64()],
-                                Vec::new(),
-                                dt,
-                                crate::common::Device::Cpu,
-                                true,
-                            )?;
-                            tracked_args[idx] =
-                                Value::Tensor(t.with_pushed_grad_node((tape_id, leaf_idx)));
-                        }
-                        other => {
+                        Err(err) => {
                             core.session.autograd.pop_tape(tape_id);
-                            return Err(MoraError::Runtime(format!(
-                                "grad: argument {idx} must be a floating-point tensor or float scalar, got {}",
-                                crate::flow::dynamic_type_name(&other)
-                            )));
+                            return Err(err);
                         }
                     }
                 }
@@ -4249,7 +4184,7 @@ pub fn resolve_value_call_named(
                     combinator: Box::new(CombinatorFrame::AutogradEval {
                         tape_id,
                         leaf_nodes,
-                        scalar_flags,
+                        tree_specs,
                         return_value,
                     }),
                     callee: *func,
@@ -4429,10 +4364,6 @@ pub fn resolve_dyn_call_named(
         }
     }
 
-    if let Some(val) = core.environment.get(name) {
-        return dispatch_named_callable(name, val, args, named_args, core);
-    }
-
     if let Some((prog, globals)) = active_globals {
         for (idx, meta) in prog.globals.iter().enumerate() {
             if meta.name == name {
@@ -4440,6 +4371,13 @@ pub fn resolve_dyn_call_named(
                 return dispatch_named_callable(name, val, args, named_args, core);
             }
         }
+        if let Some(val) = globals.get_import(name) {
+            return dispatch_named_callable(name, val, args, named_args, core);
+        }
+    }
+
+    if let Some(val) = core.environment.get(name) {
+        return dispatch_named_callable(name, val, args, named_args, core);
     }
 
     if let Some(trait_name) = name.strip_suffix("::new")
@@ -4852,5 +4790,124 @@ fn move_struct_to_device(val: &Value, dev: &crate::common::Device) -> MoraResult
             Ok(Value::Dict(out))
         }
         other => Ok(other.clone()),
+    }
+}
+
+/// P5-4: Recursively register floating-point tensors, float scalars, and nested `list`/`dict`
+/// PyTree containers as autograd leaves on `tape_id`.
+fn register_grad_tree(
+    core: &mut CoreRuntime,
+    tape_id: u64,
+    arg_idx: usize,
+    val: Value,
+    leaf_nodes: &mut Vec<usize>,
+) -> MoraResult<(Value, crate::runtime::vm::continuation::GradTreeSpec)> {
+    use crate::runtime::vm::continuation::GradTreeSpec;
+    match val {
+        Value::Tensor(t) => {
+            if !t.dtype.is_float() {
+                return Err(MoraError::Runtime(format!(
+                    "grad: cannot differentiate with respect to non-floating-point Tensor<{}>",
+                    t.dtype
+                )));
+            }
+            let Some((_, leaf_idx)) = core.session.autograd.register_leaf(
+                tape_id,
+                t.shape.clone(),
+                t.dtype,
+                t.device.clone(),
+            ) else {
+                return Err(MoraError::Runtime(
+                    "grad: failed to allocate autograd leaf".to_string(),
+                ));
+            };
+            leaf_nodes.push(leaf_idx);
+            Ok((
+                Value::Tensor(t.with_pushed_grad_node((tape_id, leaf_idx))),
+                GradTreeSpec::TensorLeaf,
+            ))
+        }
+        Value::Float(f) => {
+            let Some((_, leaf_idx)) = core.session.autograd.register_leaf(
+                tape_id,
+                Vec::new(),
+                crate::common::DType::F64,
+                crate::common::Device::Cpu,
+            ) else {
+                return Err(MoraError::Runtime(
+                    "grad: failed to allocate scalar autograd leaf".to_string(),
+                ));
+            };
+            leaf_nodes.push(leaf_idx);
+            let t = crate::value::tensor::Tensor::from_raw(
+                vec![f],
+                Vec::new(),
+                crate::common::DType::F64,
+                crate::common::Device::Cpu,
+                true,
+            )?;
+            Ok((
+                Value::Tensor(t.with_pushed_grad_node((tape_id, leaf_idx))),
+                GradTreeSpec::ScalarLeaf(crate::common::DType::F64),
+            ))
+        }
+        Value::Scalar(s) if s.dtype().is_float() => {
+            let dt = s.dtype();
+            let Some((_, leaf_idx)) = core.session.autograd.register_leaf(
+                tape_id,
+                Vec::new(),
+                dt,
+                crate::common::Device::Cpu,
+            ) else {
+                return Err(MoraError::Runtime(
+                    "grad: failed to allocate scalar autograd leaf".to_string(),
+                ));
+            };
+            leaf_nodes.push(leaf_idx);
+            let t = crate::value::tensor::Tensor::from_raw(
+                vec![s.as_f64()],
+                Vec::new(),
+                dt,
+                crate::common::Device::Cpu,
+                true,
+            )?;
+            Ok((
+                Value::Tensor(t.with_pushed_grad_node((tape_id, leaf_idx))),
+                GradTreeSpec::ScalarLeaf(dt),
+            ))
+        }
+        Value::List(items) => {
+            let mut tracked_items = Vec::with_capacity(items.len());
+            let mut child_specs = Vec::with_capacity(items.len());
+            for item in items.iter() {
+                let (tracked, spec) =
+                    register_grad_tree(core, tape_id, arg_idx, item.clone(), leaf_nodes)?;
+                tracked_items.push(tracked);
+                child_specs.push(spec);
+            }
+            Ok((
+                Value::List(tracked_items.into()),
+                GradTreeSpec::List(child_specs),
+            ))
+        }
+        Value::Dict(map) => {
+            let mut keys: Vec<String> = map.keys().cloned().collect();
+            keys.sort();
+            let mut tracked_map = HashMap::with_capacity(keys.len());
+            let mut child_specs = Vec::with_capacity(keys.len());
+            for k in keys {
+                if let Some(v) = map.get(&k) {
+                    let (tracked, spec) =
+                        register_grad_tree(core, tape_id, arg_idx, v.clone(), leaf_nodes)?;
+                    tracked_map.insert(k.clone(), tracked);
+                    child_specs.push((k, spec));
+                }
+            }
+            Ok((Value::Dict(tracked_map), GradTreeSpec::Dict(child_specs)))
+        }
+        other => Err(MoraError::Runtime(format!(
+            "grad: argument {arg_idx} must be a floating-point tensor, float scalar, or list/dict PyTree of them, got {}",
+            crate::flow::dynamic_type_name(&other)
+        ))),
     }
 }

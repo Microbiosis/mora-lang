@@ -1,0 +1,627 @@
+-- Mora Pure Standard Library: `std/nn/layers`
+-- Composable Transformer LLM building blocks written 100% in pure Mora:
+-- - `Linear<const IN: int, const OUT: int>`: compile-time shape-checked Const Generic layer
+-- - `Embedding`: differentiable token embedding table
+-- - `RMSNorm`: Root-Mean-Square layer normalization
+-- - `apply_rope`: differentiable Rotary Position Embeddings (RoPE)
+-- - `SwiGLU`: gated FFN (`(silu(x @ W_gate) * (x @ W_up)) @ W_down`)
+-- - `GroupedQueryAttention`: GQA/MHA with causal mask + `KVPageAllocator` RadixAttention cache
+-- - `TransformerBlock` & `CausalLM`: full autoregressive decoder with Safetensors & GGUF I/O
+
+import "std/nn/safetensors"
+import "std/nn/gguf"
+
+-- Compile-time shape-checked Linear projection using Mora Const Generics.
+export struct Linear < const IN: int, const OUT: int >
+  weight: Tensor<f32, [IN, OUT], cpu>
+  bias: Tensor<f32, [OUT], cpu>
+  has_bias: bool = true
+end
+
+export impl < const IN: int, const OUT: int > Linear < IN, OUT >
+  task forward < B > (self, x: Tensor<f32, [B, IN], cpu>): Tensor<f32, [B, OUT], cpu>
+    let y = x @ self.weight
+    if self.has_bias then
+      return y + self.bias
+    end
+    return y
+  end
+
+  task dims(self): list<int>
+    return [IN, OUT]
+  end
+end
+
+-- Cast a float scalar into a 1-element scalar literal matching tensor dtype (`f32` or `f64`).
+task dtype_scale(val: float, dt: string, dev: string): any
+  return Tensor::full([1], val, dt, dev)
+end
+
+-- Build a differentiable `[seq_len, vocab_size]` one-hot indicator matrix for `token_ids`.
+export task one_hot_matrix(token_ids: list<int>, vocab_size: int, dtype: string = "f32", device: string = "cpu"): any
+  let rows: list<list<float>> = []
+  for tok in token_ids
+    let tid = tok
+    if tid < 0 then
+      assign tid = 0
+    end
+    if tid >= vocab_size then
+      assign tid = vocab_size - 1
+    end
+    let row: list<float> = []
+    let v = 0
+    while v < vocab_size
+      if v == tid then
+        assign row = row.push(1.0)
+      else
+        assign row = row.push(0.0)
+      end
+      assign v = v + 1
+    end
+    assign rows = rows.push(row)
+  end
+  return Tensor::from_list(rows, dtype, device)
+end
+
+-- Build an additive causal attention mask `[seq_q, seq_k]` (0 on allowed positions, -1e9 above diagonal).
+export task causal_mask(seq_q: int, seq_k: int, pos_offset: int = 0, dtype: string = "f32", device: string = "cpu"): any
+  let rows: list<list<float>> = []
+  let i = 0
+  while i < seq_q
+    let row: list<float> = []
+    let q_pos = pos_offset + i
+    let j = 0
+    while j < seq_k
+      if j <= q_pos then
+        assign row = row.push(0.0)
+      else
+        assign row = row.push(-1000000000.0)
+      end
+      assign j = j + 1
+    end
+    assign rows = rows.push(row)
+    assign i = i + 1
+  end
+  return Tensor::from_list(rows, dtype, device)
+end
+
+-- Differentiable token embedding lookup (`[seq_len] -> [seq_len, d_model]`).
+export struct Embedding
+  weight: any
+  vocab_size: int
+  d_model: int
+  dtype: string = "f32"
+  device: string = "cpu"
+end
+
+export task embedding_init(vocab_size: int, d_model: int, dtype: string = "f32", device: string = "cpu", scale: float = 0.08): Embedding
+  let w = Tensor::randn([vocab_size, d_model], dtype, device) * dtype_scale(scale, dtype, device)
+  return Embedding(weight = w, vocab_size = vocab_size, d_model = d_model, dtype = dtype, device = device)
+end
+
+export impl Embedding
+  task forward(self, token_ids: list<int>): any
+    let oh = one_hot_matrix(token_ids, self.vocab_size, self.dtype, self.device)
+    return oh @ self.weight
+  end
+end
+
+-- Root Mean Square Layer Normalization (`x.rms_norm(eps) * weight`).
+export struct RMSNorm
+  weight: any
+  eps: float = 0.00001
+end
+
+export task rms_norm_init(dim: int, eps: float = 0.00001, dtype: string = "f32", device: string = "cpu"): RMSNorm
+  let w = Tensor::ones([dim], dtype, device)
+  return RMSNorm(weight = w, eps = eps)
+end
+
+export impl RMSNorm
+  task forward(self, x: any): any
+    return x.rms_norm(self.eps) * self.weight
+  end
+end
+
+-- Build pairwise 2x2 block-diagonal rotation matrix `[head_dim, head_dim]` for position `pos`
+-- so `apply_rope` stays 100% differentiable via matrix multiplication & elementwise ops.
+task build_rope_swap_matrix(head_dim: int, dtype: string, device: string): any
+  let rows: list<list<float>> = []
+  let i = 0
+  while i < head_dim
+    let row: list<float> = []
+    let j = 0
+    while j < head_dim
+      let val = 0.0
+      if i % 2 == 0 and j == i + 1 then
+        assign val = 1.0
+      end
+      if i % 2 == 1 and j == i - 1 then
+        assign val = -1.0
+      end
+      assign row = row.push(val)
+      assign j = j + 1
+    end
+    assign rows = rows.push(row)
+    assign i = i + 1
+  end
+  return Tensor::from_list(rows, dtype, device)
+end
+
+-- Differentiable Rotary Position Embeddings (RoPE) for `[n_heads, seq_len, head_dim]` tensors.
+export task apply_rope(x: any, pos_offset: int = 0, theta: float = 10000.0): any
+  let sh = x.shape()
+  let seq_len = sh[1]
+  let head_dim = sh[2]
+  let dt = x.dtype()
+  let dev = x.device()
+  let cos_rows: list<list<float>> = []
+  let sin_rows: list<list<float>> = []
+  let p = 0
+  while p < seq_len
+    let pos = (pos_offset + p) * 1.0
+    let crow: list<float> = []
+    let srow: list<float> = []
+    let d = 0
+    while d < head_dim
+      let pair_idx = d / 2
+      let exponent = (2.0 * pair_idx) / (head_dim * 1.0)
+      let freq = 1.0 / math.pow(theta, exponent)
+      let angle = pos * freq
+      assign crow = crow.push(math.cos(angle))
+      assign srow = srow.push(math.sin(angle))
+      assign d = d + 1
+    end
+    assign cos_rows = cos_rows.push(crow)
+    assign sin_rows = sin_rows.push(srow)
+    assign p = p + 1
+  end
+  let cos_t = Tensor::from_list(cos_rows, dt, dev).reshape([1, seq_len, head_dim])
+  let sin_t = Tensor::from_list(sin_rows, dt, dev).reshape([1, seq_len, head_dim])
+  let swap_m = build_rope_swap_matrix(head_dim, dt, dev)
+  let x_rot = x @ swap_m
+  return (x * cos_t) + (x_rot * sin_t)
+end
+
+-- SwiGLU Feed-Forward Network: `(silu(x @ w_gate) * (x @ w_up)) @ w_down`.
+export struct SwiGLU
+  w_gate: any
+  w_up: any
+  w_down: any
+end
+
+export task swiglu_init(d_model: int, d_ff: int, dtype: string = "f32", device: string = "cpu", scale: float = 0.08): SwiGLU
+  let sc = dtype_scale(scale, dtype, device)
+  let wg = Tensor::randn([d_model, d_ff], dtype, device) * sc
+  let wu = Tensor::randn([d_model, d_ff], dtype, device) * sc
+  let wd = Tensor::randn([d_ff, d_model], dtype, device) * sc
+  return SwiGLU(w_gate = wg, w_up = wu, w_down = wd)
+end
+
+export impl SwiGLU
+  task forward(self, x: any): any
+    let gate = (x @ self.w_gate).silu()
+    let up = x @ self.w_up
+    return (gate * up) @ self.w_down
+  end
+end
+
+-- Expand GQA KV heads `[n_kv_heads, kv_len, head_dim]` to `[n_heads, kv_len, head_dim]` differentiably.
+task expand_kv_heads(kv: any, n_heads: int, n_kv_heads: int, kv_len: int, head_dim: int): any
+  if n_kv_heads == n_heads then
+    return kv
+  end
+  let group = n_heads / n_kv_heads
+  let dt = kv.dtype()
+  let dev = kv.device()
+  let kv_4d = kv.reshape([n_kv_heads, 1, kv_len, head_dim])
+  let broadcast_zero = Tensor::zeros([1, group, 1, 1], dt, dev)
+  let rep = kv_4d + broadcast_zero
+  return rep.reshape([n_heads, kv_len, head_dim])
+end
+
+-- Grouped-Query Attention (GQA) with RoPE, causal mask, and optional `KVPageAllocator` RadixAttention cache.
+export struct GroupedQueryAttention
+  w_q: any
+  w_k: any
+  w_v: any
+  w_o: any
+  n_heads: int
+  n_kv_heads: int
+  head_dim: int
+  rope_theta: float = 10000.0
+end
+
+export task gqa_init(d_model: int, n_heads: int, n_kv_heads: int, rope_theta: float = 10000.0, dtype: string = "f32", device: string = "cpu", scale: float = 0.08): GroupedQueryAttention
+  let head_dim = d_model / n_heads
+  let kv_dim = n_kv_heads * head_dim
+  let sc = dtype_scale(scale, dtype, device)
+  let wq = Tensor::randn([d_model, d_model], dtype, device) * sc
+  let wk = Tensor::randn([d_model, kv_dim], dtype, device) * sc
+  let wv = Tensor::randn([d_model, kv_dim], dtype, device) * sc
+  let wo = Tensor::randn([d_model, d_model], dtype, device) * sc
+  return GroupedQueryAttention(w_q = wq, w_k = wk, w_v = wv, w_o = wo, n_heads = n_heads, n_kv_heads = n_kv_heads, head_dim = head_dim, rope_theta = rope_theta)
+end
+
+export impl GroupedQueryAttention
+  -- Full differentiable forward pass on `[seq_len, d_model]`.
+  task forward(self, x: any, pos_offset: int = 0): any
+    let sh = x.shape()
+    let seq_len = sh[0]
+    let d_model = self.n_heads * self.head_dim
+    let dt = x.dtype()
+    let dev = x.device()
+
+    let q_proj = (x @ self.w_q).reshape([seq_len, self.n_heads, self.head_dim]).transpose(0, 1).contiguous()
+    let k_proj = (x @ self.w_k).reshape([seq_len, self.n_kv_heads, self.head_dim]).transpose(0, 1).contiguous()
+    let v_proj = (x @ self.w_v).reshape([seq_len, self.n_kv_heads, self.head_dim]).transpose(0, 1).contiguous()
+
+    let q = apply_rope(q_proj, pos_offset, self.rope_theta)
+    let k_rot = apply_rope(k_proj, pos_offset, self.rope_theta)
+    let k = expand_kv_heads(k_rot, self.n_heads, self.n_kv_heads, seq_len, self.head_dim)
+    let v = expand_kv_heads(v_proj, self.n_heads, self.n_kv_heads, seq_len, self.head_dim)
+
+    let inv_sqrt_d = 1.0 / math.sqrt(self.head_dim * 1.0)
+    let scores = (q @ k.transpose()) * dtype_scale(inv_sqrt_d, dt, dev)
+    let mask = causal_mask(seq_len, seq_len, 0, dt, dev).reshape([1, seq_len, seq_len])
+    let probs = (scores + mask).softmax()
+    let ctx = (probs @ v).transpose(0, 1).contiguous().reshape([seq_len, d_model])
+    return ctx @ self.w_o
+  end
+
+  -- Incremental prefill/decode forward wired directly into `KVPageAllocator` + RadixAttention cache.
+  -- `x_new` has shape `[new_len, d_model]` starting at absolute position `pos_offset`.
+  task forward_cached(self, x_new: any, kv_alloc: any, seq_id: int, pos_offset: int): any
+    let sh = x_new.shape()
+    let new_len = sh[0]
+    let d_model = self.n_heads * self.head_dim
+    let dt = x_new.dtype()
+    let dev = x_new.device()
+
+    let q_proj = (x_new @ self.w_q).reshape([new_len, self.n_heads, self.head_dim]).transpose(0, 1).contiguous()
+    let k_proj = (x_new @ self.w_k).reshape([new_len, self.n_kv_heads, self.head_dim]).transpose(0, 1).contiguous()
+    let v_proj = (x_new @ self.w_v).reshape([new_len, self.n_kv_heads, self.head_dim]).transpose(0, 1).contiguous()
+
+    let q = apply_rope(q_proj, pos_offset, self.rope_theta)
+    let k_rot = apply_rope(k_proj, pos_offset, self.rope_theta)
+
+    -- Write newly projected [n_kv_heads, head_dim] slices into physical KV pages
+    let k_by_tok = k_rot.transpose(0, 1).contiguous()
+    let v_by_tok = v_proj.transpose(0, 1).contiguous()
+    kv_alloc.append_tokens(seq_id, new_len)
+    let t = 0
+    while t < new_len
+      let kt = k_by_tok[t].contiguous()
+      let vt = v_by_tok[t].contiguous()
+      kv_alloc.write_kv(seq_id, pos_offset + t, kt, vt)
+      assign t = t + 1
+    end
+
+    -- Read full cached prefix + suffix KV `[total_len, n_kv_heads, head_dim]`
+    let pair = kv_alloc.read_kv(seq_id)
+    let k_full_tok = pair[0]
+    let v_full_tok = pair[1]
+    let total_len = k_full_tok.shape()[0]
+    let k_full = expand_kv_heads(k_full_tok.transpose(0, 1).contiguous(), self.n_heads, self.n_kv_heads, total_len, self.head_dim)
+    let v_full = expand_kv_heads(v_full_tok.transpose(0, 1).contiguous(), self.n_heads, self.n_kv_heads, total_len, self.head_dim)
+
+    let inv_sqrt_d = 1.0 / math.sqrt(self.head_dim * 1.0)
+    let scores = (q @ k_full.transpose()) * dtype_scale(inv_sqrt_d, dt, dev)
+    let mask = causal_mask(new_len, total_len, pos_offset, dt, dev).reshape([1, new_len, total_len])
+    let probs = (scores + mask).softmax()
+    let ctx = (probs @ v_full).transpose(0, 1).contiguous().reshape([new_len, d_model])
+    return ctx @ self.w_o
+  end
+end
+
+-- Pre-Norm Transformer Decoder Block (RMSNorm -> GQA + residual -> RMSNorm -> SwiGLU + residual).
+export struct TransformerBlock
+  attn_norm: RMSNorm
+  attn: GroupedQueryAttention
+  ffn_norm: RMSNorm
+  ffn: SwiGLU
+end
+
+export task transformer_block_init(d_model: int, n_heads: int, n_kv_heads: int, d_ff: int, eps: float = 0.00001, rope_theta: float = 10000.0, dtype: string = "f32", device: string = "cpu", scale: float = 0.08): TransformerBlock
+  let an = rms_norm_init(d_model, eps, dtype, device)
+  let att = gqa_init(d_model, n_heads, n_kv_heads, rope_theta, dtype, device, scale)
+  let fn_norm = rms_norm_init(d_model, eps, dtype, device)
+  let ffn = swiglu_init(d_model, d_ff, dtype, device, scale)
+  return TransformerBlock(attn_norm = an, attn = att, ffn_norm = fn_norm, ffn = ffn)
+end
+
+export impl TransformerBlock
+  task forward(self, x: any, pos_offset: int = 0): any
+    let h = x + self.attn.forward(self.attn_norm.forward(x), pos_offset)
+    return h + self.ffn.forward(self.ffn_norm.forward(h))
+  end
+
+  task forward_cached(self, x_new: any, kv_alloc: any, seq_id: int, pos_offset: int): any
+    let h = x_new + self.attn.forward_cached(self.attn_norm.forward(x_new), kv_alloc, seq_id, pos_offset)
+    return h + self.ffn.forward(self.ffn_norm.forward(h))
+  end
+end
+
+export struct ModelConfig
+  vocab_size: int = 259
+  d_model: int = 32
+  n_layers: int = 1
+  n_heads: int = 2
+  n_kv_heads: int = 2
+  d_ff: int = 64
+  rms_eps: float = 0.00001
+  rope_theta: float = 10000.0
+  dtype: string = "f32"
+  device: string = "cpu"
+end
+
+-- Autoregressive Causal Language Model (Llama / Qwen architecture) with Safetensors & GGUF I/O.
+export struct CausalLM
+  config: ModelConfig
+  embed: Embedding
+  blocks: list<TransformerBlock>
+  final_norm: RMSNorm
+  lm_head: any
+end
+
+export task causal_lm_init(cfg: ModelConfig, scale: float = 0.08): CausalLM
+  let emb = embedding_init(cfg.vocab_size, cfg.d_model, cfg.dtype, cfg.device, scale)
+  let blks: list<TransformerBlock> = []
+  let i = 0
+  while i < cfg.n_layers
+    let b = transformer_block_init(cfg.d_model, cfg.n_heads, cfg.n_kv_heads, cfg.d_ff, cfg.rms_eps, cfg.rope_theta, cfg.dtype, cfg.device, scale)
+    assign blks = blks.push(b)
+    assign i = i + 1
+  end
+  let fnorm = rms_norm_init(cfg.d_model, cfg.rms_eps, cfg.dtype, cfg.device)
+  let head = Tensor::randn([cfg.d_model, cfg.vocab_size], cfg.dtype, cfg.device) * dtype_scale(scale, cfg.dtype, cfg.device)
+  return CausalLM(config = cfg, embed = emb, blocks = blks, final_norm = fnorm, lm_head = head)
+end
+
+-- Extract the greedy argmax token ID from the final row of a `[seq_len, vocab_size]` logits tensor.
+export task argmax_last_row(logits: any): int
+  let rows = logits.to("cpu").to_list()
+  let last_row = rows[rows.len() - 1]
+  let best_idx = 0
+  let best_val = float(last_row[0])
+  let i = 1
+  while i < last_row.len()
+    let v = float(last_row[i])
+    if v > best_val then
+      assign best_val = v
+      assign best_idx = i
+    end
+    assign i = i + 1
+  end
+  return best_idx
+end
+
+export impl CausalLM
+  -- Differentiable forward pass producing `[seq_len, vocab_size]` logits.
+  task forward(self, token_ids: list<int>): any
+    let h = self.embed.forward(token_ids)
+    for blk in self.blocks
+      assign h = blk.forward(h, 0)
+    end
+    let normed = self.final_norm.forward(h)
+    return normed @ self.lm_head
+  end
+
+  -- Flatten all trainable parameters into an ordered `list<Tensor>` for `value_and_grad` / `AdamW`.
+  -- Order: `[embed.weight, (block_i: attn_norm, w_q, w_k, w_v, w_o, ffn_norm, w_gate, w_up, w_down)*, final_norm, lm_head]`.
+  task parameters(self): list<any>
+    let ps: list<any> = []
+    assign ps = ps.push(self.embed.weight)
+    for blk in self.blocks
+      assign ps = ps.push(blk.attn_norm.weight)
+      assign ps = ps.push(blk.attn.w_q)
+      assign ps = ps.push(blk.attn.w_k)
+      assign ps = ps.push(blk.attn.w_v)
+      assign ps = ps.push(blk.attn.w_o)
+      assign ps = ps.push(blk.ffn_norm.weight)
+      assign ps = ps.push(blk.ffn.w_gate)
+      assign ps = ps.push(blk.ffn.w_up)
+      assign ps = ps.push(blk.ffn.w_down)
+    end
+    assign ps = ps.push(self.final_norm.weight)
+    assign ps = ps.push(self.lm_head)
+    return ps
+  end
+
+  -- Rebuild a `CausalLM` bound to an updated flat parameter list (e.g. after `AdamW.step` or inside `value_and_grad`).
+  task with_parameters(self, ps: list<any>): CausalLM
+    let cfg = self.config
+    let emb = Embedding(weight = ps[0], vocab_size = cfg.vocab_size, d_model = cfg.d_model, dtype = cfg.dtype, device = cfg.device)
+    let blks: list<TransformerBlock> = []
+    let idx = 1
+    let i = 0
+    while i < cfg.n_layers
+      let an = RMSNorm(weight = ps[idx], eps = cfg.rms_eps)
+      let att = GroupedQueryAttention(w_q = ps[idx + 1], w_k = ps[idx + 2], w_v = ps[idx + 3], w_o = ps[idx + 4], n_heads = cfg.n_heads, n_kv_heads = cfg.n_kv_heads, head_dim = cfg.d_model / cfg.n_heads, rope_theta = cfg.rope_theta)
+      let fn_norm = RMSNorm(weight = ps[idx + 5], eps = cfg.rms_eps)
+      let ffn = SwiGLU(w_gate = ps[idx + 6], w_up = ps[idx + 7], w_down = ps[idx + 8])
+      assign blks = blks.push(TransformerBlock(attn_norm = an, attn = att, ffn_norm = fn_norm, ffn = ffn))
+      assign idx = idx + 9
+      assign i = i + 1
+    end
+    let fnorm = RMSNorm(weight = ps[idx], eps = cfg.rms_eps)
+    let head = ps[idx + 1]
+    return CausalLM(config = cfg, embed = emb, blocks = blks, final_norm = fnorm, lm_head = head)
+  end
+
+  -- Export Hugging Face / Llama-canonical tensor name dictionary for Safetensors or GGUF checkpoints.
+  task state_dict(self): dict<string, any>
+    let sd: dict<string, any> = {}
+    assign sd = sd.set("model.embed_tokens.weight", self.embed.weight)
+    let i = 0
+    while i < self.blocks.len()
+      let blk = self.blocks[i]
+      let p = "model.layers." + str(i) + "."
+      assign sd = sd.set(p + "input_layernorm.weight", blk.attn_norm.weight)
+      assign sd = sd.set(p + "self_attn.q_proj.weight", blk.attn.w_q)
+      assign sd = sd.set(p + "self_attn.k_proj.weight", blk.attn.w_k)
+      assign sd = sd.set(p + "self_attn.v_proj.weight", blk.attn.w_v)
+      assign sd = sd.set(p + "self_attn.o_proj.weight", blk.attn.w_o)
+      assign sd = sd.set(p + "post_attention_layernorm.weight", blk.ffn_norm.weight)
+      assign sd = sd.set(p + "mlp.gate_proj.weight", blk.ffn.w_gate)
+      assign sd = sd.set(p + "mlp.up_proj.weight", blk.ffn.w_up)
+      assign sd = sd.set(p + "mlp.down_proj.weight", blk.ffn.w_down)
+      assign i = i + 1
+    end
+    assign sd = sd.set("model.norm.weight", self.final_norm.weight)
+    assign sd = sd.set("lm_head.weight", self.lm_head)
+    return sd
+  end
+
+  -- Save all weights to a standard Hugging Face `.safetensors` file via `std/nn/safetensors`.
+  task save_safetensors(self, path: string): any
+    let meta: dict<string, string> = {}
+    assign meta = meta.set("format", "mora-causal-lm")
+    assign meta = meta.set("vocab_size", str(self.config.vocab_size))
+    assign meta = meta.set("d_model", str(self.config.d_model))
+    assign meta = meta.set("n_layers", str(self.config.n_layers))
+    assign meta = meta.set("n_heads", str(self.config.n_heads))
+    assign meta = meta.set("n_kv_heads", str(self.config.n_kv_heads))
+    assign meta = meta.set("d_ff", str(self.config.d_ff))
+    return safetensors_save(path, self.state_dict(), meta)
+  end
+
+  -- Save all weights & architecture metadata to a standard GGUF v3 file via `std/nn/gguf`.
+  task save_gguf(self, path: string, extra_meta: dict<string, any> = {}): any
+    let meta = extra_meta
+    assign meta = meta.set("general.architecture", meta_string("mora-llama"))
+    assign meta = meta.set("llama.vocab_size", meta_u32(self.config.vocab_size))
+    assign meta = meta.set("llama.embedding_length", meta_u32(self.config.d_model))
+    assign meta = meta.set("llama.block_count", meta_u32(self.config.n_layers))
+    assign meta = meta.set("llama.attention.head_count", meta_u32(self.config.n_heads))
+    assign meta = meta.set("llama.attention.head_count_kv", meta_u32(self.config.n_kv_heads))
+    assign meta = meta.set("llama.feed_forward_length", meta_u32(self.config.d_ff))
+    return gguf_save(path, self.state_dict(), meta)
+  end
+
+  -- Single-layer KV-cached autoregressive greedy generation with RadixAttention prefix reuse.
+  -- When `kv_alloc != nil` and `config.n_layers == 1`, reuses cached prefix pages via
+  -- `attach_prefix` and registers the prompt into the RadixAttention trie via `cache_prefix`!
+  task generate_greedy(self, prompt_ids: list<int>, max_new_tokens: int, eos_id: int = -1, kv_alloc: any = nil, seq_id: int = 1): list<int>
+    let generated: list<int> = []
+    if prompt_ids.len() == 0 or max_new_tokens <= 0 then
+      return generated
+    end
+
+    if kv_alloc != nil and self.blocks.len() == 1 then
+      let blk = self.blocks[0]
+      kv_alloc.alloc_seq(seq_id)
+      let matched = kv_alloc.attach_prefix(seq_id, prompt_ids)
+      -- Always compute at least the last prompt token so we obtain next-token logits
+      let start_pos = matched
+      if start_pos >= prompt_ids.len() then
+        assign start_pos = prompt_ids.len() - 1
+      end
+      let suffix_ids: list<int> = []
+      let p = start_pos
+      while p < prompt_ids.len()
+        assign suffix_ids = suffix_ids.push(prompt_ids[p])
+        assign p = p + 1
+      end
+      -- Only append/write KV for tokens strictly beyond `matched`
+      let cur_logits = nil
+      if matched < prompt_ids.len() then
+        let emb_suf = self.embed.forward(suffix_ids)
+        let h_suf = blk.forward_cached(emb_suf, kv_alloc, seq_id, matched)
+        assign cur_logits = self.final_norm.forward(h_suf) @ self.lm_head
+        kv_alloc.cache_prefix(seq_id, prompt_ids)
+      else
+        -- Entire prompt was cached in RadixAttention! Compute logits for final token without duplicating KV
+        assign cur_logits = self.forward(prompt_ids)
+      end
+
+      let next_tok = argmax_last_row(cur_logits)
+      let cur_pos = prompt_ids.len()
+      let step = 0
+      while step < max_new_tokens
+        assign generated = generated.push(next_tok)
+        if eos_id >= 0 and next_tok == eos_id then
+          break
+        end
+        if step + 1 >= max_new_tokens then
+          break
+        end
+        let emb_one = self.embed.forward([next_tok])
+        let h_one = blk.forward_cached(emb_one, kv_alloc, seq_id, cur_pos)
+        let step_logits = self.final_norm.forward(h_one) @ self.lm_head
+        assign next_tok = argmax_last_row(step_logits)
+        assign cur_pos = cur_pos + 1
+        assign step = step + 1
+      end
+      kv_alloc.free_seq(seq_id)
+      return generated
+    end
+
+    -- General multi-layer greedy decoding path
+    let seq = prompt_ids
+    let step = 0
+    while step < max_new_tokens
+      let logits = self.forward(seq)
+      let next_tok = argmax_last_row(logits)
+      assign generated = generated.push(next_tok)
+      assign seq = seq.push(next_tok)
+      if eos_id >= 0 and next_tok == eos_id then
+        break
+      end
+      assign step = step + 1
+    end
+    return generated
+  end
+end
+
+-- Construct a `CausalLM` from a loaded tensor dictionary (`safetensors` or `gguf`).
+export task causal_lm_from_state_dict(cfg: ModelConfig, tensors: dict<string, any>): CausalLM
+  let emb_w = tensors.get("model.embed_tokens.weight")
+  let emb = Embedding(weight = emb_w, vocab_size = cfg.vocab_size, d_model = cfg.d_model, dtype = cfg.dtype, device = cfg.device)
+  let blks: list<TransformerBlock> = []
+  let i = 0
+  while i < cfg.n_layers
+    let p = "model.layers." + str(i) + "."
+    let an = RMSNorm(weight = tensors.get(p + "input_layernorm.weight"), eps = cfg.rms_eps)
+    let att = GroupedQueryAttention(w_q = tensors.get(p + "self_attn.q_proj.weight"), w_k = tensors.get(p + "self_attn.k_proj.weight"), w_v = tensors.get(p + "self_attn.v_proj.weight"), w_o = tensors.get(p + "self_attn.o_proj.weight"), n_heads = cfg.n_heads, n_kv_heads = cfg.n_kv_heads, head_dim = cfg.d_model / cfg.n_heads, rope_theta = cfg.rope_theta)
+    let fn_norm = RMSNorm(weight = tensors.get(p + "post_attention_layernorm.weight"), eps = cfg.rms_eps)
+    let ffn = SwiGLU(w_gate = tensors.get(p + "mlp.gate_proj.weight"), w_up = tensors.get(p + "mlp.up_proj.weight"), w_down = tensors.get(p + "mlp.down_proj.weight"))
+    assign blks = blks.push(TransformerBlock(attn_norm = an, attn = att, ffn_norm = fn_norm, ffn = ffn))
+    assign i = i + 1
+  end
+  let fnorm = RMSNorm(weight = tensors.get("model.norm.weight"), eps = cfg.rms_eps)
+  let head = tensors.get("lm_head.weight")
+  return CausalLM(config = cfg, embed = emb, blocks = blks, final_norm = fnorm, lm_head = head)
+end
+
+-- Load a `CausalLM` directly from a `.safetensors` checkpoint file.
+export task causal_lm_from_safetensors(path: string, cfg: ModelConfig): CausalLM
+  let res = safetensors_load(path, cfg.device)
+  let err_msg = match res with
+      SafetensorsResult::Ok(_) -> ""
+      SafetensorsResult::Err(msg) -> msg
+    end
+    assert(err_msg == "", "causal_lm_from_safetensors failed: " + err_msg)
+    let empty_t: dict<string, any> = {}
+    let tensors = match res with
+        SafetensorsResult::Ok(v) -> v.tensors
+        SafetensorsResult::Err(_) -> empty_t
+      end
+      return causal_lm_from_state_dict(cfg, tensors)
+    end
+
+    -- Load a `CausalLM` directly from a `.gguf` checkpoint file.
+    export task causal_lm_from_gguf(path: string, cfg: ModelConfig): CausalLM
+      let res = gguf_load(path, cfg.device)
+      let err_msg = match res with
+          GgufResult::Ok(_) -> ""
+          GgufResult::Err(msg) -> msg
+        end
+        assert(err_msg == "", "causal_lm_from_gguf failed: " + err_msg)
+        let empty_t: dict<string, any> = {}
+        let tensors = match res with
+            GgufResult::Ok(v) -> v.tensors
+            GgufResult::Err(_) -> empty_t
+          end
+          return causal_lm_from_state_dict(cfg, tensors)
+        end

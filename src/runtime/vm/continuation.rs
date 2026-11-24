@@ -107,8 +107,42 @@ pub type CapturedFrames = Vec<CallFrame>;
 /// Shared cell holding a module-top static global binding `(value, is_exported)`.
 pub type GlobalCell = Arc<Mutex<(Value, bool)>>;
 
-/// Per-module global slot storage vector.
-pub type ModuleGlobals = Arc<Vec<GlobalCell>>;
+/// Per-module runtime global state: static global slots plus lexically scoped module imports.
+///
+/// Storing imported bindings alongside each module's global cells guarantees true lexical
+/// module scoping: tasks, closures, `impl` methods, and `spawn`ed fibers defined in module `M`
+/// always resolve `M`'s transitive `import`s even after `M`'s `ImportFinalize` returns to callers.
+#[derive(Debug)]
+pub struct ModuleGlobalsInner {
+    pub slots: Vec<GlobalCell>,
+    pub imports: Mutex<HashMap<String, Value>>,
+}
+
+impl ModuleGlobalsInner {
+    pub(crate) fn get_import(&self, name: &str) -> Option<Value> {
+        self.imports.lock().get(name).cloned()
+    }
+
+    pub(crate) fn insert_import(&self, name: String, val: Value) {
+        self.imports.lock().insert(name, val);
+    }
+
+    pub(crate) fn snapshot_imports(&self) -> HashMap<String, Value> {
+        self.imports.lock().clone()
+    }
+}
+
+impl std::ops::Deref for ModuleGlobalsInner {
+    type Target = [GlobalCell];
+
+    #[inline]
+    fn deref(&self) -> &[GlobalCell] {
+        &self.slots
+    }
+}
+
+/// Per-module global slot & lexical import storage handle.
+pub type ModuleGlobals = Arc<ModuleGlobalsInner>;
 
 /// Interior-mutable heap cell backing locals captured by closures and mutated across boundaries.
 pub type UpvalueCell = Arc<Mutex<Value>>;
@@ -298,6 +332,17 @@ pub struct StructInitState {
     pub current_field: String,
 }
 
+/// P5-4: Structural PyTree template recorded when registering differentiated inputs for
+/// `grad` / `value_and_grad`, allowing gradients to be reconstructed with the exact original
+/// container shape (`Tensor`, scalar float, `list<...>`, or `dict<string, ...>`).
+#[derive(Debug, Clone)]
+pub enum GradTreeSpec {
+    TensorLeaf,
+    ScalarLeaf(crate::common::DType),
+    List(Vec<GradTreeSpec>),
+    Dict(Vec<(String, GradTreeSpec)>),
+}
+
 /// Iterative state machine frames for higher-order builtins and collection methods.
 #[derive(Debug, Clone)]
 pub enum CombinatorFrame {
@@ -336,9 +381,9 @@ pub enum CombinatorFrame {
     AutogradEval {
         tape_id: u64,
         leaf_nodes: Vec<usize>,
-        /// `Some(dt)` if the original input was a scalar float/ScalarValue (unwrap 0-D grad tensor back to scalar);
-        /// `None` if the original input was a `Value::Tensor`.
-        scalar_flags: Vec<Option<crate::common::DType>>,
+        /// PyTree structure for every differentiated argument in `argnums`, preserving
+        /// scalars, tensors, nested lists, and string-keyed dicts on gradient reconstruction.
+        tree_specs: Vec<GradTreeSpec>,
         return_value: bool,
     },
     /// Forward-mode JVP evaluation (`jvp(f, primals, tangents)`).
@@ -439,37 +484,45 @@ pub struct CapturedContinuation {
 
 /// Initialize module global cells from `prog.globals`.
 pub fn init_globals(prog: &ControlProgram) -> ModuleGlobals {
-    let cells = prog
+    let slots = prog
         .globals
         .iter()
         .map(|meta| Arc::new(Mutex::new((Value::Nil, meta.exported))))
         .collect();
-    Arc::new(cells)
+    Arc::new(ModuleGlobalsInner {
+        slots,
+        imports: Mutex::new(HashMap::new()),
+    })
 }
 
 /// Snapshot all module globals as `(value, is_exported)` tuples.
-pub fn snapshot_globals(globals: &ModuleGlobals) -> Vec<(Value, bool)> {
+pub(crate) fn snapshot_globals(globals: &ModuleGlobals) -> Vec<(Value, bool)> {
     globals.iter().map(|cell| cell.lock().clone()).collect()
 }
 
 /// Restore module globals from a previous [`snapshot_globals`] slice.
-pub fn restore_globals(globals: &ModuleGlobals, snap: &[(Value, bool)]) {
+pub(crate) fn restore_globals(globals: &ModuleGlobals, snap: &[(Value, bool)]) {
     for (cell, saved) in globals.iter().zip(snap.iter()) {
         *cell.lock() = saved.clone();
     }
 }
 
-/// Clone module globals into isolated mutex cells for concurrent worker execution.
-pub fn clone_isolated_globals(snap: &[(Value, bool)]) -> ModuleGlobals {
-    Arc::new(
-        snap.iter()
+/// Clone module globals and lexical imports into isolated mutex cells for parallel workers.
+pub(crate) fn clone_isolated_globals_with_imports(
+    snap: &[(Value, bool)],
+    imports: HashMap<String, Value>,
+) -> ModuleGlobals {
+    Arc::new(ModuleGlobalsInner {
+        slots: snap
+            .iter()
             .map(|entry| Arc::new(Mutex::new(entry.clone())))
             .collect(),
-    )
+        imports: Mutex::new(imports),
+    })
 }
 
 /// Resolve closure/sub-function `CaptureSource` descriptors from the active parent frame.
-pub fn resolve_captures(
+pub(crate) fn resolve_captures(
     captures: &[CaptureSource],
     parent_locals: &[LocalCell],
     parent_upvalues: &[UpvalueValue],
@@ -503,7 +556,7 @@ pub fn resolve_captures(
 }
 
 /// Clone worker upvalue slices while isolating shared mutable cells per concurrent worker.
-pub fn clone_worker_upvalues(
+pub(crate) fn clone_worker_upvalues(
     upvalues: &[UpvalueValue],
     child_func: &ControlFunction,
     cell_map: &mut HashMap<usize, UpvalueCell>,
@@ -547,7 +600,7 @@ pub fn materialize_frame(
 /// Construct a new [`ScriptFrame`] with positional + optional named keyword arguments,
 /// reordering named arguments into parameter slots and populating omitted defaulted parameters
 /// with [`Value::MissingArg`] for the callee's entry prologue.
-pub fn materialize_frame_named(
+pub(crate) fn materialize_frame_named(
     program: Arc<ControlProgram>,
     func_id: FnId,
     globals: ModuleGlobals,
@@ -690,7 +743,7 @@ pub fn materialize_frame_named(
 }
 
 /// Bind `perform` arguments and captured [`CapturedContinuation`] into a `HandleHandler` frame.
-pub fn materialize_handler_frame(
+pub(crate) fn materialize_handler_frame(
     barrier: &HandleBarrierState,
     perform_args: &[Value],
     cont: Arc<CapturedContinuation>,

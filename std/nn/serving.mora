@@ -1,0 +1,259 @@
+-- Mora Pure Standard Library: `std/nn/serving`
+-- Continuous-Batching LLM Serving Engine written 100% in pure Mora:
+-- - Powered by Go-style `spawn` + `channel` worker scheduling
+-- - Backed by `KVPageAllocator` with RadixAttention prefix caching (`attach_prefix` / `cache_prefix`)
+-- - OpenAI-compatible HTTP API (`/v1/chat/completions` with both JSON & real-time SSE token streaming,
+--   `/v1/models`, `/health`, `/metrics`) via `std/net/http` + `std/trace` (`trace_http_middleware`)
+-- - Native Model Context Protocol (MCP) server exposing LLM completion & telemetry tools via `std/mcp`
+
+import "std/nn/layers"
+import "std/nn/tokenizer"
+import "std/net/http"
+import "std/mcp"
+import "std/trace"
+
+export struct GenerationRequest
+  req_id: int
+  prompt_text: string
+  max_tokens: int
+  reply_ch: any
+end
+
+export struct TokenDelta
+  token_id: int
+  text: string
+  done: bool
+  prefix_hit_tokens: int
+end
+
+export struct ServingEngine
+  model: CausalLM
+  tok: Tokenizer
+  kv: kv_allocator
+  model_name: string = "mora-llm"
+  req_ch: any
+  next_req_id_ch: any
+  stats_ch: any
+  worker_handle: any
+end
+
+-- Extract concatenated chat prompt text from OpenAI `messages: [{"role":..., "content":...}]` or `prompt`.
+export task extract_prompt_text(body_obj: dict<string, any>): string
+  let raw_prompt = body_obj.get("prompt")
+  if raw_prompt != nil then
+    return str(raw_prompt)
+  end
+  let msgs = body_obj.get("messages")
+  if msgs == nil then
+    return ""
+  end
+  let out = ""
+  for msg in msgs
+    let role = msg.get("role")
+    let content = msg.get("content")
+    if out != "" then
+      assign out = out + "\n"
+    end
+    let r_str = if role != nil then str(role) else "user" end
+    let c_str = if content != nil then str(content) else "" end
+    assign out = out + r_str + ": " + c_str
+  end
+  return out
+end
+
+-- Start a background continuous-batching scheduler fiber backed by `channel` + `KVPageAllocator`.
+export task create_serving_engine(model: CausalLM, tok: Tokenizer, kv: kv_allocator, model_name: string = "mora-llm"): ServingEngine
+  let req_ch = channel(64)
+  let id_ch = channel(1)
+  id_ch.send(1)
+  let stats_ch = channel(1)
+  let init_stats: dict<string, int> = {"requests_served": 0, "tokens_generated": 0, "prefix_hit_tokens": 0}
+  stats_ch.send(init_stats)
+
+  -- Spawn cooperative continuous-batching worker fiber processing queued requests with RadixAttention!
+  let worker_handle = spawn fn()
+    while true
+      let item = req_ch.recv()
+      if item == nil then
+        break
+      end
+      let r: GenerationRequest = item
+      let prompt_ids = tok.encode(r.prompt_text, false, false)
+      let hit_tokens = kv.match_prefix(prompt_ids)
+      let gen_ids = model.generate_greedy(prompt_ids, r.max_tokens, tok.eos_id, kv, r.req_id)
+
+      -- Stream token deltas one by one over the per-request channel!
+      let idx = 0
+      while idx < gen_ids.len()
+        let tid = gen_ids[idx]
+        let piece = tok.decode([tid], true)
+        r.reply_ch.send(TokenDelta(token_id = tid, text = piece, done = false, prefix_hit_tokens = hit_tokens))
+        assign idx = idx + 1
+      end
+      -- Update aggregate engine telemetry atomically BEFORE signaling `done = true`
+      -- so immediate post-completion `/metrics` queries observe exact counts without races.
+      let st = stats_ch.recv()
+      let next_st = st.set("requests_served", st.get("requests_served") + 1).set("tokens_generated", st.get("tokens_generated") + gen_ids.len()).set("prefix_hit_tokens", st.get("prefix_hit_tokens") + hit_tokens)
+      stats_ch.send(next_st)
+      r.reply_ch.send(TokenDelta(token_id = -1, text = "", done = true, prefix_hit_tokens = hit_tokens))
+    end
+  end
+
+  return ServingEngine(model = model, tok = tok, kv = kv, model_name = model_name, req_ch = req_ch, next_req_id_ch = id_ch, stats_ch = stats_ch, worker_handle = worker_handle)
+end
+
+export impl ServingEngine
+  task alloc_req_id(self): int
+    let cur = self.next_req_id_ch.recv()
+    self.next_req_id_ch.send(cur + 1)
+    return cur
+  end
+
+  task engine_stats(self): dict<string, int>
+    let st = self.stats_ch.recv()
+    self.stats_ch.send(st)
+    let kv_st = self.kv.stats()
+    return st.set("prefix_cache_hits", kv_st["prefix_cache_hits"]).set("prefix_cached_pages", kv_st["prefix_cached_pages"]).set("used_pages", kv_st["used_pages"]).set("free_pages", kv_st["free_pages"])
+  end
+
+  -- Enqueue a generation request and return a streaming `channel` of `TokenDelta`s.
+  task submit_stream(self, prompt_text: string, max_tokens: int = 8): any
+    let rid = self.alloc_req_id()
+    let reply_ch = channel(max_tokens + 4)
+    let req = GenerationRequest(req_id = rid, prompt_text = prompt_text, max_tokens = max_tokens, reply_ch = reply_ch)
+    self.req_ch.send(req)
+    return reply_ch
+  end
+
+  -- Blocking convenience wrapper returning full generated text & prefix hit telemetry.
+  task generate_text(self, prompt_text: string, max_tokens: int = 8): dict<string, any>
+    let ch = self.submit_stream(prompt_text, max_tokens)
+    let full = ""
+    let count = 0
+    let hit_tokens = 0
+    while true
+      let d: TokenDelta = ch.recv()
+      assign hit_tokens = d.prefix_hit_tokens
+      if d.done then
+        break
+      end
+      assign full = full + d.text
+      assign count = count + 1
+    end
+    let out: dict<string, any> = {}
+    assign out = out.set("text", full).set("tokens_generated", count).set("prefix_hit_tokens", hit_tokens)
+    return out
+  end
+
+  task shutdown(self): nil
+    self.req_ch.send(nil)
+    self.worker_handle.join()
+    return nil
+  end
+end
+
+task handle_chat_completions(engine: ServingEngine, req: HttpRequest, stream: tcp_stream | tls_stream): any
+  let parsed = req.body.json()
+  let err = parsed.get("err")
+  if err != nil then
+    return json_response(400, {"error": "Invalid JSON body: " + str(err)})
+  end
+  let body_obj = parsed.get("ok")
+  let prompt_text = extract_prompt_text(body_obj)
+  let raw_max = body_obj.get("max_tokens")
+  let max_tokens = if raw_max != nil then int(raw_max) else 8 end
+  let raw_stream = body_obj.get("stream")
+  let is_stream = raw_stream != nil and raw_stream == true
+  let comp_id = "chatcmpl-mora-" + str(engine.alloc_req_id())
+
+  if is_stream then
+    let delta_ch = engine.submit_stream(prompt_text, max_tokens)
+    sse_start(stream)
+    while true
+      let d: TokenDelta = delta_ch.recv()
+      if d.done then
+        let fin_delta: dict<string, any> = {}
+        let fin_choice: dict<string, any> = {}
+        assign fin_choice = fin_choice.set("index", 0).set("delta", fin_delta).set("finish_reason", "stop")
+        let fin_chunk: dict<string, any> = {}
+        assign fin_chunk = fin_chunk.set("id", comp_id).set("object", "chat.completion.chunk").set("model", engine.model_name).set("choices", [fin_choice])
+        sse_send(stream, "", json.stringify(fin_chunk))
+        sse_send(stream, "", "[DONE]")
+        break
+      end
+      let delta_obj: dict<string, any> = {}
+      assign delta_obj = delta_obj.set("content", d.text)
+      let choice_obj: dict<string, any> = {}
+      assign choice_obj = choice_obj.set("index", 0).set("delta", delta_obj).set("finish_reason", nil)
+      let chunk: dict<string, any> = {}
+      assign chunk = chunk.set("id", comp_id).set("object", "chat.completion.chunk").set("model", engine.model_name).set("choices", [choice_obj])
+      sse_send(stream, "", json.stringify(chunk))
+    end
+    return nil
+  end
+
+  let res = engine.generate_text(prompt_text, max_tokens)
+  let msg_obj: dict<string, any> = {}
+  assign msg_obj = msg_obj.set("role", "assistant").set("content", res.get("text"))
+  let choice: dict<string, any> = {}
+  assign choice = choice.set("index", 0).set("message", msg_obj).set("finish_reason", "stop")
+  let usage: dict<string, any> = {}
+  assign usage = usage.set("completion_tokens", res.get("tokens_generated")).set("prefix_hit_tokens", res.get("prefix_hit_tokens"))
+  let out: dict<string, any> = {}
+  assign out = out.set("id", comp_id).set("object", "chat.completion").set("model", engine.model_name).set("choices", [choice]).set("usage", usage)
+  return json_response(200, out)
+end
+
+-- Build an OpenAI-compatible `http.Router` with `std/trace` latency middleware attached:
+-- - `POST /v1/chat/completions` (`stream: true` -> live SSE deltas + `[DONE]`; `stream: false` -> JSON)
+-- - `GET  /v1/models`
+-- - `GET  /metrics`
+-- - `GET  /health`
+export task build_http_router(engine: ServingEngine): Router
+  let r = router()
+  assign r = r.use_middleware(trace_http_middleware())
+
+  assign r = r.get("/health", fn(req: HttpRequest, stream: tcp_stream | tls_stream)
+    return json_response(200, {"status": "ok", "model": engine.model_name})
+  end)
+
+  assign r = r.get("/v1/models", fn(req: HttpRequest, stream: tcp_stream | tls_stream)
+    let item: dict<string, any> = {}
+    assign item = item.set("id", engine.model_name).set("object", "model").set("owned_by", "mora")
+    let resp_obj: dict<string, any> = {}
+    assign resp_obj = resp_obj.set("object", "list").set("data", [item])
+    return json_response(200, resp_obj)
+  end)
+
+  assign r = r.get("/metrics", fn(req: HttpRequest, stream: tcp_stream | tls_stream)
+    return json_response(200, engine.engine_stats())
+  end)
+
+  assign r = r.post("/v1/chat/completions", fn(req: HttpRequest, stream: tcp_stream | tls_stream)
+    return handle_chat_completions(engine, req, stream)
+  end)
+
+  return r
+end
+
+-- Build a native MCP server (`std/mcp`) exposing `generate_completion` & `serving_stats` tools.
+export task build_mcp_server(engine: ServingEngine): McpServer
+  let srv = server("mora-llm-serving", "0.112.0")
+  let gen_props: dict<string, any> = {}
+  assign gen_props = gen_props.set("prompt", {"type": "string"}).set("max_tokens", {"type": "integer"})
+  let gen_schema: dict<string, any> = {}
+  assign gen_schema = gen_schema.set("type", "object").set("properties", gen_props).set("required", ["prompt"])
+  assign srv = srv.tool("generate_completion", "Generate text with Mora CausalLM + RadixAttention KV cache", gen_schema, fn(args: dict<string, any>)
+    let p = str(args.get("prompt"))
+    let mt_raw: any = args.get("max_tokens")
+    let mt = if mt_raw != nil then int(mt_raw) else 8 end
+    return engine.generate_text(p, mt)
+  end)
+  let empty_props: dict<string, any> = {}
+  let stats_schema: dict<string, any> = {}
+  assign stats_schema = stats_schema.set("type", "object").set("properties", empty_props)
+  assign srv = srv.tool("serving_stats", "Return live LLM serving & RadixAttention KV cache metrics", stats_schema, fn(args: dict<string, any>)
+    return engine.engine_stats()
+  end)
+  return srv
+end

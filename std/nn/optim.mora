@@ -1,0 +1,210 @@
+-- Mora Pure Standard Library: `std/nn/optim`
+-- Training primitives written 100% in pure Mora:
+-- - `cross_entropy_loss`: differentiable sequence language-modeling loss
+-- - `cosine_lr_schedule`: linear warmup + cosine learning-rate decay
+-- - `clip_grad_norm`: global L2 gradient norm clipping across parameter lists
+-- - `SGD`: stochastic gradient descent with momentum and weight decay
+-- - `AdamW`: decoupled weight-decay adaptive moment optimizer with bias correction
+-- - `sync_grads_async`: overlapped gradient reduction via `ProcessGroup.all_reduce_async`
+
+import "std/nn/layers"
+
+task scalar_t(val: float, dt: string, dev: string): any
+  return Tensor::full([1], val, dt, dev)
+end
+
+-- Differentiable cross-entropy loss between `[seq_len, vocab_size]` logits and `target_ids`.
+export task cross_entropy_loss(logits: any, target_ids: list<int>): any
+  let sh = logits.shape()
+  let seq_len = sh[0]
+  let vocab_size = sh[1]
+  let dt = logits.dtype()
+  let dev = logits.device()
+  let probs = logits.softmax()
+  let eps = scalar_t(0.0000001, dt, dev)
+  let log_probs = (probs + eps).ln()
+  let targets = one_hot_matrix(target_ids, vocab_size, dt, dev)
+  let neg_inv_n = scalar_t(-1.0 / (seq_len * 1.0), dt, dev)
+  return (targets * log_probs * neg_inv_n).sum()
+end
+
+-- Linear warmup (`0..warmup_steps`) followed by cosine decay (`warmup_steps..total_steps`) to `min_lr`.
+export task cosine_lr_schedule(step: int, warmup_steps: int, total_steps: int, max_lr: float, min_lr: float = 0.0): float
+  if step <= 0 then
+    if warmup_steps > 0 then
+      return max_lr / (warmup_steps * 1.0)
+    end
+    return max_lr
+  end
+  if warmup_steps > 0 and step < warmup_steps then
+    return max_lr * ((step + 1) * 1.0) / (warmup_steps * 1.0)
+  end
+  if step >= total_steps then
+    return min_lr
+  end
+  let decay_steps = total_steps - warmup_steps
+  if decay_steps <= 0 then
+    return min_lr
+  end
+  let progress = ((step - warmup_steps) * 1.0) / (decay_steps * 1.0)
+  let cos_val = math.cos(math.PI * progress)
+  return min_lr + 0.5 * (max_lr - min_lr) * (1.0 + cos_val)
+end
+
+-- Global L2 norm clipping across a list of gradient tensors.
+export task clip_grad_norm(grads: list<any>, max_norm: float): list<any>
+  if max_norm <= 0.0 or grads.len() == 0 then
+    return grads
+  end
+  let total_sq = 0.0
+  for g in grads
+    let sq = (g * g).sum()
+    assign total_sq = total_sq + float(sq)
+  end
+  let norm = math.sqrt(total_sq)
+  if norm <= max_norm or norm <= 0.0 then
+    return grads
+  end
+  let coef = max_norm / (norm + 0.000001)
+  let out: list<any> = []
+  for g in grads
+    let sc = scalar_t(coef, g.dtype(), g.device())
+    assign out = out.push(g * sc)
+  end
+  return out
+end
+
+-- Launch non-blocking overlapped gradient AllReduce across all parameter gradients using
+-- `ProcessGroup.all_reduce_async(g, op)` and join all `TaskHandle<Tensor>`s.
+export task sync_grads_async(pg: process_group, grads: list<any>, op: string = "mean"): list<any>
+  let handles: list<any> = []
+  for g in grads
+    let h = pg.all_reduce_async(g, op)
+    assign handles = handles.push(h)
+  end
+  let synced: list<any> = []
+  for h in handles
+    assign synced = synced.push(h.join())
+  end
+  return synced
+end
+
+-- SGD optimizer with optional momentum & weight decay.
+export struct SGD
+  lr: float = 0.01
+  momentum: float = 0.0
+  weight_decay: float = 0.0
+  velocities: list<any>
+end
+
+export struct SgdStepResult
+  params: list<any>
+  state: SGD
+end
+
+export task sgd_new(params: list<any>, lr: float = 0.01, momentum: float = 0.0, weight_decay: float = 0.0): SGD
+  let vels: list<any> = []
+  for p in params
+    assign vels = vels.push(Tensor::zeros(p.shape(), p.dtype(), p.device()))
+  end
+  return SGD(lr = lr, momentum = momentum, weight_decay = weight_decay, velocities = vels)
+end
+
+export impl SGD
+  task step(self, params: list<any>, grads: list<any>, lr_override: float = -1.0): SgdStepResult
+    let lr = if lr_override >= 0.0 then lr_override else self.lr end
+    let next_params: list<any> = []
+    let next_vels: list<any> = []
+    let i = 0
+    while i < params.len()
+      let p = params[i]
+      let g = grads[i]
+      let dt = p.dtype()
+      let dev = p.device()
+      let eff_g = g
+      if self.weight_decay > 0.0 then
+        assign eff_g = eff_g + (p * scalar_t(self.weight_decay, dt, dev))
+      end
+      let v = eff_g
+      if self.momentum > 0.0 then
+        assign v = (self.velocities[i] * scalar_t(self.momentum, dt, dev)) + eff_g
+      end
+      let next_p = p - (v * scalar_t(lr, dt, dev))
+      assign next_params = next_params.push(next_p)
+      assign next_vels = next_vels.push(v)
+      assign i = i + 1
+    end
+    let next_opt = SGD(lr = self.lr, momentum = self.momentum, weight_decay = self.weight_decay, velocities = next_vels)
+    return SgdStepResult(params = next_params, state = next_opt)
+  end
+end
+
+-- AdamW optimizer (decoupled weight decay + bias-corrected first & second moments).
+export struct AdamW
+  lr: float = 0.001
+  beta1: float = 0.9
+  beta2: float = 0.999
+  eps: float = 0.00000001
+  weight_decay: float = 0.01
+  step_count: int = 0
+  m: list<any>
+  v: list<any>
+end
+
+export struct AdamWStepResult
+  params: list<any>
+  state: AdamW
+end
+
+export task adamw_new(params: list<any>, lr: float = 0.001, beta1: float = 0.9, beta2: float = 0.999, eps: float = 0.00000001, weight_decay: float = 0.01): AdamW
+  let ms: list<any> = []
+  let vs: list<any> = []
+  for p in params
+    assign ms = ms.push(Tensor::zeros(p.shape(), p.dtype(), p.device()))
+    assign vs = vs.push(Tensor::zeros(p.shape(), p.dtype(), p.device()))
+  end
+  return AdamW(lr = lr, beta1 = beta1, beta2 = beta2, eps = eps, weight_decay = weight_decay, step_count = 0, m = ms, v = vs)
+end
+
+export impl AdamW
+  task step(self, params: list<any>, grads: list<any>, lr_override: float = -1.0): AdamWStepResult
+    let lr = if lr_override >= 0.0 then lr_override else self.lr end
+    let t = self.step_count + 1
+    let bc1 = 1.0 - math.pow(self.beta1, t * 1.0)
+    let bc2 = 1.0 - math.pow(self.beta2, t * 1.0)
+    let next_params: list<any> = []
+    let next_m: list<any> = []
+    let next_v: list<any> = []
+    let i = 0
+    while i < params.len()
+      let p = params[i]
+      let g = grads[i]
+      let dt = p.dtype()
+      let dev = p.device()
+      let b1_t = scalar_t(self.beta1, dt, dev)
+      let omb1_t = scalar_t(1.0 - self.beta1, dt, dev)
+      let b2_t = scalar_t(self.beta2, dt, dev)
+      let omb2_t = scalar_t(1.0 - self.beta2, dt, dev)
+
+      let m_i = (self.m[i] * b1_t) + (g * omb1_t)
+      let v_i = (self.v[i] * b2_t) + ((g * g) * omb2_t)
+
+      let m_hat = m_i * scalar_t(1.0 / bc1, dt, dev)
+      let v_hat = v_i * scalar_t(1.0 / bc2, dt, dev)
+      let denom = v_hat.sqrt() + scalar_t(self.eps, dt, dev)
+      let update = (m_hat / denom) * scalar_t(lr, dt, dev)
+
+      let decayed_p = p
+      if self.weight_decay > 0.0 then
+        assign decayed_p = p * scalar_t(1.0 - lr * self.weight_decay, dt, dev)
+      end
+      let next_p = decayed_p - update
+      assign next_params = next_params.push(next_p)
+      assign next_m = next_m.push(m_i)
+      assign next_v = next_v.push(v_i)
+      assign i = i + 1
+    end
+    let next_state = AdamW(lr = self.lr, beta1 = self.beta1, beta2 = self.beta2, eps = self.eps, weight_decay = self.weight_decay, step_count = t, m = next_m, v = next_v)
+    return AdamWStepResult(params = next_params, state = next_state)
+  end
+end

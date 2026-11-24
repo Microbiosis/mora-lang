@@ -86,6 +86,21 @@ pub(crate) fn list_zero_arg_test_tasks(prog: &ControlProgram) -> Vec<(String, Fn
         .collect()
 }
 
+/// P5-4B: Discover all zero-argument `task bench_*()` functions defined in `prog` in declaration order.
+pub(crate) fn list_zero_arg_bench_tasks(prog: &ControlProgram) -> Vec<(String, FnId)> {
+    prog.globals
+        .iter()
+        .filter_map(|meta| match meta.kind {
+            GlobalKind::Task(fn_id)
+                if meta.name.starts_with("bench_") && prog.func(fn_id).params.is_empty() =>
+            {
+                Some((meta.name.clone(), fn_id))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// Execute a specific zero-argument task (`fn_id`) inside `prog` with its initialized `globals`.
 pub(crate) fn run_task_by_id(
     prog: Arc<ControlProgram>,

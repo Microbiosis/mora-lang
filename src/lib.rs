@@ -46,6 +46,12 @@ pub fn resolve_std_module(spec: &str) -> Option<&'static str> {
             Some(include_str!("../std/nn/safetensors.mora"))
         }
         "std/nn/gguf" | "std/nn/gguf.mora" => Some(include_str!("../std/nn/gguf.mora")),
+        "std/nn/layers" | "std/nn/layers.mora" => Some(include_str!("../std/nn/layers.mora")),
+        "std/nn/optim" | "std/nn/optim.mora" => Some(include_str!("../std/nn/optim.mora")),
+        "std/nn/tokenizer" | "std/nn/tokenizer.mora" => {
+            Some(include_str!("../std/nn/tokenizer.mora"))
+        }
+        "std/nn/serving" | "std/nn/serving.mora" => Some(include_str!("../std/nn/serving.mora")),
         "std/trace" | "std/trace.mora" => Some(include_str!("../std/trace.mora")),
         "std/json" | "std/json.mora" => Some(include_str!("../std/json.mora")),
         "std/os" | "std/os.mora" => Some(include_str!("../std/os.mora")),

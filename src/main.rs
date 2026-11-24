@@ -62,6 +62,12 @@ fn dispatch() -> i32 {
                 println!(
                     "  mora test [paths...]       Discover & run *_test.mora / test_*.mora [--filter <pat>] [--jobs <N>]"
                 );
+                println!(
+                    "  mora profile <file.mora>   Profile script spans & export Chrome Trace JSON [--out <file.json>] [--summary]"
+                );
+                println!(
+                    "  mora bench [paths...]      Discover & run *_bench.mora / bench_*.mora [--filter <pat>] [--iters <N>]"
+                );
                 println!("  mora install <url>         Install a package from a URL");
                 println!("  mora install --clean       Remove stale/broken packages from vendor/");
                 println!();
@@ -69,12 +75,18 @@ fn dispatch() -> i32 {
                 println!("  mora --help                Show this help");
                 return 0;
             }
-            // `fmt` and `test` skip the interactive banner so stdout/stderr stay CI- and pipe-clean.
+            // `fmt`, `test`, `profile`, and `bench` skip the interactive banner so stdout/stderr stay pipe-clean.
             "fmt" => {
                 return mora::cli::fmt::run_fmt(&args[2..]);
             }
             "test" => {
                 return mora::cli::test_runner::run_test(&args[2..], None);
+            }
+            "profile" => {
+                return mora::cli::profile::run_profile(&args[2..], None);
+            }
+            "bench" => {
+                return mora::cli::bench::run_bench(&args[2..], None);
             }
             // 仅看 `args[1]` 是否为 `--version` / `--help` / `fmt` / `test`；
             // 其余子命令（`run`、`build`、`install`、`--repl`、`--check`）和脚本路径继续正常分派。
@@ -146,6 +158,12 @@ fn dispatch() -> i32 {
         }
         "test" => {
             return mora::cli::test_runner::run_test(&args[2..], opt_level);
+        }
+        "profile" => {
+            return mora::cli::profile::run_profile(&args[2..], opt_level);
+        }
+        "bench" => {
+            return mora::cli::bench::run_bench(&args[2..], opt_level);
         }
         _ => run_file(&args[1], opt_level),
     }

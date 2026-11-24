@@ -213,6 +213,8 @@ fn is_float_differentiable_type(ty: &Type) -> bool {
             Type::Scalar(dt) => dt.is_float(),
             _ => false,
         },
+        Type::List(elem) => is_float_differentiable_type(elem),
+        Type::Dict(_, val) => is_float_differentiable_type(val),
         Type::Union(ms) if !ms.is_empty() => ms.iter().any(is_float_differentiable_type),
         _ => false,
     }

@@ -1,0 +1,403 @@
+-- Mora Pure Standard Library: `std/nn/tokenizer`
+-- Byte-level BPE (Byte-Pair Encoding) Tokenizer implemented 100% in pure Mora:
+-- - Lossless 256-byte base alphabet encoded as canonical hex byte tokens (`b00`..`bff`)
+--   concatenated via `"+"` during BPE merges so every UTF-8 string round-trips 100% losslessly
+-- - `train_bpe(corpus, num_merges)`: trains real frequency-ranked BPE merge rules in pure Mora
+-- - `encode(text, add_bos?, add_eos?)` & `decode(ids, skip_special?)`
+-- - Direct `from_gguf_metadata(meta)` & `to_gguf_metadata()` integration with `std/nn/gguf`
+
+import "std/nn/gguf"
+
+export struct BpeMerge
+  left: string
+  right: string
+  merged: string
+  rank: int
+end
+
+export struct Tokenizer
+  vocab: list<string>
+  token_to_id: dict<string, int>
+  merges: list<BpeMerge>
+  merge_ranks: dict<string, int>
+  bos_id: int = 256
+  eos_id: int = 257
+  unk_id: int = 258
+end
+
+task hex_digit(n: int): string
+  let digits = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d", "e", "f"]
+  return digits[n &15]
+end
+
+task parse_hex_nibble(ch: string): int
+  if ch == "0" then return 0 end
+  if ch == "1" then return 1 end
+  if ch == "2" then return 2 end
+  if ch == "3" then return 3 end
+  if ch == "4" then return 4 end
+  if ch == "5" then return 5 end
+  if ch == "6" then return 6 end
+  if ch == "7" then return 7 end
+  if ch == "8" then return 8 end
+  if ch == "9" then return 9 end
+  if ch == "a" or ch == "A" then return 10 end
+  if ch == "b" or ch == "B" then return 11 end
+  if ch == "c" or ch == "C" then return 12 end
+  if ch == "d" or ch == "D" then return 13 end
+  if ch == "e" or ch == "E" then return 14 end
+  if ch == "f" or ch == "F" then return 15 end
+  return -1
+end
+
+-- Canonical hex token representation for a single byte `0..255`, e.g. 65 -> "b41".
+export task byte_token_name(b: int): string
+  let hi = (b >> 4) &15
+  let lo = b &15
+  return "b" + hex_digit(hi) + hex_digit(lo)
+end
+
+task unwrap_int(v: any, fallback: int): int
+  if v == nil then
+    return fallback
+  end
+  return int(v)
+end
+
+-- Decode a single hex-byte token (`"b41"`) or merged token (`"b41+b42"`) into raw byte integers.
+task token_to_bytes(tok: string): list<int>
+  let out: list<int> = []
+  let parts = tok.split("+")
+  for part in parts
+    if part.len() == 3 and part.starts_with("b") then
+      let raw_b = Tensor::from_utf8(part).to_list()
+      let b1 = int(raw_b[1])
+      let b2 = int(raw_b[2])
+      let hi = if b1 >= 48 and b1 <= 57 then b1 - 48 else b1 - 87 end
+      let lo = if b2 >= 48 and b2 <= 57 then b2 - 48 else b2 - 87 end
+      assign out = out.push((hi << 4) | lo)
+      nil
+    else
+      -- Plain UTF-8 token (e.g. from external GGUF vocabularies)
+      let raw_b = Tensor::from_utf8(part).to_list()
+      for rb in raw_b
+        assign out = out.push(int(rb))
+      end
+      nil
+    end
+  end
+  return out
+end
+
+-- Construct the base 259-token lossless byte-level tokenizer (256 bytes + <bos>, <eos>, <unk>).
+export task byte_level_base_tokenizer(): Tokenizer
+  let vocab: list<string> = []
+  let t2i: dict<string, int> = {}
+  let b = 0
+  while b < 256
+    let name = byte_token_name(b)
+    assign vocab = vocab.push(name)
+    assign t2i = t2i.set(name, b)
+    assign b = b + 1
+  end
+  assign vocab = vocab.push("<bos>")
+  assign t2i = t2i.set("<bos>", 256)
+  assign vocab = vocab.push("<eos>")
+  assign t2i = t2i.set("<eos>", 257)
+  assign vocab = vocab.push("<unk>")
+  assign t2i = t2i.set("<unk>", 258)
+  let merges: list<BpeMerge> = []
+  let ranks: dict<string, int> = {}
+  return Tokenizer(vocab = vocab, token_to_id = t2i, merges = merges, merge_ranks = ranks, bos_id = 256, eos_id = 257, unk_id = 258)
+end
+
+-- Construct a `Tokenizer` from explicit vocab list and `"left right"` BPE merge strings.
+export task from_vocab_and_merges(vocab: list<string>, merge_lines: list<string>, bos_id: int = 256, eos_id: int = 257, unk_id: int = 258): Tokenizer
+  let t2i: dict<string, int> = {}
+  let i = 0
+  while i < vocab.len()
+    assign t2i = t2i.set(vocab[i], i)
+    assign i = i + 1
+  end
+  let merges: list<BpeMerge> = []
+  let ranks: dict<string, int> = {}
+  let r = 0
+  while r < merge_lines.len()
+    let line = merge_lines[r].trim()
+    let parts = line.split(" ")
+    if parts.len() >= 2 then
+      let left = parts[0]
+      let right = parts[1]
+      let merged = if left.starts_with("b") and right.starts_with("b") then left + "+" + right else left + right end
+      let key = left + " " + right
+      assign merges = merges.push(BpeMerge(left = left, right = right, merged = merged, rank = r))
+      assign ranks = ranks.set(key, r)
+      if t2i.get(merged) == nil then
+        let new_id = vocab.len()
+        assign vocab = vocab.push(merged)
+        assign t2i = t2i.set(merged, new_id)
+      end
+    end
+    assign r = r + 1
+  end
+  return Tokenizer(vocab = vocab, token_to_id = t2i, merges = merges, merge_ranks = ranks, bos_id = bos_id, eos_id = eos_id, unk_id = unk_id)
+end
+
+-- Train a real frequency-ranked byte-level BPE tokenizer from `corpus` with up to `num_merges` merges.
+export task train_bpe(corpus: list<string>, num_merges: int = 32): Tokenizer
+  let base = byte_level_base_tokenizer()
+  let vocab = base.vocab
+  let t2i = base.token_to_id
+  let merges: list<BpeMerge> = []
+  let ranks: dict<string, int> = {}
+
+  -- Convert every corpus document into initial byte-token sequences
+  let seqs: list<list<string>> = []
+  for doc in corpus
+    let raw = Tensor::from_utf8(doc).to_list()
+    let syms: list<string> = []
+    for rb in raw
+      assign syms = syms.push(byte_token_name(int(rb)))
+    end
+    if syms.len() > 0 then
+      assign seqs = seqs.push(syms)
+    end
+  end
+
+  let step = 0
+  while step < num_merges
+    let counts: dict<string, int> = {}
+    let best_key = ""
+    let best_count = 1
+    for seq in seqs
+      let j = 0
+      while j + 1 < seq.len()
+        let key = seq[j] + " " + seq[j + 1]
+        let next_c = unwrap_int(counts.get(key), 0) + 1
+        assign counts = counts.set(key, next_c)
+        if next_c > best_count then
+          assign best_count = next_c
+          assign best_key = key
+        end
+        assign j = j + 1
+      end
+    end
+    if best_key == "" then
+      break
+    end
+    let pair = best_key.split(" ")
+    let left = pair[0]
+    let right = pair[1]
+    let merged = left + "+" + right
+    assign merges = merges.push(BpeMerge(left = left, right = right, merged = merged, rank = step))
+    assign ranks = ranks.set(best_key, step)
+    if t2i.get(merged) == nil then
+      let nid = vocab.len()
+      assign vocab = vocab.push(merged)
+      assign t2i = t2i.set(merged, nid)
+    end
+    -- Apply merge across all sequences
+    let next_seqs: list<list<string>> = []
+    for seq in seqs
+      let out: list<string> = []
+      let j = 0
+      while j < seq.len()
+        if j + 1 < seq.len() and seq[j] == left and seq[j + 1] == right then
+          assign out = out.push(merged)
+          assign j = j + 2
+        else
+          assign out = out.push(seq[j])
+          assign j = j + 1
+        end
+      end
+      assign next_seqs = next_seqs.push(out)
+    end
+    assign seqs = next_seqs
+    assign step = step + 1
+  end
+
+  return Tokenizer(vocab = vocab, token_to_id = t2i, merges = merges, merge_ranks = ranks, bos_id = 256, eos_id = 257, unk_id = 258)
+end
+
+-- Load a BPE `Tokenizer` from GGUF metadata dictionary (`tokenizer.ggml.tokens` & `tokenizer.ggml.merges`).
+export task from_gguf_metadata(meta: dict<string, any>): Tokenizer
+  let raw_tokens = meta.get("tokenizer.ggml.tokens")
+  let raw_merges = meta.get("tokenizer.ggml.merges")
+  let bos_raw = meta.get("tokenizer.ggml.bos_token_id")
+  let eos_raw = meta.get("tokenizer.ggml.eos_token_id")
+  let unk_raw = meta.get("tokenizer.ggml.unknown_token_id")
+
+  let vocab: list<string> = []
+  if raw_tokens != nil then
+    for tok in raw_tokens
+      assign vocab = vocab.push(str(tok))
+    end
+  end
+  if vocab.len() == 0 then
+    return byte_level_base_tokenizer()
+  end
+
+  let merge_lines: list<string> = []
+  if raw_merges != nil then
+    for m in raw_merges
+      assign merge_lines = merge_lines.push(str(m))
+    end
+  end
+  let bos_id = unwrap_int(bos_raw, 256)
+  let eos_id = unwrap_int(eos_raw, 257)
+  let unk_id = unwrap_int(unk_raw, 258)
+  return from_vocab_and_merges(vocab, merge_lines, bos_id, eos_id, unk_id)
+end
+
+-- RFC 3629 UTF-8 byte sanitizer: preserves every valid 1..4-byte UTF-8 sequence losslessly and
+-- replaces any malformed or incomplete lone byte (common during incremental single-token byte-BPE
+-- streaming) with U+FFFD (`0xEF 0xBF 0xBD`).
+task is_utf8_cont(b: int): bool
+  return b >= 128 and b <= 191
+end
+
+task sanitize_utf8_bytes(raw: list<int>): list<int>
+  let out: list<int> = []
+  let n = raw.len()
+  let i = 0
+  while i < n
+    let b0 = raw[i]
+    if b0 >= 0 and b0 <= 127 then
+      assign out = out.push(b0)
+      assign i = i + 1
+    else
+      if b0 >= 194 and b0 <= 223 and i + 1 < n and is_utf8_cont(raw[i + 1]) then
+        assign out = out.push(b0).push(raw[i + 1])
+        assign i = i + 2
+      else
+        if b0 >= 224 and b0 <= 239 and i + 2 < n and is_utf8_cont(raw[i + 1]) and is_utf8_cont(raw[i + 2]) and !(b0 == 224 and raw[i + 1] < 160) and !(b0 == 237 and raw[i + 1] >= 160) then
+          assign out = out.push(b0).push(raw[i + 1]).push(raw[i + 2])
+          assign i = i + 3
+        else
+          if b0 >= 240 and b0 <= 244 and i + 3 < n and is_utf8_cont(raw[i + 1]) and is_utf8_cont(raw[i + 2]) and is_utf8_cont(raw[i + 3]) and !(b0 == 240 and raw[i + 1] < 144) and !(b0 == 244 and raw[i + 1] >= 144) then
+            assign out = out.push(b0).push(raw[i + 1]).push(raw[i + 2]).push(raw[i + 3])
+            assign i = i + 4
+          else
+            -- Replacement character U+FFFD (EF BF BD)
+            assign out = out.push(239).push(191).push(189)
+            assign i = i + 1
+          end
+        end
+      end
+    end
+  end
+  return out
+end
+
+export impl Tokenizer
+  task vocab_size(self): int
+    return self.vocab.len()
+  end
+
+  -- Export GGUF-standard `tokenizer.ggml.*` metadata entries compatible with `std/nn/gguf`.
+  task to_gguf_metadata(self): dict<string, any>
+    let m: dict<string, any> = {}
+    let merge_strs: list<any> = []
+    for mg in self.merges
+      assign merge_strs = merge_strs.push(mg.left + " " + mg.right)
+    end
+    let tok_any: list<any> = []
+    for t in self.vocab
+      assign tok_any = tok_any.push(t)
+    end
+    assign m = m.set("tokenizer.ggml.model", meta_string("gpt2"))
+    assign m = m.set("tokenizer.ggml.tokens", meta_array(GGUF_TYPE_STRING, tok_any))
+    assign m = m.set("tokenizer.ggml.merges", meta_array(GGUF_TYPE_STRING, merge_strs))
+    assign m = m.set("tokenizer.ggml.bos_token_id", meta_u32(self.bos_id))
+    assign m = m.set("tokenizer.ggml.eos_token_id", meta_u32(self.eos_id))
+    assign m = m.set("tokenizer.ggml.unknown_token_id", meta_u32(self.unk_id))
+    return m
+  end
+
+  -- Encode arbitrary UTF-8 `text` into BPE token IDs using greedy lowest-rank pair merges.
+  task encode(self, text: string, add_bos: bool = false, add_eos: bool = false): list<int>
+    let ids: list<int> = []
+    if add_bos then
+      assign ids = ids.push(self.bos_id)
+    end
+    if text != "" then
+      let raw = Tensor::from_utf8(text).to_list()
+      let syms: list<string> = []
+      for rb in raw
+        let b = int(rb)
+        let bname = byte_token_name(b)
+        if self.token_to_id.get(bname) != nil then
+          assign syms = syms.push(bname)
+        else
+          -- External plain-UTF8 GGUF vocabulary fallback
+          let single = Tensor::from_list([b], "u8").to_utf8()
+          assign syms = syms.push(single)
+        end
+      end
+
+      -- Iteratively merge lowest-rank adjacent BPE pair
+      while syms.len() >= 2
+        let best_rank = 1000000000
+        let best_idx = -1
+        let best_merged = ""
+        let i = 0
+        while i + 1 < syms.len()
+          let key = syms[i] + " " + syms[i + 1]
+          let rk = unwrap_int(self.merge_ranks.get(key), -1)
+          if rk >= 0 and rk < best_rank then
+            assign best_rank = rk
+            assign best_idx = i
+            assign best_merged = self.merges[rk].merged
+          end
+          assign i = i + 1
+        end
+        if best_idx < 0 then
+          break
+        end
+        let next_syms: list<string> = []
+        let j = 0
+        while j < syms.len()
+          if j == best_idx then
+            assign next_syms = next_syms.push(best_merged)
+            assign j = j + 2
+          else
+            assign next_syms = next_syms.push(syms[j])
+            assign j = j + 1
+          end
+        end
+        assign syms = next_syms
+      end
+
+      for s in syms
+        let tid = unwrap_int(self.token_to_id.get(s), self.unk_id)
+        assign ids = ids.push(tid)
+      end
+    end
+    if add_eos then
+      assign ids = ids.push(self.eos_id)
+    end
+    return ids
+  end
+
+  -- Losslessly decode token IDs back into a UTF-8 string.
+  task decode(self, ids: list<int>, skip_special: bool = true): string
+    let bytes: list<int> = []
+    for tid in ids
+      if skip_special and (tid == self.bos_id or tid == self.eos_id or tid == self.unk_id) then
+        continue
+      end
+      if tid >= 0 and tid < self.vocab.len() then
+        let tok = self.vocab[tid]
+        let b_list = token_to_bytes(tok)
+        for b in b_list
+          assign bytes = bytes.push(b)
+        end
+      end
+    end
+    if bytes.len() == 0 then
+      return ""
+    end
+    let safe_bytes = sanitize_utf8_bytes(bytes)
+    return Tensor::from_list(safe_bytes, "u8").to_utf8()
+  end
+end

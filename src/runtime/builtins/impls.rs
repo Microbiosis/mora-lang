@@ -77,6 +77,8 @@ pub(crate) fn eval_pure_builtin(
         BuiltinFnId::Tensor => Some(crate::value::tensor::call_builtin_tensor(args)),
         BuiltinFnId::Grad => Some(call_builtin_grad(args, false)),
         BuiltinFnId::ValueAndGrad => Some(call_builtin_grad(args, true)),
+        BuiltinFnId::Ok => Some(call_builtin_result_variant("Ok", args)),
+        BuiltinFnId::Err => Some(call_builtin_result_variant("Err", args)),
         BuiltinFnId::Swap
         | BuiltinFnId::Into
         | BuiltinFnId::Eval
@@ -92,8 +94,24 @@ pub(crate) fn eval_pure_builtin(
         | BuiltinFnId::MemoryPool
         | BuiltinFnId::ProcessGroup
         | BuiltinFnId::TcpProcessGroup
-        | BuiltinFnId::Profiler => None,
+        | BuiltinFnId::Profiler
+        | BuiltinFnId::TryCall => None,
     }
+}
+
+fn call_builtin_result_variant(variant: &str, args: &[Value]) -> MoraResult<Value> {
+    if args.len() != 1 {
+        return Err(MoraError::Runtime(format!(
+            "{variant}() expects 1 argument, got {}",
+            args.len()
+        )));
+    }
+    Ok(Value::EnumVariant {
+        enum_name: "result".to_string(),
+        variant: variant.to_string(),
+        payload: vec![args[0].clone()],
+        const_args: Vec::new(),
+    })
 }
 
 pub(crate) fn call_builtin_merge_with_core(

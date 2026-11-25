@@ -1244,6 +1244,19 @@ pub fn resolve_builtin_call_named(
                 crate::runtime::profiler::global_handle(),
             )))
         }
+        BuiltinFnId::TryCall => {
+            if args.is_empty() {
+                return Err(MoraError::Runtime(
+                    "try_call(fn, args...) requires at least 1 callable argument".to_string(),
+                ));
+            }
+            let callee = args.remove(0);
+            Ok(CallAction::PushCombinator {
+                combinator: Box::new(CombinatorFrame::TryCatch),
+                callee,
+                args,
+            })
+        }
         _ => unreachable!("all BuiltinFnId handled cleanly"),
     }
 }
@@ -1662,11 +1675,102 @@ pub fn resolve_method_call_named(
                 def.name, method
             )));
         }
-        Value::EnumVariant { enum_name, .. } => {
+        Value::EnumVariant {
+            enum_name,
+            variant,
+            payload,
+            ..
+        } => {
             if let Some((func, all_args)) =
                 resolve_concrete_impl_method(core, &receiver, method, &args)
             {
                 return resolve_value_call_named(func, all_args, named_args, core);
+            }
+            if variant == "Ok" || variant == "Err" {
+                let inner = || payload.first().cloned().unwrap_or(Value::Nil);
+                match method {
+                    "is_ok" => {
+                        if !args.is_empty() || !named_args.is_empty() {
+                            return Err(MoraError::Runtime(
+                                "result.is_ok() expects 0 arguments".to_string(),
+                            ));
+                        }
+                        return Ok(CallAction::Done(Value::Bool(variant == "Ok")));
+                    }
+                    "is_err" => {
+                        if !args.is_empty() || !named_args.is_empty() {
+                            return Err(MoraError::Runtime(
+                                "result.is_err() expects 0 arguments".to_string(),
+                            ));
+                        }
+                        return Ok(CallAction::Done(Value::Bool(variant == "Err")));
+                    }
+                    "ok" => {
+                        if !args.is_empty() || !named_args.is_empty() {
+                            return Err(MoraError::Runtime(
+                                "result.ok() expects 0 arguments".to_string(),
+                            ));
+                        }
+                        return Ok(CallAction::Done(if variant == "Ok" {
+                            inner()
+                        } else {
+                            Value::Nil
+                        }));
+                    }
+                    "err" => {
+                        if !args.is_empty() || !named_args.is_empty() {
+                            return Err(MoraError::Runtime(
+                                "result.err() expects 0 arguments".to_string(),
+                            ));
+                        }
+                        return Ok(CallAction::Done(if variant == "Err" {
+                            inner()
+                        } else {
+                            Value::Nil
+                        }));
+                    }
+                    "unwrap" => {
+                        if !args.is_empty() || !named_args.is_empty() {
+                            return Err(MoraError::Runtime(
+                                "result.unwrap() expects 0 arguments".to_string(),
+                            ));
+                        }
+                        if variant == "Ok" {
+                            return Ok(CallAction::Done(inner()));
+                        }
+                        return Err(MoraError::Runtime(format!(
+                            "called unwrap() on Err({})",
+                            inner()
+                        )));
+                    }
+                    "unwrap_or" => {
+                        if args.len() != 1 || !named_args.is_empty() {
+                            return Err(MoraError::Runtime(
+                                "result.unwrap_or(default) expects 1 argument".to_string(),
+                            ));
+                        }
+                        return Ok(CallAction::Done(if variant == "Ok" {
+                            inner()
+                        } else {
+                            args[0].clone()
+                        }));
+                    }
+                    "unwrap_err" => {
+                        if !args.is_empty() || !named_args.is_empty() {
+                            return Err(MoraError::Runtime(
+                                "result.unwrap_err() expects 0 arguments".to_string(),
+                            ));
+                        }
+                        if variant == "Err" {
+                            return Ok(CallAction::Done(inner()));
+                        }
+                        return Err(MoraError::Runtime(format!(
+                            "called unwrap_err() on Ok({})",
+                            inner()
+                        )));
+                    }
+                    _ => {}
+                }
             }
             return Err(MoraError::Runtime(format!(
                 "Enum '{}' has no method '{}'",

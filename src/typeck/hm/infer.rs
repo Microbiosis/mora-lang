@@ -1181,6 +1181,9 @@ impl HMInference {
             if name == "trace_dag" {
                 return self.infer_trace_dag_builtin(args, named_args, span);
             }
+            if name == "try_call" {
+                return self.infer_try_call_builtin(args, named_args, span);
+            }
             if name == "tensor" {
                 return self.infer_tensor_constructor_call("tensor", args, named_args, span);
             }

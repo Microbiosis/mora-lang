@@ -2617,6 +2617,129 @@ impl HMInference {
         Ok((Type::ComputeDag, acc_row))
     }
 
+    /// Static HM check for `try_call(f, args...) -> result<T, string>`.
+    pub(super) fn infer_try_call_builtin(
+        &mut self,
+        args: &[MirWitness],
+        named_args: &[(String, MirWitness)],
+        span: Span,
+    ) -> Result<(Type, EffectRow), Vec<TypeError>> {
+        if !named_args.is_empty() {
+            return Err(vec![TypeError::UnificationFailure {
+                expected: "positional arguments for try_call(f, args...)".to_string(),
+                got: format!("keyword argument '{}'", named_args[0].0),
+                span: Some(named_args[0].1.span),
+            }]);
+        }
+        if args.is_empty() {
+            return Err(vec![TypeError::ArityMismatch {
+                expected: 1,
+                actual: 0,
+                span,
+            }]);
+        }
+        let fn_w = &args[0];
+        let (fn_ty, mut acc_row) = self.infer_recover(fn_w);
+        let mut arg_tys = Vec::with_capacity(args.len().saturating_sub(1));
+        for a in &args[1..] {
+            let (at, r) = self.infer_recover(a);
+            acc_row = self.merge_rows(acc_row, r, span);
+            arg_tys.push((at, a.span));
+        }
+
+        let resolved_fn = self.subst.apply(&fn_ty);
+        let ok_ty = match resolved_fn {
+            Type::Arrow(param_ty, mut out_ty, row) => {
+                acc_row = self.merge_rows(acc_row, row, span);
+                if arg_tys.is_empty() {
+                    if !matches!(&*param_ty, Type::Tuple(es) if es.is_empty())
+                        && !matches!(&*param_ty, Type::Any | Type::TypeVar(_))
+                    {
+                        return Err(vec![TypeError::ArityMismatch {
+                            expected: 1,
+                            actual: 0,
+                            span,
+                        }]);
+                    }
+                    *out_ty
+                } else {
+                    let first = &arg_tys[0];
+                    self.constraints.push(SpannedConstraint::new(
+                        Constraint::Subtype {
+                            sub: Box::new(first.0.clone()),
+                            sup: param_ty,
+                        },
+                        first.1,
+                    ));
+                    for (extra_ty, extra_span) in &arg_tys[1..] {
+                        let applied_out = self.subst.apply(&out_ty);
+                        match applied_out {
+                            Type::Arrow(next_p, next_out, next_row) => {
+                                acc_row = self.merge_rows(acc_row, next_row, span);
+                                self.constraints.push(SpannedConstraint::new(
+                                    Constraint::Subtype {
+                                        sub: Box::new(extra_ty.clone()),
+                                        sup: next_p,
+                                    },
+                                    *extra_span,
+                                ));
+                                out_ty = next_out;
+                            }
+                            Type::TypeVar(_) => {
+                                let next_ret = self.fresh_type_var();
+                                let next_eff = self.fresh_row_var();
+                                self.constraints.push(SpannedConstraint::new(
+                                    Constraint::Eq(
+                                        Box::new(applied_out),
+                                        Box::new(Type::Arrow(
+                                            Box::new(extra_ty.clone()),
+                                            Box::new(next_ret.clone()),
+                                            next_eff,
+                                        )),
+                                    ),
+                                    *extra_span,
+                                ));
+                                *out_ty = next_ret;
+                            }
+                            _ => break,
+                        }
+                    }
+                    *out_ty
+                }
+            }
+            Type::Any | Type::Task | Type::Closure | Type::Builtin | Type::Error => Type::Any,
+            Type::TypeVar(_) => {
+                let ret = self.fresh_type_var();
+                let eff = self.fresh_row_var();
+                let mut arrow = ret.clone();
+                if arg_tys.is_empty() {
+                    arrow = Type::Arrow(Box::new(Type::Tuple(Vec::new())), Box::new(arrow), eff);
+                } else {
+                    for (at, _) in arg_tys.iter().rev() {
+                        let step_eff = self.fresh_row_var();
+                        arrow = Type::Arrow(Box::new(at.clone()), Box::new(arrow), step_eff);
+                    }
+                }
+                self.constraints.push(SpannedConstraint::new(
+                    Constraint::Eq(Box::new(resolved_fn), Box::new(arrow)),
+                    fn_w.span,
+                ));
+                ret
+            }
+            other => {
+                return Err(vec![TypeError::NotAClosure {
+                    found: other.name(),
+                    span: fn_w.span,
+                }]);
+            }
+        };
+
+        Ok((
+            Type::Result_(Box::new(ok_ty), Box::new(Type::String)),
+            acc_row,
+        ))
+    }
+
     // ════════════════════════════════════════════════════════════════════════
     // 7. Nominal Variant & Struct Pattern Checking / Typed Bindings
     // ════════════════════════════════════════════════════════════════════════
@@ -2809,6 +2932,32 @@ impl HMInference {
         scrutinee_ty: &Type,
         span: Span,
     ) -> Result<(super::EnumTypeDef, Vec<Type>), Vec<TypeError>> {
+        // Built-in `result<T, E>` (`Ok(v)` / `Err(e)`) pattern destructuring when not shadowed
+        // by an explicit user-declared nominal enum.
+        let builtin_result_edef = || super::EnumTypeDef {
+            name: "result".to_string(),
+            type_params: vec!["T".to_string(), "E".to_string()],
+            const_params: Vec::new(),
+            variants: vec![
+                (
+                    "Ok".to_string(),
+                    vec![Type::TypeVar(TypeVarId::Rigid("T".to_string()))],
+                ),
+                (
+                    "Err".to_string(),
+                    vec![Type::TypeVar(TypeVarId::Rigid("E".to_string()))],
+                ),
+            ],
+        };
+        if let Type::Result_(ok_ty, err_ty) = scrutinee_ty
+            && enum_name.is_none_or(|en| en.eq_ignore_ascii_case("result"))
+        {
+            return Ok((
+                builtin_result_edef(),
+                vec![(**ok_ty).clone(), (**err_ty).clone()],
+            ));
+        }
+
         let resolved_name = if let Some(en) = enum_name {
             en.to_string()
         } else if let Type::Concrete { name, .. } = scrutinee_ty
@@ -2821,6 +2970,13 @@ impl HMInference {
             .find(|(_, d)| d.variants.iter().any(|(v, _)| v == variant))
         {
             ename.clone()
+        } else if matches!(variant, "Ok" | "Err")
+            && matches!(scrutinee_ty, Type::TypeVar(_) | Type::Any | Type::Error)
+        {
+            return Ok((
+                builtin_result_edef(),
+                vec![self.fresh_type_var(), self.fresh_type_var()],
+            ));
         } else {
             return Err(vec![TypeError::UnificationFailure {
                 expected: "declared enum variant in pattern".to_string(),

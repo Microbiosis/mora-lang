@@ -431,6 +431,27 @@ pub fn builtin_signatures() -> Vec<(String, Signature)> {
             "profiler".to_string(),
             Signature::new(vec![], Type::TraceProfiler),
         ),
+        (
+            "Ok".to_string(),
+            Signature::new(
+                vec![("value".to_string(), Type::Any)],
+                Type::Result_(Box::new(Type::Any), Box::new(Type::Any)),
+            ),
+        ),
+        (
+            "Err".to_string(),
+            Signature::new(
+                vec![("error".to_string(), Type::Any)],
+                Type::Result_(Box::new(Type::Any), Box::new(Type::Any)),
+            ),
+        ),
+        (
+            "try_call".to_string(),
+            Signature::variadic(
+                vec![("f".to_string(), Type::Any)],
+                Type::Result_(Box::new(Type::Any), Box::new(Type::String)),
+            ),
+        ),
         // v0.91: 数学 builtin — math/stats/linalg/random
         // 这些是 domain prefix 模块，typeck 注册为 marker signature（任意参数→Any）
         // 实际方法分派由 dispatch.rs::call_method_builtin 处理
@@ -986,6 +1007,33 @@ fn method_signature_builtin(receiver: &Type, method: &str) -> Option<Signature> 
         (Type::Dict(_, _), "len") => Some(Signature::new(
             vec![("self".to_string(), receiver.clone())],
             Type::Int,
+        )),
+        (Type::Result_(_, _), "is_ok" | "is_err") => Some(Signature::new(
+            vec![("self".to_string(), receiver.clone())],
+            Type::Bool,
+        )),
+        (Type::Result_(ok_ty, _), "unwrap") => Some(Signature::new(
+            vec![("self".to_string(), receiver.clone())],
+            (**ok_ty).clone(),
+        )),
+        (Type::Result_(ok_ty, _), "unwrap_or") => Some(Signature::new(
+            vec![
+                ("self".to_string(), receiver.clone()),
+                ("default".to_string(), (**ok_ty).clone()),
+            ],
+            (**ok_ty).clone(),
+        )),
+        (Type::Result_(_, err_ty), "unwrap_err") => Some(Signature::new(
+            vec![("self".to_string(), receiver.clone())],
+            (**err_ty).clone(),
+        )),
+        (Type::Result_(ok_ty, _), "ok") => Some(Signature::new(
+            vec![("self".to_string(), receiver.clone())],
+            Type::Union(vec![(**ok_ty).clone(), Type::Nil]),
+        )),
+        (Type::Result_(_, err_ty), "err") => Some(Signature::new(
+            vec![("self".to_string(), receiver.clone())],
+            Type::Union(vec![(**err_ty).clone(), Type::Nil]),
         )),
         (Type::String, "len") => Some(Signature::new(
             vec![("self".to_string(), Type::String)],

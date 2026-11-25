@@ -51,6 +51,26 @@ impl HMInference {
                 return_type: Type::Channel(Box::new(elem)),
             });
         }
+        if name == "Ok" {
+            let ok_ty = self.fresh_type_var();
+            let err_ty = self.fresh_type_var();
+            return Some(BuiltinCallSpec {
+                params: vec![ok_ty.clone()],
+                min_arity: 1,
+                variadic: false,
+                return_type: Type::Result_(Box::new(ok_ty), Box::new(err_ty)),
+            });
+        }
+        if name == "Err" {
+            let ok_ty = self.fresh_type_var();
+            let err_ty = self.fresh_type_var();
+            return Some(BuiltinCallSpec {
+                params: vec![err_ty.clone()],
+                min_arity: 1,
+                variadic: false,
+                return_type: Type::Result_(Box::new(ok_ty), Box::new(err_ty)),
+            });
+        }
         if let Some(sig) = crate::typeck::dispatch::lookup_builtin(name) {
             let min_arity = sig.min_arity.unwrap_or(sig.params.len());
             let params: Vec<Type> = sig.params.into_iter().map(|(_, t)| t).collect();

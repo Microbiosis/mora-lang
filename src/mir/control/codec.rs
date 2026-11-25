@@ -432,6 +432,9 @@ fn encode_builtin_fn_id(id: BuiltinFnId) -> u8 {
         BuiltinFnId::ProcessGroup => 45,
         BuiltinFnId::TcpProcessGroup => 46,
         BuiltinFnId::Profiler => 47,
+        BuiltinFnId::Ok => 48,
+        BuiltinFnId::Err => 49,
+        BuiltinFnId::TryCall => 50,
     }
 }
 
@@ -485,6 +488,9 @@ fn decode_builtin_fn_id(tag: u8) -> MoraResult<BuiltinFnId> {
         45 => BuiltinFnId::ProcessGroup,
         46 => BuiltinFnId::TcpProcessGroup,
         47 => BuiltinFnId::Profiler,
+        48 => BuiltinFnId::Ok,
+        49 => BuiltinFnId::Err,
+        50 => BuiltinFnId::TryCall,
         other => return Err(corrupt(format!("invalid BuiltinFnId tag {other}"))),
     })
 }

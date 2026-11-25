@@ -499,6 +499,12 @@ impl ParserV3 {
                             let v = it.next().unwrap_or(Type::Unknown);
                             Some(Type::Dict(Box::new(k), Box::new(v)))
                         }
+                        "result" if !self.declared_type_names.contains(orig_name.as_str()) => {
+                            let mut it = args.into_iter();
+                            let ok_ty = it.next().unwrap_or(Type::Unknown);
+                            let err_ty = it.next().unwrap_or(Type::String);
+                            Some(Type::Result_(Box::new(ok_ty), Box::new(err_ty)))
+                        }
                         other => {
                             if self.declared_type_names.contains(orig_name.as_str()) {
                                 return Some(Type::Concrete {
@@ -551,6 +557,9 @@ impl ParserV3 {
                     "gpu_kernel" | "gpukernel" => Type::GpuKernel(None),
                     "channel" => Type::Channel(Box::new(Type::Any)),
                     "task_handle" | "taskhandle" => Type::TaskHandle(Box::new(Type::Any)),
+                    "result" if !self.declared_type_names.contains(name.as_str()) => {
+                        Type::Result_(Box::new(Type::Any), Box::new(Type::Any))
+                    }
                     "tensor" => Type::any_tensor(),
                     "any" => Type::Any,
                     "unknown" => Type::Unknown,

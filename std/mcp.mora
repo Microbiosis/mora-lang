@@ -230,6 +230,62 @@ task rpc_err(id: any, code: int, message: string): string
   return json.stringify(env_obj)
 end
 
+task tool_result_payload(text_out: string, is_error: bool): dict<string, any>
+  let content_item: dict<string, any> = {"type": "text", "text": text_out}
+  let call_out: dict<string, any> = {}
+  assign call_out = call_out.set("content", [content_item]).set("isError", is_error)
+  return call_out
+end
+
+task format_tool_value(val: any): dict<string, any>
+  if type_of(val) == "result" then
+    let as_res: result<any, any> = val
+    if as_res.is_err() then
+      return tool_result_payload(str(as_res.unwrap_err()), true)
+    end
+    return format_tool_value(as_res.unwrap())
+  end
+  if type_of(val) == "dict" then
+    let d: dict<string, any> = val
+    if type_of(d.get("content")) == "list" and type_of(d.get("isError")) == "bool" then
+      return d
+    end
+  end
+  let text_out = if type_of(val) == "string" then str(val) else json.stringify(val) end
+  return tool_result_payload(text_out, false)
+end
+
+task decode_mcp_http_response(resp: HttpClientResponse): result<dict<string, any>, string>
+  if resp.status == 0 then
+    return Err("HTTP connection closed before receiving MCP response")
+  end
+  if resp.status == 204 then
+    let empty_obj: dict<string, any> = {}
+    return Ok(empty_obj)
+  end
+  if resp.status < 200 or resp.status >= 300 then
+    let status_desc = "HTTP " + str(resp.status)
+    if resp.status_text != "" then
+      assign status_desc = status_desc + " " + resp.status_text
+    end
+    if resp.body != "" then
+      assign status_desc = status_desc + ": " + resp.body
+    end
+    return Err(status_desc)
+  end
+  let parsed = resp.body.json()
+  let perr = parsed.get("err")
+  if perr != nil then
+    return Err("invalid JSON in MCP response: " + str(perr))
+  end
+  let body_val = parsed.get("ok")
+  if type_of(body_val) != "dict" then
+    return Err("invalid MCP response: expected JSON object, got " + type_of(body_val))
+  end
+  let out_dict: dict<string, any> = body_val
+  return Ok(out_dict)
+end
+
 export impl McpServer
   task tool(self, name: string, description: string, schema: dict<string, any>, handler: any): McpServer
     let t = McpTool(name=name, description=description, schema=schema, handler=handler)
@@ -261,6 +317,9 @@ export impl McpServer
       return rpc_err(nil, -32700, "Parse error: " + str(err))
     end
     let req = parsed.get("ok")
+    if type_of(req) != "dict" then
+      return rpc_err(nil, -32600, "Invalid Request: expected JSON-RPC object")
+    end
     let id = req.get("id")
     let method = req.get("method")
     let params = req.get("params")
@@ -296,14 +355,17 @@ export impl McpServer
       return rpc_ok(id, {"tools": list_out})
     end
     if method == "tools/call" then
-      if params == nil then
-        return rpc_err(id, -32602, "Invalid params: missing params")
+      if params == nil or type_of(params) != "dict" then
+        return rpc_err(id, -32602, "Invalid params: expected params object")
       end
       let tname = params.get("name")
       let targs = params.get("arguments")
       if targs == nil then
         let empty_args: dict<string, any> = {}
         assign targs = empty_args
+      end
+      if type_of(targs) != "dict" then
+        return rpc_err(id, -32602, "Invalid params: 'arguments' must be an object")
       end
       let tool = self.tools.get(str(tname))
       if tool == nil then
@@ -314,12 +376,11 @@ export impl McpServer
         return rpc_err(id, -32602, "Invalid params: " + val_err)
       end
       let fn_handler = tool.handler
-      let result_val = fn_handler(targs)
-      let text_out = if type_of(result_val) == "string" then str(result_val) else json.stringify(result_val) end
-      let content_item: dict<string, any> = {"type": "text", "text": text_out}
-      let call_out: dict<string, any> = {}
-      assign call_out = call_out.set("content", [content_item]).set("isError", false)
-      return rpc_ok(id, call_out)
+      let exec_res = try_call(fn() fn_handler(targs) end)
+      if exec_res.is_err() then
+        return rpc_ok(id, tool_result_payload(exec_res.unwrap_err(), true))
+      end
+      return rpc_ok(id, format_tool_value(exec_res.unwrap()))
     end
     if method == "resources/list" then
       let rlist: list<any> = []
@@ -333,8 +394,8 @@ export impl McpServer
       return rpc_ok(id, {"resources": rlist})
     end
     if method == "resources/read" then
-      if params == nil then
-        return rpc_err(id, -32602, "Invalid params: missing params")
+      if params == nil or type_of(params) != "dict" then
+        return rpc_err(id, -32602, "Invalid params: expected params object")
       end
       let ruri = params.get("uri")
       let r = self.resources.get(str(ruri))
@@ -342,7 +403,19 @@ export impl McpServer
         return rpc_err(id, -32602, "Unknown resource: " + str(ruri))
       end
       let rfn = r.reader
-      let text_val = str(rfn(r.uri))
+      let r_exec = try_call(fn() rfn(r.uri) end)
+      if r_exec.is_err() then
+        return rpc_err(id, -32603, "Resource reader error: " + r_exec.unwrap_err())
+      end
+      let r_raw = r_exec.unwrap()
+      if type_of(r_raw) == "result" then
+        let r_res: result<any, any> = r_raw
+        if r_res.is_err() then
+          return rpc_err(id, -32603, "Resource reader error: " + str(r_res.unwrap_err()))
+        end
+        assign r_raw = r_res.unwrap()
+      end
+      let text_val = str(r_raw)
       let item: dict<string, any> = {"uri": r.uri, "mimeType": r.mime_type, "text": text_val}
       return rpc_ok(id, {"contents": [item]})
     end
@@ -359,8 +432,8 @@ export impl McpServer
       return rpc_ok(id, {"prompts": plist})
     end
     if method == "prompts/get" then
-      if params == nil then
-        return rpc_err(id, -32602, "Invalid params: missing params")
+      if params == nil or type_of(params) != "dict" then
+        return rpc_err(id, -32602, "Invalid params: expected params object")
       end
       let pname = params.get("name")
       let p = self.prompts.get(str(pname))
@@ -372,6 +445,9 @@ export impl McpServer
         let empty_pargs: dict<string, any> = {}
         assign pargs = empty_pargs
       end
+      if type_of(pargs) != "dict" then
+        return rpc_err(id, -32602, "Invalid params: 'arguments' must be an object")
+      end
       for arg_spec in p.arguments
         let is_req = arg_spec.get("required") == true
         let aname = str(arg_spec.get("name"))
@@ -380,7 +456,18 @@ export impl McpServer
         end
       end
       let pfn = p.handler
-      let pval = pfn(pargs)
+      let p_exec = try_call(fn() pfn(pargs) end)
+      if p_exec.is_err() then
+        return rpc_err(id, -32603, "Prompt handler error: " + p_exec.unwrap_err())
+      end
+      let pval = p_exec.unwrap()
+      if type_of(pval) == "result" then
+        let p_res: result<any, any> = pval
+        if p_res.is_err() then
+          return rpc_err(id, -32603, "Prompt handler error: " + str(p_res.unwrap_err()))
+        end
+        assign pval = p_res.unwrap()
+      end
       if type_of(pval) == "string" then
         let content_obj: dict<string, any> = {"type": "text", "text": str(pval)}
         let msg: dict<string, any> = {}
@@ -509,18 +596,18 @@ export impl McpServer
   end
 end
 
-export task call_http(addr: string, method: string, params: dict<string, any>, id: int = 1): dict<string, any>
+export task call_http(addr: string, method: string, params: dict<string, any>, id: int = 1, timeout_ms: int = 5000): result<dict<string, any>, string>
   let req_obj: dict<string, any> = {}
   assign req_obj = req_obj.set("jsonrpc", "2.0").set("id", id).set("method", method).set("params", params)
   let payload = json.stringify(req_obj)
-  let resp = post(addr, "/mcp", payload, "application/json", 5000)
-  return json.parse(resp.body)
+  let resp = try_call(fn() post(addr, "/mcp", payload, "application/json", timeout_ms) end)?
+  return decode_mcp_http_response(resp)
 end
 
-export task call_https(addr: string, method: string, params: dict<string, any>, server_name: string = "", tls_config: dict<string, any> = {}, id: int = 1): dict<string, any>
+export task call_https(addr: string, method: string, params: dict<string, any>, server_name: string = "", tls_config: dict<string, any> = {}, id: int = 1, timeout_ms: int = 5000): result<dict<string, any>, string>
   let req_obj: dict<string, any> = {}
   assign req_obj = req_obj.set("jsonrpc", "2.0").set("id", id).set("method", method).set("params", params)
   let payload = json.stringify(req_obj)
-  let resp = https_post(addr, "/mcp", payload, server_name, "application/json", tls_config, 5000)
-  return json.parse(resp.body)
+  let resp = try_call(fn() https_post(addr, "/mcp", payload, server_name, "application/json", tls_config, timeout_ms) end)?
+  return decode_mcp_http_response(resp)
 end

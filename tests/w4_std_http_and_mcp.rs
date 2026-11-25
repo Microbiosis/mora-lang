@@ -100,12 +100,12 @@ let ep_ev = sse_read_event(sse_ch)
 sse_ch.close()
 
 let empty_params: dict<string, any> = {}
-let init_res = call_http(addr, "initialize", empty_params, 1)
-let list_res = call_http(addr, "tools/list", empty_params, 2)
+let init_res = call_http(addr, "initialize", empty_params, 1).unwrap()
+let list_res = call_http(addr, "tools/list", empty_params, 2).unwrap()
 let call_params: dict<string, any> = {}
 assign call_params = call_params.set("name", "add").set("arguments", {"a": 19, "b": 23})
-let call_res = call_http(addr, "tools/call", call_params, 3)
-let res_read = call_http(addr, "resources/read", {"uri": "mora://status"}, 4)
+let call_res = call_http(addr, "tools/call", call_params, 3).unwrap()
+let res_read = call_http(addr, "resources/read", {"uri": "mora://status"}, 4).unwrap()
 
 let served = h.join()
 listener.close()
@@ -369,4 +369,205 @@ let sreply = json.parse(sline)
     assert_eq!(v[17], Value::String("1".to_string())); // serve_stdio_stream count
     assert_eq!(v[18], Value::String("found:simd:10".to_string())); // live NDJSON stream reply
     assert_eq!(v[19], Value::String("true".to_string())); // @tag(json="-") field excluded from JSON Schema
+}
+
+#[test]
+fn std_mcp_tool_error_isolation_and_client_result_error_paths() {
+    let src = r#"
+import "std/net/http"
+import "std/mcp"
+
+struct DivInput
+  num: int
+  den: int
+end
+
+struct ModeInput
+  mode: string
+end
+
+task mcp_tool_params(name: string, args: dict<string, any>): dict<string, any>
+  let p: dict<string, any> = {}
+  return p.set("name", name).set("arguments", args)
+end
+
+task call_chained(addr: string): result<string, string>
+  let a1: dict<string, any> = {"num": 84, "den": 2}
+  let r1 = call_http(addr, "tools/call", mcp_tool_params("divide", a1), 100)?
+  let txt = str(r1.get("result").get("content").get(0).get("text"))
+  return Ok(txt)
+end
+
+let srv = server("mora-mcp-resilient", "1.0.0")
+-- 1. Handler that throws uncaught runtime error (`1 / 0`) on `den == 0`
+assign srv = srv.typed_tool("divide", "Integer division", DivInput::schema(), fn(args: dict<string, any>)
+  let n = int(str(args.get("num")))
+  let d = int(str(args.get("den")))
+  return n / d
+end)
+
+-- 2. Handler that either throws `assert(...)`, returns `Err(...)`, or returns `Ok(...)`
+assign srv = srv.typed_tool("check_mode", "Mode check", ModeInput::schema(), fn(args: dict<string, any>)
+  let m = str(args.get("mode"))
+  if m == "panic" then
+    assert(false, "boom-inside-handler")
+  end
+  if m == "err_val" then
+    return Err("quota-exceeded")
+  end
+  return Ok("mode-ok:" + m)
+end)
+
+-- 3. Resource & prompt handlers that throw runtime errors must also be isolated as -32603
+assign srv = srv.resource("mora://broken", "broken", "Broken resource", "text/plain", fn(_u: string)
+  assert(false, "disk-read-failed")
+  return "unreachable"
+end)
+assign srv = srv.prompt("bad_prompt", "Broken prompt", [], fn(_a: dict<string, any>)
+  let z = 0
+  let _boom = 10 / z
+  return "unreachable"
+end)
+
+-- A. Live `serve_listener` must survive throwing handlers and continue serving healthy calls!
+let listener = tcp_listen("127.0.0.1:0")
+let addr = listener.local_addr()
+let srv_h = spawn srv.serve_listener(listener, 6)
+
+-- Call 1: division by zero inside tool handler -> HTTP 200 JSON-RPC result with `isError: true`
+let r_div0 = call_http(addr, "tools/call", mcp_tool_params("divide", {"num": 10, "den": 0}), 1).unwrap()
+let div0_is_err = r_div0.get("result").get("isError") == true
+let div0_text = str(r_div0.get("result").get("content").get(0).get("text"))
+
+-- Call 2: `assert(false, ...)` inside tool handler -> `isError: true`
+let r_panic = call_http(addr, "tools/call", mcp_tool_params("check_mode", {"mode": "panic"}), 2).unwrap()
+let panic_is_err = r_panic.get("result").get("isError") == true
+let panic_text = str(r_panic.get("result").get("content").get(0).get("text"))
+
+-- Call 3: handler returning `Err("quota-exceeded")` -> `isError: true`
+let r_res_err = call_http(addr, "tools/call", mcp_tool_params("check_mode", {"mode": "err_val"}), 3).unwrap()
+let res_err_flag = r_res_err.get("result").get("isError") == true
+let res_err_text = str(r_res_err.get("result").get("content").get(0).get("text"))
+
+-- Call 4: broken resource -> JSON-RPC `-32603` error, server still alive
+let r_broken_res = call_http(addr, "resources/read", {"uri": "mora://broken"}, 4).unwrap()
+let broken_res_code = int(str(r_broken_res.get("error").get("code")))
+
+-- Call 5: broken prompt -> JSON-RPC `-32603` error, server still alive
+let pr_params: dict<string, any> = {}
+assign pr_params = pr_params.set("name", "bad_prompt").set("arguments", {})
+let r_broken_pr = call_http(addr, "prompts/get", pr_params, 5).unwrap()
+let broken_pr_code = int(str(r_broken_pr.get("error").get("code")))
+
+-- Call 6: subsequent valid call via `?` propagation on `result<dict<string, any>, string>` STILL SUCCEEDS!
+let ok_chained = call_chained(addr).unwrap()
+let served_mcp = srv_h.join()
+listener.close()
+
+-- B. Live `serve_stdio_stream` must also survive throwing tool calls and serve the next line!
+let st_l = tcp_listen("127.0.0.1:0")
+let st_addr = st_l.local_addr()
+let st_srv = spawn fn()
+  let s = st_l.accept()
+  let cnt = srv.serve_stdio_stream(s)
+  s.close()
+  return cnt
+end
+let st_cli = tcp_connect(st_addr, 5000)
+st_cli.write("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"divide\",\"arguments\":{\"num\":5,\"den\":0}}}\n")
+let st_line1 = json.parse(st_cli.read_line(8192))
+st_cli.write("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"check_mode\",\"arguments\":{\"mode\":\"fast\"}}}\n")
+let st_line2 = json.parse(st_cli.read_line(8192))
+st_cli.close()
+let st_cnt = st_srv.join()
+st_l.close()
+
+-- C. Client `call_http` error paths (`result<dict<string, any>, string>`):
+--    1) HTTP 500 plain-text error body
+--    2) HTTP 200 malformed JSON body
+--    3) HTTP 200 non-object JSON array body
+--    4) Server hangs past `timeout_ms`
+--    5) Immediate socket drop before status line
+let bad_l = tcp_listen("127.0.0.1:0")
+let bad_addr = bad_l.local_addr()
+let bad_srv = spawn fn()
+  -- 1) 500 plain text
+  let c1 = bad_l.accept()
+  let _req1 = read_request(c1)
+  write_response(c1, response(500, "upstream gateway exploded"), nil, false)
+  c1.close()
+
+  -- 2) 200 malformed JSON
+  let c2 = bad_l.accept()
+  let _req2 = read_request(c2)
+  write_response(c2, response(200, "<<<not-valid-json>>>", "application/json"), nil, false)
+  c2.close()
+
+  -- 3) 200 JSON array instead of JSON-RPC object
+  let c3 = bad_l.accept()
+  let _req3 = read_request(c3)
+  write_response(c3, response(200, "[1,2,3]", "application/json"), nil, false)
+  c3.close()
+
+  -- 4) Slow upstream exceeding client `timeout_ms = 60`
+  let c4 = bad_l.accept()
+  let _req4 = read_request(c4)
+  sleep(220)
+  c4.close()
+
+  -- 5) Abrupt socket close before writing any HTTP status line
+  let c5 = bad_l.accept()
+  let _req5 = read_request(c5)
+  c5.close()
+  return 5
+end
+
+let e_500 = call_http(bad_addr, "ping", {}, 1, 2000)
+let e_bad_json = call_http(bad_addr, "ping", {}, 2, 2000)
+let e_non_obj = call_http(bad_addr, "ping", {}, 3, 2000)
+let e_timeout = call_http(bad_addr, "ping", {}, 4, 60)
+let e_eof = call_http(bad_addr, "ping", {}, 5, 2000)
+let _bad_done = bad_srv.join()
+bad_l.close()
+
+-- 6) Connection refused on closed listener port -> `Err(...)`
+let e_refused = call_http(bad_addr, "ping", {}, 6, 500)
+
+let m_500 = match e_500 with
+  Ok(_) -> "unexpected-ok"
+  Err(msg) -> msg
+end
+
+let c_500 = str(m_500.contains("HTTP 500") and m_500.contains("upstream gateway exploded"))
+let c_bad_json = str(e_bad_json.is_err() and e_bad_json.unwrap_err().contains("invalid JSON"))
+let c_non_obj = str(e_non_obj.is_err() and e_non_obj.unwrap_err().contains("expected JSON object"))
+let c_eof = str(e_eof.is_err() and e_eof.unwrap_err().contains("closed"))
+
+[str(div0_is_err), str(div0_text != ""), str(panic_is_err), str(panic_text.contains("boom-inside-handler")), str(res_err_flag), res_err_text, str(broken_res_code), str(broken_pr_code), ok_chained, str(served_mcp), str(st_cnt), str(st_line1.get("result").get("isError")), str(st_line2.get("result").get("isError")), str(st_line2.get("result").get("content").get(0).get("text")), c_500, c_bad_json, c_non_obj, str(e_timeout.is_err()), c_eof, str(e_refused.is_err())]
+"#;
+    let out = compile_check_and_run(src);
+    let Value::List(items) = out else {
+        panic!("expected list, got {out:?}");
+    };
+    let v = items.to_vec();
+    assert_eq!(v[0], Value::String("true".to_string()));
+    assert_eq!(v[1], Value::String("true".to_string()));
+    assert_eq!(v[2], Value::String("true".to_string()));
+    assert_eq!(v[3], Value::String("true".to_string()));
+    assert_eq!(v[4], Value::String("true".to_string()));
+    assert_eq!(v[5], Value::String("quota-exceeded".to_string()));
+    assert_eq!(v[6], Value::String("-32603".to_string()));
+    assert_eq!(v[7], Value::String("-32603".to_string()));
+    assert_eq!(v[8], Value::String("42".to_string()));
+    assert_eq!(v[9], Value::String("6".to_string()));
+    assert_eq!(v[10], Value::String("2".to_string()));
+    assert_eq!(v[11], Value::String("true".to_string()));
+    assert_eq!(v[12], Value::String("false".to_string()));
+    assert_eq!(v[13], Value::String("mode-ok:fast".to_string()));
+    assert_eq!(v[14], Value::String("true".to_string()));
+    assert_eq!(v[15], Value::String("true".to_string()));
+    assert_eq!(v[16], Value::String("true".to_string()));
+    assert_eq!(v[17], Value::String("true".to_string()));
+    assert_eq!(v[18], Value::String("true".to_string()));
+    assert_eq!(v[19], Value::String("true".to_string()));
 }

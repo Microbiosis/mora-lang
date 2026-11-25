@@ -340,7 +340,7 @@ export impl Router
   end
 end
 
-task parse_headers_from_stream(stream: tcp_stream | tls_stream, ctx: any): dict<string, string>
+task parse_headers_from_stream(stream: tcp_stream | tls_stream, ctx: context | nil): dict<string, string>
   let hdrs: dict<string, string> = {}
   while true
     let raw_line = stream.read_line(8192, ctx)
@@ -358,7 +358,7 @@ task parse_headers_from_stream(stream: tcp_stream | tls_stream, ctx: any): dict<
   return hdrs
 end
 
-task read_exact_body(stream: tcp_stream | tls_stream, content_len: int, ctx: any): string
+task read_exact_body(stream: tcp_stream | tls_stream, content_len: int, ctx: context | nil): string
   if content_len <= 0 then
     return ""
   end
@@ -374,7 +374,7 @@ task read_exact_body(stream: tcp_stream | tls_stream, content_len: int, ctx: any
   return body
 end
 
-task read_chunked_body(stream: tcp_stream | tls_stream, max_body_bytes: int, ctx: any): ChunkedResult
+task read_chunked_body(stream: tcp_stream | tls_stream, max_body_bytes: int, ctx: context | nil): ChunkedResult
   let body = ""
   while true
     let size_line = stream.read_line(4096, ctx)
@@ -644,11 +644,15 @@ export task serve_tls(addr: string, cert_pem: string, key_pem: string, handler: 
   return count
 end
 
-export task read_http_response(stream: tcp_stream | tls_stream, ctx: any = nil, max_body_bytes: int = 0): HttpClientResponse
+export task read_http_response(stream: tcp_stream | tls_stream, ctx: context | nil = nil, max_body_bytes: int = 0): HttpClientResponse
   let status_line = stream.read_line(8192, ctx).trim()
+  if status_line == "" then
+    let empty_hdrs: dict<string, string> = {}
+    return HttpClientResponse(status = 0, status_text = "Connection Closed", headers = empty_hdrs, body = "")
+  end
   let parts = status_line.split(" ")
-  let code = if parts.len() >= 2 then int(parts.get(1)) else 200 end
-  let reason = if parts.len() >= 3 then join_tail(parts.drop(2), " ") else "OK" end
+  let code = if parts.len() >= 2 then int(parts.get(1)) else 0 end
+  let reason = if parts.len() >= 3 then join_tail(parts.drop(2), " ") else "" end
   let hdrs = parse_headers_from_stream(stream, ctx)
   let te_str = hdrs.get("transfer-encoding")
   let cl_str = hdrs.get("content-length")
@@ -677,7 +681,7 @@ export task read_http_response(stream: tcp_stream | tls_stream, ctx: any = nil, 
   return HttpClientResponse(status = code, status_text = reason, headers = hdrs, body = body)
 end
 
-export task send_request_on(stream: tcp_stream | tls_stream, method: string, host: string, path: string, body: string = "", content_type: string = "application/json", keep_alive: bool = true, ctx: any = nil): HttpClientResponse
+export task send_request_on(stream: tcp_stream | tls_stream, method: string, host: string, path: string, body: string = "", content_type: string = "application/json", keep_alive: bool = true, ctx: context | nil = nil): HttpClientResponse
   let conn_val = if keep_alive then "keep-alive" else "close" end
   let req = method.upper() + " " + path + " HTTP/1.1\r\nHost: " + host + "\r\nConnection: " + conn_val + "\r\n"
   if body != "" then
@@ -688,7 +692,7 @@ export task send_request_on(stream: tcp_stream | tls_stream, method: string, hos
   return read_http_response(stream, ctx, 0)
 end
 
-export task send_chunked_request_on(stream: tcp_stream | tls_stream, method: string, host: string, path: string, chunks: list<string>, content_type: string = "text/plain", keep_alive: bool = false, ctx: any = nil): HttpClientResponse
+export task send_chunked_request_on(stream: tcp_stream | tls_stream, method: string, host: string, path: string, chunks: list<string>, content_type: string = "text/plain", keep_alive: bool = false, ctx: context | nil = nil): HttpClientResponse
   let conn_val = if keep_alive then "keep-alive" else "close" end
   let req = method.upper() + " " + path + " HTTP/1.1\r\nHost: " + host + "\r\nConnection: " + conn_val + "\r\nContent-Type: " + content_type + "\r\nTransfer-Encoding: chunked\r\n\r\n" + encode_chunked_body(chunks)
   stream.write(req, ctx)
@@ -697,16 +701,20 @@ end
 
 export task request(method: string, addr: string, path: string, body: string = "", content_type: string = "application/json", timeout_ms: int = 5000): HttpClientResponse
   let stream = tcp_connect(addr, timeout_ms)
-  let resp = send_request_on(stream, method, addr, path, body, content_type, false, nil)
-  stream.close()
-  return resp
+  defer stream.close()
+  if timeout_ms > 0 then
+    return send_request_on(stream, method, addr, path, body, content_type, false, context().with_timeout(timeout_ms))
+  end
+  return send_request_on(stream, method, addr, path, body, content_type, false, nil)
 end
 
 export task post_chunked(addr: string, path: string, chunks: list<string>, content_type: string = "text/plain", timeout_ms: int = 5000): HttpClientResponse
   let stream = tcp_connect(addr, timeout_ms)
-  let resp = send_chunked_request_on(stream, "POST", addr, path, chunks, content_type, false, nil)
-  stream.close()
-  return resp
+  defer stream.close()
+  if timeout_ms > 0 then
+    return send_chunked_request_on(stream, "POST", addr, path, chunks, content_type, false, context().with_timeout(timeout_ms))
+  end
+  return send_chunked_request_on(stream, "POST", addr, path, chunks, content_type, false, nil)
 end
 
 export task get(addr: string, path: string = "/", timeout_ms: int = 5000): HttpClientResponse
@@ -737,10 +745,12 @@ end
 
 export task https_request(method: string, addr: string, path: string, server_name: string = "", body: string = "", content_type: string = "application/json", tls_config: dict<string, any> = {}, timeout_ms: int = 5000): HttpClientResponse
   let stream = tls_connect(addr, server_name, tls_config, timeout_ms)
+  defer stream.close()
   let host_hdr = if server_name != "" then server_name else addr end
-  let resp = send_request_on(stream, method, host_hdr, path, body, content_type, false, nil)
-  stream.close()
-  return resp
+  if timeout_ms > 0 then
+    return send_request_on(stream, method, host_hdr, path, body, content_type, false, context().with_timeout(timeout_ms))
+  end
+  return send_request_on(stream, method, host_hdr, path, body, content_type, false, nil)
 end
 
 export task https_get(addr: string, path: string = "/", server_name: string = "", tls_config: dict<string, any> = {}, timeout_ms: int = 5000): HttpClientResponse
@@ -753,10 +763,12 @@ end
 
 export task https_post_chunked(addr: string, path: string, chunks: list<string>, server_name: string = "", content_type: string = "text/plain", tls_config: dict<string, any> = {}, timeout_ms: int = 5000): HttpClientResponse
   let stream = tls_connect(addr, server_name, tls_config, timeout_ms)
+  defer stream.close()
   let host_hdr = if server_name != "" then server_name else addr end
-  let resp = send_chunked_request_on(stream, "POST", host_hdr, path, chunks, content_type, false, nil)
-  stream.close()
-  return resp
+  if timeout_ms > 0 then
+    return send_chunked_request_on(stream, "POST", host_hdr, path, chunks, content_type, false, context().with_timeout(timeout_ms))
+  end
+  return send_chunked_request_on(stream, "POST", host_hdr, path, chunks, content_type, false, nil)
 end
 
 export task open_https_sse(addr: string, path: string = "/sse", server_name: string = "", tls_config: dict<string, any> = {}, timeout_ms: int = 5000): tls_stream

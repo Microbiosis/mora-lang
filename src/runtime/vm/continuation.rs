@@ -377,6 +377,8 @@ pub enum CombinatorFrame {
     },
     /// `swap(atom, f)` writeback awaiting `f(old)` return value.
     Swap { atom: Arc<Mutex<Value>> },
+    /// `try_call(f, args...)` boundary catching runtime/IO/timeout errors into `result<T, string>`.
+    TryCatch,
     /// Reverse-mode autograd wrapper around a differentiated function call.
     AutogradEval {
         tape_id: u64,

@@ -53,6 +53,9 @@ All notable changes to Mora will be documented in this file.
 - **原生异步 TLS 1.2/1.3 传输层粘包/分片状态机修复（`src/runtime/tls/`、`tests/p3_tls_and_https.rs`）**：
   - 修复 `MoraTlsStream::pump_decrypt` 仅在 `net_in` 非空时调用 `engine.decrypt` 的缺陷（消除 macOS/Linux OpenSSL Memory-BIO 握手尾包 `[ClientFinished | 1-RTT ApplicationData]` 粘包写入 `rbio` 后双端死锁），并将进展判定改为 `plain_buf.len() > prev_plain_len`（消除 `read_line_bytes` 跨记录分片行的空转循环），同时在 `from_handshake` 补充 `SECBUFFER_EXTRA` 连续握手记录推进。
   - 修复 OpenSSL（`openssl.rs`）与 Win32 Schannel（`schannel.rs`）在 `[ApplicationData | close_notify]` 或后握手控制记录粘包时的 `DecryptStatus::PeerClosed` 锁存、非应用记录连续排空及 Schannel `SEC_I_CONTEXT_EXPIRED`/`SEC_I_RENEGOTIATE` 原始控制记录误入明文缓冲问题，补充确定性 sans-IO 与流级回归单测。
+- **一等 `result<T, E>` / `try_call` 原语闭环与纯 Mora `std/mcp` 错误隔离及客户端结果路径（`src/runtime/vm/`、`src/typeck/`、`std/mcp.mora`、`std/net/http.mora`）**：
+  - 补齐源码级 `result<T, E>` 泛型注解解析、多态构造器 `Ok(v)`/`Err(e)`、`is_ok`/`is_err`/`unwrap`/`unwrap_or`/`unwrap_err`/`ok`/`err` 方法、`match` 模式解构与堆帧 VM `CombinatorFrame::TryCatch`（`try_call(f, args...) -> result<T, string>`，兼容同步抛错、`defer` 与 M:N 异步 `AwaitFuture` 挂起恢复）。
+  - `std/mcp.mora`：`tools/call` 隔离用户工具处理器运行期异常与 `Err(...)` 返回并规范输出 `isError: true` 结果包（`resources/read` 与 `prompts/get` 异常隔离为 `-32603`），服务循环永不因业务异常崩溃；客户端 `call_http`/`call_https` 新增可配置 `timeout_ms`（覆盖连接与读写全链路）并返回 `result<dict<string, any>, string>`，完整拦截连接失败、超时、断连、HTTP 非 2xx 与非法 JSON。
 
 ## [0.111.0] — Phase P4 全栈深水区里程碑：编译期 Const Generics 与源码级 GPU `kernel`、16B 未装箱 VM 与 M:N 协作式纤程、代价模型与严格 W^X 原生 JIT、分布式集合通信与纳秒级 `std/trace`
 

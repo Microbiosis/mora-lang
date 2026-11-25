@@ -62,7 +62,7 @@ let tool_args: dict<string, any> = {}
 assign tool_args = tool_args.set("prompt", "Hello Mora").set("max_tokens", 64)
 let tool_params: dict<string, any> = {}
 assign tool_params = tool_params.set("name", "echo_budget").set("arguments", tool_args)
-let call_resp = call_http(addr, "tools/call", tool_params, 1)
+let call_resp = call_http(addr, "tools/call", tool_params, 1).unwrap()
 let tool_out = str(call_resp.get("result").get("content").get(0).get("text"))
 assert(tool_out == "prompt_len=10,budget=64", "unexpected MCP tool result")
 print("MCP tools/call ->", tool_out)
@@ -70,7 +70,7 @@ print("MCP tools/call ->", tool_out)
 -- 3. JSON-RPC resources/read
 let res_params: dict<string, any> = {}
 assign res_params = res_params.set("uri", "mora://info")
-let res_resp = call_http(addr, "resources/read", res_params, 2)
+let res_resp = call_http(addr, "resources/read", res_params, 2).unwrap()
 let res_out = str(res_resp.get("result").get("contents").get(0).get("text"))
 assert(res_out == "mora-cloud-ready", "unexpected MCP resource result")
 print("MCP resources/read ->", res_out)

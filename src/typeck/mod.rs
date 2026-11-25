@@ -639,6 +639,7 @@ impl Type {
             "any" => Type::Union(vec![]),
             "list" => Type::List(Box::new(Type::Union(vec![]))),
             "dict" => Type::Dict(Box::new(Type::Union(vec![])), Box::new(Type::Union(vec![]))),
+            "result" => Type::Result_(Box::new(Type::Union(vec![])), Box::new(Type::Union(vec![]))),
             "channel" => Type::Channel(Box::new(Type::Union(vec![]))),
             "task_handle" | "taskhandle" => Type::TaskHandle(Box::new(Type::Union(vec![]))),
             "context" => Type::Context,
@@ -680,6 +681,19 @@ impl Type {
                     None => {
                         Type::Dict(Box::new(Type::Union(vec![])), Box::new(Type::Union(vec![])))
                     }
+                }
+            }
+            s if s.starts_with("result<") && s.ends_with('>') => {
+                let inner = &s[7..s.len() - 1];
+                match split_top_level_comma(inner) {
+                    Some((ok_str, err_str)) => Type::Result_(
+                        Box::new(Type::from_hint(ok_str.trim())),
+                        Box::new(Type::from_hint(err_str.trim())),
+                    ),
+                    None => Type::Result_(
+                        Box::new(Type::from_hint(inner.trim())),
+                        Box::new(Type::String),
+                    ),
                 }
             }
             // v0.x: string<char> 单字符

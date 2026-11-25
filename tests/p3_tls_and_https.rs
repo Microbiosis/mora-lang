@@ -451,12 +451,12 @@ let call_args: dict<string, any> = {}
 assign call_args = call_args.set("x", 21).set("k", 2)
 let call_params: dict<string, any> = {}
 assign call_params = call_params.set("name", "scale").set("arguments", call_args)
-let rpc_call = call_https(addr, "tools/call", call_params, "localhost", tls_cfg, 10)
+let rpc_call = call_https(addr, "tools/call", call_params, "localhost", tls_cfg, 10).unwrap()
 
 -- 3. HTTPS JSON-RPC resources/read
 let res_params: dict<string, any> = {}
 assign res_params = res_params.set("uri", "mora://status")
-let rpc_res = call_https(addr, "resources/read", res_params, "localhost", tls_cfg, 11)
+let rpc_res = call_https(addr, "resources/read", res_params, "localhost", tls_cfg, 11).unwrap()
 
 -- 4. HTTPS /sse MCP endpoint discovery
 let sse = open_https_sse(addr, "/sse", "localhost", tls_cfg)

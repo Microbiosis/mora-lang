@@ -183,7 +183,9 @@ impl<'a> VmEngine<'a> {
         max_steps: usize,
     ) -> MoraResult<VmOutcome> {
         self.step_budget = Some(max_steps.max(1));
-        self.handle_error(err)?;
+        if let Some(root_val) = self.handle_error(err)? {
+            return Ok(VmOutcome::Completed(root_val));
+        }
         self.run_loop_budgeted()
     }
 
@@ -210,7 +212,9 @@ impl<'a> VmEngine<'a> {
                                     }
                                 }
                                 Err(err) => {
-                                    self.handle_error(err)?;
+                                    if let Some(root_val) = self.handle_error(err)? {
+                                        return Ok(root_val);
+                                    }
                                 }
                             }
                         }
@@ -257,7 +261,9 @@ impl<'a> VmEngine<'a> {
                                 outcome: None,
                             });
                         }
-                        self.handle_error(msg)?;
+                        if let Some(root_val) = self.handle_error(msg)? {
+                            return Ok(VmOutcome::Completed(root_val));
+                        }
                     }
                 },
                 CallFrame::HandleBarrier(_) => {
@@ -345,8 +351,7 @@ impl<'a> VmEngine<'a> {
                             continue;
                         }
                         Err(saved_err) => {
-                            self.handle_error(saved_err)?;
-                            return Ok(None);
+                            return self.handle_error(saved_err);
                         }
                     }
                 }
@@ -533,6 +538,12 @@ impl<'a> VmEngine<'a> {
                 *atom.lock() = reply.clone();
                 Ok(Some(reply))
             }
+            CombinatorFrame::TryCatch => Ok(Some(Value::EnumVariant {
+                enum_name: "result".to_string(),
+                variant: "Ok".to_string(),
+                payload: vec![reply],
+                const_args: Vec::new(),
+            })),
             CombinatorFrame::AutogradEval {
                 tape_id,
                 leaf_nodes,
@@ -958,7 +969,7 @@ impl<'a> VmEngine<'a> {
         }
     }
 
-    fn handle_error(&mut self, mut err: MoraError) -> MoraResult<()> {
+    fn handle_error(&mut self, mut err: MoraError) -> MoraResult<Option<Value>> {
         while let Some(frame) = self.frames.pop() {
             match frame {
                 CallFrame::ErrorContext { prefix } => {
@@ -991,6 +1002,15 @@ impl<'a> VmEngine<'a> {
                 CallFrame::NoGradGuard => {
                     self.core.session.autograd.exit_no_grad();
                 }
+                CallFrame::Combinator(CombinatorFrame::TryCatch) => {
+                    let caught = Value::EnumVariant {
+                        enum_name: "result".to_string(),
+                        variant: "Err".to_string(),
+                        payload: vec![Value::String(err.to_string())],
+                        const_args: Vec::new(),
+                    };
+                    return self.deliver_value(caught);
+                }
                 CallFrame::Combinator(
                     CombinatorFrame::AutogradEval { tape_id, .. }
                     | CombinatorFrame::JvpEval { tape_id, .. }
@@ -1015,7 +1035,7 @@ impl<'a> VmEngine<'a> {
                                     outcome: Some(Err(err)),
                                 });
                                 self.frames.push(CallFrame::Script(Box::new(defer_frame)));
-                                return Ok(());
+                                return Ok(None);
                             }
                             Err(e) => {
                                 err = e;
@@ -1045,7 +1065,7 @@ impl<'a> VmEngine<'a> {
                                     outcome: Some(Err(err)),
                                 });
                                 self.frames.push(CallFrame::Script(Box::new(defer_frame)));
-                                return Ok(());
+                                return Ok(None);
                             }
                             Err(e) => {
                                 err = e;

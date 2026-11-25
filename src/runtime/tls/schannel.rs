@@ -894,6 +894,8 @@ pub(crate) struct PlatformTlsSession {
     ctx: SecHandle,
     ctx_initialized: bool,
     handshake_done: bool,
+    renegotiating: bool,
+    peer_closed: bool,
     server_name: Option<String>,
     ca_pem: Option<String>,
     insecure_skip_verify: bool,
@@ -982,6 +984,8 @@ pub(crate) fn create_client_session(cfg: &TlsClientConfig) -> MoraResult<Platfor
         ctx: SecHandle::default(),
         ctx_initialized: false,
         handshake_done: false,
+        renegotiating: false,
+        peer_closed: false,
         server_name: Some(cfg.server_name.clone()),
         ca_pem: cfg.ca_pem.clone(),
         insecure_skip_verify: cfg.insecure_skip_verify,
@@ -1002,6 +1006,8 @@ pub(crate) fn create_server_session(
         ctx: SecHandle::default(),
         ctx_initialized: false,
         handshake_done: false,
+        renegotiating: false,
+        peer_closed: false,
         server_name: None,
         ca_pem: None,
         insecure_skip_verify: false,
@@ -1578,6 +1584,19 @@ impl TlsEngine for PlatformTlsSession {
                 "TLS (Schannel): decrypt called before handshake completed".to_string(),
             ));
         }
+        if self.peer_closed {
+            return Ok(DecryptStatus::PeerClosed);
+        }
+        if self.renegotiating {
+            match self.run_handshake_call(incoming, outgoing_response)? {
+                HandshakeStatus::Complete => {
+                    self.renegotiating = false;
+                }
+                HandshakeStatus::NeedMoreData => {
+                    return Ok(DecryptStatus::NeedMoreData);
+                }
+            }
+        }
         let a = api()?;
         let mut produced_any = false;
 
@@ -1611,11 +1630,19 @@ impl TlsEngine for PlatformTlsSession {
                 };
             }
 
+            // Only extract `SECBUFFER_DATA` on `SEC_E_OK`: on `SEC_I_CONTEXT_EXPIRED`
+            // (`close_notify`) or `SEC_I_RENEGOTIATE` (`NewSessionTicket`), Schannel leaves
+            // `bufs[0]` tagged with its input `SECBUFFER_DATA` type pointing at the raw TLS
+            // control/alert record rather than decrypted application plaintext.
             let mut data_span: Option<(usize, usize)> = None;
             let mut extra_len: usize = 0;
             let base_ptr = incoming.as_ptr() as usize;
             for b in &bufs {
-                if b.buffer_type == SECBUFFER_DATA && b.cb_buffer > 0 && !b.pv_buffer.is_null() {
+                if st == SEC_E_OK
+                    && b.buffer_type == SECBUFFER_DATA
+                    && b.cb_buffer > 0
+                    && !b.pv_buffer.is_null()
+                {
                     let off = (b.pv_buffer as usize).saturating_sub(base_ptr);
                     data_span = Some((off, b.cb_buffer as usize));
                 } else if b.buffer_type == SECBUFFER_EXTRA {
@@ -1636,18 +1663,26 @@ impl TlsEngine for PlatformTlsSession {
             match st {
                 SEC_E_OK => {}
                 SEC_I_CONTEXT_EXPIRED => {
-                    return if produced_any {
-                        Ok(DecryptStatus::Ok)
-                    } else {
-                        Ok(DecryptStatus::PeerClosed)
-                    };
+                    // Latch `close_notify` immediately even when preceding `ApplicationData`
+                    // records were decrypted in this same batch (`MoraTlsStream` drains `plain_buf`
+                    // completely before surfacing `peer_eof`).
+                    self.peer_closed = true;
+                    return Ok(DecryptStatus::PeerClosed);
                 }
                 SEC_I_RENEGOTIATE => {
                     // TLS 1.3 post-handshake messages (e.g. NewSessionTicket) or TLS 1.2 renegotiation.
-                    self.handshake_done = false;
-                    let _ = self.run_handshake_call(incoming, outgoing_response)?;
-                    if !self.handshake_done {
-                        return Ok(DecryptStatus::NeedMoreData);
+                    self.renegotiating = true;
+                    match self.run_handshake_call(incoming, outgoing_response)? {
+                        HandshakeStatus::Complete => {
+                            self.renegotiating = false;
+                        }
+                        HandshakeStatus::NeedMoreData => {
+                            return if produced_any {
+                                Ok(DecryptStatus::Ok)
+                            } else {
+                                Ok(DecryptStatus::NeedMoreData)
+                            };
+                        }
                     }
                 }
                 other => {

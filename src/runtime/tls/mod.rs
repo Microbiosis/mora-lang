@@ -188,6 +188,7 @@ impl MoraTlsStream {
             if let Some(c) = ctx {
                 c.status()?;
             }
+            let prev_in_len = net_in.len();
             let step = engine.handshake_step(&mut net_in, &mut net_out);
             if !net_out.is_empty() {
                 let to_send = std::mem::take(&mut net_out);
@@ -200,6 +201,12 @@ impl MoraTlsStream {
             match step? {
                 HandshakeStatus::Complete => break,
                 HandshakeStatus::NeedMoreData => {
+                    // If the engine consumed a TLS record from `net_in` (e.g. Schannel
+                    // `SECBUFFER_EXTRA` across coalesced handshake records) and unparsed bytes
+                    // remain in `net_in`, advance the state machine immediately before reading TCP.
+                    if !net_in.is_empty() && net_in.len() < prev_in_len {
+                        continue;
+                    }
                     let chunk = tcp.read_bytes(16384, ctx).await?;
                     if chunk.is_empty() {
                         return Err(MoraError::Io(
@@ -255,8 +262,18 @@ impl MoraTlsStream {
         self.alpn_protocol.as_deref()
     }
 
-    /// Pump at least one decrypted plaintext chunk into `state.plain_buf` (or set `peer_eof`).
-    async fn pump_decrypt(&self, ctx: Option<&TaskContext>) -> MoraResult<()> {
+    /// Pump decrypted plaintext into `state.plain_buf` until its length exceeds `prev_plain_len`
+    /// (or `state.peer_eof` is reached).
+    ///
+    /// Note: `engine.decrypt` MUST be polled even when `state.net_in` is empty because memory-BIO
+    /// backends (OpenSSL/LibreSSL) drain coalesced post-handshake ciphertext (such as an immediate
+    /// 1-RTT `ApplicationData` record arriving in the same TCP segment as `ClientFinished`) into
+    /// their own internal BIO buffers during `handshake_step` / `decrypt`.
+    async fn pump_decrypt(
+        &self,
+        prev_plain_len: usize,
+        ctx: Option<&TaskContext>,
+    ) -> MoraResult<()> {
         loop {
             if self.is_closed() {
                 return Err(MoraError::Io("TLS stream is closed".to_string()));
@@ -268,33 +285,29 @@ impl MoraTlsStream {
             let mut outgoing_reply = Vec::new();
             let status = {
                 let mut st = self.state.lock();
-                if !st.plain_buf.is_empty() || st.peer_eof {
+                if st.plain_buf.len() > prev_plain_len || st.peer_eof {
                     return Ok(());
                 }
-                if !st.net_in.is_empty() {
-                    let TlsStreamState {
-                        engine,
-                        net_in,
-                        plain_buf,
-                        peer_eof,
-                    } = &mut *st;
-                    let dec = engine.decrypt(net_in, plain_buf, &mut outgoing_reply)?;
-                    if dec == DecryptStatus::PeerClosed {
-                        *peer_eof = true;
-                    }
-                    Some(dec)
-                } else {
-                    None
+                let TlsStreamState {
+                    engine,
+                    net_in,
+                    plain_buf,
+                    peer_eof,
+                } = &mut *st;
+                let dec = engine.decrypt(net_in, plain_buf, &mut outgoing_reply)?;
+                if dec == DecryptStatus::PeerClosed {
+                    *peer_eof = true;
                 }
+                dec
             };
 
             if !outgoing_reply.is_empty() {
-                let _ = self.tcp.write_bytes(&outgoing_reply, ctx).await;
+                self.tcp.write_bytes(&outgoing_reply, ctx).await?;
             }
 
             match status {
-                Some(DecryptStatus::Ok | DecryptStatus::PeerClosed) => return Ok(()),
-                Some(DecryptStatus::NeedMoreData) | None => {
+                DecryptStatus::Ok | DecryptStatus::PeerClosed => return Ok(()),
+                DecryptStatus::NeedMoreData => {
                     let chunk = self.tcp.read_bytes(16384, ctx).await?;
                     if chunk.is_empty() {
                         let mut st = self.state.lock();
@@ -331,7 +344,7 @@ impl MoraTlsStream {
                     return Ok(Vec::new());
                 }
             }
-            self.pump_decrypt(ctx).await?;
+            self.pump_decrypt(0, ctx).await?;
         }
     }
 
@@ -348,7 +361,7 @@ impl MoraTlsStream {
             return Ok(Vec::new());
         }
         loop {
-            {
+            let prev_plain_len = {
                 let mut st = self.state.lock();
                 if let Some(pos) = st.plain_buf.iter().position(|&b| b == b'\n') {
                     let end = (pos + 1).min(max_bytes);
@@ -360,8 +373,9 @@ impl MoraTlsStream {
                 if st.peer_eof {
                     return Ok(std::mem::take(&mut st.plain_buf));
                 }
-            }
-            self.pump_decrypt(ctx).await?;
+                st.plain_buf.len()
+            };
+            self.pump_decrypt(prev_plain_len, ctx).await?;
         }
     }
 
@@ -415,5 +429,302 @@ impl MoraTlsStream {
             }
             self.tcp.close().await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::scheduler::TaskScheduler;
+    use std::io::{Read, Write};
+    use std::net::TcpStream as StdTcpStream;
+    use std::sync::mpsc;
+
+    fn load_test_tls_material() -> (String, String, String) {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let cert = std::fs::read_to_string(root.join("test_data/tls/test_server.pem"))
+            .expect("read test_server.pem");
+        let key = std::fs::read_to_string(root.join("test_data/tls/test_server_pkcs8.key"))
+            .expect("read test_server_pkcs8.key");
+        let ca = std::fs::read_to_string(root.join("test_data/tls/test_ca.pem"))
+            .expect("read test_ca.pem");
+        (cert, key, ca)
+    }
+
+    #[test]
+    fn sans_io_coalesced_client_finished_appdata_and_close_notify() {
+        let (cert_pem, key_pem, ca_pem) = load_test_tls_material();
+        let srv_ctx = platform::build_server_context(&TlsServerConfig {
+            cert_pem,
+            key_pem,
+            alpn_protocols: vec!["http/1.1".to_string()],
+        })
+        .expect("build_server_context");
+        let mut srv = platform::create_server_session(srv_ctx).expect("create_server_session");
+        let mut cli = platform::create_client_session(&TlsClientConfig {
+            server_name: "localhost".to_string(),
+            ca_pem: Some(ca_pem),
+            alpn_protocols: vec!["http/1.1".to_string()],
+            insecure_skip_verify: false,
+        })
+        .expect("create_client_session");
+
+        let mut c2s = Vec::new();
+        let mut s2c = Vec::new();
+        let mut empty = Vec::new();
+
+        // 1. ClientHello -> ServerHello..ServerFinished
+        assert_eq!(
+            cli.handshake_step(&mut empty, &mut c2s)
+                .expect("client step 1"),
+            HandshakeStatus::NeedMoreData
+        );
+        assert!(!c2s.is_empty());
+
+        let srv_step1 = srv
+            .handshake_step(&mut c2s, &mut s2c)
+            .expect("server step 1");
+        assert_eq!(srv_step1, HandshakeStatus::NeedMoreData);
+        assert!(!s2c.is_empty());
+
+        // Advance handshake until whichever side completes FIRST:
+        // - TLS 1.3 (OpenSSL): `cli` completes first (1.5-RTT) and coalesces `[ClientFinished | AppData]` -> `srv`.
+        // - TLS 1.2 (Schannel): `srv` completes first (2-RTT) and coalesces `[ServerFinished | AppData]` -> `cli`.
+        let client_finished_first = loop {
+            let cli_st = cli
+                .handshake_step(&mut s2c, &mut c2s)
+                .expect("client handshake step");
+            if cli_st == HandshakeStatus::Complete {
+                break true;
+            }
+            let srv_st = srv
+                .handshake_step(&mut c2s, &mut s2c)
+                .expect("server handshake step");
+            if srv_st == HandshakeStatus::Complete {
+                break false;
+            }
+        };
+
+        if client_finished_first {
+            // Coalesce `ClientFinished` + first `ApplicationData` record into ONE buffer `c2s`.
+            cli.encrypt(b"hello-coalesced\n", &mut c2s)
+                .expect("client 1-RTT encrypt");
+            let srv_final = srv
+                .handshake_step(&mut c2s, &mut s2c)
+                .expect("server final handshake step");
+            assert_eq!(srv_final, HandshakeStatus::Complete);
+
+            // Without feeding any additional bytes into `c2s` (which OpenSSL has already drained to 0
+            // bytes inside `self.rbio`), `srv.decrypt` MUST immediately yield `"hello-coalesced\n"`.
+            let mut srv_plain = Vec::new();
+            let mut srv_reply = Vec::new();
+            let dec1 = srv
+                .decrypt(&mut c2s, &mut srv_plain, &mut srv_reply)
+                .expect("server decrypt coalesced appdata");
+            assert_eq!(dec1, DecryptStatus::Ok);
+            assert_eq!(srv_plain, b"hello-coalesced\n");
+            s2c.extend_from_slice(&srv_reply);
+        } else {
+            // Coalesce `ServerFinished` + first `ApplicationData` record into ONE buffer `s2c`.
+            srv.encrypt(b"hello-coalesced\n", &mut s2c)
+                .expect("server 2-RTT encrypt");
+            let cli_final = cli
+                .handshake_step(&mut s2c, &mut c2s)
+                .expect("client final handshake step");
+            assert_eq!(cli_final, HandshakeStatus::Complete);
+
+            let mut cli_early_plain = Vec::new();
+            let mut cli_early_reply = Vec::new();
+            let dec1 = cli
+                .decrypt(&mut s2c, &mut cli_early_plain, &mut cli_early_reply)
+                .expect("client decrypt coalesced appdata");
+            assert_eq!(dec1, DecryptStatus::Ok);
+            assert_eq!(cli_early_plain, b"hello-coalesced\n");
+        }
+
+        // Coalesce any post-handshake server frames (`NewSessionTicket`) + `ApplicationData`
+        // + `close_notify` into ONE buffer `s2c` and verify client drains plaintext AND latches EOF.
+        srv.encrypt(b"tail-without-newline", &mut s2c)
+            .expect("server encrypt tail");
+        srv.shutdown_alert(&mut s2c).expect("server shutdown_alert");
+
+        let mut cli_plain = Vec::new();
+        let mut cli_reply = Vec::new();
+        let cli_dec = cli
+            .decrypt(&mut s2c, &mut cli_plain, &mut cli_reply)
+            .expect("client decrypt coalesced ticket + appdata + close_notify");
+        assert_eq!(cli_plain, b"tail-without-newline");
+        assert_eq!(cli_dec, DecryptStatus::PeerClosed);
+
+        // Subsequent decrypt with empty input stays `PeerClosed`.
+        let cli_dec_after = cli
+            .decrypt(&mut empty, &mut cli_plain, &mut cli_reply)
+            .expect("client decrypt after close_notify");
+        assert_eq!(cli_dec_after, DecryptStatus::PeerClosed);
+    }
+
+    #[test]
+    fn stream_coalesced_handshake_appdata_fragmented_readline_and_close_notify() {
+        let (cert_pem, key_pem, ca_pem) = load_test_tls_material();
+        let sched = TaskScheduler::shared();
+
+        sched.block_on(async move {
+            let ctx = TaskContext::root().with_timeout(Duration::from_secs(5));
+            let listener = MoraTlsListener::bind(
+                "127.0.0.1:0",
+                &TlsServerConfig {
+                    cert_pem,
+                    key_pem,
+                    alpn_protocols: vec!["http/1.1".to_string()],
+                },
+            )
+            .await
+            .expect("bind TLS listener");
+            let addr = listener.local_addr().to_string();
+
+            let (done_tx, done_rx) = mpsc::channel::<()>();
+            let cli_thread = std::thread::spawn(move || {
+                let mut raw = StdTcpStream::connect(&addr).expect("raw TCP connect");
+                raw.set_nodelay(true).expect("set_nodelay");
+                raw.set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("set_read_timeout");
+
+                let mut cli = platform::create_client_session(&TlsClientConfig {
+                    server_name: "localhost".to_string(),
+                    ca_pem: Some(ca_pem),
+                    alpn_protocols: vec!["http/1.1".to_string()],
+                    insecure_skip_verify: false,
+                })
+                .expect("create_client_session");
+
+                let mut net_in = Vec::new();
+                let mut net_out = Vec::new();
+                let mut buf = [0u8; 16384];
+
+                // Step 1: send ClientHello.
+                assert_eq!(
+                    cli.handshake_step(&mut net_in, &mut net_out)
+                        .expect("cli step 1"),
+                    HandshakeStatus::NeedMoreData
+                );
+                raw.write_all(&net_out).expect("write ClientHello");
+                net_out.clear();
+
+                // Drive until client handshake finishes, holding back any final `ClientFinished` in `net_out`.
+                let mut hs_done = false;
+                loop {
+                    while !net_in.is_empty() {
+                        let before = net_in.len();
+                        let st = cli
+                            .handshake_step(&mut net_in, &mut net_out)
+                            .expect("cli handshake step");
+                        if st == HandshakeStatus::Complete {
+                            hs_done = true;
+                            break;
+                        }
+                        if !net_out.is_empty() {
+                            raw.write_all(&net_out).expect("write handshake step");
+                            net_out.clear();
+                        }
+                        if net_in.len() == before {
+                            break;
+                        }
+                    }
+                    if hs_done {
+                        break;
+                    }
+                    let n = raw.read(&mut buf).expect("read server handshake");
+                    assert!(n > 0, "unexpected EOF during handshake");
+                    net_in.extend_from_slice(&buf[..n]);
+                }
+
+                // Deterministically coalesce `[ClientFinished | AppData]` into ONE single `write_all`
+                // and pause slightly before sending so server's `accept` reads all bytes in one recv.
+                cli.encrypt(b"coalesced-1rtt-line\n", &mut net_out)
+                    .expect("encrypt 1-RTT line");
+                std::thread::sleep(Duration::from_millis(15));
+                raw.write_all(&net_out)
+                    .expect("write coalesced ClientFinished + AppData");
+                net_out.clear();
+
+                // Read server echo to confirm handshake + first line succeeded without deadlock.
+                let mut echo_plain = Vec::new();
+                let mut reply = Vec::new();
+                while echo_plain != b"ACK:coalesced-1rtt-line\n" {
+                    let st = cli
+                        .decrypt(&mut net_in, &mut echo_plain, &mut reply)
+                        .expect("cli decrypt echo");
+                    if !reply.is_empty() {
+                        raw.write_all(&reply).expect("write reply");
+                        reply.clear();
+                    }
+                    if st == DecryptStatus::NeedMoreData {
+                        let n = raw.read(&mut buf).expect("read echo ciphertext");
+                        assert!(n > 0, "unexpected EOF waiting for echo");
+                        net_in.extend_from_slice(&buf[..n]);
+                    }
+                }
+
+                // Now send a single logical line fragmented across two distinct TLS records & packets.
+                cli.encrypt(b"frag-alpha-", &mut net_out)
+                    .expect("encrypt frag 1");
+                raw.write_all(&net_out).expect("write frag 1");
+                net_out.clear();
+                std::thread::sleep(Duration::from_millis(20));
+
+                cli.encrypt(b"frag-omega\n", &mut net_out)
+                    .expect("encrypt frag 2");
+                raw.write_all(&net_out).expect("write frag 2");
+                net_out.clear();
+                std::thread::sleep(Duration::from_millis(15));
+
+                // Finally coalesce an unterminated tail + `close_notify` WITHOUT closing raw TCP yet!
+                cli.encrypt(b"final-unterminated", &mut net_out)
+                    .expect("encrypt tail");
+                cli.shutdown_alert(&mut net_out).expect("emit close_notify");
+                raw.write_all(&net_out).expect("write tail + close_notify");
+
+                // Hold TCP socket open until server confirms observing both tail and TLS EOF.
+                let _ = done_rx.recv_timeout(Duration::from_secs(5));
+            });
+
+            let srv_stream = listener
+                .accept(Some(&ctx))
+                .await
+                .expect("server TLS accept");
+            let line1 = srv_stream
+                .read_line_bytes(4096, Some(&ctx))
+                .await
+                .expect("read coalesced line 1");
+            assert_eq!(line1, b"coalesced-1rtt-line\n");
+
+            srv_stream
+                .write_bytes(b"ACK:coalesced-1rtt-line\n", Some(&ctx))
+                .await
+                .expect("write ACK");
+
+            let line2 = srv_stream
+                .read_line_bytes(4096, Some(&ctx))
+                .await
+                .expect("read fragmented line 2");
+            assert_eq!(line2, b"frag-alpha-frag-omega\n");
+
+            let tail = srv_stream
+                .read_line_bytes(4096, Some(&ctx))
+                .await
+                .expect("read unterminated tail before close_notify");
+            assert_eq!(tail, b"final-unterminated");
+
+            let eof = srv_stream
+                .read_line_bytes(4096, Some(&ctx))
+                .await
+                .expect("read EOF after close_notify while TCP still open");
+            assert!(eof.is_empty());
+
+            let _ = done_tx.send(());
+            srv_stream.close().await;
+            listener.close();
+            cli_thread.join().expect("join client thread");
+        });
     }
 }

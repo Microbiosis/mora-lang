@@ -484,3 +484,73 @@ let res_text = rpc_res.get("result").get("contents").get(0).get("text")
     assert_eq!(v[4], Value::String("endpoint:/mcp".to_string()));
     assert_eq!(v[5], Value::String("4".to_string()));
 }
+
+#[test]
+fn p3_tls_coalesced_handshake_fragmented_readline_and_close_notify() {
+    // Regression test for:
+    // 1. Coalesced `[ClientFinished | 1-RTT ApplicationData]` drained into OpenSSL `rbio`
+    // 2. Multi-record fragmented `read_line()` (`prev_plain_len > 0` across delayed TLS records)
+    // 3. Unterminated final line followed immediately by `close_notify`
+    let src = r#"
+import "std/net/tls"
+
+let cert_pem = file.read_text("test_data/tls/test_server.pem")
+let key_pem = file.read_text("test_data/tls/test_server_pkcs8.key")
+let ca_pem = file.read_text("test_data/tls/test_ca.pem")
+
+let listener = listen("127.0.0.1:0", cert_pem, key_pem, ["http/1.1"])
+let addr = listener.local_addr()
+
+let srv_task = spawn fn()
+  let round = 0
+  while round < 6
+    let c = listener.accept()
+    let first = c.read_line().trim()
+    let frag = c.read_line().trim()
+    c.write("OK:" + first + "|" + frag + "\n")
+    c.write("tail-" + str(round))
+    c.close()
+    assign round = round + 1
+  end
+  return round
+end
+
+let last_reply = ""
+let last_tail = ""
+let eof_ok = true
+let i = 0
+while i < 6
+  let cli = connect(addr, "localhost", ca_pem, ["http/1.1"], false, 5000)
+  -- Immediate 1-RTT write right after handshake completion
+  cli.write("burst-" + str(i) + "\n")
+  -- Multi-record fragmented line without newline in first two records
+  cli.write("segA-")
+  sleep(10)
+  cli.write("segB-")
+  sleep(10)
+  cli.write("segC\n")
+  assign last_reply = cli.read_line().trim()
+  assign last_tail = cli.read_line()
+  let eof_check = cli.read_line()
+  if eof_check != "" then
+    assign eof_ok = false
+  end
+  cli.close()
+  assign i = i + 1
+end
+
+let rounds = srv_task.join()
+listener.close()
+[str(rounds), last_reply, last_tail, str(eof_ok)]
+"#;
+
+    let out = compile_check_and_run(src);
+    let Value::List(items) = out else {
+        panic!("expected list, got {out:?}");
+    };
+    let v = items.to_vec();
+    assert_eq!(v[0], Value::String("6".to_string()));
+    assert_eq!(v[1], Value::String("OK:burst-5|segA-segB-segC".to_string()));
+    assert_eq!(v[2], Value::String("tail-5".to_string()));
+    assert_eq!(v[3], Value::String("true".to_string()));
+}

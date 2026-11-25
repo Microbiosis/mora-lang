@@ -50,6 +50,9 @@ All notable changes to Mora will be documented in this file.
 ### P5-5：旗舰端到端纯 Mora LLM 示例与全仓 CI 同步（`examples/llm_train_and_serve_e2e.mora`）
 
 - 新增零外部副作用端到端旗舰示例 `examples/llm_train_and_serve_e2e.mora`（已纳入 `tests/p3_cli_fmt_test_and_examples.rs` 自动化类型检查、格式化校验与实跑门禁），单文件完整串起 BPE 训练 → Mini `CausalLM` + `AdamW` 训练收敛 → Safetensors & GGUF v3 零误差权重/词表往返 → 实时 OpenAI HTTP/SSE 流式推理 + RadixAttention 缓存命中 + MCP 工具 + `std/trace` 追踪。
+- **原生异步 TLS 1.2/1.3 传输层粘包/分片状态机修复（`src/runtime/tls/`、`tests/p3_tls_and_https.rs`）**：
+  - 修复 `MoraTlsStream::pump_decrypt` 仅在 `net_in` 非空时调用 `engine.decrypt` 的缺陷（消除 macOS/Linux OpenSSL Memory-BIO 握手尾包 `[ClientFinished | 1-RTT ApplicationData]` 粘包写入 `rbio` 后双端死锁），并将进展判定改为 `plain_buf.len() > prev_plain_len`（消除 `read_line_bytes` 跨记录分片行的空转循环），同时在 `from_handshake` 补充 `SECBUFFER_EXTRA` 连续握手记录推进。
+  - 修复 OpenSSL（`openssl.rs`）与 Win32 Schannel（`schannel.rs`）在 `[ApplicationData | close_notify]` 或后握手控制记录粘包时的 `DecryptStatus::PeerClosed` 锁存、非应用记录连续排空及 Schannel `SEC_I_CONTEXT_EXPIRED`/`SEC_I_RENEGOTIATE` 原始控制记录误入明文缓冲问题，补充确定性 sans-IO 与流级回归单测。
 
 ## [0.111.0] — Phase P4 全栈深水区里程碑：编译期 Const Generics 与源码级 GPU `kernel`、16B 未装箱 VM 与 M:N 协作式纤程、代价模型与严格 W^X 原生 JIT、分布式集合通信与纳秒级 `std/trace`
 

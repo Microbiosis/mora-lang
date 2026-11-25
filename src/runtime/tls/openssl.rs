@@ -598,6 +598,7 @@ pub(crate) struct PlatformTlsSession {
     wbio: *mut c_void, // borrowed by `ssl` (freed by `SSL_free`)
     ctx_owner: CtxOwner,
     handshake_done: bool,
+    peer_closed: bool,
 }
 
 // SAFETY: Owned exclusively behind a `Mutex` in `MoraTlsStream`; never accessed concurrently.
@@ -871,6 +872,7 @@ pub(crate) fn create_client_session(cfg: &TlsClientConfig) -> MoraResult<Platfor
         wbio,
         ctx_owner: CtxOwner::ClientOwned(ctx),
         handshake_done: false,
+        peer_closed: false,
     })
 }
 
@@ -909,10 +911,17 @@ pub(crate) fn create_server_session(
         wbio,
         ctx_owner: CtxOwner::ServerShared(ctx),
         handshake_done: false,
+        peer_closed: false,
     })
 }
 
 impl PlatformTlsSession {
+    fn rbio_pending(&self, a: &OpenSslApi) -> usize {
+        // SAFETY: Queries pending unread ciphertext bytes in `self.rbio`.
+        let pending = unsafe { (a.bio_ctrl)(self.rbio, BIO_CTRL_PENDING, 0, ptr::null_mut()) };
+        pending.max(0) as usize
+    }
+
     fn feed_incoming(&self, a: &OpenSslApi, incoming: &mut Vec<u8>) {
         if incoming.is_empty() {
             return;
@@ -1049,12 +1058,16 @@ impl TlsEngine for PlatformTlsSession {
                 "TLS (OpenSSL): decrypt called before handshake completed".to_string(),
             ));
         }
+        if self.peer_closed {
+            return Ok(DecryptStatus::PeerClosed);
+        }
         let a = api()?;
         self.feed_incoming(a, incoming);
 
         let mut produced = false;
         let mut scratch = [0u8; 16384];
         loop {
+            let rbio_before = self.rbio_pending(a);
             let n = {
                 // SAFETY: Decrypts available application data from `rbio` into `scratch`.
                 unsafe {
@@ -1076,6 +1089,13 @@ impl TlsEngine for PlatformTlsSession {
                 unsafe { (a.ssl_get_error)(self.ssl, n) }
             };
             if err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE {
+                let rbio_after = self.rbio_pending(a);
+                // If `SSL_read` consumed a non-application record (e.g. TLS 1.3 `NewSessionTicket`
+                // or `KeyUpdate`) without `SSL_MODE_AUTO_RETRY` and unread ciphertext still remains
+                // in `rbio`, continue draining immediately instead of stalling on socket I/O.
+                if rbio_after > 0 && rbio_after < rbio_before {
+                    continue;
+                }
                 return if produced {
                     Ok(DecryptStatus::Ok)
                 } else {
@@ -1083,11 +1103,11 @@ impl TlsEngine for PlatformTlsSession {
                 };
             }
             if err == SSL_ERROR_ZERO_RETURN {
-                return if produced {
-                    Ok(DecryptStatus::Ok)
-                } else {
-                    Ok(DecryptStatus::PeerClosed)
-                };
+                // Latch `close_notify` immediately even if preceding `ApplicationData` records were
+                // decrypted in this same batch (`MoraTlsStream` always drains `plain_buf` before
+                // surfacing EOF).
+                self.peer_closed = true;
+                return Ok(DecryptStatus::PeerClosed);
             }
             return Err(MoraError::Io(format!(
                 "TLS (OpenSSL): SSL_read failed (err={err}): {}",

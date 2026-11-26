@@ -13,18 +13,58 @@ pub(crate) fn call_method_list_pure(
     method: &str,
     args: &[Value],
 ) -> Option<MoraResult<Value>> {
+    call_method_list_fbip(list, method, args, None)
+}
+
+/// P6-1 Perceus/FBIP: Evaluate pure list methods consuming `list` by ownership so uniquely-owned
+/// lists mutate spine/tail chunks in place on `push` / `set`.
+pub(crate) fn call_method_list_fbip(
+    list: List,
+    method: &str,
+    args: &[Value],
+    fbip_stats: Option<&crate::runtime::fbip::FbipCounters>,
+) -> Option<MoraResult<Value>> {
     if matches!(method, "map" | "filter" | "reduce") {
         return None;
     }
-    Some(call_method_list_inner(list, method, args))
+    Some(call_method_list_inner(list, method, args, fbip_stats))
 }
 
-fn call_method_list_inner(list: List, method: &str, args: &[Value]) -> MoraResult<Value> {
+fn call_method_list_inner(
+    list: List,
+    method: &str,
+    args: &[Value],
+    fbip_stats: Option<&crate::runtime::fbip::FbipCounters>,
+) -> MoraResult<Value> {
     match method {
         "push" => {
             let item = args.first().cloned().unwrap_or(Value::Nil);
-            // v0.104.6：List 不可变，push 返回新列表
-            let new_list = list.push(item);
+            let (new_list, reused) = list.push_owned(item);
+            if reused && let Some(stats) = fbip_stats {
+                stats.on_list_reuse();
+            }
+            Ok(Value::List(new_list))
+        }
+        "set" => {
+            let index = super::required_num_arg(args, 0, "List.set", "index")?;
+            if index < 0.0 {
+                return Err(MoraError::Runtime(
+                    "List.set: index must be non-negative".to_string(),
+                ));
+            }
+            let idx = index as usize;
+            if idx >= list.len() {
+                return Err(MoraError::Runtime(format!(
+                    "index {} out of bounds (len {})",
+                    idx,
+                    list.len()
+                )));
+            }
+            let item = args.get(1).cloned().unwrap_or(Value::Nil);
+            let (new_list, reused) = list.set_owned(idx, item);
+            if reused && let Some(stats) = fbip_stats {
+                stats.on_list_reuse();
+            }
             Ok(Value::List(new_list))
         }
         "get" => {
@@ -337,20 +377,41 @@ fn call_method_list_inner(list: List, method: &str, args: &[Value]) -> MoraResul
 }
 
 pub(crate) fn call_method_dict_pure(
-    map: &HashMap<String, Value>,
+    map: &crate::value::dict::Dict,
     method: &str,
     args: &[Value],
 ) -> Option<MoraResult<Value>> {
+    call_method_dict_fbip(map.clone(), method, args, None)
+}
+
+/// P6-1 Perceus/FBIP: Evaluate pure dict methods consuming `map: Dict` by ownership so uniquely-owned
+/// dicts mutate their underlying `HashMap` in place in $O(1)$ on `set` / `remove`.
+pub(crate) fn call_method_dict_fbip(
+    map: crate::value::dict::Dict,
+    method: &str,
+    args: &[Value],
+    fbip_stats: Option<&crate::runtime::fbip::FbipCounters>,
+) -> Option<MoraResult<Value>> {
     match method {
         "get" => {
-            let key = args.first().map(|v| v.to_string()).unwrap_or_default();
-            Some(Ok(map.get(&key).cloned().unwrap_or(Value::Nil)))
+            let key = text_argument(args.first());
+            Some(Ok(map.get(key.as_ref()).cloned().unwrap_or(Value::Nil)))
         }
         "set" => {
             let key = args.first().map(|v| v.to_string()).unwrap_or_default();
             let value = args.get(1).cloned().unwrap_or(Value::Nil);
-            let mut new_map = map.clone();
-            new_map.insert(key, value);
+            let (new_map, reused) = map.set_owned(key, value);
+            if reused && let Some(stats) = fbip_stats {
+                stats.on_dict_reuse();
+            }
+            Some(Ok(Value::Dict(new_map)))
+        }
+        "remove" => {
+            let key = args.first().map(|v| v.to_string()).unwrap_or_default();
+            let (new_map, reused) = map.remove_owned(&key);
+            if reused && let Some(stats) = fbip_stats {
+                stats.on_dict_reuse();
+            }
             Some(Ok(Value::Dict(new_map)))
         }
         "keys" => {
@@ -383,13 +444,13 @@ pub(crate) fn call_method_dict_pure(
                     "err".to_string(),
                     Value::String("ParseError: empty body".to_string()),
                 );
-                return Some(Ok(Value::Dict(err)));
+                return Some(Ok(Value::Dict(err.into())));
             }
             match json_to_value(&body_str) {
                 Ok(val) => {
                     let mut result = HashMap::new();
                     result.insert("ok".to_string(), val);
-                    Some(Ok(Value::Dict(result)))
+                    Some(Ok(Value::Dict(result.into())))
                 }
                 Err(e) => {
                     let mut err = HashMap::new();
@@ -397,7 +458,7 @@ pub(crate) fn call_method_dict_pure(
                         "err".to_string(),
                         Value::String(format!("ParseError: {}", e.message())),
                     );
-                    Some(Ok(Value::Dict(err)))
+                    Some(Ok(Value::Dict(err.into())))
                 }
             }
         }
@@ -449,6 +510,14 @@ pub(crate) fn call_method_builtin_pure(
     }
 }
 
+fn text_argument(value: Option<&Value>) -> std::borrow::Cow<'_, str> {
+    match value {
+        Some(Value::String(s)) => std::borrow::Cow::Borrowed(s),
+        Some(v) => std::borrow::Cow::Owned(v.to_string()),
+        None => std::borrow::Cow::Borrowed(""),
+    }
+}
+
 pub(crate) fn call_method_string_pure(s: &str, method: &str, args: &[Value]) -> MoraResult<Value> {
     match method {
         // v0.104.6：数**字符**而非 UTF-8 字节
@@ -457,16 +526,16 @@ pub(crate) fn call_method_string_pure(s: &str, method: &str, args: &[Value]) -> 
         "lower" => Ok(Value::String(s.to_lowercase())),
         "trim" => Ok(Value::String(s.trim().to_string())),
         "starts_with" => {
-            let prefix = args.first().map(|v| v.to_string()).unwrap_or_default();
-            Ok(Value::Bool(s.starts_with(&prefix)))
+            let prefix = text_argument(args.first());
+            Ok(Value::Bool(s.starts_with(prefix.as_ref())))
         }
         "ends_with" => {
-            let suffix = args.first().map(|v| v.to_string()).unwrap_or_default();
-            Ok(Value::Bool(s.ends_with(&suffix)))
+            let suffix = text_argument(args.first());
+            Ok(Value::Bool(s.ends_with(suffix.as_ref())))
         }
         "contains" => {
-            let needle = args.first().map(|v| v.to_string()).unwrap_or_default();
-            Ok(Value::Bool(s.contains(&needle)))
+            let needle = text_argument(args.first());
+            Ok(Value::Bool(s.contains(needle.as_ref())))
         }
         "split" => {
             let sep = args.first().map(|v| v.to_string()).unwrap_or_default();
@@ -488,13 +557,13 @@ pub(crate) fn call_method_string_pure(s: &str, method: &str, args: &[Value]) -> 
                     "err".to_string(),
                     Value::String("ParseError: empty body".to_string()),
                 );
-                return Ok(Value::Dict(err));
+                return Ok(Value::Dict(err.into()));
             }
             match json_to_value(s) {
                 Ok(val) => {
                     let mut result = HashMap::new();
                     result.insert("ok".to_string(), val);
-                    Ok(Value::Dict(result))
+                    Ok(Value::Dict(result.into()))
                 }
                 Err(e) => {
                     let mut err = HashMap::new();
@@ -502,7 +571,7 @@ pub(crate) fn call_method_string_pure(s: &str, method: &str, args: &[Value]) -> 
                         "err".to_string(),
                         Value::String(format!("ParseError: {}", e.message())),
                     );
-                    Ok(Value::Dict(err))
+                    Ok(Value::Dict(err.into()))
                 }
             }
         }
@@ -511,6 +580,88 @@ pub(crate) fn call_method_string_pure(s: &str, method: &str, args: &[Value]) -> 
             method
         ))),
     }
+}
+
+/// P6-1: Single-source read-only method evaluation on `&Value` + `&[RegSlot]`, avoiding any
+/// duplicate VM fast-path table in `engine.rs` while guaranteeing borrowed receivers and arguments
+/// never clone inner `Tensor` / `Dict` / `List` / `String` buffers.
+pub(crate) fn eval_borrowing_method_slots(
+    recv: &Value,
+    method: &str,
+    args: &[crate::runtime::vm::loans::CallArg<'_>],
+    named_count: usize,
+    autograd: &crate::runtime::autograd::AutogradContext,
+) -> Option<MoraResult<crate::runtime::vm::RegSlot>> {
+    use crate::runtime::vm::RegSlot;
+    if let Value::EnumVariant {
+        enum_name, variant, ..
+    } = recv
+        && enum_name == "result"
+        && matches!(variant.as_str(), "Ok" | "Err")
+        && matches!(method, "is_ok" | "is_err")
+    {
+        return Some(if args.is_empty() && named_count == 0 {
+            Ok(RegSlot::Bool((variant == "Ok") == (method == "is_ok")))
+        } else {
+            Err(MoraError::Runtime(format!(
+                "result.{method}() expects 0 arguments"
+            )))
+        });
+    }
+    if named_count != 0 {
+        return None;
+    }
+    // 标量按值读取，堆上的参数直接借用。
+    let immediate;
+    let values = match args {
+        [] => &[][..],
+        [arg] => {
+            let value = if let Some(value) = arg.as_heap() {
+                value
+            } else {
+                immediate = arg.to_value();
+                &immediate
+            };
+            std::slice::from_ref(value)
+        }
+        _ => return None,
+    };
+    let result = match recv {
+        Value::Tensor(t) => crate::value::tensor::eval_tensor_readonly(
+            t,
+            method,
+            args.len(),
+            autograd.is_tracked(t),
+        )?,
+        Value::Dict(map) if matches!(method, "len" | "get" | "keys" | "values" | "json") => {
+            call_method_dict_pure(map, method, values)?
+        }
+        Value::List(list)
+            if matches!(
+                method,
+                "len" | "get" | "sum" | "mean" | "median" | "stddev" | "var" | "min" | "max"
+            ) =>
+        {
+            call_method_list_pure(list.clone(), method, values)?
+        }
+        Value::String(s)
+            if matches!(
+                method,
+                "len"
+                    | "upper"
+                    | "lower"
+                    | "trim"
+                    | "json"
+                    | "starts_with"
+                    | "ends_with"
+                    | "contains"
+            ) =>
+        {
+            call_method_string_pure(s, method, values)
+        }
+        _ => return None,
+    };
+    Some(result.map(RegSlot::from_value))
 }
 
 /// Evaluate any pure value method; returns `None` when VM callback/ambient/trait dispatch is needed.

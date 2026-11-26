@@ -5152,7 +5152,7 @@ impl HMInference {
                 }
                 Ok((Type::List(Box::new(Type::Int)), acc_row))
             }
-            "ndim" | "rank" | "numel" | "nbytes" | "byte_len" | "len" => {
+            "ndim" | "rank" | "numel" | "nbytes" | "byte_len" | "storage_id" | "len" => {
                 if !args.is_empty() {
                     return Err(vec![TypeError::ArityMismatch {
                         expected: 0,
@@ -5182,8 +5182,8 @@ impl HMInference {
                 }
                 Ok((Type::Bool, acc_row))
             }
-            "contiguous" | "abs" | "sqrt" | "exp" | "ln" | "relu" | "gelu" | "silu" | "tanh"
-            | "sigmoid" | "softmax" => {
+            "contiguous" | "abs" | "sqrt" | "exp" | "ln" | "log" | "sin" | "cos" | "relu"
+            | "gelu" | "silu" | "tanh" | "sigmoid" | "softmax" => {
                 if !args.is_empty() {
                     return Err(vec![TypeError::ArityMismatch {
                         expected: 0,

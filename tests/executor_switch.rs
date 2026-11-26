@@ -132,19 +132,18 @@ fn switch_while_break() {
     let (prog, _) = mora::cli::compile_and_opt(&source, None).expect("compile_and_opt failed");
     let mut core = CoreRuntime::default();
     let arc = Arc::new(prog);
-    let (_, globals) = execute_program(arc.clone(), &mut core).unwrap();
+    let (top, globals) = execute_program(arc.clone(), &mut core).unwrap();
     let _ = run_main_task(arc.clone(), globals.clone(), &mut core);
-    // 通过 globals 验证：break 触发则 total=10，未触发则=55
-    let total = arc
-        .globals
-        .iter()
-        .position(|g| g.name == "total")
-        .map(|i| globals[i].lock().0.clone())
-        .unwrap_or(Value::Nil);
+    // break 触发则 total=10，未触发则=55；fixture 的末表达式是 `total + 1000i`，因此程序
+    // 的返回值直接编码了这个事实（1010 / 1055）。
+    //
+    // 这里必须观察**返回值**而不是 `<main>` 全局槽：P6-1 的 Perceus 所有权转移会在全局的
+    // 最后一次读取处把所有权搬出全局槽 —— 脚本的顶层绑定随 `<main>` 一同消亡。需要执行后
+    // 仍能读到全局值的宿主，必须走保留全局的 lowering 路径编译。
     assert!(
-        matches!(total, Value::Int(10)),
+        matches!(top, Value::Int(1010)),
         "while break: total should be 10 (break at i=5), got {:?}",
-        total
+        top
     );
 }
 

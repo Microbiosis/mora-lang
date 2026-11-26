@@ -128,7 +128,7 @@ fn d209_stringify_never_emits_raw_control_chars() {
 fn dict_with_key(c: char) -> mora::value::Value {
     let mut m = std::collections::HashMap::new();
     m.insert(format!("k{c}y"), mora::value::Value::String("v".into()));
-    mora::value::Value::Dict(m)
+    mora::value::Value::Dict(m.into())
 }
 
 /// `Value::Char` 修前**一种字符都没转义** —— 单独钉住。
@@ -153,7 +153,7 @@ fn d209_dict_key_and_value_use_the_same_escaper() {
         "a\nb".to_string(),
         mora::value::Value::String("c\nd".into()),
     );
-    let got = value_to_json(&mora::value::Value::Dict(m));
+    let got = value_to_json(&mora::value::Value::Dict(m.into()));
     assert_eq!(
         got, r#"{"a\nb":"c\nd"}"#,
         "key 与 value 的转义结果应完全一致"

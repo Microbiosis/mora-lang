@@ -26,7 +26,11 @@ use crate::value::BuiltinKind;
 /// File & payload magic header for Mora AOT SSA bytecode (`MORABC02`).
 pub(crate) const BYTECODE_MAGIC: &[u8; 8] = b"MORABC02";
 /// Binary wire format version.
-pub(crate) const BYTECODE_VERSION: u16 = 2;
+///
+/// `3` (v0.113.0 / P6-1): adds per-function borrowed-parameter summaries and per-instruction
+/// last-use kill masks. `2` artifacts are rejected by the version gate below and must be
+/// rebuilt from source; the loader never attempts to guess an older layout.
+pub(crate) const BYTECODE_VERSION: u16 = 3;
 
 const MAX_COLLECTION_LEN: usize = 1_000_000;
 const MAX_STR_LEN: usize = 64 * 1024 * 1024;
@@ -106,6 +110,15 @@ impl ByteWriter {
 
     #[inline]
     fn write_var_u32(&mut self, mut v: u32) {
+        while v >= 0x80 {
+            self.buf.push((v as u8 & 0x7f) | 0x80);
+            v >>= 7;
+        }
+        self.buf.push(v as u8);
+    }
+
+    #[inline]
+    fn write_var_u64(&mut self, mut v: u64) {
         while v >= 0x80 {
             self.buf.push((v as u8 & 0x7f) | 0x80);
             v >>= 7;
@@ -291,6 +304,25 @@ impl<'a> ByteReader<'a> {
         Err(corrupt("varint exceeded 5 bytes"))
     }
 
+    fn read_var_u64(&mut self) -> MoraResult<u64> {
+        let mut out: u64 = 0;
+        let mut shift = 0u32;
+        for i in 0..10 {
+            let b = self.read_u8()?;
+            if i == 9 && b > 1 {
+                return Err(corrupt("u64 varint overflow"));
+            }
+            out |= u64::from(b & 0x7f)
+                .checked_shl(shift)
+                .ok_or_else(|| corrupt("u64 varint shift overflow"))?;
+            if (b & 0x80) == 0 {
+                return Ok(out);
+            }
+            shift += 7;
+        }
+        Err(corrupt("u64 varint exceeded 10 bytes"))
+    }
+
     fn read_len(&mut self, max: usize) -> MoraResult<usize> {
         let len = self.read_var_u32()? as usize;
         if len > max {
@@ -435,6 +467,8 @@ fn encode_builtin_fn_id(id: BuiltinFnId) -> u8 {
         BuiltinFnId::Ok => 48,
         BuiltinFnId::Err => 49,
         BuiltinFnId::TryCall => 50,
+        BuiltinFnId::FbipStats => 51,
+        BuiltinFnId::FbipResetStats => 52,
     }
 }
 
@@ -491,6 +525,8 @@ fn decode_builtin_fn_id(tag: u8) -> MoraResult<BuiltinFnId> {
         48 => BuiltinFnId::Ok,
         49 => BuiltinFnId::Err,
         50 => BuiltinFnId::TryCall,
+        51 => BuiltinFnId::FbipStats,
+        52 => BuiltinFnId::FbipResetStats,
         other => return Err(corrupt(format!("invalid BuiltinFnId tag {other}"))),
     })
 }
@@ -1672,6 +1708,39 @@ fn write_inst(w: &mut ByteWriter, inst: &ControlInst) -> MoraResult<()> {
             w.write_fn(*fn_id);
             w.write_captures(captures)?;
         }
+        ControlInst::MoveLocal(dst, slot) => {
+            w.write_u8(55);
+            w.write_reg(*dst);
+            w.write_local(*slot);
+        }
+        ControlInst::MoveGlobal(dst, slot) => {
+            w.write_u8(56);
+            w.write_reg(*dst);
+            w.write_global(*slot);
+        }
+        ControlInst::DropLocal(slot) => {
+            w.write_u8(57);
+            w.write_local(*slot);
+        }
+        ControlInst::DropReg(reg) => {
+            w.write_u8(58);
+            w.write_reg(*reg);
+        }
+        ControlInst::ProjectField {
+            dst,
+            receiver,
+            field,
+        } => {
+            w.write_u8(59);
+            w.write_reg(*dst);
+            w.write_reg(*receiver);
+            w.write_sym(*field);
+        }
+        ControlInst::BorrowLocal(dst, slot) => {
+            w.write_u8(60);
+            w.write_reg(*dst);
+            w.write_local(*slot);
+        }
     }
     Ok(())
 }
@@ -2154,6 +2223,16 @@ fn read_inst(r: &mut ByteReader<'_>) -> MoraResult<ControlInst> {
             fn_id: r.read_fn()?,
             captures: r.read_captures()?,
         },
+        55 => ControlInst::MoveLocal(r.read_reg()?, r.read_local()?),
+        56 => ControlInst::MoveGlobal(r.read_reg()?, r.read_global()?),
+        57 => ControlInst::DropLocal(r.read_local()?),
+        58 => ControlInst::DropReg(r.read_reg()?),
+        59 => ControlInst::ProjectField {
+            dst: r.read_reg()?,
+            receiver: r.read_reg()?,
+            field: r.read_sym()?,
+        },
+        60 => ControlInst::BorrowLocal(r.read_reg()?, r.read_local()?),
         other => return Err(corrupt(format!("invalid ControlInst opcode {other}"))),
     })
 }
@@ -2289,6 +2368,10 @@ fn write_program(w: &mut ByteWriter, prog: &ControlProgram) -> MoraResult<()> {
     // 2. Entry function ID
     w.write_fn(prog.entry);
 
+    // 2b. P6-1: global ownership policy — whether `<main>`-private globals must keep their
+    // value after `<main>` returns (embedding environment capture).
+    w.write_bool(prog.preserve_globals_at_exit);
+
     // 3. Global metadata
     w.write_len(prog.globals.len())?;
     for g in &prog.globals {
@@ -2332,6 +2415,10 @@ fn write_program(w: &mut ByteWriter, prog: &ControlProgram) -> MoraResult<()> {
         w.write_len(f.param_has_default.len())?;
         for &hd in &f.param_has_default {
             w.write_bool(hd);
+        }
+        w.write_len(f.param_borrows.len())?;
+        for &pb in &f.param_borrows {
+            w.write_bool(pb);
         }
         w.write_len(f.upvalues.len())?;
         for uv in &f.upvalues {
@@ -2384,6 +2471,19 @@ fn write_program(w: &mut ByteWriter, prog: &ControlProgram) -> MoraResult<()> {
             for inst in &bb.insts {
                 write_inst(w, inst)?;
             }
+            w.write_len(bb.inst_kill_masks.len())?;
+            for m in &bb.inst_kill_masks {
+                let ws = m.words();
+                w.write_len(ws.len())?;
+                for &word in ws {
+                    w.write_var_u64(word);
+                }
+            }
+            let tws = bb.term_kill_mask.words();
+            w.write_len(tws.len())?;
+            for &word in tws {
+                w.write_var_u64(word);
+            }
             write_terminator(w, &bb.terminator)?;
         }
     }
@@ -2401,6 +2501,9 @@ fn read_program(r: &mut ByteReader<'_>) -> MoraResult<ControlProgram> {
 
     // 2. Entry function ID
     let entry = r.read_fn()?;
+
+    // 2b. P6-1: global ownership policy.
+    let preserve_globals_at_exit = r.read_bool()?;
 
     // 3. Global metadata
     let n_globals = r.read_len(MAX_COLLECTION_LEN)?;
@@ -2448,6 +2551,11 @@ fn read_program(r: &mut ByteReader<'_>) -> MoraResult<ControlProgram> {
         let mut param_has_default = Vec::with_capacity(n_def);
         for _ in 0..n_def {
             param_has_default.push(r.read_bool()?);
+        }
+        let n_pb = r.read_len(MAX_COLLECTION_LEN)?;
+        let mut param_borrows = Vec::with_capacity(n_pb);
+        for _ in 0..n_pb {
+            param_borrows.push(r.read_bool()?);
         }
         let n_uv = r.read_len(MAX_COLLECTION_LEN)?;
         let mut upvalues = Vec::with_capacity(n_uv);
@@ -2502,11 +2610,34 @@ fn read_program(r: &mut ByteReader<'_>) -> MoraResult<ControlProgram> {
             for _ in 0..n_insts {
                 insts.push(read_inst(r)?);
             }
+            let n_masks = r.read_len(MAX_COLLECTION_LEN)?;
+            if n_masks != 0 && n_masks != n_insts {
+                return Err(corrupt(format!(
+                    "inst_kill_masks length {n_masks} != insts length {n_insts}"
+                )));
+            }
+            let mut inst_kill_masks = Vec::with_capacity(n_masks);
+            for _ in 0..n_masks {
+                let nw = r.read_len(MAX_COLLECTION_LEN)?;
+                let mut ws = Vec::with_capacity(nw);
+                for _ in 0..nw {
+                    ws.push(r.read_var_u64()?);
+                }
+                inst_kill_masks.push(crate::mir::control::KillMask::from_words(ws));
+            }
+            let ntw = r.read_len(MAX_COLLECTION_LEN)?;
+            let mut tws = Vec::with_capacity(ntw);
+            for _ in 0..ntw {
+                tws.push(r.read_var_u64()?);
+            }
+            let term_kill_mask = crate::mir::control::KillMask::from_words(tws);
             let terminator = read_terminator(r)?;
             blocks.push(BasicBlock {
                 id: bb_id,
                 params: bb_params,
                 insts,
+                inst_kill_masks,
+                term_kill_mask,
                 terminator,
             });
         }
@@ -2516,6 +2647,7 @@ fn read_program(r: &mut ByteReader<'_>) -> MoraResult<ControlProgram> {
             kind,
             params,
             param_has_default,
+            param_borrows,
             upvalues,
             shared_locals,
             local_names,
@@ -2533,6 +2665,7 @@ fn read_program(r: &mut ByteReader<'_>) -> MoraResult<ControlProgram> {
         functions,
         entry,
         globals,
+        preserve_globals_at_exit,
     };
     verify_program(&prog)?;
     Ok(prog)
@@ -2734,6 +2867,32 @@ run_all(7)
     }
 
     #[test]
+    fn stale_bytecode_version_is_rejected_before_any_decode() {
+        // P6-1 changed the wire layout (borrow summaries + last-use kill masks), so the format
+        // version moved to 3. A v2 artifact must fail with a version diagnosis instead of decoding
+        // arbitrary bytes as instructions or entry indices.
+        let (prog, _) = ParserV3::compile("print(42)\n").expect("compile");
+        let pkg = CompiledPackage {
+            opt_level: 1,
+            entry: prog,
+            modules: BTreeMap::new(),
+        };
+        let mut encoded = encode_package(&pkg).expect("encode");
+        let stale_version: u16 = 2;
+        encoded[8..10].copy_from_slice(&stale_version.to_le_bytes());
+        let body_end = encoded.len() - 8;
+        let checksum = fnv1a_64(&encoded[..body_end]);
+        encoded[body_end..].copy_from_slice(&checksum.to_le_bytes());
+        let err = decode_package(&encoded).expect_err("stale bytecode must be rejected");
+        assert!(
+            err.to_string().contains(&format!(
+                "unsupported bytecode version {stale_version} (expected {BYTECODE_VERSION})"
+            )),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn fresh_local_cell_morabc02_opcode_51_roundtrip() {
         let src = r#"
 task make_counters(): list<int>
@@ -2904,5 +3063,135 @@ end
                 .into(),
             )
         );
+    }
+
+    #[test]
+    fn roundtrip_perceus_opcodes_55_to_60_and_kill_masks() {
+        let src = r#"
+fbip_reset_stats()
+
+struct Pair
+  a: dict<string, int>
+  b: int
+end
+
+task inspect_len(d: dict<string, int>): int
+  return d.len()
+end
+
+task rebuild(p: Pair): Pair
+  return Pair(a = p.a.set("x", 9), b = p.b + 1)
+end
+
+task branch_use(cond: bool, x: dict<string, int>): int
+  let tmp = {"unused": 1}
+  let n0 = inspect_len(x)
+  if cond then
+    return x.set("k", n0).len()
+  else
+    return n0
+  end
+end
+
+let g = {"a": 1}
+assign g = g.set("b", 2)
+let p = rebuild(Pair(a = {"m": 1}, b = 4))
+let n1 = inspect_len(g)
+let n2 = branch_use(false, g)
+let st = fbip_stats()
+[n1, n2, p.a.len(), p.b, st.get("dict_inplace_reuses"), st.get("borrowed_call_elisions")]
+"#;
+        let (mut prog, _) = ParserV3::compile(src).expect("compile perceus opcodes");
+        optimize_program(&mut prog, OptLevel::Aggressive);
+
+        let has_move_local = prog.functions.iter().any(|f| {
+            f.blocks.iter().any(|b| {
+                b.insts
+                    .iter()
+                    .any(|i| matches!(i, ControlInst::MoveLocal(_, _)))
+            })
+        });
+        let has_borrow_local = prog.functions.iter().any(|f| {
+            f.blocks.iter().any(|b| {
+                b.insts
+                    .iter()
+                    .any(|i| matches!(i, ControlInst::BorrowLocal(_, _)))
+            })
+        });
+        let has_proj_field = prog.functions.iter().any(|f| {
+            f.blocks.iter().any(|b| {
+                b.insts
+                    .iter()
+                    .any(|i| matches!(i, ControlInst::ProjectField { .. }))
+            })
+        });
+        let has_move_global = prog.functions.iter().any(|f| {
+            f.blocks.iter().any(|b| {
+                b.insts
+                    .iter()
+                    .any(|i| matches!(i, ControlInst::MoveGlobal(_, _)))
+            })
+        });
+        let has_drop = prog.functions.iter().any(|f| {
+            f.blocks.iter().any(|b| {
+                b.insts
+                    .iter()
+                    .any(|i| matches!(i, ControlInst::DropLocal(_) | ControlInst::DropReg(_)))
+            })
+        });
+        let has_borrow = prog
+            .functions
+            .iter()
+            .any(|f| f.param_borrows.contains(&true));
+        let has_kill_mask = prog.functions.iter().any(|f| {
+            f.blocks.iter().any(|b| {
+                b.inst_kill_masks.iter().any(|m| !m.is_empty()) || !b.term_kill_mask.is_empty()
+            })
+        });
+        assert!(has_move_local, "expected MoveLocal in Perceus IR");
+        assert!(has_borrow_local, "expected BorrowLocal in Perceus IR");
+        assert!(has_proj_field, "expected ProjectField in Perceus IR");
+        assert!(has_move_global, "expected MoveGlobal in Perceus IR");
+        assert!(has_drop, "expected DropLocal/DropReg in Perceus IR");
+        assert!(has_borrow, "expected inferred borrowed parameter");
+        assert!(has_kill_mask, "expected non-zero Perceus kill masks");
+
+        let pkg = CompiledPackage {
+            opt_level: 2,
+            entry: prog,
+            modules: BTreeMap::new(),
+        };
+        let encoded = encode_package(&pkg).expect("encode MORABC02 with Perceus opcodes 55..60");
+        let decoded =
+            decode_package(&encoded).expect("decode MORABC02 with Perceus opcodes 55..60");
+
+        let mut core = CoreRuntime::default();
+        let (val, _) =
+            execute_program(Arc::new(decoded.entry), &mut core).expect("execute decoded Perceus");
+        let Value::List(items) = val else {
+            panic!("expected list result");
+        };
+        assert_eq!(items.get(0), Some(&Value::Int(2)));
+        assert_eq!(items.get(1), Some(&Value::Int(2)));
+        assert_eq!(items.get(2), Some(&Value::Int(2)));
+        assert_eq!(items.get(3), Some(&Value::Int(5)));
+        match items.get(4) {
+            Some(Value::Int(reuses)) => {
+                assert!(
+                    *reuses >= 2,
+                    "expected dict_inplace_reuses >= 2, got {reuses}"
+                )
+            }
+            other => panic!("expected int reuse count, got {other:?}"),
+        }
+        match items.get(5) {
+            Some(Value::Int(borrows)) => {
+                assert!(
+                    *borrows >= 1,
+                    "expected borrowed_call_elisions >= 1, got {borrows}"
+                )
+            }
+            other => panic!("expected int borrowed call count, got {other:?}"),
+        }
     }
 }

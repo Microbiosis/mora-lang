@@ -217,19 +217,14 @@ impl std::fmt::Display for Value {
             }
             Value::Tensor(t) => write!(f, "{t}"),
             Value::StructType(def) => write!(f, "<struct {}>", def.name),
-            Value::StructInstance {
-                type_name,
-                fields,
-                field_order,
-                ..
-            } => {
-                write!(f, "{type_name} {{ ")?;
-                for (i, fname) in field_order.iter().enumerate() {
+            Value::StructInstance { fields, def, .. } => {
+                write!(f, "{} {{ ", def.name)?;
+                for (i, fdef) in def.fields.iter().enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{fname}: ")?;
-                    if let Some(v) = fields.get(fname) {
+                    write!(f, "{}: ", fdef.name)?;
+                    if let Some(v) = fields.get(&fdef.name) {
                         fmt_inner(f, v, 1)?;
                     } else {
                         write!(f, "nil")?;

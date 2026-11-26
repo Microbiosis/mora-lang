@@ -4,9 +4,14 @@
 //! These helpers never push VM frames and never touch the runtime environment: the only
 //! optional side effect is recording onto the autograd tape the caller passes in.
 
+mod pattern;
+
+pub use pattern::match_pattern;
+pub(crate) use pattern::match_pattern_slot;
+
 use crate::error::{MoraError, MoraResult};
 use crate::flow::{dynamic_type_name, type_name, values_equal};
-use crate::mir::control::{CompiledPattern, ControlQqSegment, PatternTarget};
+use crate::mir::control::ControlQqSegment;
 use crate::runtime::autograd::AutogradContext;
 use crate::value::Value;
 
@@ -105,6 +110,16 @@ pub fn index_value_tracked(
 
 /// Update `obj[idx] = val` in place for lists and dicts.
 pub fn index_assign_value(obj: &mut Value, idx: &Value, val: &Value) -> MoraResult<()> {
+    index_assign_value_fbip(obj, idx, val.clone(), None)
+}
+
+/// P6-1 Perceus/FBIP: Update `obj[idx] = val` reusing uniquely-owned `List` / `Dict` storage in place.
+pub fn index_assign_value_fbip(
+    obj: &mut Value,
+    idx: &Value,
+    val: Value,
+    fbip_stats: Option<&crate::runtime::fbip::FbipCounters>,
+) -> MoraResult<()> {
     match (obj, idx) {
         (Value::List(list), Value::Int(i)) => {
             let i = checked_index(*i as f64, list.len(), "index")?;
@@ -115,7 +130,12 @@ pub fn index_assign_value(obj: &mut Value, idx: &Value, val: &Value) -> MoraResu
                     list.len()
                 )))
             } else {
-                *list = list.set(i, val.clone());
+                let owned = std::mem::take(list);
+                let (updated, reused) = owned.set_owned(i, val);
+                if reused && let Some(stats) = fbip_stats {
+                    stats.on_list_reuse();
+                }
+                *list = updated;
                 Ok(())
             }
         }
@@ -128,12 +148,20 @@ pub fn index_assign_value(obj: &mut Value, idx: &Value, val: &Value) -> MoraResu
                     list.len()
                 )))
             } else {
-                *list = list.set(i, val.clone());
+                let owned = std::mem::take(list);
+                let (updated, reused) = owned.set_owned(i, val);
+                if reused && let Some(stats) = fbip_stats {
+                    stats.on_list_reuse();
+                }
+                *list = updated;
                 Ok(())
             }
         }
         (Value::Dict(map), Value::String(key)) => {
-            map.insert(key.clone(), val.clone());
+            let reused = map.insert_mut(key.clone(), val);
+            if reused && let Some(stats) = fbip_stats {
+                stats.on_dict_reuse();
+            }
             Ok(())
         }
         _ => Err(MoraError::Runtime(
@@ -183,7 +211,7 @@ pub fn eval_quasiquote(
             ControlQqSegment::Unquote(r) => {
                 out.push_str(&value_to_string(&regs[r.0 as usize].to_value()))
             }
-            ControlQqSegment::UnquoteSplice(r) => match regs[r.0 as usize].as_boxed() {
+            ControlQqSegment::UnquoteSplice(r) => match regs[r.0 as usize].as_heap() {
                 Some(Value::List(items)) => {
                     let rendered: Vec<String> = items.iter().map(value_to_string).collect();
                     out.push_str(&rendered.join(", "));
@@ -199,172 +227,6 @@ pub fn eval_quasiquote(
         }
     }
     Ok(Value::Code(out))
-}
-
-/// Atomically match `val` against `pattern` and return all captured target bindings on success.
-pub fn match_pattern(
-    val: &Value,
-    pattern: &CompiledPattern,
-) -> Option<Vec<(PatternTarget, Value)>> {
-    let mut bindings = Vec::new();
-    if match_pattern_inner(val, pattern, &mut bindings) {
-        Some(bindings)
-    } else {
-        None
-    }
-}
-
-fn match_pattern_inner(
-    val: &Value,
-    pattern: &CompiledPattern,
-    bindings: &mut Vec<(PatternTarget, Value)>,
-) -> bool {
-    match pattern {
-        CompiledPattern::Wildcard => true,
-        CompiledPattern::Bind(target) => {
-            if !matches!(target, PatternTarget::Discard) {
-                bindings.push((*target, val.clone()));
-            }
-            true
-        }
-        CompiledPattern::Nil => matches!(val, Value::Nil),
-        CompiledPattern::Bool(b) => matches!(val, Value::Bool(v) if v == b),
-        CompiledPattern::Int(n) => matches!(val, Value::Int(v) if v == n),
-        CompiledPattern::Float(f) => matches!(val, Value::Float(v) if v == f),
-        CompiledPattern::Scalar(s) => matches!(val, Value::Scalar(v) if v == s),
-        CompiledPattern::Char(c) => matches!(val, Value::Char(v) if v == c),
-        CompiledPattern::String(s) => matches!(val, Value::String(v) if v == s),
-        CompiledPattern::Tuple(elems) => {
-            let Value::List(list) = val else {
-                return false;
-            };
-            if list.len() != elems.len() {
-                return false;
-            }
-            list.iter()
-                .zip(elems.iter())
-                .all(|(item, pat)| match_pattern_inner(item, pat, bindings))
-        }
-        CompiledPattern::ListVec { elements, rest } => {
-            let Value::List(list) = val else {
-                return false;
-            };
-            if rest.is_some() {
-                if list.len() < elements.len() {
-                    return false;
-                }
-                for (idx, pat) in elements.iter().enumerate() {
-                    if !match_pattern_inner(&list[idx], pat, bindings) {
-                        return false;
-                    }
-                }
-                if let Some(rest_pat) = rest {
-                    let tail_items: crate::value::list::List =
-                        list.iter().skip(elements.len()).cloned().collect();
-                    return match_pattern_inner(&Value::List(tail_items), rest_pat, bindings);
-                }
-                true
-            } else {
-                if list.len() != elements.len() {
-                    return false;
-                }
-                list.iter()
-                    .zip(elements.iter())
-                    .all(|(item, pat)| match_pattern_inner(item, pat, bindings))
-            }
-        }
-        CompiledPattern::ListCons { head, tail } => match val {
-            Value::Cons { car, cdr } => {
-                match_pattern_inner(car, head, bindings) && match_pattern_inner(cdr, tail, bindings)
-            }
-            Value::List(list) if !list.is_empty() => {
-                let first = &list[0];
-                let rest_list: crate::value::list::List = list.iter().skip(1).cloned().collect();
-                match_pattern_inner(first, head, bindings)
-                    && match_pattern_inner(&Value::List(rest_list), tail, bindings)
-            }
-            _ => false,
-        },
-        CompiledPattern::Dict { required, rest } => {
-            let Value::Dict(map) = val else {
-                return false;
-            };
-            if !*rest && map.len() != required.len() {
-                return false;
-            }
-            for (k, sub_pat) in required {
-                let Some(entry_val) = map.get(k) else {
-                    return false;
-                };
-                if !match_pattern_inner(entry_val, sub_pat, bindings) {
-                    return false;
-                }
-            }
-            true
-        }
-        CompiledPattern::TypeAscription { ty_name, inner } => {
-            let actual = dynamic_type_name(val);
-            let base = type_name(val);
-            let matches_ty = match ty_name.as_str() {
-                "number" => matches!(val, Value::Int(_) | Value::Float(_)),
-                "dynamic" | "any" => true,
-                other => actual == other || base == other,
-            };
-            matches_ty && match_pattern_inner(val, inner, bindings)
-        }
-        CompiledPattern::Variant {
-            enum_name,
-            variant,
-            fields,
-        } => {
-            let Value::EnumVariant {
-                enum_name: v_enum,
-                variant: v_name,
-                payload,
-                ..
-            } = val
-            else {
-                return false;
-            };
-            if let Some(expected_enum) = enum_name
-                && expected_enum != v_enum
-            {
-                return false;
-            }
-            if v_name != variant || payload.len() != fields.len() {
-                return false;
-            }
-            payload
-                .iter()
-                .zip(fields.iter())
-                .all(|(item, pat)| match_pattern_inner(item, pat, bindings))
-        }
-        CompiledPattern::Struct { name, fields, rest } => {
-            let Value::StructInstance {
-                type_name: s_name,
-                fields: s_fields,
-                ..
-            } = val
-            else {
-                return false;
-            };
-            if s_name != name {
-                return false;
-            }
-            if !*rest && s_fields.len() != fields.len() {
-                return false;
-            }
-            for (k, sub_pat) in fields {
-                let Some(entry_val) = s_fields.get(k) else {
-                    return false;
-                };
-                if !match_pattern_inner(entry_val, sub_pat, bindings) {
-                    return false;
-                }
-            }
-            true
-        }
-    }
 }
 
 /// Evaluate `eval "..." given: expr expect: expr1, ...` assertions.

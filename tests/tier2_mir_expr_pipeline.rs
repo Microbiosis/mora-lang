@@ -61,7 +61,13 @@ fn v3_parse_variable_reference() {
     let prog = compile_v3("let x = 1\nx");
     assert!(entry_insts(&prog).into_iter().any(|inst| matches!(
         inst,
-        ControlInst::LoadGlobal(_, _) | ControlInst::LoadLocal(_, _)
+        // P6-1 Perceus/FBIP：变量的**最后一次**读取会被升级为所有权转移指令
+        // （`MoveGlobal` / `MoveLocal`）—— 它同样是「变量读取」指令，只是额外
+        // 携带「该槽位在此处交出所有权」的语义。
+        ControlInst::LoadGlobal(_, _)
+            | ControlInst::LoadLocal(_, _)
+            | ControlInst::MoveGlobal(_, _)
+            | ControlInst::MoveLocal(_, _)
     )));
 }
 
@@ -134,7 +140,13 @@ fn v3_lower_variable_reference_produces_var() {
     let prog = compile_v3("let x = 42\nx");
     assert!(entry_insts(&prog).into_iter().any(|inst| matches!(
         inst,
-        ControlInst::LoadGlobal(_, _) | ControlInst::LoadLocal(_, _)
+        // P6-1 Perceus/FBIP：变量的**最后一次**读取会被升级为所有权转移指令
+        // （`MoveGlobal` / `MoveLocal`）—— 它同样是「变量读取」指令，只是额外
+        // 携带「该槽位在此处交出所有权」的语义。
+        ControlInst::LoadGlobal(_, _)
+            | ControlInst::LoadLocal(_, _)
+            | ControlInst::MoveGlobal(_, _)
+            | ControlInst::MoveLocal(_, _)
     )));
 }
 

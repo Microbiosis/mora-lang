@@ -19,11 +19,11 @@ use crate::common::trait_info::{
 };
 use crate::common::{BinaryOp, DType, ScalarValue, Span};
 use crate::error::{MoraError, MoraResult};
-use crate::flow::{eval_binary_tracked, eval_unary_neg_tracked, is_truthy};
+use crate::flow::is_truthy;
 use crate::mir::control::{
     CalleeTarget, ControlConst, ControlInst, ControlSelectArm, ControlSliceAxis,
-    ControlSpawnTarget, ControlTerminator, FnId, OptLevel, ParallelSegment, PatternTarget, UnaryOp,
-    optimize_program,
+    ControlSpawnTarget, ControlTerminator, FnId, KillMask, OptLevel, ParallelSegment,
+    PatternTarget, UnaryOp, optimize_program, verify_program,
 };
 use crate::mir::effect::ambient;
 use crate::parser_v3::ParserV3;
@@ -35,18 +35,20 @@ use crate::value::{
 };
 
 use super::builtins::{
-    CallAction, VmFuture, resolve_builtin_call_named, resolve_dyn_call_named,
-    resolve_method_call_named, resolve_value_call, resolve_value_call_named,
+    CallAction, VmFuture, dispatch_method, resolve_builtin_call_slots_named,
+    resolve_dyn_call_named, resolve_method_call_named, resolve_value_call,
+    resolve_value_call_named, resolve_value_call_slots_named,
 };
 use super::continuation::{
     CallFrame, CapturedContinuation, CapturedFrames, CombinatorFrame, HandleBarrierState,
     ModuleGlobals, ParallelFrame, RegSlot, ScriptFrame, SelectResumeState, TransactionState,
-    UpvalueCell, UpvalueValue, clone_worker_upvalues, materialize_frame, materialize_frame_named,
-    materialize_handler_frame, resolve_captures, restore_globals, snapshot_globals,
+    UpvalueCell, UpvalueValue, clone_worker_upvalues, materialize_frame,
+    materialize_frame_slots_named, materialize_handler_frame, resolve_captures, restore_globals,
+    snapshot_globals,
 };
+use super::loans::{CallArg, PendingArg};
 use super::value_ops::{
-    eval_assert, eval_quasiquote, index_assign_value, index_value_tracked, make_dyn_trait,
-    match_pattern,
+    eval_assert, eval_quasiquote, index_value_tracked, make_dyn_trait, match_pattern_slot,
 };
 
 /// P4-2: Reason why a cooperative M:N VM execution suspended and yielded its heap call stack.
@@ -85,6 +87,9 @@ enum StepOutcome {
 pub struct VmEngine<'a> {
     pub core: &'a mut CoreRuntime,
     frames: CapturedFrames,
+    /// P6-1: $O(1)$ count of active `CallFrame::HandleBarrier`s currently on `self.frames`.
+    /// When non-zero, destructive Perceus moves degrade to clones for multi-shot replay soundness.
+    active_handler_barriers: u32,
     /// Remaining step budget when running in cooperative M:N mode (`None` = unbounded sync run).
     step_budget: Option<usize>,
     /// Deferred cooperative yield (preemption or async future) emitted by the most recent step.
@@ -97,6 +102,7 @@ impl<'a> VmEngine<'a> {
         Self {
             core,
             frames: Vec::new(),
+            active_handler_barriers: 0,
             step_budget: None,
             pending_yield: None,
         }
@@ -104,9 +110,14 @@ impl<'a> VmEngine<'a> {
 
     /// Create a VM initialized with a previously suspended [`CapturedFrames`] stack.
     pub fn with_frames(core: &'a mut CoreRuntime, frames: CapturedFrames) -> Self {
+        let active_handler_barriers = frames
+            .iter()
+            .filter(|f| matches!(f, CallFrame::HandleBarrier(_)))
+            .count() as u32;
         Self {
             core,
             frames,
+            active_handler_barriers,
             step_budget: None,
             pending_yield: None,
         }
@@ -313,8 +324,12 @@ impl<'a> VmEngine<'a> {
                     self.frames.push(CallFrame::Script(sf));
                     return Ok(None);
                 }
-                CallFrame::HandleBarrier(_) | CallFrame::ErrorContext { .. } => {
-                    // Handled body returned normally or macro finished cleanly; pass `val` down.
+                CallFrame::HandleBarrier(_) => {
+                    self.active_handler_barriers -= 1;
+                    continue;
+                }
+                CallFrame::ErrorContext { .. } => {
+                    // Macro or annotated context finished cleanly; pass `val` down.
                     continue;
                 }
                 CallFrame::NoGradGuard => {
@@ -732,12 +747,9 @@ impl<'a> VmEngine<'a> {
                         &st.const_args,
                         &st.fields,
                     )?;
-                    let field_order = st.def.fields.iter().map(|f| f.name.clone()).collect();
                     return Ok(Some(Value::StructInstance {
-                        type_name: st.def.name.clone(),
-                        fields: st.fields,
-                        field_order,
-                        const_args: final_consts,
+                        fields: st.fields.into(),
+                        const_args: Arc::from(final_consts),
                         def: st.def,
                     }));
                 }
@@ -832,7 +844,8 @@ impl<'a> VmEngine<'a> {
                         final_result,
                         pending,
                     }));
-                let action = resolve_value_call(next_cb, vec![Value::Dict(next_event)], self.core)?;
+                let action =
+                    resolve_value_call(next_cb, vec![Value::Dict(next_event.into())], self.core)?;
                 self.apply_action_chained(action)?;
                 Ok(None)
             }
@@ -1073,8 +1086,10 @@ impl<'a> VmEngine<'a> {
                         }
                     }
                 }
-                CallFrame::HandleBarrier(_)
-                | CallFrame::AutoResume(_)
+                CallFrame::HandleBarrier(_) => {
+                    self.active_handler_barriers -= 1;
+                }
+                CallFrame::AutoResume(_)
                 | CallFrame::Combinator(_)
                 | CallFrame::Transaction(_)
                 | CallFrame::Parallel(_) => {}
@@ -1185,7 +1200,18 @@ impl<'a> VmEngine<'a> {
         effect_name: &str,
         args: Vec<Value>,
     ) -> MoraResult<()> {
+        for index in (barrier_idx + 1..self.frames.len()).rev() {
+            let (parents, top) = self.frames.split_at_mut(index);
+            if let CallFrame::Script(script) = &mut top[0] {
+                script.snapshot_loans(parents);
+            }
+        }
         let mut drained = self.frames.split_off(barrier_idx);
+        let removed_barriers = drained
+            .iter()
+            .filter(|f| matches!(f, CallFrame::HandleBarrier(_)))
+            .count() as u32;
+        self.active_handler_barriers -= removed_barriers;
         let CallFrame::HandleBarrier(barrier) = drained.remove(0) else {
             unreachable!("find_barrier returned HandleBarrier index");
         };
@@ -1215,6 +1241,11 @@ impl<'a> VmEngine<'a> {
         self.frames
             .push(CallFrame::HandleBarrier(cont.barrier.clone()));
         let mut restored = cont.frames.clone();
+        let inner_barriers = restored
+            .iter()
+            .filter(|f| matches!(f, CallFrame::HandleBarrier(_)))
+            .count() as u32;
+        self.active_handler_barriers += 1 + inner_barriers;
         for f in &restored {
             if matches!(f, CallFrame::NoGradGuard) {
                 self.core.session.autograd.enter_no_grad();
@@ -1408,14 +1439,38 @@ enum ScriptStep {
 
 impl<'a> VmEngine<'a> {
     #[inline]
+    fn has_active_barrier(&self) -> bool {
+        debug_assert_eq!(
+            self.active_handler_barriers as usize,
+            self.frames
+                .iter()
+                .filter(|f| matches!(f, CallFrame::HandleBarrier(_)))
+                .count(),
+            "VmEngine::active_handler_barriers drifted from self.frames"
+        );
+        self.active_handler_barriers != 0
+    }
+
+    #[inline]
     fn push_script_frame_suspending(&mut self, frame: &mut ScriptFrame) {
-        let saved_defers = std::mem::take(&mut frame.defers);
-        let mut pushed = frame.clone();
-        pushed.defers = saved_defers;
+        let pushed = ScriptFrame {
+            program: Arc::clone(&frame.program),
+            func_id: frame.func_id,
+            globals: Arc::clone(&frame.globals),
+            upvalues: Arc::clone(&frame.upvalues),
+            locals: std::mem::take(&mut frame.locals),
+            loans: std::mem::take(&mut frame.loans),
+            regs: std::mem::take(&mut frame.regs),
+            block_id: frame.block_id,
+            pc: frame.pc,
+            resume_dst: frame.resume_dst.take(),
+            defers: std::mem::take(&mut frame.defers),
+        };
         self.frames.push(CallFrame::Script(Box::new(pushed)));
     }
 
     fn step_script(&mut self, frame: &mut ScriptFrame) -> ScriptStep {
+        let can_move = !self.has_active_barrier();
         let mut cancel_budget: u32 = 0;
         loop {
             if let Some(ref mut rem) = self.step_budget {
@@ -1435,8 +1490,26 @@ impl<'a> VmEngine<'a> {
             let block_idx = frame.block_id.0 as usize;
             let inst_len = frame.func().blocks[block_idx].insts.len();
             if frame.pc < inst_len {
-                let inst = frame.func().blocks[block_idx].insts[frame.pc].clone();
-                match self.exec_inst(frame, inst) {
+                let (inst, kill_mask) = {
+                    let blk = &frame.func().blocks[block_idx];
+                    let km = blk
+                        .inst_kill_masks
+                        .get(frame.pc)
+                        .cloned()
+                        .unwrap_or(KillMask::Empty);
+                    (blk.insts[frame.pc].clone(), km)
+                };
+                // P6-1: 借入参数以帧槽地址向下传递。需要按值读、捕获或跨任务搬运时，
+                // 必须先物化为拥有的槽。物化只在这里（唯一指令分发点）发生：
+                // 既覆盖 `exec_inst` 内部的全部指令，也覆盖被它二次分派的 `Spawn`/`Select`，
+                // 避免每个执行器各写一份、漂移出第二真值源。
+                if frame.has_borrowed_parameters() && !matches!(inst, ControlInst::BorrowLocal(..))
+                {
+                    for local in crate::mir::control::liveness::inst_local_uses(&inst) {
+                        frame.materialize_local(local, &self.frames);
+                    }
+                }
+                match self.exec_inst(frame, inst, &kill_mask, can_move) {
                     StepOutcome::NextInst => {
                         frame.pc += 1;
                     }
@@ -1448,17 +1521,34 @@ impl<'a> VmEngine<'a> {
                     StepOutcome::Err(e) => return ScriptStep::Err(e),
                 }
             } else {
-                let term = frame.func().blocks[block_idx].terminator.clone();
+                let (term, tmask) = {
+                    let blk = &frame.func().blocks[block_idx];
+                    (blk.terminator.clone(), blk.term_kill_mask.clone())
+                };
+                let tkill = |bit: usize| -> bool { tmask.test(bit) };
                 match term {
                     ControlTerminator::Jump { target, args } => {
                         if args.len() == 1 {
                             let p = frame.func().blocks[target.0 as usize].params[0];
-                            let slot = frame.regs[args[0].0 as usize].clone();
+                            let slot = frame.read_or_take_slot(
+                                args[0],
+                                tkill(0),
+                                can_move,
+                                &self.core.session.fbip_stats,
+                            );
                             frame.regs[p.0 as usize] = slot;
                         } else if !args.is_empty() {
                             let slots: Vec<RegSlot> = args
                                 .iter()
-                                .map(|r| frame.regs[r.0 as usize].clone())
+                                .enumerate()
+                                .map(|(i, r)| {
+                                    frame.read_or_take_slot(
+                                        *r,
+                                        tkill(i),
+                                        can_move,
+                                        &self.core.session.fbip_stats,
+                                    )
+                                })
                                 .collect();
                             let target_params =
                                 frame.func().blocks[target.0 as usize].params.clone();
@@ -1478,19 +1568,41 @@ impl<'a> VmEngine<'a> {
                     } => {
                         // Zero-boxing inline truthiness check on 16B RegSlot!
                         let truthy = frame.regs[cond.0 as usize].is_truthy();
-                        let (target, arg_regs) = if truthy {
-                            (then_bb, then_args)
+                        if tkill(0) {
+                            let _ = frame.read_or_take_slot(
+                                cond,
+                                true,
+                                can_move,
+                                &self.core.session.fbip_stats,
+                            );
+                        }
+                        let then_len = then_args.len();
+                        let (target, arg_regs, base_bit) = if truthy {
+                            (then_bb, then_args, 1usize)
                         } else {
-                            (else_bb, else_args)
+                            (else_bb, else_args, 1usize + then_len)
                         };
                         if arg_regs.len() == 1 {
                             let p = frame.func().blocks[target.0 as usize].params[0];
-                            let slot = frame.regs[arg_regs[0].0 as usize].clone();
+                            let slot = frame.read_or_take_slot(
+                                arg_regs[0],
+                                tkill(base_bit),
+                                can_move,
+                                &self.core.session.fbip_stats,
+                            );
                             frame.regs[p.0 as usize] = slot;
                         } else if !arg_regs.is_empty() {
                             let slots: Vec<RegSlot> = arg_regs
                                 .iter()
-                                .map(|r| frame.regs[r.0 as usize].clone())
+                                .enumerate()
+                                .map(|(i, r)| {
+                                    frame.read_or_take_slot(
+                                        *r,
+                                        tkill(base_bit + i),
+                                        can_move,
+                                        &self.core.session.fbip_stats,
+                                    )
+                                })
                                 .collect();
                             let target_params =
                                 frame.func().blocks[target.0 as usize].params.clone();
@@ -1502,7 +1614,16 @@ impl<'a> VmEngine<'a> {
                         frame.pc = 0;
                     }
                     ControlTerminator::Return(opt_r) | ControlTerminator::Halt(opt_r) => {
-                        let val = opt_r.map(|r| frame.get_val(r)).unwrap_or(Value::Nil);
+                        let val = opt_r
+                            .map(|r| {
+                                frame.read_or_take_val(
+                                    r,
+                                    tkill(0),
+                                    can_move,
+                                    &self.core.session.fbip_stats,
+                                )
+                            })
+                            .unwrap_or(Value::Nil);
                         if let Some((fn_id, upvalues)) = frame.defers.pop() {
                             let defer_frame = match materialize_frame(
                                 Arc::clone(&frame.program),
@@ -1531,7 +1652,18 @@ impl<'a> VmEngine<'a> {
                         resume_bb,
                     } => {
                         let effect_name = frame.program.symbols.resolve(effect).to_string();
-                        let arg_vals: Vec<Value> = args.iter().map(|r| frame.get_val(*r)).collect();
+                        let arg_vals: Vec<Value> = args
+                            .iter()
+                            .enumerate()
+                            .map(|(i, r)| {
+                                frame.read_or_take_val(
+                                    *r,
+                                    tkill(i),
+                                    can_move,
+                                    &self.core.session.fbip_stats,
+                                )
+                            })
+                            .collect();
                         frame.block_id = resume_bb;
                         frame.pc = 0;
                         frame.resume_dst = None;
@@ -1564,11 +1696,45 @@ impl<'a> VmEngine<'a> {
                         )));
                     }
                     ControlTerminator::TailCall { target, args } => {
-                        let arg_vals: Vec<Value> = args.iter().map(|r| frame.get_val(*r)).collect();
-                        let action = match self.resolve_callee(frame, &target, arg_vals) {
+                        let mut bit_idx = 0usize;
+                        let callee_val_opt = if let CalleeTarget::Value(r) = &target {
+                            let v = frame.read_or_take_val(
+                                *r,
+                                tkill(0),
+                                can_move,
+                                &self.core.session.fbip_stats,
+                            );
+                            bit_idx = 1;
+                            Some(v)
+                        } else {
+                            None
+                        };
+                        let arg_slots: Vec<PendingArg> = args
+                            .iter()
+                            .enumerate()
+                            .map(|(i, r)| {
+                                frame.prepare_arg(
+                                    *r,
+                                    tkill(bit_idx + i),
+                                    can_move,
+                                    self.frames.len(),
+                                    &self.core.session.fbip_stats,
+                                )
+                            })
+                            .collect();
+                        let mut action = match self.resolve_callee_with_slots(
+                            frame,
+                            &target,
+                            callee_val_opt,
+                            arg_slots,
+                            Vec::new(),
+                        ) {
                             Ok(a) => a,
                             Err(e) => return ScriptStep::Err(e),
                         };
+                        if let CallAction::PushFrame { frame: next, .. } = &mut action {
+                            next.inherit_tail_owners(frame, self.frames.len());
+                        }
                         if !frame.defers.is_empty() {
                             let defers = std::mem::take(&mut frame.defers);
                             self.frames.push(CallFrame::DeferDrain {
@@ -1625,34 +1791,34 @@ impl<'a> VmEngine<'a> {
         }
     }
 
-    fn resolve_callee(
+    fn resolve_callee_with_slots(
         &mut self,
         frame: &ScriptFrame,
         target: &CalleeTarget,
-        arg_vals: Vec<Value>,
+        pre_taken_callee: Option<Value>,
+        arg_slots: Vec<PendingArg>,
+        named_slots: Vec<(String, PendingArg)>,
     ) -> MoraResult<CallAction> {
-        self.resolve_callee_named(frame, target, arg_vals, Vec::new())
-    }
-
-    fn resolve_callee_named(
-        &mut self,
-        frame: &ScriptFrame,
-        target: &CalleeTarget,
-        arg_vals: Vec<Value>,
-        named_vals: Vec<(String, Value)>,
-    ) -> MoraResult<CallAction> {
+        let arg_slots: Vec<_> = arg_slots
+            .into_iter()
+            .map(|arg| arg.bind(&self.frames, frame))
+            .collect();
+        let named_slots: Vec<_> = named_slots
+            .into_iter()
+            .map(|(name, arg)| (name, arg.bind(&self.frames, frame)))
+            .collect();
         match target {
             CalleeTarget::Builtin(id) => {
-                resolve_builtin_call_named(*id, self.core, arg_vals, named_vals)
+                resolve_builtin_call_slots_named(*id, self.core, arg_slots, named_slots)
             }
             CalleeTarget::Fn(fn_id) => {
-                let next_frame = materialize_frame_named(
+                let next_frame = materialize_frame_slots_named(
                     Arc::clone(&frame.program),
                     *fn_id,
                     Arc::clone(&frame.globals),
                     Arc::new(Vec::new()),
-                    &arg_vals,
-                    &named_vals,
+                    arg_slots,
+                    named_slots,
                 )?;
                 Ok(CallAction::PushFrame {
                     frame: next_frame,
@@ -1660,11 +1826,16 @@ impl<'a> VmEngine<'a> {
                 })
             }
             CalleeTarget::Value(r) => {
-                let val = frame.get_val(*r);
-                resolve_value_call_named(val, arg_vals, named_vals, self.core)
+                let val = pre_taken_callee.unwrap_or_else(|| frame.get_val(*r));
+                resolve_value_call_slots_named(val, arg_slots, named_slots, self.core)
             }
             CalleeTarget::DynGlobal(sym) => {
                 let name = frame.program.symbols.resolve(*sym);
+                let arg_vals: Vec<Value> = arg_slots.into_iter().map(CallArg::take_value).collect();
+                let named_vals: Vec<(String, Value)> = named_slots
+                    .into_iter()
+                    .map(|(k, s)| (k, s.take_value()))
+                    .collect();
                 resolve_dyn_call_named(
                     name,
                     arg_vals,
@@ -1674,6 +1845,25 @@ impl<'a> VmEngine<'a> {
                 )
             }
         }
+    }
+
+    fn resolve_callee_with_val(
+        &mut self,
+        frame: &ScriptFrame,
+        target: &CalleeTarget,
+        pre_taken_callee: Option<Value>,
+        arg_vals: Vec<Value>,
+        named_vals: Vec<(String, Value)>,
+    ) -> MoraResult<CallAction> {
+        let arg_slots = arg_vals
+            .into_iter()
+            .map(|v| PendingArg::Owned(RegSlot::from_value(v)))
+            .collect();
+        let named_slots = named_vals
+            .into_iter()
+            .map(|(k, v)| (k, PendingArg::Owned(RegSlot::from_value(v))))
+            .collect();
+        self.resolve_callee_with_slots(frame, target, pre_taken_callee, arg_slots, named_slots)
     }
 
     fn suspend_and_dispatch(
@@ -1732,7 +1922,14 @@ impl<'a> VmEngine<'a> {
         }
     }
 
-    fn exec_inst(&mut self, frame: &mut ScriptFrame, inst: ControlInst) -> StepOutcome {
+    fn exec_inst(
+        &mut self,
+        frame: &mut ScriptFrame,
+        inst: ControlInst,
+        kill_mask: &KillMask,
+        can_move: bool,
+    ) -> StepOutcome {
+        let kill = |bit: usize| -> bool { kill_mask.test(bit) };
         match inst {
             ControlInst::Const(dst, c) => {
                 // Zero-boxing inline constant materialization into 16B RegSlot.
@@ -1747,17 +1944,37 @@ impl<'a> VmEngine<'a> {
                 StepOutcome::NextInst
             }
             ControlInst::Copy(dst, src) => {
-                frame.regs[dst.0 as usize] = frame.regs[src.0 as usize].clone();
+                let slot =
+                    frame.read_or_take_slot(src, kill(0), can_move, &self.core.session.fbip_stats);
+                frame.regs[dst.0 as usize] = slot;
                 StepOutcome::NextInst
             }
             ControlInst::Unary(dst, op, src) => {
                 match op {
                     UnaryOp::Truthy => {
-                        frame.set_slot(dst, RegSlot::Bool(frame.regs[src.0 as usize].is_truthy()));
+                        let res = frame.regs[src.0 as usize].is_truthy();
+                        if kill(0) {
+                            let _ = frame.read_or_take_slot(
+                                src,
+                                true,
+                                can_move,
+                                &self.core.session.fbip_stats,
+                            );
+                        }
+                        frame.set_slot(dst, RegSlot::Bool(res));
                         StepOutcome::NextInst
                     }
                     UnaryOp::Not => {
-                        frame.set_slot(dst, RegSlot::Bool(!frame.regs[src.0 as usize].is_truthy()));
+                        let res = !frame.regs[src.0 as usize].is_truthy();
+                        if kill(0) {
+                            let _ = frame.read_or_take_slot(
+                                src,
+                                true,
+                                can_move,
+                                &self.core.session.fbip_stats,
+                            );
+                        }
+                        frame.set_slot(dst, RegSlot::Bool(res));
                         StepOutcome::NextInst
                     }
                     UnaryOp::Neg => {
@@ -1780,7 +1997,12 @@ impl<'a> VmEngine<'a> {
                             }
                             _ => {}
                         }
-                        let v = frame.get_val(src);
+                        let v = frame.read_or_take_val(
+                            src,
+                            kill(0),
+                            can_move,
+                            &self.core.session.fbip_stats,
+                        );
                         if let Some((func, all_args)) = super::builtins::resolve_operator_impl(
                             self.core,
                             &v,
@@ -1793,7 +2015,11 @@ impl<'a> VmEngine<'a> {
                                 Err(e) => StepOutcome::Err(e),
                             };
                         }
-                        match eval_unary_neg_tracked(&v, Some(&mut self.core.session.autograd)) {
+                        match crate::flow::eval_unary_neg_fbip(
+                            v,
+                            Some(&mut self.core.session.autograd),
+                            Some(&self.core.session.fbip_stats),
+                        ) {
                             Ok(negated) => {
                                 frame.set_val(dst, negated);
                                 StepOutcome::NextInst
@@ -1888,8 +2114,10 @@ impl<'a> VmEngine<'a> {
                     _ => {}
                 }
 
-                let l = frame.get_val(lhs);
-                let r = frame.get_val(rhs);
+                let l =
+                    frame.read_or_take_val(lhs, kill(0), can_move, &self.core.session.fbip_stats);
+                let r =
+                    frame.read_or_take_val(rhs, kill(1), can_move, &self.core.session.fbip_stats);
                 // P4-1A: Stackful trait-driven operator overloading on nominal types.
                 let trait_op = match op {
                     BinaryOp::Add => Some(("Add", "add", false)),
@@ -1926,7 +2154,13 @@ impl<'a> VmEngine<'a> {
                         Err(e) => StepOutcome::Err(e),
                     };
                 }
-                match eval_binary_tracked(l, &op, r, Some(&mut self.core.session.autograd)) {
+                match crate::flow::eval_binary_fbip(
+                    l,
+                    &op,
+                    r,
+                    Some(&mut self.core.session.autograd),
+                    Some(&self.core.session.fbip_stats),
+                ) {
                     Ok(v) => {
                         frame.set_val(dst, v);
                         StepOutcome::NextInst
@@ -1935,18 +2169,25 @@ impl<'a> VmEngine<'a> {
                 }
             }
             ControlInst::ListLit(dst, items) => {
-                let list: crate::value::list::List =
-                    items.into_iter().map(|r| frame.get_val(r)).collect();
+                let list: crate::value::list::List = items
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, r)| {
+                        frame.read_or_take_val(r, kill(i), can_move, &self.core.session.fbip_stats)
+                    })
+                    .collect();
                 frame.set_val(dst, Value::List(list));
                 StepOutcome::NextInst
             }
             ControlInst::DictLit(dst, pairs) => {
                 let mut map = HashMap::with_capacity(pairs.len());
-                for (sym, r) in pairs {
+                for (i, (sym, r)) in pairs.into_iter().enumerate() {
                     let key = frame.program.symbols.resolve(sym).to_string();
-                    map.insert(key, frame.get_val(r));
+                    let val =
+                        frame.read_or_take_val(r, kill(i), can_move, &self.core.session.fbip_stats);
+                    map.insert(key, val);
                 }
-                frame.set_val(dst, Value::Dict(map));
+                frame.set_val(dst, Value::Dict(map.into()));
                 StepOutcome::NextInst
             }
             ControlInst::Quasiquote(dst, segs) => match eval_quasiquote(&segs, &frame.regs) {
@@ -1988,7 +2229,8 @@ impl<'a> VmEngine<'a> {
                 generics,
             } => {
                 let tname = frame.program.symbols.resolve(trait_name).to_string();
-                let val = frame.get_val(src);
+                let val =
+                    frame.read_or_take_val(src, kill(0), can_move, &self.core.session.fbip_stats);
                 frame.set_val(dst, make_dyn_trait(val, &tname, &generics));
                 StepOutcome::NextInst
             }
@@ -1997,9 +2239,43 @@ impl<'a> VmEngine<'a> {
                 frame.set_slot(dst, frame.locals[slot.0 as usize].get_slot());
                 StepOutcome::NextInst
             }
+            ControlInst::BorrowLocal(dst, slot) => {
+                if can_move {
+                    frame.borrow_local(dst, slot, &self.frames);
+                } else {
+                    frame.materialize_local(slot, &self.frames);
+                    frame.set_slot(dst, frame.locals[slot.0 as usize].get_slot());
+                }
+                StepOutcome::NextInst
+            }
+            ControlInst::MoveLocal(dst, slot) => {
+                let s = if can_move {
+                    frame.locals[slot.0 as usize].take_slot()
+                } else {
+                    if frame.locals[slot.0 as usize].holds_fbip_candidate() {
+                        self.core.session.fbip_stats.on_continuation_copy_fallback();
+                    }
+                    frame.locals[slot.0 as usize].get_slot()
+                };
+                frame.set_slot(dst, s);
+                StepOutcome::NextInst
+            }
+            ControlInst::DropLocal(slot) => {
+                if can_move {
+                    frame.locals[slot.0 as usize].drop_slot();
+                }
+                StepOutcome::NextInst
+            }
+            ControlInst::DropReg(reg) => {
+                if can_move {
+                    frame.regs[reg.0 as usize] = RegSlot::Nil;
+                }
+                StepOutcome::NextInst
+            }
             ControlInst::StoreLocal(slot, src) => {
                 // Zero-boxing unshared local store directly from 16B RegSlot!
-                let s = frame.regs[src.0 as usize].clone();
+                let s =
+                    frame.read_or_take_slot(src, kill(0), can_move, &self.core.session.fbip_stats);
                 frame.locals[slot.0 as usize].set_slot(s);
                 StepOutcome::NextInst
             }
@@ -2025,7 +2301,8 @@ impl<'a> VmEngine<'a> {
                 StepOutcome::NextInst
             }
             ControlInst::StoreUpvalue(slot, src) => {
-                let val = frame.get_val(src);
+                let val =
+                    frame.read_or_take_val(src, kill(0), can_move, &self.core.session.fbip_stats);
                 match frame.upvalues[slot.0 as usize].set(val) {
                     Ok(()) => StepOutcome::NextInst,
                     Err(e) => StepOutcome::Err(e),
@@ -2036,8 +2313,22 @@ impl<'a> VmEngine<'a> {
                 frame.set_val(dst, val);
                 StepOutcome::NextInst
             }
+            ControlInst::MoveGlobal(dst, slot) => {
+                let val = if can_move {
+                    std::mem::replace(&mut frame.globals[slot.0 as usize].lock().0, Value::Nil)
+                } else {
+                    let g = frame.globals[slot.0 as usize].lock();
+                    if matches!(g.0, Value::Dict(_) | Value::List(_) | Value::Tensor(_)) {
+                        self.core.session.fbip_stats.on_continuation_copy_fallback();
+                    }
+                    g.0.clone()
+                };
+                frame.set_val(dst, val);
+                StepOutcome::NextInst
+            }
             ControlInst::StoreGlobal(slot, src) => {
-                let val = frame.get_val(src);
+                let val =
+                    frame.read_or_take_val(src, kill(0), can_move, &self.core.session.fbip_stats);
                 frame.globals[slot.0 as usize].lock().0 = val;
                 StepOutcome::NextInst
             }
@@ -2054,14 +2345,16 @@ impl<'a> VmEngine<'a> {
             }
             ControlInst::DefineDyn(sym, src, exported) => {
                 let name = frame.program.symbols.resolve(sym).to_string();
-                let val = frame.get_val(src);
+                let val =
+                    frame.read_or_take_val(src, kill(0), can_move, &self.core.session.fbip_stats);
                 self.core.environment.define(name, val, exported);
                 StepOutcome::NextInst
             }
             ControlInst::AssignDyn(sym, src) => {
-                let name = frame.program.symbols.resolve(sym);
-                let val = frame.get_val(src);
-                let _ = self.core.environment.assign(name, val);
+                let name = frame.program.symbols.resolve(sym).to_string();
+                let val =
+                    frame.read_or_take_val(src, kill(0), can_move, &self.core.session.fbip_stats);
+                let _ = self.core.environment.assign(&name, val);
                 StepOutcome::NextInst
             }
             ControlInst::ExportGlobal(slot) => {
@@ -2074,10 +2367,20 @@ impl<'a> VmEngine<'a> {
                 StepOutcome::NextInst
             }
             ControlInst::Index(dst, obj, idx) => {
-                let obj_val = frame.get_val(obj);
-                let idx_val = frame.get_val(idx);
-                match index_value_tracked(&obj_val, &idx_val, Some(&mut self.core.session.autograd))
-                {
+                // P6-1: Borrow `obj` in place from `RegSlot::Heap` without cloning the container!
+                let idx_val =
+                    frame.read_or_take_val(idx, kill(1), can_move, &self.core.session.fbip_stats);
+                let res = if let Some(obj_ref) = frame.regs[obj.0 as usize].as_heap() {
+                    index_value_tracked(obj_ref, &idx_val, Some(&mut self.core.session.autograd))
+                } else {
+                    let obj_val = frame.get_val(obj);
+                    index_value_tracked(&obj_val, &idx_val, Some(&mut self.core.session.autograd))
+                };
+                if kill(0) {
+                    let _ =
+                        frame.read_or_take_slot(obj, true, can_move, &self.core.session.fbip_stats);
+                }
+                match res {
                     Ok(v) => {
                         frame.set_val(dst, v);
                         StepOutcome::NextInst
@@ -2086,10 +2389,18 @@ impl<'a> VmEngine<'a> {
                 }
             }
             ControlInst::IndexAssign(dst, obj, idx, val) => {
-                let mut container = frame.get_val(obj);
-                let idx_val = frame.get_val(idx);
-                let elem_val = frame.get_val(val);
-                match index_assign_value(&mut container, &idx_val, &elem_val) {
+                let mut container =
+                    frame.read_or_take_val(obj, kill(0), can_move, &self.core.session.fbip_stats);
+                let idx_val =
+                    frame.read_or_take_val(idx, kill(1), can_move, &self.core.session.fbip_stats);
+                let elem_val =
+                    frame.read_or_take_val(val, kill(2), can_move, &self.core.session.fbip_stats);
+                match super::value_ops::index_assign_value_fbip(
+                    &mut container,
+                    &idx_val,
+                    elem_val,
+                    Some(&self.core.session.fbip_stats),
+                ) {
                     Ok(()) => {
                         frame.set_val(dst, container);
                         StepOutcome::NextInst
@@ -2098,12 +2409,25 @@ impl<'a> VmEngine<'a> {
                 }
             }
             ControlInst::TensorSlice { dst, target, axes } => {
-                let target_val = frame.get_val(target);
+                let target_val = frame.read_or_take_val(
+                    target,
+                    kill(0),
+                    can_move,
+                    &self.core.session.fbip_stats,
+                );
+                let mut bit_idx = 1usize;
                 let mut rt_axes = Vec::with_capacity(axes.len());
                 for ax in &axes {
                     match ax {
                         ControlSliceAxis::Index(r) => {
-                            let i = match value_to_slice_isize(&frame.get_val(*r)) {
+                            let rv = frame.read_or_take_val(
+                                *r,
+                                kill(bit_idx),
+                                can_move,
+                                &self.core.session.fbip_stats,
+                            );
+                            bit_idx += 1;
+                            let i = match value_to_slice_isize(&rv) {
                                 Ok(v) => v,
                                 Err(e) => return StepOutcome::Err(e),
                             };
@@ -2111,24 +2435,51 @@ impl<'a> VmEngine<'a> {
                         }
                         ControlSliceAxis::Range { start, stop, step } => {
                             let s = match start {
-                                Some(r) => match value_to_slice_isize(&frame.get_val(*r)) {
-                                    Ok(v) => Some(v),
-                                    Err(e) => return StepOutcome::Err(e),
-                                },
+                                Some(r) => {
+                                    let rv = frame.read_or_take_val(
+                                        *r,
+                                        kill(bit_idx),
+                                        can_move,
+                                        &self.core.session.fbip_stats,
+                                    );
+                                    bit_idx += 1;
+                                    match value_to_slice_isize(&rv) {
+                                        Ok(v) => Some(v),
+                                        Err(e) => return StepOutcome::Err(e),
+                                    }
+                                }
                                 None => None,
                             };
                             let e = match stop {
-                                Some(r) => match value_to_slice_isize(&frame.get_val(*r)) {
-                                    Ok(v) => Some(v),
-                                    Err(e) => return StepOutcome::Err(e),
-                                },
+                                Some(r) => {
+                                    let rv = frame.read_or_take_val(
+                                        *r,
+                                        kill(bit_idx),
+                                        can_move,
+                                        &self.core.session.fbip_stats,
+                                    );
+                                    bit_idx += 1;
+                                    match value_to_slice_isize(&rv) {
+                                        Ok(v) => Some(v),
+                                        Err(e) => return StepOutcome::Err(e),
+                                    }
+                                }
                                 None => None,
                             };
                             let st = match step {
-                                Some(r) => match value_to_slice_isize(&frame.get_val(*r)) {
-                                    Ok(v) => Some(v),
-                                    Err(e) => return StepOutcome::Err(e),
-                                },
+                                Some(r) => {
+                                    let rv = frame.read_or_take_val(
+                                        *r,
+                                        kill(bit_idx),
+                                        can_move,
+                                        &self.core.session.fbip_stats,
+                                    );
+                                    bit_idx += 1;
+                                    match value_to_slice_isize(&rv) {
+                                        Ok(v) => Some(v),
+                                        Err(e) => return StepOutcome::Err(e),
+                                    }
+                                }
                                 None => None,
                             };
                             rt_axes.push(RuntimeSliceAxis::Range {
@@ -2159,17 +2510,54 @@ impl<'a> VmEngine<'a> {
                 args,
                 named_args,
             } => {
-                let arg_vals: Vec<Value> = args.iter().map(|r| frame.get_val(*r)).collect();
-                let named_vals: Vec<(String, Value)> = named_args
+                let mut bit_idx = 0usize;
+                let callee_val_opt = if let CalleeTarget::Value(r) = &target {
+                    let v = frame.read_or_take_val(
+                        *r,
+                        kill(0),
+                        can_move,
+                        &self.core.session.fbip_stats,
+                    );
+                    bit_idx = 1;
+                    Some(v)
+                } else {
+                    None
+                };
+                let arg_slots: Vec<PendingArg> = args
                     .iter()
-                    .map(|(sym, r)| {
-                        (
-                            frame.program.symbols.resolve(*sym).to_string(),
-                            frame.get_val(*r),
-                        )
+                    .map(|r| {
+                        let s = frame.prepare_arg(
+                            *r,
+                            kill(bit_idx),
+                            can_move,
+                            self.frames.len(),
+                            &self.core.session.fbip_stats,
+                        );
+                        bit_idx += 1;
+                        s
                     })
                     .collect();
-                match self.resolve_callee_named(frame, &target, arg_vals, named_vals) {
+                let named_slots: Vec<(String, PendingArg)> = named_args
+                    .iter()
+                    .map(|(sym, r)| {
+                        let s = frame.prepare_arg(
+                            *r,
+                            kill(bit_idx),
+                            can_move,
+                            self.frames.len(),
+                            &self.core.session.fbip_stats,
+                        );
+                        bit_idx += 1;
+                        (frame.program.symbols.resolve(*sym).to_string(), s)
+                    })
+                    .collect();
+                match self.resolve_callee_with_slots(
+                    frame,
+                    &target,
+                    callee_val_opt,
+                    arg_slots,
+                    named_slots,
+                ) {
                     Ok(action) => self.suspend_and_dispatch(frame, dst, action),
                     Err(e) => StepOutcome::Err(e),
                 }
@@ -2181,14 +2569,43 @@ impl<'a> VmEngine<'a> {
                 args,
                 named_args,
             } => {
-                let arg_vals: Vec<Value> = args.iter().map(|r| frame.get_val(*r)).collect();
+                let mut bit_idx = 0usize;
+                let callee_val_opt = if let CalleeTarget::Value(r) = &target {
+                    let v = frame.read_or_take_val(
+                        *r,
+                        kill(0),
+                        can_move,
+                        &self.core.session.fbip_stats,
+                    );
+                    bit_idx = 1;
+                    Some(v)
+                } else {
+                    None
+                };
+                let arg_vals: Vec<Value> = args
+                    .iter()
+                    .map(|r| {
+                        let v = frame.read_or_take_val(
+                            *r,
+                            kill(bit_idx),
+                            can_move,
+                            &self.core.session.fbip_stats,
+                        );
+                        bit_idx += 1;
+                        v
+                    })
+                    .collect();
                 let named_vals: Vec<(String, Value)> = named_args
                     .iter()
                     .map(|(sym, r)| {
-                        (
-                            frame.program.symbols.resolve(*sym).to_string(),
-                            frame.get_val(*r),
-                        )
+                        let v = frame.read_or_take_val(
+                            *r,
+                            kill(bit_idx),
+                            can_move,
+                            &self.core.session.fbip_stats,
+                        );
+                        bit_idx += 1;
+                        (frame.program.symbols.resolve(*sym).to_string(), v)
                     })
                     .collect();
                 let const_vals: Vec<(String, i64)> = const_args
@@ -2196,14 +2613,18 @@ impl<'a> VmEngine<'a> {
                     .map(|(sym, v)| (frame.program.symbols.resolve(*sym).to_string(), *v))
                     .collect();
                 let action = match &target {
-                    CalleeTarget::Value(r) => match frame.get_val(*r) {
-                        Value::StructType(def) => {
-                            super::builtins::construct_struct_instance_with_consts(
-                                def, const_vals, arg_vals, named_vals,
-                            )
+                    CalleeTarget::Value(r) => {
+                        match callee_val_opt.unwrap_or_else(|| frame.get_val(*r)) {
+                            Value::StructType(def) => {
+                                super::builtins::construct_struct_instance_with_consts(
+                                    def, const_vals, arg_vals, named_vals,
+                                )
+                            }
+                            other => {
+                                resolve_value_call_named(other, arg_vals, named_vals, self.core)
+                            }
                         }
-                        other => resolve_value_call_named(other, arg_vals, named_vals, self.core),
-                    },
+                    }
                     CalleeTarget::DynGlobal(sym) => {
                         let name = frame.program.symbols.resolve(*sym);
                         if let Some((type_name, member)) = name.split_once("::") {
@@ -2222,7 +2643,9 @@ impl<'a> VmEngine<'a> {
                                     &edef, member, const_vals, arg_vals, named_vals,
                                 )
                             } else {
-                                self.resolve_callee_named(frame, &target, arg_vals, named_vals)
+                                self.resolve_callee_with_val(
+                                    frame, &target, None, arg_vals, named_vals,
+                                )
                             }
                         } else if let Some(def) =
                             self.core.registry.struct_registry.get(name).cloned()
@@ -2231,10 +2654,10 @@ impl<'a> VmEngine<'a> {
                                 def, const_vals, arg_vals, named_vals,
                             )
                         } else {
-                            self.resolve_callee_named(frame, &target, arg_vals, named_vals)
+                            self.resolve_callee_with_val(frame, &target, None, arg_vals, named_vals)
                         }
                     }
-                    _ => self.resolve_callee_named(frame, &target, arg_vals, named_vals),
+                    _ => self.resolve_callee_with_val(frame, &target, None, arg_vals, named_vals),
                 };
                 match action {
                     Ok(a) => self.suspend_and_dispatch(frame, dst, a),
@@ -2243,35 +2666,50 @@ impl<'a> VmEngine<'a> {
             }
             ControlInst::GetConstGeneric { dst, src, name } => {
                 let cname = frame.program.symbols.resolve(name);
-                match frame.regs[src.0 as usize].as_boxed() {
-                    Some(
-                        Value::StructInstance {
-                            type_name,
-                            const_args,
-                            ..
-                        }
-                        | Value::EnumVariant {
-                            enum_name: type_name,
-                            const_args,
-                            ..
-                        },
-                    ) => {
+                let res = match frame.regs[src.0 as usize].as_heap() {
+                    Some(Value::StructInstance {
+                        def, const_args, ..
+                    }) => {
                         if let Some((_, val)) = const_args.iter().find(|(k, _)| k == cname) {
-                            frame.set_slot(dst, RegSlot::Int(*val));
-                            StepOutcome::NextInst
+                            Ok(*val)
                         } else {
-                            StepOutcome::Err(MoraError::Runtime(format!(
-                                "const generic parameter '{cname}' is not bound on instance of '{type_name}'"
+                            Err(MoraError::Runtime(format!(
+                                "const generic parameter '{cname}' is not bound on instance of '{}'",
+                                def.name
+                            )))
+                        }
+                    }
+                    Some(Value::EnumVariant {
+                        enum_name,
+                        const_args,
+                        ..
+                    }) => {
+                        if let Some((_, val)) = const_args.iter().find(|(k, _)| k == cname) {
+                            Ok(*val)
+                        } else {
+                            Err(MoraError::Runtime(format!(
+                                "const generic parameter '{cname}' is not bound on instance of '{enum_name}'"
                             )))
                         }
                     }
                     _ => {
                         let other = frame.get_val(src);
-                        StepOutcome::Err(MoraError::Runtime(format!(
+                        Err(MoraError::Runtime(format!(
                             "cannot read const generic '{cname}' from non-nominal receiver {}",
                             crate::flow::type_name(&other)
                         )))
                     }
+                };
+                if kill(0) {
+                    let _ =
+                        frame.read_or_take_slot(src, true, can_move, &self.core.session.fbip_stats);
+                }
+                match res {
+                    Ok(val) => {
+                        frame.set_slot(dst, RegSlot::Int(val));
+                        StepOutcome::NextInst
+                    }
+                    Err(e) => StepOutcome::Err(e),
                 }
             }
             ControlInst::ModuleCall {
@@ -2282,14 +2720,31 @@ impl<'a> VmEngine<'a> {
                 named_args,
             } => {
                 let mname = frame.program.symbols.resolve(method).to_string();
-                let arg_vals: Vec<Value> = args.iter().map(|r| frame.get_val(*r)).collect();
+                let mut bit_idx = 0usize;
+                let arg_vals: Vec<Value> = args
+                    .iter()
+                    .map(|r| {
+                        let v = frame.read_or_take_val(
+                            *r,
+                            kill(bit_idx),
+                            can_move,
+                            &self.core.session.fbip_stats,
+                        );
+                        bit_idx += 1;
+                        v
+                    })
+                    .collect();
                 let named_vals: Vec<(String, Value)> = named_args
                     .iter()
                     .map(|(sym, r)| {
-                        (
-                            frame.program.symbols.resolve(*sym).to_string(),
-                            frame.get_val(*r),
-                        )
+                        let v = frame.read_or_take_val(
+                            *r,
+                            kill(bit_idx),
+                            can_move,
+                            &self.core.session.fbip_stats,
+                        );
+                        bit_idx += 1;
+                        (frame.program.symbols.resolve(*sym).to_string(), v)
                     })
                     .collect();
                 match resolve_method_call_named(
@@ -2312,23 +2767,100 @@ impl<'a> VmEngine<'a> {
                 named_args,
             } => {
                 let mname = frame.program.symbols.resolve(method).to_string();
-                let recv = frame.get_val(receiver);
-                let arg_vals: Vec<Value> = args.iter().map(|r| frame.get_val(*r)).collect();
-                let named_vals: Vec<(String, Value)> = named_args
+                let recv_slot = frame.prepare_arg(
+                    receiver,
+                    kill(0),
+                    can_move,
+                    self.frames.len(),
+                    &self.core.session.fbip_stats,
+                );
+                let mut bit_idx = 1usize;
+                let arg_slots: Vec<PendingArg> = args
                     .iter()
-                    .map(|(sym, r)| {
-                        (
-                            frame.program.symbols.resolve(*sym).to_string(),
-                            frame.get_val(*r),
-                        )
+                    .map(|r| {
+                        let s = frame.prepare_arg(
+                            *r,
+                            kill(bit_idx),
+                            can_move,
+                            self.frames.len(),
+                            &self.core.session.fbip_stats,
+                        );
+                        bit_idx += 1;
+                        s
                     })
                     .collect();
+                let named_slots: Vec<(String, PendingArg)> = named_args
+                    .iter()
+                    .map(|(sym, r)| {
+                        let s = frame.prepare_arg(
+                            *r,
+                            kill(bit_idx),
+                            can_move,
+                            self.frames.len(),
+                            &self.core.session.fbip_stats,
+                        );
+                        bit_idx += 1;
+                        (frame.program.symbols.resolve(*sym).to_string(), s)
+                    })
+                    .collect();
+                match dispatch_method(
+                    self.core,
+                    recv_slot.bind(&self.frames, frame).into(),
+                    &mname,
+                    arg_slots
+                        .into_iter()
+                        .map(|arg| arg.bind(&self.frames, frame))
+                        .collect(),
+                    named_slots
+                        .into_iter()
+                        .map(|(name, arg)| (name, arg.bind(&self.frames, frame)))
+                        .collect(),
+                    Span::default(),
+                ) {
+                    Ok(action) => self.suspend_and_dispatch(frame, dst, action),
+                    Err(e) => StepOutcome::Err(e),
+                }
+            }
+            ControlInst::ProjectField {
+                dst,
+                receiver,
+                field,
+            } => {
+                let mname = frame.program.symbols.resolve(field).to_string();
+                if can_move && let Some(val) = frame.take_struct_field(receiver, &mname) {
+                    if kill(0) {
+                        frame.clear_reg(receiver);
+                    }
+                    frame.set_val(dst, val);
+                    return StepOutcome::NextInst;
+                }
+                if let Some(Value::StructInstance { fields, .. }) =
+                    frame.regs[receiver.0 as usize].as_heap()
+                    && let Some(val) = fields.get(&mname).cloned()
+                {
+                    if kill(0) {
+                        let _ = frame.read_or_take_slot(
+                            receiver,
+                            true,
+                            can_move,
+                            &self.core.session.fbip_stats,
+                        );
+                    }
+                    frame.set_val(dst, val);
+                    return StepOutcome::NextInst;
+                }
+                let recv = frame.read_or_take_val(
+                    receiver,
+                    kill(0),
+                    can_move,
+                    &self.core.session.fbip_stats,
+                );
                 match resolve_method_call_named(
                     self.core,
                     recv,
                     &mname,
-                    arg_vals,
-                    named_vals,
+                    Vec::new(),
+                    Vec::new(),
                     Span::default(),
                 ) {
                     Ok(action) => self.suspend_and_dispatch(frame, dst, action),
@@ -2336,8 +2868,10 @@ impl<'a> VmEngine<'a> {
                 }
             }
             ControlInst::Pipe { dst, lhs, rhs } => {
-                let l = frame.get_val(lhs);
-                let r = frame.get_val(rhs);
+                let l =
+                    frame.read_or_take_val(lhs, kill(0), can_move, &self.core.session.fbip_stats);
+                let r =
+                    frame.read_or_take_val(rhs, kill(1), can_move, &self.core.session.fbip_stats);
                 match resolve_value_call(r, vec![l], self.core) {
                     Ok(action) => self.suspend_and_dispatch(frame, dst, action),
                     Err(e) => StepOutcome::Err(e),
@@ -2348,27 +2882,58 @@ impl<'a> VmEngine<'a> {
                 val,
                 pattern,
             } => {
-                let scrutinee = frame.get_val(val);
-                if let Some(bindings) = match_pattern(&scrutinee, &pattern) {
-                    for (target, bound_val) in bindings {
-                        match target {
-                            PatternTarget::Local(slot) => {
-                                frame.locals[slot.0 as usize].set(bound_val);
-                            }
-                            PatternTarget::Global(slot) => {
-                                frame.globals[slot.0 as usize].lock().0 = bound_val;
-                            }
-                            PatternTarget::Dyn(sym) => {
-                                let name = frame.program.symbols.resolve(sym).to_string();
-                                self.core.environment.define(name, bound_val, false);
-                            }
-                            PatternTarget::Discard => {}
+                let dead_on_taken_arm = kill(0) || {
+                    let func = frame.func();
+                    let blk = &func.blocks[frame.block_id.0 as usize];
+                    frame.pc + 1 == blk.insts.len()
+                        && match &blk.terminator {
+                            ControlTerminator::Branch {
+                                cond,
+                                then_bb,
+                                then_args,
+                                ..
+                            } if *cond == dst_ok && !then_args.contains(&val) => func.blocks
+                                [then_bb.0 as usize]
+                                .insts
+                                .iter()
+                                .take_while(|i| {
+                                    matches!(i, ControlInst::DropLocal(_) | ControlInst::DropReg(_))
+                                })
+                                .any(|i| matches!(i, ControlInst::DropReg(r) if *r == val)),
+                            _ => false,
                         }
-                    }
-                    frame.set_slot(dst_ok, RegSlot::Bool(true));
-                } else {
-                    frame.set_slot(dst_ok, RegSlot::Bool(false));
+                };
+
+                let bindings = match_pattern_slot(
+                    &mut frame.regs[val.0 as usize],
+                    &pattern,
+                    can_move && dead_on_taken_arm,
+                );
+                if kill(0) && !(can_move && dead_on_taken_arm && bindings.is_some()) {
+                    let _ =
+                        frame.read_or_take_slot(val, true, can_move, &self.core.session.fbip_stats);
                 }
+                let Some(bindings) = bindings else {
+                    frame.set_slot(dst_ok, RegSlot::Bool(false));
+                    return StepOutcome::NextInst;
+                };
+
+                for (target, bound_val) in bindings {
+                    match target {
+                        PatternTarget::Local(slot) => {
+                            frame.locals[slot.0 as usize].set(bound_val);
+                        }
+                        PatternTarget::Global(slot) => {
+                            frame.globals[slot.0 as usize].lock().0 = bound_val;
+                        }
+                        PatternTarget::Dyn(sym) => {
+                            let name = frame.program.symbols.resolve(sym).to_string();
+                            self.core.environment.define(name, bound_val, false);
+                        }
+                        PatternTarget::Discard => {}
+                    }
+                }
+                frame.set_slot(dst_ok, RegSlot::Bool(true));
                 StepOutcome::NextInst
             }
             ControlInst::Handle {
@@ -2415,6 +2980,7 @@ impl<'a> VmEngine<'a> {
                 frame.resume_dst = Some(dst);
                 self.push_script_frame_suspending(frame);
                 self.frames.push(CallFrame::HandleBarrier(barrier));
+                self.active_handler_barriers += 1;
                 self.frames.push(CallFrame::Script(Box::new(body_frame)));
                 StepOutcome::Yielded
             }
@@ -2480,7 +3046,7 @@ impl<'a> VmEngine<'a> {
                     Ok(true) => StepOutcome::Yielded,
                     Ok(false) => {
                         if let Some(CallFrame::Script(restored)) = self.frames.pop() {
-                            frame.defers = restored.defers;
+                            *frame = *restored;
                         }
                         frame.pc -= 1;
                         frame.resume_dst = None;
@@ -2490,8 +3056,12 @@ impl<'a> VmEngine<'a> {
                     Err(e) => StepOutcome::Err(e),
                 }
             }
-            ControlInst::Spawn { dst, target } => self.exec_spawn(frame, dst, target),
-            ControlInst::Select { dst, arms } => self.exec_select(frame, dst, arms),
+            ControlInst::Spawn { dst, target } => {
+                self.exec_spawn(frame, dst, target, kill_mask, can_move)
+            }
+            ControlInst::Select { dst, arms } => {
+                self.exec_select(frame, dst, arms, kill_mask, can_move)
+            }
             ControlInst::NoGrad {
                 dst,
                 body_fn,
@@ -2559,6 +3129,9 @@ impl<'a> VmEngine<'a> {
                         )));
                     }
                     optimize_program(&mut compiled, OptLevel::from_env());
+                    if let Err(e) = verify_program(&compiled) {
+                        return StepOutcome::Err(e);
+                    }
                     Arc::new(compiled)
                 };
                 let entry = child_prog.entry;
@@ -2592,8 +3165,20 @@ impl<'a> VmEngine<'a> {
                 tolerance,
                 replay_path: _,
             } => {
-                let given_val = frame.get_val(given);
-                let expect_vals: Vec<Value> = expects.iter().map(|r| frame.get_val(*r)).collect();
+                let given_val =
+                    frame.read_or_take_val(given, kill(0), can_move, &self.core.session.fbip_stats);
+                let expect_vals: Vec<Value> = expects
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| {
+                        frame.read_or_take_val(
+                            *r,
+                            kill(1 + i),
+                            can_move,
+                            &self.core.session.fbip_stats,
+                        )
+                    })
+                    .collect();
                 let name_str = frame.program.symbols.resolve(name);
                 match eval_assert(name_str, &given_val, &expect_vals, tolerance) {
                     Ok(()) => StepOutcome::NextInst,
@@ -2893,33 +3478,37 @@ impl<'a> VmEngine<'a> {
             ControlInst::TryProbe(dst, src) => {
                 let is_ok = match &frame.regs[src.0 as usize] {
                     RegSlot::Nil => false,
-                    RegSlot::Boxed(v) => match v.as_ref() {
-                        Value::Nil => false,
-                        Value::EnumVariant { variant, .. }
+                    slot => match slot.as_heap() {
+                        Some(Value::Nil) => false,
+                        Some(Value::EnumVariant { variant, .. })
                             if variant == "Err" || variant == "None" =>
                         {
                             false
                         }
                         _ => true,
                     },
-                    _ => true,
                 };
+                if kill(0) {
+                    let _ =
+                        frame.read_or_take_slot(src, true, can_move, &self.core.session.fbip_stats);
+                }
                 frame.set_slot(dst, RegSlot::Bool(is_ok));
                 StepOutcome::NextInst
             }
             ControlInst::TryUnwrap(dst, src) => {
-                let unwrapped = match &frame.regs[src.0 as usize] {
-                    RegSlot::Boxed(v) => match v.as_ref() {
-                        Value::EnumVariant {
-                            variant, payload, ..
-                        } if variant == "Ok" || variant == "Some" => match payload.len() {
-                            0 => Value::Nil,
-                            1 => payload[0].clone(),
-                            _ => Value::List(payload.clone().into()),
-                        },
-                        other => other.clone(),
+                let src_val =
+                    frame.read_or_take_val(src, kill(0), can_move, &self.core.session.fbip_stats);
+                let unwrapped = match src_val {
+                    Value::EnumVariant {
+                        variant,
+                        mut payload,
+                        ..
+                    } if variant == "Ok" || variant == "Some" => match payload.len() {
+                        0 => Value::Nil,
+                        1 => payload.pop().unwrap_or(Value::Nil),
+                        _ => Value::List(payload.into()),
                     },
-                    other => other.to_value(),
+                    other => other,
                 };
                 frame.set_val(dst, unwrapped);
                 StepOutcome::NextInst
@@ -2950,7 +3539,10 @@ impl<'a> VmEngine<'a> {
         frame: &mut ScriptFrame,
         dst: crate::mir::control::VReg,
         target: ControlSpawnTarget,
+        kill_mask: &KillMask,
+        can_move: bool,
     ) -> StepOutcome {
+        let kill = |bit: usize| -> bool { kill_mask.test(bit) };
         if let Err(err) = self.core.check_cancelled() {
             return StepOutcome::Err(err);
         }
@@ -2967,16 +3559,7 @@ impl<'a> VmEngine<'a> {
                 args,
                 named_args,
             } => {
-                let arg_vals: Vec<Value> = args.iter().map(|r| frame.get_val(*r)).collect();
-                let named_vals: Vec<(String, Value)> = named_args
-                    .iter()
-                    .map(|(sym, r)| {
-                        (
-                            frame.program.symbols.resolve(*sym).to_string(),
-                            frame.get_val(*r),
-                        )
-                    })
-                    .collect();
+                let mut bit_idx = 0usize;
                 let callee_val = match target {
                     CalleeTarget::Builtin(id) => ControlConst::BuiltinFn(id).to_value(),
                     CalleeTarget::Fn(fn_id) => {
@@ -2998,7 +3581,16 @@ impl<'a> VmEngine<'a> {
                             globals: Arc::clone(&frame.globals),
                         }
                     }
-                    CalleeTarget::Value(r) => frame.get_val(r),
+                    CalleeTarget::Value(r) => {
+                        let v = frame.read_or_take_val(
+                            r,
+                            kill(0),
+                            can_move,
+                            &self.core.session.fbip_stats,
+                        );
+                        bit_idx = 1;
+                        v
+                    }
                     CalleeTarget::DynGlobal(sym) => {
                         let name = frame.program.symbols.resolve(sym);
                         if let Some(id) = crate::mir::control::BuiltinFnId::from_name(name) {
@@ -3012,6 +3604,32 @@ impl<'a> VmEngine<'a> {
                         }
                     }
                 };
+                let arg_vals: Vec<Value> = args
+                    .iter()
+                    .map(|r| {
+                        let v = frame.read_or_take_val(
+                            *r,
+                            kill(bit_idx),
+                            can_move,
+                            &self.core.session.fbip_stats,
+                        );
+                        bit_idx += 1;
+                        v
+                    })
+                    .collect();
+                let named_vals: Vec<(String, Value)> = named_args
+                    .iter()
+                    .map(|(sym, r)| {
+                        let v = frame.read_or_take_val(
+                            *r,
+                            kill(bit_idx),
+                            can_move,
+                            &self.core.session.fbip_stats,
+                        );
+                        bit_idx += 1;
+                        (frame.program.symbols.resolve(*sym).to_string(), v)
+                    })
+                    .collect();
                 scheduler
                     .spawn_mora_value_named(callee_val, arg_vals, named_vals, self.core, &base_ctx)
             }
@@ -3021,16 +3639,38 @@ impl<'a> VmEngine<'a> {
                 args,
                 named_args,
             } => {
-                let recv_val = frame.get_val(receiver);
+                let recv_val = frame.read_or_take_val(
+                    receiver,
+                    kill(0),
+                    can_move,
+                    &self.core.session.fbip_stats,
+                );
+                let mut bit_idx = 1usize;
                 let method_name = frame.program.symbols.resolve(method).to_string();
-                let arg_vals: Vec<Value> = args.iter().map(|r| frame.get_val(*r)).collect();
+                let arg_vals: Vec<Value> = args
+                    .iter()
+                    .map(|r| {
+                        let v = frame.read_or_take_val(
+                            *r,
+                            kill(bit_idx),
+                            can_move,
+                            &self.core.session.fbip_stats,
+                        );
+                        bit_idx += 1;
+                        v
+                    })
+                    .collect();
                 let named_vals: Vec<(String, Value)> = named_args
                     .iter()
                     .map(|(sym, r)| {
-                        (
-                            frame.program.symbols.resolve(*sym).to_string(),
-                            frame.get_val(*r),
-                        )
+                        let v = frame.read_or_take_val(
+                            *r,
+                            kill(bit_idx),
+                            can_move,
+                            &self.core.session.fbip_stats,
+                        );
+                        bit_idx += 1;
+                        (frame.program.symbols.resolve(*sym).to_string(), v)
                     })
                     .collect();
                 scheduler.spawn_mora_method_named(
@@ -3043,7 +3683,8 @@ impl<'a> VmEngine<'a> {
                 )
             }
             ControlSpawnTarget::Callable(reg) => {
-                let callee_val = frame.get_val(reg);
+                let callee_val =
+                    frame.read_or_take_val(reg, kill(0), can_move, &self.core.session.fbip_stats);
                 scheduler.spawn_mora_value(callee_val, Vec::new(), self.core, &base_ctx)
             }
         };
@@ -3056,37 +3697,65 @@ impl<'a> VmEngine<'a> {
         frame: &mut ScriptFrame,
         dst: crate::mir::control::VReg,
         arms: Vec<ControlSelectArm>,
+        kill_mask: &KillMask,
+        can_move: bool,
     ) -> StepOutcome {
         use crate::runtime::scheduler::{SelectBranch, select_arms};
+        let kill = |bit: usize| -> bool { kill_mask.test(bit) };
         if let Err(err) = self.core.check_cancelled() {
             return StepOutcome::Err(err);
         }
+        let mut bit_idx = 0usize;
         let mut branches = Vec::with_capacity(arms.len());
         for arm in &arms {
             match arm {
                 ControlSelectArm::Recv { channel, .. } => {
-                    let Some(Value::Channel(ch)) = frame.regs[channel.0 as usize].as_boxed() else {
-                        let got = frame.get_val(*channel);
+                    let ch_val = frame.read_or_take_val(
+                        *channel,
+                        kill(bit_idx),
+                        can_move,
+                        &self.core.session.fbip_stats,
+                    );
+                    bit_idx += 1;
+                    let Value::Channel(ch) = ch_val else {
                         return StepOutcome::Err(MoraError::Runtime(format!(
                             "select recv arm requires a channel, got {}",
-                            crate::flow::type_name(&got)
+                            crate::flow::type_name(&ch_val)
                         )));
                     };
-                    branches.push(SelectBranch::Recv(Arc::clone(ch)));
+                    branches.push(SelectBranch::Recv(ch));
                 }
                 ControlSelectArm::Send { channel, value, .. } => {
-                    let Some(Value::Channel(ch)) = frame.regs[channel.0 as usize].as_boxed() else {
-                        let got = frame.get_val(*channel);
+                    let ch_val = frame.read_or_take_val(
+                        *channel,
+                        kill(bit_idx),
+                        can_move,
+                        &self.core.session.fbip_stats,
+                    );
+                    bit_idx += 1;
+                    let val = frame.read_or_take_val(
+                        *value,
+                        kill(bit_idx),
+                        can_move,
+                        &self.core.session.fbip_stats,
+                    );
+                    bit_idx += 1;
+                    let Value::Channel(ch) = ch_val else {
                         return StepOutcome::Err(MoraError::Runtime(format!(
                             "select send arm requires a channel, got {}",
-                            crate::flow::type_name(&got)
+                            crate::flow::type_name(&ch_val)
                         )));
                     };
-                    let val = frame.get_val(*value);
-                    branches.push(SelectBranch::Send(Arc::clone(ch), val));
+                    branches.push(SelectBranch::Send(ch, val));
                 }
                 ControlSelectArm::Timeout { ms, .. } => {
-                    let ms_val = frame.get_val(*ms);
+                    let ms_val = frame.read_or_take_val(
+                        *ms,
+                        kill(bit_idx),
+                        can_move,
+                        &self.core.session.fbip_stats,
+                    );
+                    bit_idx += 1;
                     let dur =
                         match crate::runtime::builtins::duration_from_ms(&ms_val, "select timeout")
                         {
@@ -3286,7 +3955,7 @@ fn reconstruct_grad_tree(
             for (k, c) in entries {
                 out.insert(k.clone(), reconstruct_grad_tree(c, grads, higher_order)?);
             }
-            Ok(Value::Dict(out))
+            Ok(Value::Dict(out.into()))
         }
     }
 }

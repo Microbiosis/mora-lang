@@ -137,6 +137,13 @@ fn call_for(name: &str) -> Option<&'static str> {
         "process_group" => "process_group(2)",
         "tcp_process_group" => "tcp_process_group(0, 1, [\"127.0.0.1:0\"])",
         "profiler" => "profiler()",
+        // P6-1 Perceus/FBIP 遥测内建
+        "fbip_stats" => "fbip_stats()",
+        "fbip_reset_stats" => "fbip_reset_stats()",
+        // v0.113.0 预备：一等 `result<T, E>` 构造器与 `try_call`
+        "Ok" => "Ok(1)",
+        "Err" => "Err(\"boom\")",
+        "try_call" => "try_call(fn(x) x end, 1)",
         // domain prefix 模块 / 宏展开，无独立固定返回值语义
         "math" | "stats" | "linalg" | "macroexpand" => return None,
         _ => return None,

@@ -12,7 +12,6 @@
 //! 空容器、嵌套、含特殊字符的 dict key、浮点。
 
 use mora::test_support::TempDir;
-use std::collections::HashMap;
 
 use mora::flow::{json_to_value, value_to_json};
 use mora::value::Value;
@@ -80,7 +79,7 @@ fn d223_string_round_trip_is_lossless_for_every_code_point() {
 fn d223_value_shapes_round_trip() {
     let cases: Vec<(&str, Value)> = vec![
         ("空 list", lst(vec![])),
-        ("空 dict", Value::Dict(HashMap::new())),
+        ("空 dict", Value::Dict(Default::default())),
         (
             "嵌套 list",
             lst(vec![lst(vec![Value::Int(1), Value::Int(2)])]),

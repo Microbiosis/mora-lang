@@ -119,6 +119,8 @@ pub struct ExecSession {
     pub(crate) fs_context: FsContext,
     /// Per-fiber reverse-mode automatic differentiation tape stack (`grad` / `no_grad`).
     pub(crate) autograd: AutogradContext,
+    /// P6-1: Per-session Perceus / FBIP in-place reuse telemetry (shared across child fibers).
+    pub(crate) fbip_stats: Arc<crate::runtime::fbip::FbipCounters>,
 }
 
 impl Default for ExecSession {
@@ -129,13 +131,14 @@ impl Default for ExecSession {
             task_context: None,
             fs_context: FsContext::unrestricted(),
             autograd: AutogradContext::new(),
+            fbip_stats: Arc::new(crate::runtime::fbip::FbipCounters::default()),
         }
     }
 }
 
 impl ExecSession {
-    /// Fork a lightweight child session for a `spawn`ed fiber: preserves filesystem policy and
-    /// task context while starting with a fresh isolated `AutogradContext`.
+    /// Fork a lightweight child session for a `spawn`ed fiber: preserves filesystem policy,
+    /// task context, and shared `fbip_stats` while starting with a fresh isolated `AutogradContext`.
     pub(crate) fn fork_for_fiber(&self) -> Self {
         Self {
             gensym_counter: self.gensym_counter,
@@ -143,6 +146,7 @@ impl ExecSession {
             task_context: self.task_context.clone(),
             fs_context: self.fs_context.clone(),
             autograd: AutogradContext::new(),
+            fbip_stats: Arc::clone(&self.fbip_stats),
         }
     }
 }

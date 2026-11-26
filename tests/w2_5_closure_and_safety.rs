@@ -455,7 +455,7 @@ impl HostObject for CounterHost {
             "count".to_string(),
             Value::Int(self.count.load(Ordering::SeqCst)),
         );
-        Some(Value::Dict(map))
+        Some(Value::Dict(map.into()))
     }
 
     fn dyn_eq(&self, other: &dyn HostObject) -> bool {

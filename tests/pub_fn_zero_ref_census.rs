@@ -1,4 +1,4 @@
-//! v0.104.6 D386 —— 全仓 **`pub fn` 零引用普查**：37 / 815 是「完整但未接入」的库能力
+//! v0.104.6 D386 —— 全仓 **`pub fn` 零引用普查**：「完整但未接入」的库能力有多少
 //!
 //! 「功能未接通」是本会话最常见的结论类型（D346 `xform` / D356 / D360
 //! `orchestrate loop` / D361 `IndexAssign` / D363 / D385）。
@@ -10,7 +10,7 @@
 //! （`pub` 项本来就不算 dead）。所以只能**人工判调用链**：
 //! 对每个 `pub fn`，数它在全仓 `src/` 出现几次；只出现 1 次 ⇒ 只有定义、零引用。
 //!
-//! ## 结果：815 个 `pub fn` 里 **37 个**零引用
+//! ## D386 原始快照（v0.104.6）：815 个 `pub fn` 里 **37 个**零引用
 //!
 //! 按模块分组：
 //!
@@ -21,6 +21,41 @@
 //! | `pregel/` + `trace_collector/` | 6 | `with_step_timeout` / `set_otel_endpoint` / `metrics_json` |
 //! | `mir/` + `flow.rs` + `orchestrate_dag/` | 8 | `run_with_signal_cached` / `label_index` / `is_pipe_method` |
 //! | **历史** `interpreter/` + `tea/` + `toolplane/` | 6 | `save_checkpoint` / `dispatch_many` / `shared_default_registry` |
+//!
+//! ⚠ 上表含**已被删除**的历史模块（`interpreter/` 等，见 AGENTS.md §0.6
+//! Wave 1/2 的编译器瘦身），**不再反映当前源码树** —— 保留它只作历史记录。
+//!
+//! ## 当前实测（2026-11-26，P6-1 收尾重测）：535 个 `pub fn` 里 **22 个**零引用
+//!
+//! | 模块 | 零引用数 | 代表 |
+//! |---|---|---|
+//! | `typeck/`（`mod.rs` + `hm/env.rs`） | 7 | `is_empty_union` / `enter_scope` / `exit_scope` / `push_scope` / `pop_scope` / `is_builtin_type_name` / `from_span_with_detail` |
+//! | `value.rs` / `value/list.rs` | 5 | `is_moved` / `is_borrowed_mut` / `into_value` / `sorted_by_key` / `to_mut_vec` |
+//! | `runtime/`（`scheduler.rs` / `core.rs` / `autograd.rs` / `vm/continuation.rs`） | 5 | `spawn_mora_task` / `fiber_stats` / `with_fs_root` / `active_tape_id` / `cell_key` |
+//! | `common/` + `error.rs` | 3 | `is_buffer` / `at_line` / `from_type_errors` |
+//! | `flow.rs` | 2 | `is_pipe_method` / `literal_to_value_static` |
+//!
+//! 口径：普查按**名字**去重（`pub fn` 行 642 条 → 唯一名字 535 个）。
+//!
+//! ### P6-1 的**二次分类**（本文件既定契约：超上界 ⇒ 重做分类）
+//!
+//! P6-1（Perceus / FBIP 所有权转移与零拷贝原地复用）落地后 `pub fn` 总数
+//! 从 **515 涨到 538**，突破原上界 520。分类结论：新增的 23 个 public API
+//! 里**只有 2 个零引用**，且都不是「库 API 备用」，而是本次变更自身的遗留，
+//! 故**删除**而非保留：
+//!
+//! | 删除项 | 位置 | 原因 |
+//! |---|---|---|
+//! | `as_hashmap` | `value/dict.rs` | 与 `Deref<Target = HashMap>` 完全重复，零调用 |
+//! | `is_unique` | `value/dict.rs` + `value/list.rs` | 零调用；唯一性判定已在 `set_owned` / `push_owned` 内部以 `Arc::get_mut` 实现 |
+//! | `eval_binary_tracked` | `flow.rs` | 被 P6-1 的 `eval_binary_fbip` 取代后零调用，留下即是重复路径 |
+//!
+//! 删除后：**535 个 `pub fn` 里 22 个零引用**，与 P6-1 之前的基线**完全相同**
+//! —— P6-1 净增 20 个 public API 名称，**零引用集合零变化**（全部已接线）。
+//!
+//! ⚠ 普查按**名字**计数，同名方法会互相遮蔽（`Dict::is_unique` 与
+//! `List::is_unique` 合并成一个名字）。故「零引用」判定**必须逐个核实调用点**，
+//! 不能只看名字计数 —— 本次删除 3 项即靠逐点核实得出。
 //!
 //! ## 抽查结论：全是**库 API 备用**，不是「写残的半成品」
 //!
@@ -35,6 +70,9 @@
 //! **判定：全部保留，不擅动。**
 //! 库 API 备用是正常设计（未来接线、或给下游用）；
 //! 删掉它们的风险高于收益。
+//!
+//! ⚠ 该判定只适用于**既有**库 API。本次变更**自己引入**的零调用 public API
+//! 不适用 —— 新代码不该带着「以后再说」的钩子交付（AGENTS.md §0）。
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -95,16 +133,20 @@ fn pub_fn_census() -> BTreeMap<String, (String, usize)> {
     out
 }
 
-/// **普查规模**：`pub fn` 总数落在 `[250, 520]`（v0.110.1 补齐 P3-A/B/C 公开原语与 CLI 入口后）。
+/// **普查规模**：`pub fn` 总数落在 `[250, 540]`（P6-1 补齐 Perceus/FBIP 公开原语后）。
 ///
 /// 低于下界说明抽样的源码树变了；高于上界说明**新增了大量 public API**，
 /// 应重新做一次「零引用」分类。
+///
+/// v0.110.1 时上界是 520（当时实测 515）。P6-1 把总数推到 538 后已按本文件
+/// 契约重做过分类（见文件头），清理到 **535**，上界相应提到 540 —— 保持
+/// 「超界即触发重新分类」的紧箍咒，而不是把上界一路放宽。
 #[test]
 fn d386_pub_fn_census_scale_is_stable() {
     let c = pub_fn_census();
     assert!(
-        (250..=520).contains(&c.len()),
-        "`pub fn` 总数 {} 超出 [250, 520] —— 源码树结构变了？",
+        (250..=540).contains(&c.len()),
+        "`pub fn` 总数 {} 超出 [250, 540] —— 源码树结构变了？",
         c.len()
     );
 }
@@ -113,6 +155,9 @@ fn d386_pub_fn_census_scale_is_stable() {
 ///
 /// 这是「完整但未接入」的量化基线。突破上界说明**新增了一批未接线的库能力**
 /// （值得逐个看）；跌破下界说明大批能力**被接上了**（好消息）。
+///
+/// P6-1 收尾实测 **22** —— 与 P6-1 之前的基线相同：本次变更**未新增任何**
+/// 零引用 public API（新增的 20 个名字全部已接线）。
 #[test]
 fn d386_zero_reference_pub_fn_count_is_bounded() {
     let c = pub_fn_census();

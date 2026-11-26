@@ -173,6 +173,7 @@ fn dummy_program(
     insts: Vec<ControlInst>,
     terminator: ControlTerminator,
 ) -> ControlProgram {
+    let inst_kill_masks = vec![Default::default(); insts.len()];
     ControlProgram {
         symbols: SymbolTable::new(),
         functions: vec![ControlFunction {
@@ -181,6 +182,7 @@ fn dummy_program(
             kind: FunctionKind::Main,
             params: Vec::new(),
             param_has_default: Vec::new(),
+            param_borrows: Vec::new(),
             upvalues: Vec::new(),
             shared_locals: Vec::new(),
             local_names: Vec::new(),
@@ -190,7 +192,9 @@ fn dummy_program(
                 id: BlockId(0),
                 params: Vec::new(),
                 insts,
+                inst_kill_masks,
                 terminator,
+                term_kill_mask: Default::default(),
             }],
             entry: BlockId(0),
             handler_k_slot: None,
@@ -198,6 +202,7 @@ fn dummy_program(
         }],
         entry: FnId(0),
         globals: Vec::new(),
+        preserve_globals_at_exit: false,
     }
 }
 
@@ -249,5 +254,45 @@ fn in_range_highest_register_is_not_rejected() {
     assert!(
         matches!(v, Value::Int(7)),
         "返回值应来自 reg 0，实得: {v:?}"
+    );
+}
+
+#[test]
+fn ownership_verifier_rejects_drops_before_a_reachable_read() {
+    use mora::mir::control::{LocalSlot, verify_program};
+    let r = VReg(0);
+    let slot = LocalSlot(0);
+    let mut regs = dummy_program(
+        1,
+        vec![
+            ControlInst::Const(r, ControlConst::Nil),
+            ControlInst::DropReg(r),
+        ],
+        ControlTerminator::Return(Some(r)),
+    );
+    regs.functions[0].blocks[0].inst_kill_masks.clear();
+    assert!(
+        verify_program(&regs)
+            .expect_err("寄存器仍须用于返回")
+            .to_string()
+            .contains("DropReg on live reg")
+    );
+
+    let mut locals = dummy_program(
+        2,
+        vec![
+            ControlInst::Const(r, ControlConst::Nil),
+            ControlInst::StoreLocal(slot, r),
+            ControlInst::DropLocal(slot),
+            ControlInst::LoadLocal(VReg(1), slot),
+        ],
+        ControlTerminator::Return(Some(VReg(1))),
+    );
+    locals.functions[0].n_locals = 1;
+    assert!(
+        verify_program(&locals)
+            .expect_err("块内赋值后仍须读取局部槽")
+            .to_string()
+            .contains("DropLocal on still-live local slot")
     );
 }

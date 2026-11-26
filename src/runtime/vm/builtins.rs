@@ -16,15 +16,18 @@ use crate::error::{MoraError, MoraResult};
 use crate::mir::control::BuiltinFnId;
 use crate::mir::effect::ambient;
 use crate::runtime::CoreRuntime;
-use crate::runtime::builtins::impls::eval_pure_builtin;
-use crate::runtime::builtins::method::eval_pure_method;
+use crate::runtime::builtins::impls::{eval_borrowing_builtin_slots, eval_pure_builtin};
+use crate::runtime::builtins::method::{eval_borrowing_method_slots, eval_pure_method};
 use crate::runtime::builtins::traits::{
-    TraitMethodTarget, construct_trait_instance_core, resolve_concrete_impl_method,
-    resolve_trait_method_call,
+    TraitMethodTarget, construct_trait_instance_core, lookup_concrete_impl_callee,
+    resolve_concrete_impl_method, resolve_trait_method_call,
 };
 use crate::value::{BuiltinKind, MODULE_OBJECTS, StructDefRuntime, Value};
 
-use super::continuation::{CombinatorFrame, ScriptFrame, materialize_frame_named};
+use super::continuation::{
+    CombinatorFrame, RegSlot, ScriptFrame, materialize_frame_named, materialize_frame_slots_named,
+};
+use super::loans::CallArg;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -436,7 +439,7 @@ pub fn resolve_builtin_call_named(
             }
         }
     }
-    if let Some(res) = eval_pure_builtin(id, core, &args) {
+    if let Some(res) = eval_pure_builtin(id, core, &mut args) {
         return res.map(CallAction::Done);
     }
 
@@ -1257,6 +1260,26 @@ pub fn resolve_builtin_call_named(
                 args,
             })
         }
+        BuiltinFnId::FbipStats => {
+            if !args.is_empty() {
+                return Err(MoraError::Runtime(format!(
+                    "fbip_stats() expects 0 arguments, got {}",
+                    args.len()
+                )));
+            }
+            Ok(CallAction::Done(core.session.fbip_stats.to_dict_value()))
+        }
+        BuiltinFnId::FbipResetStats => {
+            if !args.is_empty() {
+                return Err(MoraError::Runtime(format!(
+                    "fbip_reset_stats() expects 0 arguments, got {}",
+                    args.len()
+                )));
+            }
+            core.session.fbip_stats.reset();
+            crate::runtime::fbip::reset_thread_heap_clone_count();
+            Ok(CallAction::Done(Value::Nil))
+        }
         _ => unreachable!("all BuiltinFnId handled cleanly"),
     }
 }
@@ -1335,12 +1358,9 @@ pub(crate) fn construct_struct_instance_with_consts(
 
     if pending_defaults.is_empty() {
         let const_args = finalize_struct_const_args(&def, &explicit_const_args, &fields)?;
-        let field_order = def.fields.iter().map(|f| f.name.clone()).collect();
         return Ok(CallAction::Done(Value::StructInstance {
-            type_name: def.name.clone(),
-            fields,
-            field_order,
-            const_args,
+            fields: fields.into(),
+            const_args: Arc::from(const_args),
             def,
         }));
     }
@@ -1465,7 +1485,7 @@ pub(crate) fn resolve_operator_impl(
     mut rhs_args: Vec<Value>,
 ) -> Option<(Value, Vec<Value>)> {
     let target_name = match receiver {
-        Value::StructInstance { type_name, .. } => type_name.as_str(),
+        Value::StructInstance { def, .. } => def.name.as_str(),
         Value::EnumVariant { enum_name, .. } => enum_name.as_str(),
         Value::TraitObject { for_type, .. } => for_type.as_str(),
         _ => return None,
@@ -1488,6 +1508,122 @@ pub(crate) fn resolve_operator_impl(
     Some((func, all_args))
 }
 
+/// 共享寄存器借用其堆值，独占寄存器直接交出值。两者共用同一方法解析顺序。
+pub(crate) enum MethodReceiver<'a> {
+    StackBorrowed(super::loans::SlotAddress, &'a RegSlot),
+    Borrowed(Arc<Value>),
+    Owned(Value),
+}
+
+impl<'a> From<CallArg<'a>> for MethodReceiver<'a> {
+    fn from(arg: CallArg<'a>) -> Self {
+        let slot = match arg {
+            CallArg::Borrowed(source, slot) => return Self::StackBorrowed(source, slot),
+            CallArg::Owned(slot) => slot,
+        };
+        match slot {
+            RegSlot::Heap(value) => match Arc::try_unwrap(value) {
+                Ok(value) => Self::Owned(value),
+                Err(shared) => Self::Borrowed(shared),
+            },
+            primitive => Self::Owned(primitive.take_value()),
+        }
+    }
+}
+
+impl<'a> MethodReceiver<'a> {
+    fn value(&self) -> &Value {
+        match self {
+            Self::StackBorrowed(_, slot) => slot.as_heap().expect("借用操作数保存的是堆值"),
+            Self::Borrowed(shared) => shared,
+            Self::Owned(value) => value,
+        }
+    }
+
+    fn into_slot(self) -> CallArg<'a> {
+        match self {
+            Self::StackBorrowed(source, slot) => CallArg::Borrowed(source, slot),
+            Self::Borrowed(shared) => CallArg::Owned(RegSlot::Heap(shared)),
+            Self::Owned(value) => CallArg::from_value(value),
+        }
+    }
+
+    fn into_owned(self) -> Value {
+        match self {
+            Self::StackBorrowed(_, slot) => slot.to_value(),
+            Self::Borrowed(shared) => Arc::unwrap_or_clone(shared),
+            Self::Owned(value) => value,
+        }
+    }
+}
+
+pub(crate) fn dispatch_method<'a>(
+    core: &mut CoreRuntime,
+    receiver: MethodReceiver<'a>,
+    method: &str,
+    args: Vec<CallArg<'a>>,
+    named_args: Vec<(String, CallArg<'a>)>,
+    call_site: Span,
+) -> MoraResult<CallAction> {
+    {
+        let recv_ref = receiver.value();
+        let is_direct_struct_field = args.is_empty()
+            && named_args.is_empty()
+            && matches!(recv_ref, Value::StructInstance { fields, .. } if fields.contains_key(method));
+        if !is_direct_struct_field {
+            if matches!(
+                recv_ref,
+                Value::StructInstance { .. } | Value::EnumVariant { .. }
+            ) && let Some((func, has_self)) = lookup_concrete_impl_callee(core, recv_ref, method)
+            {
+                let mut all_slots = Vec::with_capacity(usize::from(has_self) + args.len());
+                if has_self {
+                    all_slots.push(receiver.into_slot());
+                }
+                all_slots.extend(args);
+                return resolve_value_call_slots_named(func, all_slots, named_args, core);
+            }
+            if let Some(res) = eval_borrowing_method_slots(
+                recv_ref,
+                method,
+                &args,
+                named_args.len(),
+                &core.session.autograd,
+            ) {
+                return res.map(|slot| CallAction::Done(slot.take_value()));
+            }
+        }
+    }
+    let recv_val = receiver.into_owned();
+    let arg_vals: Vec<Value> = args.into_iter().map(CallArg::take_value).collect();
+    let named_vals: Vec<(String, Value)> = named_args
+        .into_iter()
+        .map(|(k, s)| (k, s.take_value()))
+        .collect();
+    dispatch_owned_method(core, recv_val, method, arg_vals, named_vals, call_site)
+}
+
+/// P6-1: Resolve a built-in free function call from [`RegSlot`]s, short-circuiting read-only
+/// borrowing builtins in place before unwrapping owned [`Value`]s.
+pub(crate) fn resolve_builtin_call_slots_named<'a>(
+    id: BuiltinFnId,
+    core: &mut CoreRuntime,
+    args: Vec<CallArg<'a>>,
+    named_args: Vec<(String, CallArg<'a>)>,
+) -> MoraResult<CallAction> {
+    if named_args.is_empty()
+        && let Some(res) = eval_borrowing_builtin_slots(id, &args)
+    {
+        return res.map(|s| CallAction::Done(s.take_value()));
+    }
+    let arg_vals: Vec<Value> = args.into_iter().map(CallArg::take_value).collect();
+    let named_vals: Vec<(String, Value)> = named_args
+        .into_iter()
+        .map(|(k, s)| (k, s.take_value()))
+        .collect();
+    resolve_builtin_call_named(id, core, arg_vals, named_vals)
+}
+
 /// Resolve a method invocation `receiver.method(args..., kw=val...)` onto pure result or stackful action.
 pub fn resolve_method_call_named(
     core: &mut CoreRuntime,
@@ -1497,31 +1633,101 @@ pub fn resolve_method_call_named(
     named_args: Vec<(String, Value)>,
     call_site: Span,
 ) -> MoraResult<CallAction> {
-    // Tensor methods run with live autograd tape tracking first, then fall back to user impls.
-    if let Value::Tensor(ref t) = receiver {
-        if named_args.is_empty() {
-            match crate::value::tensor::call_tensor_method_tracked(
-                t,
+    dispatch_method(
+        core,
+        MethodReceiver::Owned(receiver),
+        method,
+        args.into_iter().map(CallArg::from_value).collect(),
+        named_args
+            .into_iter()
+            .map(|(name, value)| (name, CallArg::from_value(value)))
+            .collect(),
+        call_site,
+    )
+}
+
+fn dispatch_owned_method(
+    core: &mut CoreRuntime,
+    receiver: Value,
+    method: &str,
+    args: Vec<Value>,
+    named_args: Vec<(String, Value)>,
+    call_site: Span,
+) -> MoraResult<CallAction> {
+    // P6-1 Perceus/FBIP: Move `Arc<Tensor>` out of `receiver` before dispatching so uniquely-owned
+    // dead tensors retain `Arc::strong_count == 1` for in-place 64B host / GPU VRAM reuse!
+    let mut receiver = match receiver {
+        Value::Tensor(t) => {
+            if named_args.is_empty() {
+                match crate::value::tensor::call_tensor_method_fbip(
+                    t,
+                    method,
+                    &args,
+                    Some(&mut core.session.autograd),
+                    Some(&core.session.fbip_stats),
+                ) {
+                    crate::value::tensor::TensorMethodDispatch::Handled(Ok(v)) => {
+                        return Ok(CallAction::Done(v));
+                    }
+                    crate::value::tensor::TensorMethodDispatch::Handled(Err(e)) => {
+                        return Err(e);
+                    }
+                    crate::value::tensor::TensorMethodDispatch::UnknownMethod(t_back, e) => {
+                        let recv_back = Value::Tensor(t_back);
+                        if let Some((func, all_args)) =
+                            resolve_concrete_impl_method(core, &recv_back, method, &args)
+                        {
+                            return resolve_value_call_named(func, all_args, named_args, core);
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+            let recv_back = Value::Tensor(t);
+            if let Some((func, all_args)) =
+                resolve_concrete_impl_method(core, &recv_back, method, &args)
+            {
+                return resolve_value_call_named(func, all_args, named_args, core);
+            }
+            recv_back
+        }
+        Value::Dict(d) if named_args.is_empty() && matches!(method, "set" | "remove") => {
+            if let Some(res) = crate::runtime::builtins::method::call_method_dict_fbip(
+                d,
                 method,
                 &args,
-                Some(&mut core.session.autograd),
+                Some(&core.session.fbip_stats),
             ) {
-                Ok(v) => return Ok(CallAction::Done(v)),
-                Err(e) if e.message().contains("Tensor has no method") => {
-                    if let Some((func, all_args)) =
-                        resolve_concrete_impl_method(core, &receiver, method, &args)
-                    {
-                        return resolve_value_call_named(func, all_args, named_args, core);
-                    }
-                    return Err(e);
-                }
-                Err(e) => return Err(e),
+                return res.map(CallAction::Done);
             }
-        } else if let Some((func, all_args)) =
-            resolve_concrete_impl_method(core, &receiver, method, &args)
-        {
-            return resolve_value_call_named(func, all_args, named_args, core);
+            unreachable!("Dict.set / Dict.remove always handled synchronously")
         }
+        Value::List(l)
+            if named_args.is_empty() && matches!(method, "push" | "set" | "take" | "drop") =>
+        {
+            if let Some(res) = crate::runtime::builtins::method::call_method_list_fbip(
+                l,
+                method,
+                &args,
+                Some(&core.session.fbip_stats),
+            ) {
+                return res.map(CallAction::Done);
+            }
+            unreachable!("List.push / set / take / drop always handled synchronously")
+        }
+        other => other,
+    };
+
+    // P6-1 Perceus/FBIP: Direct zero-arg struct field projection moves the field out in $O(1)$
+    // when `StructInstance.fields` is uniquely owned (`Arc::strong_count == 1`) and drops the
+    // enclosing `StructInstance` immediately, preserving `Arc::strong_count == 1` on the field.
+    if args.is_empty()
+        && named_args.is_empty()
+        && let Value::StructInstance { ref mut fields, .. } = receiver
+        && let Some(val) = fields.remove_if_unique(method)
+    {
+        drop(receiver);
+        return Ok(CallAction::Done(val));
     }
 
     // Nominal struct type & instance dispatch (field access, inherent/trait impls, schema/tags).
@@ -1565,12 +1771,8 @@ pub fn resolve_method_call_named(
                 }
             };
         }
-        Value::StructInstance {
-            type_name,
-            fields,
-            def,
-            ..
-        } => {
+        Value::StructInstance { fields, def, .. } => {
+            let type_name = &def.name;
             // 1. Direct field read when invoked with 0 args (`obj.field`)
             if args.is_empty()
                 && named_args.is_empty()
@@ -1614,7 +1816,7 @@ pub fn resolve_method_call_named(
                     collect_struct_tensors(&receiver, &prefix, include_buffers, &mut |k, t| {
                         out.insert(k, Value::Tensor(t));
                     });
-                    return Ok(CallAction::Done(Value::Dict(out)));
+                    return Ok(CallAction::Done(Value::Dict(out.into())));
                 }
                 "load_state_dict" => {
                     let (state_map, strict) =
@@ -1686,25 +1888,9 @@ pub fn resolve_method_call_named(
             {
                 return resolve_value_call_named(func, all_args, named_args, core);
             }
-            if variant == "Ok" || variant == "Err" {
+            if enum_name == "result" && (variant == "Ok" || variant == "Err") {
                 let inner = || payload.first().cloned().unwrap_or(Value::Nil);
                 match method {
-                    "is_ok" => {
-                        if !args.is_empty() || !named_args.is_empty() {
-                            return Err(MoraError::Runtime(
-                                "result.is_ok() expects 0 arguments".to_string(),
-                            ));
-                        }
-                        return Ok(CallAction::Done(Value::Bool(variant == "Ok")));
-                    }
-                    "is_err" => {
-                        if !args.is_empty() || !named_args.is_empty() {
-                            return Err(MoraError::Runtime(
-                                "result.is_err() expects 0 arguments".to_string(),
-                            ));
-                        }
-                        return Ok(CallAction::Done(Value::Bool(variant == "Err")));
-                    }
                     "ok" => {
                         if !args.is_empty() || !named_args.is_empty() {
                             return Err(MoraError::Runtime(
@@ -1781,10 +1967,11 @@ pub fn resolve_method_call_named(
     }
 
     if let Value::Builtin(BuiltinKind::Math) = &receiver {
-        return crate::runtime::builtins::math::call_math_method_tracked(
+        return crate::runtime::builtins::math::call_math_method_fbip(
             method,
-            &args,
+            args,
             Some(&mut core.session.autograd),
+            Some(&core.session.fbip_stats),
         )
         .map(CallAction::Done);
     }
@@ -2838,7 +3025,7 @@ fn resolve_compute_dag_method(
                 "chrome_json".to_string(),
                 Value::String(crate::runtime::profiler::format_chrome_trace_json(&events)),
             );
-            Ok(CallAction::Done(Value::Dict(m)))
+            Ok(CallAction::Done(Value::Dict(m.into())))
         }
         "node_count" => {
             if !args.is_empty() {
@@ -2941,7 +3128,7 @@ fn resolve_compute_dag_method(
                 "vram_buffer_reuses".to_string(),
                 Value::Int(vram_reuses as i64),
             );
-            Ok(CallAction::Done(Value::Dict(m)))
+            Ok(CallAction::Done(Value::Dict(m.into())))
         }
         "cost_report" => {
             if !args.is_empty() {
@@ -3045,11 +3232,11 @@ fn resolve_compute_dag_method(
                         Value::Float(nc.arithmetic_intensity),
                     );
                     nm.insert("bound".to_string(), Value::String(nc.bound.to_string()));
-                    Value::Dict(nm)
+                    Value::Dict(nm.into())
                 })
                 .collect();
             m.insert("nodes".to_string(), Value::List(node_list.into()));
-            Ok(CallAction::Done(Value::Dict(m)))
+            Ok(CallAction::Done(Value::Dict(m.into())))
         }
         "cache_stats" => {
             if !args.is_empty() {
@@ -3062,7 +3249,7 @@ fn resolve_compute_dag_method(
             m.insert("hits".to_string(), Value::Int(stats.hits as i64));
             m.insert("misses".to_string(), Value::Int(stats.misses as i64));
             m.insert("entries".to_string(), Value::Int(stats.entries as i64));
-            Ok(CallAction::Done(Value::Dict(m)))
+            Ok(CallAction::Done(Value::Dict(m.into())))
         }
         "backend_info" => {
             if !args.is_empty() {
@@ -3089,7 +3276,7 @@ fn resolve_compute_dag_method(
                 "worker_threads".to_string(),
                 Value::String(backend.worker_threads().to_string()),
             );
-            Ok(CallAction::Done(Value::Dict(m)))
+            Ok(CallAction::Done(Value::Dict(m.into())))
         }
         _ => Err(MoraError::Runtime(format!(
             "ComputeDag has no method: {method}"
@@ -3211,7 +3398,7 @@ fn dispatch_with_watermarks(
             pending: fired,
         }),
         callee: first_cb,
-        args: vec![Value::Dict(first_event)],
+        args: vec![Value::Dict(first_event.into())],
     }
 }
 
@@ -3562,7 +3749,7 @@ fn resolve_kv_allocator_method(
         "total_pages" => Ok(CallAction::Done(Value::Int(kv.total_pages as i64))),
         "utilization" => Ok(CallAction::Done(Value::Float(kv.utilization()))),
         "bytes_used" => Ok(CallAction::Done(Value::Int(kv.bytes_used() as i64))),
-        "stats" => Ok(CallAction::Done(Value::Dict(kv.stats_dict()))),
+        "stats" => Ok(CallAction::Done(Value::Dict(kv.stats_dict().into()))),
         _ => Err(MoraError::Runtime(format!(
             "KVAllocator has no method: {method}"
         ))),
@@ -3701,7 +3888,7 @@ fn resolve_memory_pool_method(
         "cached_bytes" => Ok(CallAction::Done(Value::Int(pool.cached_bytes() as i64))),
         "max_bytes" => Ok(CallAction::Done(Value::Int(pool.max_bytes() as i64))),
         "utilization" => Ok(CallAction::Done(Value::Float(pool.utilization()))),
-        "stats" => Ok(CallAction::Done(Value::Dict(pool.stats_dict()))),
+        "stats" => Ok(CallAction::Done(Value::Dict(pool.stats_dict().into()))),
         _ => Err(MoraError::Runtime(format!(
             "MemoryPool has no method: {method}"
         ))),
@@ -3765,7 +3952,7 @@ fn resolve_process_group_method(
                 .into_iter()
                 .map(|(k, v)| (k, Value::Int(v)))
                 .collect();
-            Ok(CallAction::Done(Value::Dict(map)))
+            Ok(CallAction::Done(Value::Dict(map.into())))
         }
         "all_reduce" => {
             if args.is_empty() || args.len() > 2 {
@@ -4173,6 +4360,79 @@ pub fn resolve_value_call(
     core: &mut CoreRuntime,
 ) -> MoraResult<CallAction> {
     resolve_value_call_named(callee, args, Vec::new(), core)
+}
+
+/// P6-1: Resolve a runtime callable [`Value`] directly from [`RegSlot`] arguments, preserving
+/// `RegSlot::Heap(Arc<Value>)` identity across `Task` / `Closure` / `Macro` frames.
+pub(crate) fn resolve_value_call_slots_named<'a>(
+    callee: Value,
+    args: Vec<CallArg<'a>>,
+    named_args: Vec<(String, CallArg<'a>)>,
+    core: &mut CoreRuntime,
+) -> MoraResult<CallAction> {
+    match callee {
+        Value::Task {
+            program,
+            fn_id,
+            globals,
+            ..
+        } => {
+            let frame = materialize_frame_slots_named(
+                program,
+                fn_id,
+                globals,
+                Arc::new(Vec::new()),
+                args,
+                named_args,
+            )?;
+            Ok(CallAction::PushFrame {
+                frame,
+                error_prefix: None,
+            })
+        }
+        Value::Closure {
+            program,
+            fn_id,
+            globals,
+            upvalues,
+            ..
+        } => {
+            let frame =
+                materialize_frame_slots_named(program, fn_id, globals, upvalues, args, named_args)?;
+            Ok(CallAction::PushFrame {
+                frame,
+                error_prefix: None,
+            })
+        }
+        Value::Macro {
+            name,
+            program,
+            fn_id,
+            globals,
+            ..
+        } => {
+            let frame = materialize_frame_slots_named(
+                program,
+                fn_id,
+                globals,
+                Arc::new(Vec::new()),
+                args,
+                named_args,
+            )?;
+            Ok(CallAction::PushFrame {
+                frame,
+                error_prefix: Some(format!("macro '{name}' execution error: ")),
+            })
+        }
+        other => {
+            let arg_vals: Vec<Value> = args.into_iter().map(CallArg::take_value).collect();
+            let named_vals: Vec<(String, Value)> = named_args
+                .into_iter()
+                .map(|(k, s)| (k, s.take_value()))
+                .collect();
+            resolve_value_call_named(other, arg_vals, named_vals, core)
+        }
+    }
 }
 
 /// Resolve an arbitrary runtime callable [`Value`] with optional named keyword arguments.
@@ -4606,13 +4866,9 @@ fn collect_struct_tensors(
         Value::Tensor(t) => {
             visit(prefix.to_string(), Arc::clone(t));
         }
-        Value::StructInstance {
-            fields,
-            field_order,
-            def,
-            ..
-        } => {
-            for fname in field_order {
+        Value::StructInstance { fields, def, .. } => {
+            for fdef in &def.fields {
+                let fname = &fdef.name;
                 let Some(fval) = fields.get(fname) else {
                     continue;
                 };
@@ -4797,14 +5053,13 @@ fn rebuild_with_state_dict(
             }
         }
         Value::StructInstance {
-            type_name,
             fields,
-            field_order,
             const_args,
             def,
         } => {
             let mut new_fields = fields.clone();
-            for fname in field_order {
+            for fdef in &def.fields {
+                let fname = &fdef.name;
                 let Some(fval) = fields.get(fname) else {
                     continue;
                 };
@@ -4814,13 +5069,11 @@ fn rebuild_with_state_dict(
                 let child_key = join_state_key(prefix, fname);
                 let updated =
                     rebuild_with_state_dict(fval, &child_key, state, matched_keys, missing_keys)?;
-                new_fields.insert(fname.clone(), updated);
+                new_fields.insert_mut(fname.clone(), updated);
             }
             Ok(Value::StructInstance {
-                type_name: type_name.clone(),
                 fields: new_fields,
-                field_order: field_order.clone(),
-                const_args: const_args.clone(),
+                const_args: Arc::clone(const_args),
                 def: Arc::clone(def),
             })
         }
@@ -4851,7 +5104,7 @@ fn rebuild_with_state_dict(
                     );
                 }
             }
-            Ok(Value::Dict(out))
+            Ok(Value::Dict(out.into()))
         }
         other => Ok(other.clone()),
     }
@@ -4861,9 +5114,7 @@ fn move_struct_to_device(val: &Value, dev: &crate::common::Device) -> MoraResult
     match val {
         Value::Tensor(t) => Ok(Value::Tensor(t.to_device(dev.clone())?)),
         Value::StructInstance {
-            type_name,
             fields,
-            field_order,
             const_args,
             def,
         } => {
@@ -4872,10 +5123,8 @@ fn move_struct_to_device(val: &Value, dev: &crate::common::Device) -> MoraResult
                 new_fields.insert(k.clone(), move_struct_to_device(v, dev)?);
             }
             Ok(Value::StructInstance {
-                type_name: type_name.clone(),
-                fields: new_fields,
-                field_order: field_order.clone(),
-                const_args: const_args.clone(),
+                fields: new_fields.into(),
+                const_args: Arc::clone(const_args),
                 def: Arc::clone(def),
             })
         }
@@ -4891,7 +5140,7 @@ fn move_struct_to_device(val: &Value, dev: &crate::common::Device) -> MoraResult
             for (k, v) in map {
                 out.insert(k.clone(), move_struct_to_device(v, dev)?);
             }
-            Ok(Value::Dict(out))
+            Ok(Value::Dict(out.into()))
         }
         other => Ok(other.clone()),
     }
@@ -5007,7 +5256,10 @@ fn register_grad_tree(
                     child_specs.push((k, spec));
                 }
             }
-            Ok((Value::Dict(tracked_map), GradTreeSpec::Dict(child_specs)))
+            Ok((
+                Value::Dict(tracked_map.into()),
+                GradTreeSpec::Dict(child_specs),
+            ))
         }
         other => Err(MoraError::Runtime(format!(
             "grad: argument {arg_idx} must be a floating-point tensor, float scalar, or list/dict PyTree of them, got {}",

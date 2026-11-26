@@ -128,16 +128,26 @@ pub fn eval_unary_neg_tracked(
     val: &Value,
     autograd: Option<&mut crate::runtime::autograd::AutogradContext>,
 ) -> Result<Value, MoraError> {
+    eval_unary_neg_fbip(val.clone(), autograd, None)
+}
+
+/// P6-1 Perceus/FBIP: Evaluate unary arithmetic negation (`-x`) consuming `val` by ownership so
+/// uniquely-owned contiguous tensors reuse their 64B host or GPU VRAM buffer in place.
+pub fn eval_unary_neg_fbip(
+    val: Value,
+    autograd: Option<&mut crate::runtime::autograd::AutogradContext>,
+    fbip_stats: Option<&crate::runtime::fbip::FbipCounters>,
+) -> Result<Value, MoraError> {
     match val {
         Value::Int(n) => n.checked_neg().map(Value::Int).ok_or_else(|| {
             MoraError::Runtime("integer overflow in unary negation of i64::MIN".to_string())
         }),
-        Value::Float(f) => Ok(Value::Float(-*f)),
+        Value::Float(f) => Ok(Value::Float(-f)),
         Value::Scalar(s) => s.neg().map(Value::Scalar),
-        Value::Tensor(t) => crate::value::tensor::eval_tensor_neg_tracked(t, autograd),
+        Value::Tensor(t) => crate::value::tensor::eval_tensor_neg_fbip(t, autograd, fbip_stats),
         other => Err(MoraError::Runtime(format!(
             "cannot negate value of type {}",
-            type_name(other)
+            type_name(&other)
         ))),
     }
 }
@@ -155,14 +165,16 @@ fn scalar_for_zero_d_cmp(v: &Value) -> Option<Value> {
 }
 
 pub fn eval_binary(left: Value, op: &BinaryOp, right: Value) -> Result<Value, MoraError> {
-    eval_binary_tracked(left, op, right, None)
+    eval_binary_fbip(left, op, right, None, None)
 }
 
-pub fn eval_binary_tracked(
+/// P6-1 Perceus/FBIP: Evaluate binary operator `op` consuming `left` and `right` by ownership.
+pub fn eval_binary_fbip(
     left: Value,
     op: &BinaryOp,
     right: Value,
     autograd: Option<&mut crate::runtime::autograd::AutogradContext>,
+    fbip_stats: Option<&crate::runtime::fbip::FbipCounters>,
 ) -> Result<Value, MoraError> {
     if matches!(&left, Value::Tensor(_)) || matches!(&right, Value::Tensor(_)) {
         match op {
@@ -173,8 +185,8 @@ pub fn eval_binary_tracked(
             | BinaryOp::Mod
             | BinaryOp::Pow
             | BinaryOp::MatMul => {
-                return crate::value::tensor::eval_tensor_binary_tracked(
-                    op, &left, &right, autograd,
+                return crate::value::tensor::eval_tensor_binary_fbip(
+                    op, left, right, autograd, fbip_stats,
                 );
             }
             BinaryOp::Equal => {
@@ -212,89 +224,70 @@ pub fn eval_binary_tracked(
         }
     }
     if matches!(&left, Value::Scalar(_)) || matches!(&right, Value::Scalar(_)) {
-        match (&left, op, &right) {
-            (Value::String(a), BinaryOp::Add, _) => {
-                return Ok(Value::String(format!("{a}{right}")));
+        match (left, op, right) {
+            (Value::String(mut a), BinaryOp::Add, rhs) => {
+                use std::fmt::Write as _;
+                let _ = write!(&mut a, "{rhs}");
+                return Ok(Value::String(a));
             }
-            (_, BinaryOp::Add, Value::String(b)) => return Ok(Value::String(format!("{left}{b}"))),
+            (lhs, BinaryOp::Add, Value::String(b)) => {
+                return Ok(Value::String(format!("{lhs}{b}")));
+            }
             (Value::Scalar(a), _, Value::Scalar(b)) => {
-                return match crate::common::ScalarValue::eval_binary(op, *a, *b) {
+                return match crate::common::ScalarValue::eval_binary(op, a, b) {
                     Ok(crate::common::ScalarBinaryOut::Scalar(s)) => Ok(Value::Scalar(s)),
                     Ok(crate::common::ScalarBinaryOut::Bool(flag)) => Ok(Value::Bool(flag)),
                     Err(err) => Err(err),
                 };
             }
-            (_, BinaryOp::Equal, _) => return Ok(Value::Bool(values_equal(&left, &right))),
-            (_, BinaryOp::NotEqual, _) => return Ok(Value::Bool(!values_equal(&left, &right))),
-            _ => {
+            (lhs, BinaryOp::Equal, rhs) => return Ok(Value::Bool(values_equal(&lhs, &rhs))),
+            (lhs, BinaryOp::NotEqual, rhs) => return Ok(Value::Bool(!values_equal(&lhs, &rhs))),
+            (lhs, _, rhs) => {
                 return Err(MoraError::Runtime(format!(
                     "DType mismatch: cannot apply {:?} to '{}' and '{}' without explicit cast",
                     op,
-                    type_name(&left),
-                    type_name(&right)
+                    type_name(&lhs),
+                    type_name(&rhs)
                 )));
             }
         }
     }
     match op {
-        BinaryOp::Add => match (&left, &right) {
+        BinaryOp::Add => match (left, right) {
             // ── 数值加法：委托数值塔（D468）──
-            //
-            // 此前这一臂自己实现了一整套提升规则（Int/Float 的四种
-            // 组合 + `coerce_mixed`），与 `numeric_op` 的规则
-            // **各写各的** —— 同一对操作数在 `Add` 与 `Sub` 下行为不同。
-            // 现在两者共用数值塔的同一套分派。
-            (Value::Int(_), Value::Int(_))
-            | (Value::Float(_), Value::Float(_))
-            | (Value::Int(_), Value::Float(_))
-            | (Value::Float(_), Value::Int(_)) => numeric::eval(op, &left, &right),
-            (Value::String(a), Value::String(b)) => Ok(Value::String(format!("{}{}", a, b))),
-            // 字符串 + 任意类型 → 自动转字符串拼接
-            (Value::String(a), _) => Ok(Value::String(format!("{}{}", a, right))),
-            (_, Value::String(b)) => Ok(Value::String(format!("{}{}", left, b))),
+            (lhs @ (Value::Int(_) | Value::Float(_)), rhs @ (Value::Int(_) | Value::Float(_))) => {
+                numeric::eval(op, &lhs, &rhs)
+            }
+            (Value::String(mut a), Value::String(b)) => {
+                a.push_str(&b);
+                Ok(Value::String(a))
+            }
+            // 字符串 + 任意类型 → 原地追加到左操作数 String 缓冲区（容量足够时零重分配）
+            (Value::String(mut a), rhs) => {
+                use std::fmt::Write as _;
+                let _ = write!(&mut a, "{rhs}");
+                Ok(Value::String(a))
+            }
+            (lhs, Value::String(b)) => Ok(Value::String(format!("{lhs}{b}"))),
             (Value::List(a), Value::List(b)) => {
                 // v0.17: 等长列表逐元素相加，否则拼接
                 if a.len() == b.len() {
-                    // v0.104.2: 逐元素加法委托 `eval_binary(Add)` ——
-                    // 此前只列了 `Float+Float` 与 `String+String`，
-                    // **Int 落到 `_ => Nil`**：`[1i] + [2i]` 得 `[nil]`
-                    //（等长时逐元素、不等长才拼接，于是同一运算的结果取决于
-                    // 长度 —— `[] + [1i]` 得 `[1]` 而 `[1i] + [2i]` 得 `[nil]`）。
-                    // 委托后与标量加法同一套规则（Int+Int / Int+Float /
-                    // Float+Float / 字符串拼接），语义收敛。
-                    //
-                    // v0.104.6 D468：改用 `broadcast_with`（唯一实现）。
-                    broadcast_with(
-                        &BinaryOp::Add,
-                        a.iter().zip(b.iter()).map(|(x, y)| (x.clone(), y.clone())),
-                    )
+                    broadcast_with(&BinaryOp::Add, a.into_iter().zip(b))
                 } else {
-                    // v0.104.6：List 不可变，拼接走「取回 Vec → extend → 装回」
-                    let mut merged = a.to_vec();
-                    merged.extend(b.iter().cloned());
-                    Ok(Value::List(merged.into()))
+                    let (merged, reused) = a.extend_owned(b);
+                    if reused && let Some(stats) = fbip_stats {
+                        stats.on_list_reuse();
+                    }
+                    Ok(Value::List(merged))
                 }
             }
-            // v0.17: 广播 - list + number
-            //
-            // v0.104.6 D22：逐元素递归回 `eval_binary` 派发。
-            //
-            // v0.104.6 D468：改用 `broadcast_with` —— 广播逻辑此前在
-            // `Add` 分支与 `numeric_op` 里**各手写一份**（两份逻辑相同、
-            // 注释各写一整套历史），现已收敛为**唯一实现**
-            // `broadcast_with`（见下方）。
-            //
-            // 递归派发之后标量侧覆盖 Int/Float，元素侧自动获得 `Add`
-            // 支持的全部组合。真正无意义的元素对（如 `Bool + Float`）
-            // 落 `unwrap_or(Nil)`，与既有约定一致。
             (Value::List(list), scalar @ (Value::Float(_) | Value::Int(_))) => broadcast_with(
                 &BinaryOp::Add,
-                list.iter().map(|i| (i.clone(), scalar.clone())),
+                list.into_iter().map(|i| (i, scalar.clone())),
             ),
-            // v0.17: 广播 - number + list
             (scalar @ (Value::Float(_) | Value::Int(_)), Value::List(list)) => broadcast_with(
                 &BinaryOp::Add,
-                list.iter().map(|i| (scalar.clone(), i.clone())),
+                list.into_iter().map(|i| (scalar.clone(), i)),
             ),
             _ => Err(MoraError::Other(
                 "Operands must be two numbers, two strings, or two lists".to_string(),
@@ -459,17 +452,18 @@ pub fn values_equal(a: &Value, b: &Value) -> bool {
         }
         (
             Value::StructInstance {
-                type_name: ta,
                 fields: fa,
-                ..
+                const_args: ca,
+                def: da,
             },
             Value::StructInstance {
-                type_name: tb,
                 fields: fb,
-                ..
+                const_args: cb,
+                def: db,
             },
         ) => {
-            ta == tb
+            (std::sync::Arc::ptr_eq(da, db) || da.name == db.name)
+                && ca == cb
                 && fa.len() == fb.len()
                 && fa
                     .iter()
@@ -648,7 +642,7 @@ pub fn type_name(value: &Value) -> &'static str {
 /// built-in type name otherwise). Used by `type_of`, `is_instance`, `dyn Trait`, and method dispatch.
 pub fn dynamic_type_name(value: &Value) -> String {
     match value {
-        Value::StructInstance { type_name, .. } => type_name.clone(),
+        Value::StructInstance { def, .. } => def.name.clone(),
         Value::EnumVariant { enum_name, .. } => enum_name.clone(),
         other => type_name(other).to_string(),
     }

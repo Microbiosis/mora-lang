@@ -316,7 +316,7 @@ fn histogram(xs: &[f64], bins: usize) -> Value {
         d.insert("lo".to_string(), Value::Float(min));
         d.insert("hi".to_string(), Value::Float(max));
         d.insert("count".to_string(), Value::Float(xs.len() as f64));
-        return Value::List(vec![Value::Dict(d)].into());
+        return Value::List(vec![Value::Dict(d.into())].into());
     }
     let width = (max - min) / bins as f64;
     let mut counts = vec![0usize; bins];
@@ -333,7 +333,7 @@ fn histogram(xs: &[f64], bins: usize) -> Value {
         d.insert("lo".to_string(), Value::Float(min + i as f64 * width));
         d.insert("hi".to_string(), Value::Float(min + (i + 1) as f64 * width));
         d.insert("count".to_string(), Value::Float(c as f64));
-        result.push(Value::Dict(d));
+        result.push(Value::Dict(d.into()));
     }
     Value::List(result.into())
 }

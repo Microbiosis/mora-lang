@@ -124,6 +124,8 @@ pub enum BuiltinFnId {
     Deref,
     Err,
     Eval,
+    FbipResetStats,
+    FbipStats,
     Float,
     Gensym,
     Grad,
@@ -181,6 +183,8 @@ impl BuiltinFnId {
             "deref" => Some(Self::Deref),
             "Err" => Some(Self::Err),
             "eval" => Some(Self::Eval),
+            "fbip_reset_stats" => Some(Self::FbipResetStats),
+            "fbip_stats" => Some(Self::FbipStats),
             "float" => Some(Self::Float),
             "gensym" => Some(Self::Gensym),
             "grad" => Some(Self::Grad),
@@ -239,6 +243,8 @@ impl BuiltinFnId {
             Self::Deref => "deref",
             Self::Err => "Err",
             Self::Eval => "eval",
+            Self::FbipResetStats => "fbip_reset_stats",
+            Self::FbipStats => "fbip_stats",
             Self::Float => "float",
             Self::Gensym => "gensym",
             Self::Grad => "grad",
@@ -588,7 +594,17 @@ pub enum ControlInst {
 
     // Slot / global storage operations
     LoadLocal(VReg, LocalSlot),
+    /// P6-1 Perceus/FBIP: Zero-clone borrow of a still-live unshared `LocalSlot` feeding a
+    /// verified `param_borrows[i] == true` `Call` site in the same basic block.
+    BorrowLocal(VReg, LocalSlot),
+    /// P6-1 Perceus/FBIP: Final live read of an unshared `LocalSlot` — transfers ownership
+    /// directly into `dst` (clearing the local slot to `Nil` when no effect `HandleBarrier` is active).
+    MoveLocal(VReg, LocalSlot),
     StoreLocal(LocalSlot, VReg),
+    /// P6-1 Perceus/FBIP: Drop a dead unshared `LocalSlot` on asymmetric branch entry.
+    DropLocal(LocalSlot),
+    /// P6-1 Perceus/FBIP: Drop a dead SSA `VReg` on asymmetric branch entry or unused effectful `dst`.
+    DropReg(VReg),
     /// P5-1A: Allocate a fresh `UpvalueCell` for `LocalSlot` if it is shared with closures,
     /// enforcing Go-1.22-style per-iteration loop variable capture semantics.
     FreshLocalCell(LocalSlot),
@@ -597,6 +613,9 @@ pub enum ControlInst {
     LoadUpvalue(VReg, UpvalueSlot),
     StoreUpvalue(UpvalueSlot, VReg),
     LoadGlobal(VReg, GlobalSlot),
+    /// P6-1 Perceus/FBIP: Final live read of a private `<main>` `GlobalSlot` prior to a
+    /// post-dominating `StoreGlobal`, transferring ownership into `dst`.
+    MoveGlobal(VReg, GlobalSlot),
     StoreGlobal(GlobalSlot, VReg),
     LoadDyn(VReg, SymId),
     DefineDyn(SymId, VReg, bool),
@@ -646,6 +665,14 @@ pub enum ControlInst {
         method: SymId,
         args: Vec<VReg>,
         named_args: Vec<(SymId, VReg)>,
+    },
+    /// P6-1 Perceus/FBIP: Compile-time statically resolved nominal struct field projection.
+    /// Extracts `field` in place when `can_move` holds and `receiver` uniquely owns its CoW
+    /// `StructInstance` + `fields` dictionary, or clones in $O(1)$ when shared.
+    ProjectField {
+        dst: VReg,
+        receiver: VReg,
+        field: SymId,
     },
     Pipe {
         dst: VReg,
@@ -787,9 +814,12 @@ impl ControlInst {
             | Self::MakeClosure { dst: d, .. }
             | Self::MakeDynTrait { dst: d, .. }
             | Self::LoadLocal(d, _)
+            | Self::BorrowLocal(d, _)
+            | Self::MoveLocal(d, _)
             | Self::IsMissingArg(d, _)
             | Self::LoadUpvalue(d, _)
             | Self::LoadGlobal(d, _)
+            | Self::MoveGlobal(d, _)
             | Self::LoadDyn(d, _)
             | Self::Index(d, _, _)
             | Self::IndexAssign(d, _, _, _)
@@ -799,6 +829,7 @@ impl ControlInst {
             | Self::GetConstGeneric { dst: d, .. }
             | Self::ModuleCall { dst: d, .. }
             | Self::MethodCall { dst: d, .. }
+            | Self::ProjectField { dst: d, .. }
             | Self::Pipe { dst: d, .. }
             | Self::MatchPattern { dst_ok: d, .. }
             | Self::Handle { dst: d, .. }
@@ -811,6 +842,8 @@ impl ControlInst {
             | Self::TryUnwrap(d, _)
             | Self::Assert(d, _) => Some(*d),
             Self::StoreLocal(..)
+            | Self::DropLocal(..)
+            | Self::DropReg(..)
             | Self::FreshLocalCell(..)
             | Self::PushDefer { .. }
             | Self::StoreUpvalue(..)
@@ -841,10 +874,15 @@ impl ControlInst {
             Self::Const(..)
             | Self::MakeClosure { .. }
             | Self::LoadLocal(..)
+            | Self::BorrowLocal(..)
+            | Self::MoveLocal(..)
+            | Self::DropLocal(..)
+            | Self::DropReg(..)
             | Self::FreshLocalCell(..)
             | Self::IsMissingArg(..)
             | Self::LoadUpvalue(..)
             | Self::LoadGlobal(..)
+            | Self::MoveGlobal(..)
             | Self::LoadDyn(..)
             | Self::ExportGlobal(..)
             | Self::ExportDyn(..)
@@ -870,6 +908,7 @@ impl ControlInst {
             | Self::TryUnwrap(_, s)
             | Self::MakeDynTrait { src: s, .. }
             | Self::GetConstGeneric { src: s, .. }
+            | Self::ProjectField { receiver: s, .. }
             | Self::StoreLocal(_, s)
             | Self::StoreUpvalue(_, s)
             | Self::StoreGlobal(_, s)
@@ -1006,9 +1045,12 @@ impl ControlInst {
         match self {
             Self::Const(d, _)
             | Self::LoadLocal(d, _)
+            | Self::BorrowLocal(d, _)
+            | Self::MoveLocal(d, _)
             | Self::IsMissingArg(d, _)
             | Self::LoadUpvalue(d, _)
             | Self::LoadGlobal(d, _)
+            | Self::MoveGlobal(d, _)
             | Self::LoadDyn(d, _)
             | Self::MakeClosure { dst: d, .. }
             | Self::Handle { dst: d, .. }
@@ -1021,7 +1063,12 @@ impl ControlInst {
             | Self::Unary(d, _, s)
             | Self::Assert(d, s)
             | Self::MakeDynTrait { dst: d, src: s, .. }
-            | Self::GetConstGeneric { dst: d, src: s, .. } => {
+            | Self::GetConstGeneric { dst: d, src: s, .. }
+            | Self::ProjectField {
+                dst: d,
+                receiver: s,
+                ..
+            } => {
                 *d = f(*d);
                 *s = f(*s);
             }
@@ -1091,6 +1138,7 @@ impl ControlInst {
                 }
             }
             Self::StoreLocal(_, s)
+            | Self::DropReg(s)
             | Self::StoreUpvalue(_, s)
             | Self::StoreGlobal(_, s)
             | Self::DefineDyn(_, s, _)
@@ -1216,6 +1264,7 @@ impl ControlInst {
                 }
             }
             Self::ExportGlobal(..)
+            | Self::DropLocal(..)
             | Self::FreshLocalCell(..)
             | Self::PushDefer { .. }
             | Self::ExportDyn(..)
@@ -1258,12 +1307,17 @@ impl ControlInst {
             Self::MatchPattern { .. }
             | Self::MakeClosure { .. }
             | Self::LoadLocal(..)
+            | Self::BorrowLocal(..)
+            | Self::MoveLocal(..)
+            | Self::DropLocal(..)
+            | Self::DropReg(..)
             | Self::FreshLocalCell(..)
             | Self::IsMissingArg(..)
             | Self::StoreLocal(..)
             | Self::LoadUpvalue(..)
             | Self::StoreUpvalue(..)
             | Self::LoadGlobal(..)
+            | Self::MoveGlobal(..)
             | Self::StoreGlobal(..)
             | Self::LoadDyn(..)
             | Self::DefineDyn(..)
@@ -1273,6 +1327,7 @@ impl ControlInst {
             | Self::Call { .. }
             | Self::ModuleCall { .. }
             | Self::MethodCall { .. }
+            | Self::ProjectField { .. }
             | Self::Pipe { .. }
             | Self::Handle { .. }
             | Self::Transaction { .. }
@@ -1419,12 +1474,138 @@ impl ControlTerminator {
     }
 }
 
+/// Exact arbitrary-arity operand last-use bitset for Perceus / FBIP ownership transfer.
+///
+/// Stores `<= 64` operand bits inline in a single `u64` (zero heap allocation on virtually all
+/// instructions and terminators) and transparently spills to `Box<[u64]>` when an instruction or
+/// terminator has `> 64` input registers — guaranteeing uniform in-place ownership transfer at
+/// every operand index with no 64-bit truncation or post-instruction fallback.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum KillMask {
+    #[default]
+    Empty,
+    Inline(u64),
+    Words(Box<[u64]>),
+}
+
+impl KillMask {
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Empty => true,
+            Self::Inline(w) => *w == 0,
+            Self::Words(ws) => ws.iter().all(|&w| w == 0),
+        }
+    }
+
+    #[inline]
+    pub fn test(&self, bit: usize) -> bool {
+        match self {
+            Self::Empty => false,
+            Self::Inline(w) => bit < 64 && ((*w >> bit) & 1) != 0,
+            Self::Words(ws) => ws
+                .get(bit / 64)
+                .is_some_and(|w| ((*w >> (bit % 64)) & 1) != 0),
+        }
+    }
+
+    #[inline]
+    pub fn set(&mut self, bit: usize) {
+        if bit < 64 {
+            match self {
+                Self::Empty => *self = Self::Inline(1u64 << bit),
+                Self::Inline(w) => *w |= 1u64 << bit,
+                Self::Words(ws) => {
+                    if let Some(w) = ws.get_mut(0) {
+                        *w |= 1u64 << bit;
+                    } else {
+                        *self = Self::Inline(1u64 << bit);
+                    }
+                }
+            }
+            return;
+        }
+        let word_idx = bit / 64;
+        let bit_off = bit % 64;
+        match self {
+            Self::Empty => {
+                let mut v = vec![0u64; word_idx + 1];
+                v[word_idx] = 1u64 << bit_off;
+                *self = Self::Words(v.into_boxed_slice());
+            }
+            Self::Inline(w0) => {
+                let mut v = vec![0u64; word_idx + 1];
+                v[0] = *w0;
+                v[word_idx] = 1u64 << bit_off;
+                *self = Self::Words(v.into_boxed_slice());
+            }
+            Self::Words(ws) => {
+                if word_idx >= ws.len() {
+                    let mut v = ws.to_vec();
+                    v.resize(word_idx + 1, 0);
+                    v[word_idx] |= 1u64 << bit_off;
+                    *self = Self::Words(v.into_boxed_slice());
+                } else {
+                    ws[word_idx] |= 1u64 << bit_off;
+                }
+            }
+        }
+    }
+
+    /// True if any set bit lies at index `>= bound`.
+    pub fn has_bits_at_or_above(&self, bound: usize) -> bool {
+        match self {
+            Self::Empty => false,
+            Self::Inline(w) => bound < 64 && (*w >> bound) != 0,
+            Self::Words(ws) => {
+                let first_word = bound / 64;
+                let rem = bound % 64;
+                if let Some(&w) = ws.get(first_word)
+                    && (w >> rem) != 0
+                {
+                    return true;
+                }
+                let start = if rem == 0 { first_word } else { first_word + 1 };
+                ws.get(start..)
+                    .is_some_and(|tail| tail.iter().any(|&w| w != 0))
+            }
+        }
+    }
+
+    #[inline]
+    pub fn words(&self) -> &[u64] {
+        match self {
+            Self::Empty => &[],
+            Self::Inline(0) => &[],
+            Self::Inline(w) => std::slice::from_ref(w),
+            Self::Words(ws) => ws,
+        }
+    }
+
+    pub fn from_words(mut words: Vec<u64>) -> Self {
+        while words.last() == Some(&0) {
+            words.pop();
+        }
+        match words.len() {
+            0 => Self::Empty,
+            1 => Self::Inline(words[0]),
+            _ => Self::Words(words.into_boxed_slice()),
+        }
+    }
+}
+
 /// One basic block in a [`ControlFunction`].
 #[derive(Debug, Clone)]
 pub struct BasicBlock {
     pub id: BlockId,
     pub params: Vec<VReg>,
     pub insts: Vec<ControlInst>,
+    /// P6-1 Perceus/FBIP: either empty (unannotated) or 1:1 with `insts`. Bit `k` of
+    /// `inst_kill_masks[pc]` is 1 iff the `k`-th register in `insts[pc].input_regs()` is the final
+    /// live read of that `VReg` on all reachable paths and its final occurrence in `insts[pc]`.
+    pub inst_kill_masks: Vec<KillMask>,
+    /// P6-1 Perceus/FBIP: exact last-use ownership bitset for `terminator` register operands.
+    pub term_kill_mask: KillMask,
     pub terminator: ControlTerminator,
 }
 
@@ -1438,6 +1619,9 @@ pub struct ControlFunction {
     /// Wave 3 Stage 3C: `param_has_default[i] == true` when parameter `i` has a default initializer
     /// lowered into the entry prologue via `IsMissingArg`.
     pub param_has_default: Vec<bool>,
+    /// P6-1 Perceus/FBIP: `param_borrows[i] == true` when parameter `i` is statically inferred as
+    /// read-only & non-escaping (borrowed rather than owned).
+    pub param_borrows: Vec<bool>,
     pub upvalues: Vec<UpvalueDesc>,
     /// For `LocalSlot(i)`: true if an inner closure/handler captures it as a shared mutable cell.
     pub shared_locals: Vec<bool>,
@@ -1578,6 +1762,18 @@ pub struct ControlProgram {
     pub functions: Vec<ControlFunction>,
     pub entry: FnId,
     pub globals: Vec<GlobalMeta>,
+    /// P6-1 Perceus/FBIP: whether `<main>`-private global slots must keep their values after
+    /// `<main>` returns.
+    ///
+    /// `true` when an embedding environment captures the program globals after execution (the
+    /// REPL copies every global of a chunk into the session environment; `eval` restores the
+    /// caller's environment). `false` for scripts, AOT binaries and module initializers, whose
+    /// globals are dead once `<main>` returns.
+    ///
+    /// This is exactly what decides whether the Perceus pass may transfer a private global's
+    /// ownership out of its slot (`MoveGlobal`) at its last use — the difference between
+    /// `let x = …; f(x)` reusing `x`'s buffer in place and cloning it.
+    pub preserve_globals_at_exit: bool,
 }
 
 impl ControlProgram {
@@ -1597,6 +1793,16 @@ pub fn verify_program(prog: &ControlProgram) -> MoraResult<()> {
             prog.functions.len()
         )));
     }
+    // P6-1 Perceus/FBIP: the `<main>`-private globals whose ownership may be transferred out
+    // of their slot, and the subset that must survive `<main>` because the embedding
+    // environment captures program globals after execution.
+    let private_main_globals = crate::mir::control::liveness::compute_private_main_globals(prog);
+    let exit_globals: HashSet<GlobalSlot> = if prog.preserve_globals_at_exit {
+        private_main_globals.clone()
+    } else {
+        HashSet::new()
+    };
+
     for (idx, func) in prog.functions.iter().enumerate() {
         if func.id.0 as usize != idx {
             return Err(MoraError::Parse(format!(
@@ -1604,12 +1810,29 @@ pub fn verify_program(prog: &ControlProgram) -> MoraResult<()> {
                 func.id
             )));
         }
-        verify_function(func, prog.functions.len(), prog.globals.len())?;
+        verify_function(
+            func,
+            &prog.functions,
+            &prog.symbols,
+            prog.globals.len(),
+            func.id == prog.entry,
+            &private_main_globals,
+            &exit_globals,
+        )?;
     }
     Ok(())
 }
 
-fn verify_function(func: &ControlFunction, n_funcs: usize, n_globals: usize) -> MoraResult<()> {
+fn verify_function(
+    func: &ControlFunction,
+    all_funcs: &[ControlFunction],
+    symbols: &SymbolTable,
+    n_globals: usize,
+    is_main: bool,
+    private_main_globals: &HashSet<GlobalSlot>,
+    exit_globals: &HashSet<GlobalSlot>,
+) -> MoraResult<()> {
+    let n_funcs = all_funcs.len();
     let n_blocks = func.blocks.len();
     if (func.entry.0 as usize) >= n_blocks {
         return Err(MoraError::Parse(format!(
@@ -1722,13 +1945,324 @@ fn verify_function(func: &ControlFunction, n_funcs: usize, n_globals: usize) -> 
 
     for &bid in &reachable {
         let block = &func.blocks[bid.0 as usize];
+        if !block.inst_kill_masks.is_empty() && block.inst_kill_masks.len() != block.insts.len() {
+            return Err(MoraError::Parse(format!(
+                "fn {:?} {:?}: inst_kill_masks len {} != insts len {}",
+                func.id,
+                bid,
+                block.inst_kill_masks.len(),
+                block.insts.len()
+            )));
+        }
         for (iidx, inst) in block.insts.iter().enumerate() {
+            if let ControlInst::DropReg(r) = inst
+                && r.0 >= func.n_regs
+            {
+                return Err(MoraError::Parse(format!(
+                    "fn {:?} {:?}: DropReg {:?} >= n_regs {}",
+                    func.id, bid, r, func.n_regs
+                )));
+            }
             for used in inst.input_regs() {
                 check_dominance(func, &idom, &defs, used, bid, Some(iidx))?;
             }
         }
         for used in block.terminator.input_regs() {
             check_dominance(func, &idom, &defs, used, bid, None)?;
+        }
+    }
+
+    verify_perceus_kills(func, &reachable)?;
+    verify_perceus_slot_moves(
+        func,
+        all_funcs,
+        symbols,
+        &reachable,
+        is_main,
+        private_main_globals,
+        exit_globals,
+    )?;
+    Ok(())
+}
+
+/// P6-1 Perceus/FBIP soundness verifier for storage-slot ownership transfers.
+///
+/// A `MoveLocal` / `MoveGlobal` destructively clears the slot it reads, and a `DropLocal`
+/// clears it outright — so each of them may only fire on a slot that is dead on every reachable
+/// path. The liveness is re-derived here with the very same analysis the optimizer used
+/// (`liveness::compute_slot_liveness`), which makes an unsound transfer a compile-time error
+/// instead of a silently dropped value at runtime.
+fn verify_perceus_slot_moves(
+    func: &ControlFunction,
+    all_funcs: &[ControlFunction],
+    symbols: &SymbolTable,
+    reachable: &HashSet<BlockId>,
+    is_main: bool,
+    private_main_globals: &HashSet<GlobalSlot>,
+    exit_globals: &HashSet<GlobalSlot>,
+) -> MoraResult<()> {
+    use crate::mir::control::liveness;
+
+    let has_slot_move = func.blocks.iter().any(|b| {
+        b.insts.iter().any(|i| {
+            matches!(
+                i,
+                ControlInst::MoveLocal(..)
+                    | ControlInst::BorrowLocal(..)
+                    | ControlInst::MoveGlobal(..)
+                    | ControlInst::DropLocal(_)
+            )
+        })
+    });
+    if !has_slot_move {
+        return Ok(());
+    }
+
+    let eligible_local = |s: LocalSlot| -> bool {
+        (s.0 as usize) < (func.n_locals as usize)
+            && !func
+                .shared_locals
+                .get(s.0 as usize)
+                .copied()
+                .unwrap_or(false)
+            && !func
+                .param_borrows
+                .get(s.0 as usize)
+                .copied()
+                .unwrap_or(false)
+    };
+    // Same exit seed as the optimizer: only `<main>` can own a `<main>`-private global.
+    let no_exit_globals: HashSet<GlobalSlot> = HashSet::new();
+    let exit_seed: &HashSet<GlobalSlot> = if is_main {
+        exit_globals
+    } else {
+        &no_exit_globals
+    };
+    let live =
+        liveness::compute_slot_liveness(func, &eligible_local, private_main_globals, exit_seed);
+
+    for &bid in reachable {
+        let block = &func.blocks[bid.0 as usize];
+        let local_out = &live.local_live_out[bid.0 as usize];
+        let global_out = &live.global_live_out[bid.0 as usize];
+        for (pc, inst) in block.insts.iter().enumerate() {
+            match inst {
+                ControlInst::BorrowLocal(dst, s) => {
+                    // Find every use of `dst` across the function: all must live at a single
+                    // borrowing consumer (`Call`, `MethodCall`, or `TailCall` terminator) strictly
+                    // after `pc` in `block`, validated by `liveness::is_valid_borrow_*`.
+                    let mut consumer_pc: Option<usize> = None;
+                    for &ubid in reachable {
+                        let ub = &func.blocks[ubid.0 as usize];
+                        if ub.terminator.input_regs().contains(dst) {
+                            if ubid != bid
+                                || !liveness::is_valid_borrow_terminator(
+                                    &ub.terminator,
+                                    *dst,
+                                    all_funcs,
+                                )
+                            {
+                                return Err(MoraError::Parse(format!(
+                                    "fn {:?} {:?} pc {pc}: BorrowLocal reg {:?} escapes into non-borrowing terminator",
+                                    func.id, bid, dst
+                                )));
+                            }
+                            if consumer_pc.replace(ub.insts.len()).is_some() {
+                                return Err(MoraError::Parse(format!(
+                                    "fn {:?} {:?} pc {pc}: BorrowLocal reg {:?} used by multiple consumers",
+                                    func.id, bid, dst
+                                )));
+                            }
+                        }
+                        for (upc, uinst) in ub.insts.iter().enumerate() {
+                            if !uinst.input_regs().contains(dst) {
+                                continue;
+                            }
+                            if ubid != bid || upc <= pc {
+                                return Err(MoraError::Parse(format!(
+                                    "fn {:?} {:?} pc {pc}: BorrowLocal reg {:?} used outside following block consumer",
+                                    func.id, bid, dst
+                                )));
+                            }
+                            if consumer_pc.replace(upc).is_some_and(|prev| prev != upc) {
+                                return Err(MoraError::Parse(format!(
+                                    "fn {:?} {:?} pc {pc}: BorrowLocal reg {:?} used by multiple instructions",
+                                    func.id, bid, dst
+                                )));
+                            }
+                            if !liveness::is_valid_borrow_inst(uinst, *dst, all_funcs, symbols) {
+                                return Err(MoraError::Parse(format!(
+                                    "fn {:?} {:?} pc {pc}: BorrowLocal reg {:?} passed to non-borrowing consumer",
+                                    func.id, bid, dst
+                                )));
+                            }
+                        }
+                    }
+                    let Some(upc) = consumer_pc else {
+                        return Err(MoraError::Parse(format!(
+                            "fn {:?} {:?} pc {pc}: unused BorrowLocal reg {:?}",
+                            func.id, bid, dst
+                        )));
+                    };
+                    let end_excl = upc.saturating_add(1).min(block.insts.len());
+                    for inner in &block.insts[pc + 1..end_excl] {
+                        if matches!(
+                            inner,
+                            ControlInst::StoreLocal(w, _) | ControlInst::MoveLocal(_, w) if w == s
+                        ) {
+                            return Err(MoraError::Parse(format!(
+                                "fn {:?} {:?} pc {pc}: slot {:?} mutated or moved before BorrowLocal consumer at pc {upc}",
+                                func.id, bid, s
+                            )));
+                        }
+                    }
+                }
+                ControlInst::MoveLocal(_, s) => {
+                    let after = liveness::local_live_after(block, pc, local_out, &eligible_local);
+                    if after.contains(s) {
+                        return Err(MoraError::Parse(format!(
+                            "fn {:?} {:?} pc {pc}: MoveLocal on still-live local slot {:?}",
+                            func.id, bid, s
+                        )));
+                    }
+                }
+                ControlInst::MoveGlobal(_, g) => {
+                    if !is_main {
+                        return Err(MoraError::Parse(format!(
+                            "fn {:?} {:?} pc {pc}: MoveGlobal is only allowed in <main>",
+                            func.id, bid
+                        )));
+                    }
+                    if !private_main_globals.contains(g) {
+                        return Err(MoraError::Parse(format!(
+                            "fn {:?} {:?} pc {pc}: MoveGlobal on non-private global {:?}",
+                            func.id, bid, g
+                        )));
+                    }
+                    let after =
+                        liveness::global_live_after(block, pc, global_out, private_main_globals);
+                    if after.contains(g) {
+                        return Err(MoraError::Parse(format!(
+                            "fn {:?} {:?} pc {pc}: MoveGlobal on still-live global {:?}",
+                            func.id, bid, g
+                        )));
+                    }
+                }
+                ControlInst::DropLocal(s)
+                    if liveness::local_live_after(block, pc, local_out, &eligible_local)
+                        .contains(s) =>
+                {
+                    return Err(MoraError::Parse(format!(
+                        "fn {:?} {:?} pc {pc}: DropLocal on still-live local slot {:?}",
+                        func.id, bid, s
+                    )));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// P6-1 Perceus/FBIP soundness verifier: ensures no `inst_kill_masks` / `term_kill_mask` bit kills
+/// a `VReg` that is still live on any reachable path, and no `DropReg` drops a live `VReg`.
+fn verify_perceus_kills(func: &ControlFunction, reachable: &HashSet<BlockId>) -> MoraResult<()> {
+    use crate::mir::control::liveness;
+
+    let any_annotated = func.blocks.iter().any(|b| {
+        !b.inst_kill_masks.is_empty()
+            || !b.term_kill_mask.is_empty()
+            || b.insts
+                .iter()
+                .any(|inst| matches!(inst, ControlInst::DropReg(_)))
+    });
+    if !any_annotated {
+        return Ok(());
+    }
+
+    let live_in = liveness::compute_vreg_live_in(func, reachable);
+
+    for &bid in reachable {
+        let block = &func.blocks[bid.0 as usize];
+        let mut live: HashSet<VReg> = HashSet::new();
+        for succ in block.terminator.successors() {
+            if reachable.contains(&succ) {
+                let sblk = &func.blocks[succ.0 as usize];
+                for &r in &live_in[succ.0 as usize] {
+                    if !sblk.params.contains(&r) {
+                        live.insert(r);
+                    }
+                }
+            }
+        }
+
+        // Verify terminator kill mask against the exact shared `compute_terminator_kill_mask` oracle.
+        let tmask = &block.term_kill_mask;
+        if !tmask.is_empty() {
+            let max_valid =
+                liveness::compute_terminator_kill_mask(func, bid, reachable, &live_in, &live);
+            let t_inputs = block.terminator.input_regs();
+            if tmask.has_bits_at_or_above(t_inputs.len()) {
+                return Err(MoraError::Parse(format!(
+                    "fn {:?} {:?}: term_kill_mask has out-of-range bits (len {})",
+                    func.id,
+                    bid,
+                    t_inputs.len()
+                )));
+            }
+            for (i, &r) in t_inputs.iter().enumerate() {
+                if tmask.test(i) && !max_valid.test(i) {
+                    return Err(MoraError::Parse(format!(
+                        "fn {:?} {:?}: terminator reg {:?} (operand {i}) killed while still live",
+                        func.id, bid, r
+                    )));
+                }
+            }
+        }
+
+        for r in block.terminator.input_regs() {
+            live.insert(r);
+        }
+
+        for (pc, inst) in block.insts.iter().enumerate().rev() {
+            let imask = block.inst_kill_masks.get(pc);
+            if let ControlInst::DropReg(r) = inst {
+                if imask.is_some_and(|m| !m.is_empty()) {
+                    return Err(MoraError::Parse(format!(
+                        "fn {:?} {:?} pc {pc}: DropReg must have empty kill_mask",
+                        func.id, bid
+                    )));
+                }
+                if live.contains(r) {
+                    return Err(MoraError::Parse(format!(
+                        "fn {:?} {:?} pc {pc}: DropReg on live reg {:?}",
+                        func.id, bid, r
+                    )));
+                }
+                live.remove(r);
+                continue;
+            }
+            if let Some(d) = inst.dst() {
+                live.remove(&d);
+            }
+            let inputs = inst.input_regs();
+            if let Some(m) = imask
+                && m.has_bits_at_or_above(inputs.len())
+            {
+                return Err(MoraError::Parse(format!(
+                    "fn {:?} {:?} pc {pc}: inst_kill_mask has out-of-range bits",
+                    func.id, bid
+                )));
+            }
+            for (k, &r) in inputs.iter().enumerate().rev() {
+                if imask.is_some_and(|m| m.test(k)) && live.contains(&r) {
+                    return Err(MoraError::Parse(format!(
+                        "fn {:?} {:?} pc {pc}: Perceus use-after-move on reg {:?}",
+                        func.id, bid, r
+                    )));
+                }
+                live.insert(r);
+            }
         }
     }
     Ok(())
@@ -1801,6 +2335,9 @@ fn verify_inst_slots(
 ) -> MoraResult<()> {
     match inst {
         ControlInst::LoadLocal(_, l)
+        | ControlInst::BorrowLocal(_, l)
+        | ControlInst::MoveLocal(_, l)
+        | ControlInst::DropLocal(l)
         | ControlInst::FreshLocalCell(l)
         | ControlInst::IsMissingArg(_, l)
         | ControlInst::StoreLocal(l, _) => {
@@ -1808,6 +2345,36 @@ fn verify_inst_slots(
                 return Err(MoraError::Parse(format!(
                     "fn {:?}: local slot {:?} >= n_locals {}",
                     func.id, l, func.n_locals
+                )));
+            }
+            if matches!(
+                inst,
+                ControlInst::MoveLocal(_, _)
+                    | ControlInst::BorrowLocal(_, _)
+                    | ControlInst::DropLocal(_)
+            ) && func
+                .shared_locals
+                .get(l.0 as usize)
+                .copied()
+                .unwrap_or(false)
+            {
+                return Err(MoraError::Parse(format!(
+                    "fn {:?}: MoveLocal/BorrowLocal/DropLocal forbidden on shared local {:?}",
+                    func.id, l
+                )));
+            }
+            if matches!(
+                inst,
+                ControlInst::MoveLocal(_, _) | ControlInst::DropLocal(_)
+            ) && func
+                .param_borrows
+                .get(l.0 as usize)
+                .copied()
+                .unwrap_or(false)
+            {
+                return Err(MoraError::Parse(format!(
+                    "fn {:?}: MoveLocal/DropLocal forbidden on borrowed parameter {:?}",
+                    func.id, l
                 )));
             }
         }
@@ -1822,6 +2389,7 @@ fn verify_inst_slots(
             }
         }
         ControlInst::LoadGlobal(_, g)
+        | ControlInst::MoveGlobal(_, g)
         | ControlInst::StoreGlobal(g, _)
         | ControlInst::ExportGlobal(g) => {
             if (g.0 as usize) >= n_globals {

@@ -142,7 +142,7 @@ impl ParallelResult {
                 d.insert("error".to_string(), Value::Nil);
             }
         }
-        Value::Dict(d)
+        Value::Dict(d.into())
     }
 }
 

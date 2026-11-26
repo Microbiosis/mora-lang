@@ -5,6 +5,7 @@
 
 pub mod codec;
 pub mod ir;
+pub mod liveness;
 pub mod lower;
 pub mod opt;
 
@@ -12,12 +13,12 @@ pub use ir::{
     BasicBlock, BlockId, BuiltinFnId, CalleeTarget, CaptureSource, CompiledPattern, ControlConst,
     ControlFunction, ControlImplMethod, ControlInst, ControlProgram, ControlQqSegment,
     ControlSelectArm, ControlSliceAxis, ControlSpawnTarget, ControlStructField, ControlTerminator,
-    ControlTraitMethod, FnId, FunctionKind, GlobalKind, GlobalMeta, GlobalSlot, LocalSlot,
-    ParallelSegment, PatternTarget, Purity, SymId, SymbolTable, UnaryOp, UpvalueDesc, UpvalueSlot,
-    VReg, verify_program,
+    ControlTraitMethod, FnId, FunctionKind, GlobalKind, GlobalMeta, GlobalSlot, KillMask,
+    LocalSlot, ParallelSegment, PatternTarget, Purity, SymId, SymbolTable, UnaryOp, UpvalueDesc,
+    UpvalueSlot, VReg, verify_program,
 };
 pub use lower::{lower_program, lower_program_with_dyn_globals};
-pub use opt::{OptLevel, optimize_program};
+pub use opt::{OptLevel, optimize_program, perceus_ownership_pass};
 
 #[cfg(test)]
 mod tests {

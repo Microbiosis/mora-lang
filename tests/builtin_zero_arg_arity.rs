@@ -232,22 +232,17 @@ fn d327_unary_entrypoints_use_require_1() {
             "`call_builtin_{name}` 里仍有 `unwrap_or(Value::Nil)` —— \
              缺参会静默当成 nil。函数体：\n{body}"
         );
+        let first = if name == "atom" {
+            "args.first_mut()"
+        } else {
+            "args.first()"
+        };
         assert!(
-            body.contains(&format!("require_1(\"{name}\"")),
-            "`call_builtin_{name}` 应走 `require_1(\"{name}\", &args)`; 函数体：\n{body}"
+            body.contains(&format!("require_1(\"{name}\", {first})")),
+            "缺参检查须从第一个参数取值：{body}"
         );
     }
 
-    // require_1 只收紧下限
-    let helper_at = src.find("fn require_1(").expect("应有 require_1 辅助函数");
-    let helper = &src[helper_at..helper_at + 400];
-    assert!(
-        helper.contains("args.first()"),
-        "`require_1` 应只查 `args.first()`（下限）"
-    );
-    assert!(
-        !helper.contains("args.len() == 1"),
-        "`require_1` 不得写成 `args.len() == 1` —— 那会连**多余实参**一起拒，\
-         违反 `signature_no_over_tightening` 定下的「只能收紧下限」"
-    );
+    // 单个 Option 只能表达第一个参数是否存在，辅助函数无法依赖参数总数。
+    assert!(src.contains("fn require_1<T>(name: &str, first: Option<T>)"));
 }

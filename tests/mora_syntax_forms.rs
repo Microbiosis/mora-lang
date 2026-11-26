@@ -176,10 +176,19 @@ const FORMS: &[(&str, &str, Form, &str)] = &[
         "D110 实测：`Expected variable name after 'let'`；`match` 支持同模式",
     ),
     (
-        "let 泛型标注",
-        "let r: result<number, string> = 1\nprint(r)\n",
+        "let 泛型标注（受支持的一等 result<T,E>）",
+        "let r: result<number, string> = Ok(1)\nprint(r)\n",
+        Form::Ok,
+        "v0.112.0 G2 起 `result<T,E>` 标注**受支持**；本表只测**解析层**，故算 Ok。\
+         typeck 侧的强制（`= 1` 必须报类型错误，而非静默丢弃）由 \
+         `tests/spec_code_block_census.rs::d110_result_generic_annotation_is_enforced_not_silently_dropped` 钉住",
+    ),
+    (
+        "let 泛型标注（不受支持的泛型）",
+        "let m: map<number, number> = {}\nprint(m)\n",
         Form::Rejected,
-        "D110：不受支持的泛型必须**报错**（D111 起不再静默丢弃）",
+        "D110：不受支持的泛型必须**报错**（D111 起不再静默丢弃）——\
+         实测 `unsupported generic type annotation 'map'`",
     ),
     (
         "函数参数类型标注",

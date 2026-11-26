@@ -27,9 +27,11 @@ pub fn compile_and_opt(
     crate::mir::control::ControlProgram,
     Vec<crate::mir::witness::MirWitness>,
 )> {
-    let (mut prog, witnesses) = ParserV3::compile(source)?;
+    let witnesses = ParserV3::parse_witnesses(source)?;
+    let mut prog = crate::mir::control::lower_program(&witnesses)?;
     let level = opt_level.unwrap_or_default();
     crate::mir::control::optimize_program(&mut prog, level);
+    crate::mir::control::verify_program(&prog)?;
     Ok((prog, witnesses))
 }
 /// v0.104.6 D191：读源码时**剥掉开头的 UTF-8 BOM**。

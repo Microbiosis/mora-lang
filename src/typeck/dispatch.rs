@@ -432,6 +432,17 @@ pub fn builtin_signatures() -> Vec<(String, Signature)> {
             Signature::new(vec![], Type::TraceProfiler),
         ),
         (
+            "fbip_stats".to_string(),
+            Signature::new(
+                vec![],
+                Type::Dict(Box::new(Type::String), Box::new(Type::Int)),
+            ),
+        ),
+        (
+            "fbip_reset_stats".to_string(),
+            Signature::new(vec![], Type::Nil),
+        ),
+        (
             "Ok".to_string(),
             Signature::new(
                 vec![("value".to_string(), Type::Any)],
@@ -957,6 +968,17 @@ fn method_signature_builtin(receiver: &Type, method: &str) -> Option<Signature> 
             ],
             (**elem).clone(),
         )),
+        (Type::List(elem), "set") => Some(Signature::new(
+            vec![
+                ("self".to_string(), receiver.clone()),
+                (
+                    "index".to_string(),
+                    Type::Union(vec![Type::Int, Type::Float]),
+                ),
+                ("value".to_string(), (**elem).clone()),
+            ],
+            Type::List(elem.clone()),
+        )),
         // v0.104.6：以下三条 `len` 方法签名此前声明 `Type::Float`，与运行期的
         // `Value::Int` 不符（详见上方 builtin `len` 签名的说明）。
         (Type::List(_), "len") => Some(Signature::new(
@@ -995,6 +1017,13 @@ fn method_signature_builtin(receiver: &Type, method: &str) -> Option<Signature> 
                 ("value".to_string(), Type::Any),
             ],
             Type::Dict(k.clone(), Box::new(Type::Any)),
+        )),
+        (Type::Dict(k, v), "remove") => Some(Signature::new(
+            vec![
+                ("self".to_string(), receiver.clone()),
+                ("key".to_string(), k.as_ref().clone()),
+            ],
+            Type::Dict(k.clone(), v.clone()),
         )),
         (Type::Dict(k, _), "keys") => Some(Signature::new(
             vec![("self".to_string(), receiver.clone())],
@@ -1828,7 +1857,10 @@ fn method_signature_builtin(receiver: &Type, method: &str) -> Option<Signature> 
             vec![("self".to_string(), receiver.clone())],
             Type::List(Box::new(Type::Int)),
         )),
-        (Type::Tensor { .. }, "ndim" | "rank" | "numel" | "len") => Some(Signature::new(
+        (
+            Type::Tensor { .. },
+            "ndim" | "rank" | "numel" | "nbytes" | "byte_len" | "storage_id" | "len",
+        ) => Some(Signature::new(
             vec![("self".to_string(), receiver.clone())],
             Type::Int,
         )),
@@ -1841,8 +1873,8 @@ fn method_signature_builtin(receiver: &Type, method: &str) -> Option<Signature> 
         ),
         (
             Type::Tensor { .. },
-            "contiguous" | "abs" | "sqrt" | "exp" | "ln" | "relu" | "gelu" | "silu" | "tanh"
-            | "sigmoid" | "softmax",
+            "contiguous" | "abs" | "sqrt" | "exp" | "ln" | "log" | "sin" | "cos" | "relu" | "gelu"
+            | "silu" | "tanh" | "sigmoid" | "softmax",
         ) => Some(Signature::new(
             vec![("self".to_string(), receiver.clone())],
             receiver.clone(),

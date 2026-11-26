@@ -36,9 +36,14 @@
 //! ```text
 //! xs[0] = 9      → exit 2  Failed to parse
 //! xs.at(0) = 9   → exit 2  Failed to parse
-//! xs.set(0, 9)   → exit 1  List has no method: set
 //! m["a"] = 2     → exit 2  Failed to parse
 //! ```
+//!
+//! ⚠ **P6-1 变更**：`xs.set(0, 9)` **不再是**「索引赋值的一种候选写法** ——
+//! P6-1 为 `list` 实现了 `set(i, v)` **值语义方法**（原地复用快路径需要它）。
+//! 它是**普通方法调用**，**不经过** `IndexAssign` 链路，且遵循值语义：
+//! `let ys = xs.set(0, 9)` → `xs` 仍是 `[1, 2]`，`ys` 是 `[9, 2]`。
+//! 由 `d361_list_set_is_a_value_semantics_method_not_index_assignment` 钉住。
 //!
 //! **判定为「功能未接通」，不是静默错值** ——
 //! 没有「本该是 A 却是 B」，是「压根没法表达」⇒ 只报告，不擅动
@@ -195,19 +200,23 @@ fn d361_type_mismatch_index_errors_without_full_dump() {
     }
 }
 
-/// **索引赋值的四种候选写法全部不可达**。
+/// **索引赋值的三种候选写法全部不可达**。
 ///
 /// 这是**否定轮的核心观测**：整条 `IndexAssign` 链路在 `src/mir/` 与
 /// `src/typeck/` 有 54 处定义与传递，但 `src/parser_v3/` **零构造**。
 ///
 /// 判定为「功能未接通」而非「静默错值」—— 没有「本该是 A 却是 B」，
 /// 是「压根没法表达」。⇒ 只报告，**不擅动**（与 D346 `xform` 同类）。
+///
+/// ⚠ P6-1 变更：原第四个候选 `xs.set(0, 9)` **被移出本判据**。P6-1 为 `list`
+/// 实现了 `set(i, v)` 值语义方法（原地复用快路径需要它），它**从来不是**索引赋值 ——
+/// 它是普通方法调用，不经过 `IndexAssign` 链路。真正表达「下标赋值」的三种写法
+/// （`xs[0] = 9` / `xs.at(0) = 9` / `m["a"] = 2`）仍然不可达。
 #[test]
 fn d361_index_assignment_has_no_reachable_syntax() {
     for (tag, body) in [
         ("brackets", "let xs = [1, 2]\nxs[0] = 9\nprint(xs)\n"),
         ("at_call", "let xs = [1, 2]\nxs.at(0) = 9\nprint(xs)\n"),
-        ("set_method", "let xs = [1, 2]\nxs.set(0, 9)\nprint(xs)\n"),
         ("dict_brackets", "let m = {a: 1}\nm[\"a\"] = 2\nprint(m)\n"),
     ] {
         let (code, got) = ev(body);
@@ -216,6 +225,23 @@ fn d361_index_assignment_has_no_reachable_syntax() {
             "`{tag}` 形态居然成功了 —— 若索引赋值已接通，本判据的「未接通」结论失效，需重新评估: out={got}"
         );
     }
+}
+
+/// **`list.set(i, v)` 是值语义方法，不是索引赋值。**
+///
+/// P6-1 实现了它（`list` 原地复用快路径需要），因此 `xs.set(0, 9)` 现在**可以**写出来 ——
+/// 但它走的是普通方法调用，**不经过** `WitnessKind::IndexAssign` →
+/// `ControlInst::IndexAssign` 链路；且遵循值语义：返回新列表，原列表不变。
+#[test]
+fn d361_list_set_is_a_value_semantics_method_not_index_assignment() {
+    // `ev` 把过滤掉横幅后的多行输出用 " | " 拼接。
+    let (code, got) = ev("let xs = [1, 2]\nlet ys = xs.set(0, 9)\nprint(xs)\nprint(ys)\n");
+    assert_eq!(code, 0, "`list.set` 应可用; 实得 exit={code} out={got}");
+    assert_eq!(
+        got.trim(),
+        "[1, 2] | [9, 2]",
+        "原列表不应被就地改写，且 `set` 应返回新列表; 实得: {got}"
+    );
 }
 
 /// **源码层断言**：`IndexAssign` 在 MIR/typeck 层有定义，且在 v0.111.0（P4-1B）之后

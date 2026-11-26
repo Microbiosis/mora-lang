@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use crate::common::{DType, Device};
 use crate::error::{MoraError, MoraResult};
-use crate::value::tensor::{Tensor, broadcast_runtime_shapes, checked_numel};
+use crate::value::tensor::{RowNorm, Tensor, broadcast_runtime_shapes, checked_numel};
 
 /// Unique handle `(tape_id, node_index)` attached to tracked [`Tensor`]s during differentiation.
 pub type TapeNodeId = (u64, usize);
@@ -725,19 +725,7 @@ impl AutogradTape {
                     last_dim,
                     eps,
                 } => {
-                    let d = (*last_dim).max(1);
-                    let d_f = d as f64;
-                    let mut ga = vec![0.0; g_out.len()];
-                    for row in 0..(g_out.len() / d) {
-                        let base = row * d;
-                        let ms = a_vals[base..base + d].iter().map(|x| x * x).sum::<f64>() / d_f;
-                        let inv_rms = 1.0 / (ms + *eps).sqrt();
-                        let dot_gx: f64 = (0..d).map(|j| g_out[base + j] * a_vals[base + j]).sum();
-                        let coeff = (inv_rms * inv_rms / d_f) * dot_gx;
-                        for j in 0..d {
-                            ga[base + j] = inv_rms * (g_out[base + j] - coeff * a_vals[base + j]);
-                        }
-                    }
+                    let ga = RowNorm::Rms.differential(a_vals, &g_out, *last_dim, *eps);
                     accum_grad(&mut grads, *a, &ga);
                 }
                 TapeOp::LayerNorm {
@@ -746,34 +734,7 @@ impl AutogradTape {
                     last_dim,
                     eps,
                 } => {
-                    let d = (*last_dim).max(1);
-                    let d_f = d as f64;
-                    let mut ga = vec![0.0; g_out.len()];
-                    for row in 0..(g_out.len() / d) {
-                        let base = row * d;
-                        let mean = a_vals[base..base + d].iter().sum::<f64>() / d_f;
-                        let var = a_vals[base..base + d]
-                            .iter()
-                            .map(|x| {
-                                let c = x - mean;
-                                c * c
-                            })
-                            .sum::<f64>()
-                            / d_f;
-                        let inv_std = 1.0 / (var + *eps).sqrt();
-                        let mut sum_g = 0.0;
-                        let mut sum_gx = 0.0;
-                        for j in 0..d {
-                            let xhat = (a_vals[base + j] - mean) * inv_std;
-                            sum_g += g_out[base + j];
-                            sum_gx += g_out[base + j] * xhat;
-                        }
-                        for j in 0..d {
-                            let xhat = (a_vals[base + j] - mean) * inv_std;
-                            ga[base + j] =
-                                (inv_std / d_f) * (d_f * g_out[base + j] - sum_g - xhat * sum_gx);
-                        }
-                    }
+                    let ga = RowNorm::Layer.differential(a_vals, &g_out, *last_dim, *eps);
                     accum_grad(&mut grads, *a, &ga);
                 }
             }
@@ -1222,58 +1183,17 @@ impl AutogradTape {
                     a_vals,
                     last_dim,
                     eps,
-                } => tangents[*a].as_ref().map(|da| {
-                    let d = (*last_dim).max(1);
-                    let d_f = d as f64;
-                    let mut out = vec![0.0; da.len()];
-                    for row in 0..(da.len() / d) {
-                        let base = row * d;
-                        let ms = a_vals[base..base + d].iter().map(|x| x * x).sum::<f64>() / d_f;
-                        let inv_rms = 1.0 / (ms + *eps).sqrt();
-                        let dot_dx: f64 = (0..d).map(|j| da[base + j] * a_vals[base + j]).sum();
-                        let coeff = (inv_rms * inv_rms / d_f) * dot_dx;
-                        for j in 0..d {
-                            out[base + j] = inv_rms * (da[base + j] - coeff * a_vals[base + j]);
-                        }
-                    }
-                    out
-                }),
+                } => tangents[*a]
+                    .as_ref()
+                    .map(|da| RowNorm::Rms.differential(a_vals, da, *last_dim, *eps)),
                 TapeOp::LayerNorm {
                     a,
                     a_vals,
                     last_dim,
                     eps,
-                } => tangents[*a].as_ref().map(|da| {
-                    let d = (*last_dim).max(1);
-                    let d_f = d as f64;
-                    let mut out = vec![0.0; da.len()];
-                    for row in 0..(da.len() / d) {
-                        let base = row * d;
-                        let mean = a_vals[base..base + d].iter().sum::<f64>() / d_f;
-                        let var = a_vals[base..base + d]
-                            .iter()
-                            .map(|x| {
-                                let c = x - mean;
-                                c * c
-                            })
-                            .sum::<f64>()
-                            / d_f;
-                        let inv_std = 1.0 / (var + *eps).sqrt();
-                        let mut sum_d = 0.0;
-                        let mut sum_dx = 0.0;
-                        for j in 0..d {
-                            let xhat = (a_vals[base + j] - mean) * inv_std;
-                            sum_d += da[base + j];
-                            sum_dx += da[base + j] * xhat;
-                        }
-                        for j in 0..d {
-                            let xhat = (a_vals[base + j] - mean) * inv_std;
-                            out[base + j] =
-                                (inv_std / d_f) * (d_f * da[base + j] - sum_d - xhat * sum_dx);
-                        }
-                    }
-                    out
-                }),
+                } => tangents[*a]
+                    .as_ref()
+                    .map(|da| RowNorm::Layer.differential(a_vals, da, *last_dim, *eps)),
             };
             tangents[idx] = out_tan;
         }
@@ -1362,6 +1282,21 @@ impl AutogradContext {
         self.tapes
             .iter()
             .any(|t| tensor.node_on_tape(t.id).is_some())
+    }
+
+    /// True when `tensor` is attached to ANY live tape on `self.tapes` — regardless of
+    /// `no_grad_depth` — so a nested `no_grad` block inside an outer `grad` / `jvp` / `trace_dag`
+    /// never mutates an outer-tape tensor's storage in place, while standalone `no_grad` inference
+    /// and optimizer steps (`tapes.is_empty()`) safely reuse uniquely-owned `requires_grad = true`
+    /// tensors in place.
+    #[inline]
+    pub(crate) fn has_live_tape_node(&self, tensor: &Tensor) -> bool {
+        !self.tapes.is_empty()
+            && !tensor.grad_nodes.is_empty()
+            && self
+                .tapes
+                .iter()
+                .any(|t| tensor.node_on_tape(t.id).is_some())
     }
 
     /// Record a unary operation on EVERY active tape tracking `input`, returning `out` attached to

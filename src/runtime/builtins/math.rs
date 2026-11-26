@@ -10,21 +10,26 @@
 use crate::error::{MoraError, MoraResult};
 use crate::value::Value;
 
-/// math.* builtin 入口分发（支持自动微分磁带追踪）
-pub fn call_math_method_tracked(
+/// math.* builtin 入口分发（P6-1 Perceus/FBIP：按所有权消费张量实参以支持 64B 主机/VRAM 原地复用，并兼容自动微分磁带追踪）
+pub(crate) fn call_math_method_fbip(
     method: &str,
-    args: &[Value],
+    args: Vec<Value>,
     autograd: Option<&mut crate::runtime::autograd::AutogradContext>,
+    fbip_stats: Option<&crate::runtime::fbip::FbipCounters>,
 ) -> MoraResult<Value> {
-    if let Some(Value::Tensor(t)) = args.first()
+    if args.len() == 1
         && matches!(
             method,
             "sin" | "cos" | "tanh" | "exp" | "log" | "sqrt" | "abs"
         )
+        && matches!(args.first(), Some(Value::Tensor(_)))
     {
-        return crate::value::tensor::eval_tensor_math_unary_tracked(t, method, autograd);
+        let Some(Value::Tensor(t)) = args.into_iter().next() else {
+            unreachable!("checked single Tensor argument above");
+        };
+        return crate::value::tensor::eval_tensor_math_unary_fbip(t, method, autograd, fbip_stats);
     }
-    call_math_method(method, args)
+    call_math_method(method, &args)
 }
 
 /// math.* builtin 入口分发

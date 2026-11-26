@@ -170,28 +170,50 @@ fn d110_function_parameter_annotations_are_supported() {
     assert!(ParserV3::compile("let g = fn(a) a + 1\nprint(g(1))\n").is_ok());
 }
 
-/// **缺口 2**：`result<...>` 泛型标注**会**被拒（标注本身不支持，D111 起是**明确报错**
-/// 而非静默丢弃）。
+/// **缺口 2（已闭合）**：`result<...>` 泛型标注**受支持且被 typeck 强制**。
 ///
-/// ⚠ 判据必须走 **完整编译**：`ParserV3::compile` 单独调时，标注会被
-/// **静默丢弃**（D111 的缺陷），只靠 typeck 检不出来。
+/// 历史沿革：D111 前 `let r: result<number, string> = 1` 的标注被**静默丢弃**；
+/// D111 起标注本身被明确报错（`unsupported generic type annotation`）。
+/// 一等 `result<T, E>` 落地后，标注**重新受支持** —— 且必须**被强制**：
+/// 把非 result 的值绑到 `result<T, E>` 标注上必须报类型错误，而不是
+/// 「标注被丢弃、值原样通过」。
 #[test]
-fn d110_result_generic_annotation_is_rejected_not_silently_dropped() {
-    // D111 前：`let r: result<number, string> = 1` 编译通过、typeck 0 条、
-    // 程序 exit 0 且 `r = 1.0` —— 标注被丢弃。
-    // D111 后：解析阶段就报 `unsupported generic type annotation` 并失败。
-    let res = ParserV3::compile("let r: result<number, string> = 1\nprint(r)\n");
+fn d110_result_generic_annotation_is_enforced_not_silently_dropped() {
+    let err_count = |src: &str| {
+        let (_, wits) = ParserV3::compile(src).expect("语法应通过");
+        mora::typeck::check_mir::check_program_witnesses(&wits).len()
+    };
+
+    // 标注受支持：解析阶段不再报错。
     assert!(
-        res.is_err(),
-        "`result<…>` 标注不受支持，必须**报错**而不是被静默丢弃。\
-         若本测试失败，说明静默丢弃又回来了（D111 回归）"
+        ParserV3::compile("let r: result<number, string> = 1\nprint(r)\n").is_ok(),
+        "`result<…>` 标注现已受支持，解析阶段不应报错"
     );
 
-    // 泛型 return 标注仍必须明确报错，不得被静默丢弃（D111）
-    let r2 = ParserV3::compile("task f(x): result<number, string>\n  return x\nend\n");
+    // 但标注必须被强制：把 int 绑到 `result<number, string>` 上必须报类型错误。
     assert!(
-        r2.is_err(),
-        "`task` 返回泛型标注同样必须报错（不得静默丢弃）"
+        err_count("let r: result<number, string> = 1\nprint(r)\n") > 0,
+        "`result<…>` 标注必须被 typeck 强制（否则又回到「静默丢弃」）"
+    );
+    assert_eq!(
+        err_count("let r: result<number, string> = Ok(1)\nprint(r)\n"),
+        0,
+        "正确的 `result` 值必须通过 `result<…>` 标注的检查"
+    );
+
+    // `task` 返回标注同样受支持且被强制。
+    assert!(
+        ParserV3::compile("task f(x: number): result<number, string>\n  return x\nend\n").is_ok(),
+        "`task` 返回的 `result<…>` 标注现已受支持"
+    );
+    assert!(
+        err_count("task f(x: number): result<number, string>\n  return x\nend\n") > 0,
+        "`task` 返回的 `result<…>` 标注必须被 typeck 强制"
+    );
+    assert_eq!(
+        err_count("task f(x: number): result<number, string>\n  return Ok(x)\nend\n"),
+        0,
+        "返回 `result` 的 `task` 必须通过 `result<…>` 返回标注的检查"
     );
 
     // 对照：受支持的泛型标注照常可用

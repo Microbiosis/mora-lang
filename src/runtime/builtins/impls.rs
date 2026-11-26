@@ -28,11 +28,8 @@ use crate::value::Value;
 /// 全部登记成**一元**箭头（`str: α → String` 等），同族的
 /// `type_of()` / `deref()` / `methods_of()` / `len()` / `compose()`
 /// 也全都对缺参报错。所以「缺参报错」是既有契约，本条只是让实现回到契约上。
-fn require_1(name: &str, args: &[Value]) -> MoraResult<Value> {
-    match args.first() {
-        Some(v) => Ok(v.clone()),
-        None => Err(MoraError::Runtime(format!("{name}() requires 1 argument"))),
-    }
+fn require_1<T>(name: &str, first: Option<T>) -> MoraResult<T> {
+    first.ok_or_else(|| MoraError::Runtime(format!("{name}() requires 1 argument")))
 }
 
 use crate::mir::control::BuiltinFnId;
@@ -42,7 +39,7 @@ use crate::runtime::CoreRuntime;
 pub(crate) fn eval_pure_builtin(
     id: BuiltinFnId,
     core: &mut CoreRuntime,
-    args: &[Value],
+    args: &mut Vec<Value>,
 ) -> Option<MoraResult<Value>> {
     match id {
         BuiltinFnId::Assert => Some(call_builtin_assert(args)),
@@ -64,7 +61,7 @@ pub(crate) fn eval_pure_builtin(
         BuiltinFnId::Tail => Some(call_builtin_tail(args)),
         BuiltinFnId::Curry => Some(call_builtin_curry(args)),
         BuiltinFnId::Uncurry => Some(call_builtin_uncurry(args)),
-        BuiltinFnId::Cons => Some(call_builtin_cons(args)),
+        BuiltinFnId::Cons => Some(call_builtin_cons_owned(args)),
         BuiltinFnId::Car => Some(call_builtin_car(args)),
         BuiltinFnId::Cdr => Some(call_builtin_cdr(args)),
         BuiltinFnId::Quote => Some(call_builtin_quote(args)),
@@ -77,8 +74,8 @@ pub(crate) fn eval_pure_builtin(
         BuiltinFnId::Tensor => Some(crate::value::tensor::call_builtin_tensor(args)),
         BuiltinFnId::Grad => Some(call_builtin_grad(args, false)),
         BuiltinFnId::ValueAndGrad => Some(call_builtin_grad(args, true)),
-        BuiltinFnId::Ok => Some(call_builtin_result_variant("Ok", args)),
-        BuiltinFnId::Err => Some(call_builtin_result_variant("Err", args)),
+        BuiltinFnId::Ok => Some(call_builtin_result_variant_owned("Ok", args)),
+        BuiltinFnId::Err => Some(call_builtin_result_variant_owned("Err", args)),
         BuiltinFnId::Swap
         | BuiltinFnId::Into
         | BuiltinFnId::Eval
@@ -95,21 +92,83 @@ pub(crate) fn eval_pure_builtin(
         | BuiltinFnId::ProcessGroup
         | BuiltinFnId::TcpProcessGroup
         | BuiltinFnId::Profiler
+        | BuiltinFnId::FbipStats
+        | BuiltinFnId::FbipResetStats
         | BuiltinFnId::TryCall => None,
     }
 }
 
-fn call_builtin_result_variant(variant: &str, args: &[Value]) -> MoraResult<Value> {
+/// P6-1: Zero-clone borrowed evaluation for read-only built-in functions (`is_borrowing_builtin`),
+/// inspecting `RegSlot::Heap` payloads in place so borrowed arguments never bump inner `Arc` counts.
+pub(crate) fn eval_borrowing_builtin_slots(
+    id: BuiltinFnId,
+    args: &[crate::runtime::vm::loans::CallArg<'_>],
+) -> Option<MoraResult<crate::runtime::vm::RegSlot>> {
+    use crate::runtime::vm::RegSlot;
+    match id {
+        BuiltinFnId::Len if args.len() == 1 => {
+            if let Some(vref) = args[0].as_heap() {
+                Some(call_builtin_len_ref(Some(vref)).map(RegSlot::Int))
+            } else {
+                let v = args[0].to_value();
+                Some(call_builtin_len_ref(Some(&v)).map(RegSlot::Int))
+            }
+        }
+        BuiltinFnId::TypeOf if args.len() == 1 => {
+            let s = match args[0].as_heap() {
+                Some(v) => crate::flow::dynamic_type_name(v),
+                None => crate::flow::dynamic_type_name(&args[0].to_value()),
+            };
+            Some(Ok(RegSlot::from_value(Value::String(s))))
+        }
+        BuiltinFnId::IsInstance if args.len() == 2 => {
+            let Some(Value::String(target)) = args[1].as_heap() else {
+                return None;
+            };
+            let matched = match args[0].as_heap() {
+                Some(v) => {
+                    crate::flow::dynamic_type_name(v) == *target || value_type_name(v) == target
+                }
+                None => {
+                    let v = args[0].to_value();
+                    crate::flow::dynamic_type_name(&v) == *target || value_type_name(&v) == target
+                }
+            };
+            Some(Ok(RegSlot::Bool(matched)))
+        }
+        BuiltinFnId::MethodsOf if args.len() == 1 => {
+            let methods = match args[0].as_heap() {
+                Some(v) => v.methods(),
+                None => args[0].to_value().methods(),
+            };
+            Some(Ok(RegSlot::from_value(Value::List(
+                methods.into_iter().map(Value::String).collect(),
+            ))))
+        }
+        BuiltinFnId::Bool if args.len() == 1 => Some(Ok(RegSlot::Bool(args[0].is_truthy()))),
+        BuiltinFnId::Str if args.len() == 1 => {
+            let s = match args[0].as_heap() {
+                Some(v) => v.to_string(),
+                None => args[0].to_value().to_string(),
+            };
+            Some(Ok(RegSlot::from_value(Value::String(s))))
+        }
+        _ => None,
+    }
+}
+
+fn call_builtin_result_variant_owned(variant: &str, args: &mut Vec<Value>) -> MoraResult<Value> {
     if args.len() != 1 {
         return Err(MoraError::Runtime(format!(
             "{variant}() expects 1 argument, got {}",
             args.len()
         )));
     }
+    let payload = std::mem::take(args);
     Ok(Value::EnumVariant {
         enum_name: "result".to_string(),
         variant: variant.to_string(),
-        payload: vec![args[0].clone()],
+        payload,
         const_args: Vec::new(),
     })
 }
@@ -216,8 +275,8 @@ pub(crate) fn call_builtin_range(args: &[Value]) -> MoraResult<Value> {
     Ok(Value::List(items.into()))
 }
 
-pub(crate) fn call_builtin_len(args: &[Value]) -> MoraResult<Value> {
-    let len = match args.first() {
+pub(crate) fn call_builtin_len_ref(arg: Option<&Value>) -> MoraResult<i64> {
+    let len = match arg {
         Some(Value::List(list)) => {
             testcase!(true, "len: list");
             list.len()
@@ -244,17 +303,21 @@ pub(crate) fn call_builtin_len(args: &[Value]) -> MoraResult<Value> {
             ));
         }
     };
-    Ok(Value::Int(len as i64))
+    Ok(len as i64)
+}
+
+pub(crate) fn call_builtin_len(args: &[Value]) -> MoraResult<Value> {
+    call_builtin_len_ref(args.first()).map(Value::Int)
 }
 
 pub(crate) fn call_builtin_str(args: &[Value]) -> MoraResult<Value> {
-    let v = require_1("str", args)?;
+    let v = require_1("str", args.first())?;
     testcase!(true, "str: any");
     Ok(Value::String(v.to_string()))
 }
 
 pub(crate) fn call_builtin_int(args: &[Value]) -> MoraResult<Value> {
-    let v = require_1("int", args)?;
+    let v = require_1("int", args.first())?;
     let out = match v {
         Value::String(s) => {
             let t = s.trim();
@@ -272,9 +335,9 @@ pub(crate) fn call_builtin_int(args: &[Value]) -> MoraResult<Value> {
                     "int() cannot convert non-finite float: {f}"
                 )));
             }
-            f as i64
+            *f as i64
         }
-        Value::Int(n) => n,
+        Value::Int(n) => *n,
         Value::Scalar(s) => {
             if let Some(n) = s.as_i64() {
                 n
@@ -289,7 +352,7 @@ pub(crate) fn call_builtin_int(args: &[Value]) -> MoraResult<Value> {
             }
         }
         Value::Bool(b) => {
-            if b {
+            if *b {
                 1
             } else {
                 0
@@ -298,7 +361,7 @@ pub(crate) fn call_builtin_int(args: &[Value]) -> MoraResult<Value> {
         other => {
             return Err(MoraError::Runtime(format!(
                 "int() does not accept {}",
-                crate::flow::type_name(&other)
+                crate::flow::type_name(other)
             )));
         }
     };
@@ -307,17 +370,17 @@ pub(crate) fn call_builtin_int(args: &[Value]) -> MoraResult<Value> {
 }
 
 pub(crate) fn call_builtin_float(args: &[Value]) -> MoraResult<Value> {
-    let v = require_1("float", args)?;
+    let v = require_1("float", args.first())?;
     let out = match v {
         Value::String(s) => s
             .trim()
             .parse::<f64>()
             .map_err(|_| MoraError::Runtime(format!("float() cannot parse string: {s:?}")))?,
-        Value::Float(f) => f,
-        Value::Int(n) => n as f64,
+        Value::Float(f) => *f,
+        Value::Int(n) => *n as f64,
         Value::Scalar(s) => s.as_f64(),
         Value::Bool(b) => {
-            if b {
+            if *b {
                 1.0
             } else {
                 0.0
@@ -326,7 +389,7 @@ pub(crate) fn call_builtin_float(args: &[Value]) -> MoraResult<Value> {
         other => {
             return Err(MoraError::Runtime(format!(
                 "float() does not accept {}",
-                crate::flow::type_name(&other)
+                crate::flow::type_name(other)
             )));
         }
     };
@@ -335,9 +398,9 @@ pub(crate) fn call_builtin_float(args: &[Value]) -> MoraResult<Value> {
 }
 
 pub(crate) fn call_builtin_bool(args: &[Value]) -> MoraResult<Value> {
-    let v = require_1("bool", args)?;
+    let v = require_1("bool", args.first())?;
     testcase!(true, "bool: coercion");
-    Ok(Value::Bool(crate::flow::is_truthy(&v)))
+    Ok(Value::Bool(crate::flow::is_truthy(v)))
 }
 
 pub(crate) fn call_builtin_compose(args: &[Value]) -> MoraResult<Value> {
@@ -360,8 +423,9 @@ pub(crate) fn call_builtin_partial(args: &[Value]) -> MoraResult<Value> {
     Ok(Value::Partial(Box::new(func), partial_args))
 }
 
-pub(crate) fn call_builtin_atom(args: &[Value]) -> MoraResult<Value> {
-    let value = require_1("atom", args)?;
+fn call_builtin_atom(args: &mut [Value]) -> MoraResult<Value> {
+    let first = require_1("atom", args.first_mut())?;
+    let value = std::mem::replace(first, Value::Nil);
     Ok(Value::Atom(Arc::new(Mutex::new(value))))
 }
 
@@ -572,15 +636,18 @@ pub(crate) fn call_builtin_uncurry(args: &[Value]) -> MoraResult<Value> {
     }
 }
 
-pub(crate) fn call_builtin_cons(args: &[Value]) -> MoraResult<Value> {
+fn call_builtin_cons_owned(args: &mut Vec<Value>) -> MoraResult<Value> {
     if args.len() < 2 {
         return Err(MoraError::Runtime(
             "cons(car, cdr) expects 2 arguments".to_string(),
         ));
     }
+    let mut it = args.drain(..2);
+    let car = it.next().unwrap_or(Value::Nil);
+    let cdr = it.next().unwrap_or(Value::Nil);
     Ok(Value::Cons {
-        car: Box::new(args[0].clone()),
-        cdr: Box::new(args[1].clone()),
+        car: Box::new(car),
+        cdr: Box::new(cdr),
     })
 }
 

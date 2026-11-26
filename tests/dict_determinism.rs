@@ -106,7 +106,7 @@ fn value_display_dict_is_sorted() {
     for (i, k) in KEYS.iter().enumerate() {
         map.insert((*k).to_string(), Value::Float(i as f64));
     }
-    let rendered = Value::Dict(map).to_string();
+    let rendered = Value::Dict(map.into()).to_string();
     assert_sorted("Display/12", &rendered, KEYS.len());
 }
 

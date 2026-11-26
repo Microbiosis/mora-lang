@@ -10,20 +10,26 @@
 //! 8 种 literal）逐条实例化跑一遍，覆盖面由 spec 语法本身决定，
 //! 而不是靠人回忆「该测什么」。
 //!
-//! ## 实测结果（v0.104.6）
+//! ## 实测结果（2026-11-26 复核）
 //!
-//! 38 条里 **35 条通过**，3 条是 spec 自身不完整 —— 逐条查过，不是实现缺陷：
+//! 38 条（18 statement + 20 expr）**全部通过**。
 //!
-//! 1. `question = expr "?"`（spec :1278）—— **规范列了但语义未定义**：
-//!    §13.3 明写「**待补充**: T-Let, T-If, T-Match, T-Pipe, **T-Question**
-//!    等判断规则」。解析器不接受后缀 `?`。要实现它得先定语义，属语言设计决定，
-//!    未擅自做 —— 见 `question_operator_is_still_unimplemented`。
-//! 2. `5 |> double`（spec :479）—— 那行 spec 只写了 RHS、**没给 `double` 的
-//!    定义**；用完整定义复测即通过（见 `pipe_into_named_function`）。
-//! 3. `1 |> str()` —— spec 从未这样用。`|>` 的解析目标是**模块或具名函数**
+//! v0.104.6 时本表记的是「35 条通过 / 3 条 spec 自身不完整」，其中第 1 条 ——
+//! `question = expr "?"`（spec :1278）—— 当时是「**规范列了但语义未定义**」：
+//! §13.3 明写「**待补充**: T-Let, T-If, T-Match, T-Pipe, **T-Question** 等判断
+//! 规则」，故解析器不接受后缀 `?`。v0.112.0 G2 起该产生式**已实现**
+//! （`result` / `option` / nullable 后缀 `?` 错误传播，已接通 Parser → HM →
+//! Control SSA IR → MORABC02 → VM），现已并入本表（`question (v0.112.0 G2)`）。
+//!
+//! 原记 3 条 spec 自身不完整中的第 1 条已解决，余下 2 条仍是 **spec 自身不完整**
+//! （逐条查过，不是实现缺陷）：
+//!
+//! 1. `5 |> double`（spec :479）—— 那行 spec 只写了 RHS、**没给 `double` 的
+//!    定义**；用完整定义复测即通过（见 `pipe_into_named_function_works`）。
+//! 2. `1 |> str()` —— spec 从未这样用。`|>` 的解析目标是**模块或具名函数**
 //!    （`|> map(...)`、`|> upper()`），`str` 是自由 builtin，不是 pipe 目标。
 //!
-//! 其余 35 条全部通过，含 TEA 的 `model`/`msg`/`update`/`app` 四个声明、
+//! 本表全部通过，含 TEA 的 `model`/`msg`/`update`/`app` 四个声明、
 //! 代数效果的 `handle`/`perform`、准引号与同像性 `eval`/`quote`。
 
 use std::sync::Arc;

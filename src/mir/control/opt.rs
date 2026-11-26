@@ -14,10 +14,17 @@
 //!   dead-code elimination and block compaction (up to 2 rounds).
 //! - `Aggressive`: `Basic` plus GVN/CSE and LICM (up to 4 rounds).
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use crate::flow::eval_binary;
 use crate::value::Value;
+
+use super::liveness::{
+    SlotLiveness, collect_pattern_globals, compute_private_main_globals, compute_slot_liveness,
+    compute_terminator_kill_mask, compute_vreg_live_in, inst_local_uses, is_borrowing_builtin,
+    is_projecting_method, is_valid_borrow_inst, is_valid_borrow_terminator, method_arg_borrows,
+    method_receiver_borrows, pattern_mentions_local, program_mentions_eval,
+};
 
 /// Optimization level for Control SSA optimization passes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,31 +70,39 @@ impl Default for OptLevel {
 }
 
 use super::ir::{
-    BasicBlock, BlockId, BuiltinFnId, ControlConst, ControlFunction, ControlInst, ControlProgram,
-    ControlTerminator, Purity, UnaryOp, VReg,
+    BasicBlock, BlockId, BuiltinFnId, CalleeTarget, ControlConst, ControlFunction, ControlInst,
+    ControlProgram, ControlTerminator, FunctionKind, GlobalSlot, KillMask, LocalSlot, Purity,
+    SymId, SymbolTable, UnaryOp, VReg, verify_program,
 };
 
-/// Optimize every function in `prog` at the requested [`OptLevel`].
+/// Optimize every function in `prog` at the requested [`OptLevel`], and run the P6-1 Perceus /
+/// FBIP ownership, borrow-inference, and edge-drop pass across all [`OptLevel`]s.
 pub fn optimize_program(prog: &mut ControlProgram, level: OptLevel) {
-    if !level.enabled() {
-        return;
-    }
-    let max_rounds = if level.aggressive() { 4 } else { 2 };
-    for func in &mut prog.functions {
-        for _ in 0..max_rounds {
-            let mut changed = false;
-            changed |= const_and_copy_prop(func);
-            if level.aggressive() {
-                changed |= gvn_cse(func);
-                changed |= licm_hoist_pure(func);
-            }
-            changed |= simplify_cfg(func);
-            changed |= dce_and_compact(func);
-            if !changed {
-                break;
+    if level.enabled() {
+        strip_perceus_annotations(prog);
+        let max_rounds = if level.aggressive() { 4 } else { 2 };
+        for func in &mut prog.functions {
+            for _ in 0..max_rounds {
+                let mut changed = false;
+                changed |= const_and_copy_prop(func);
+                if level.aggressive() {
+                    changed |= gvn_cse(func);
+                    changed |= licm_hoist_pure(func);
+                }
+                changed |= simplify_cfg(func);
+                changed |= dce_and_compact(func);
+                if !changed {
+                    break;
+                }
             }
         }
     }
+    perceus_ownership_pass(prog);
+    debug_assert!(
+        verify_program(prog).is_ok(),
+        "optimize_program produced invalid ControlProgram: {:?}",
+        verify_program(prog).err()
+    );
 }
 
 /// Canonical float key preserving signed zero and distinct NaN bit patterns.
@@ -519,6 +534,8 @@ fn create_preheader(
         id: pre_id,
         params: pre_params.clone(),
         insts: Vec::new(),
+        inst_kill_masks: Vec::new(),
+        term_kill_mask: KillMask::Empty,
         terminator: ControlTerminator::Jump {
             target: header,
             args: pre_params,
@@ -742,4 +759,1076 @@ fn dce_and_compact(func: &mut ControlFunction) -> bool {
     }
 
     changed
+}
+
+// ─── P6-1: Lean 4 Perceus / FBIP Ownership, Borrow Inference & Edge-Drop Pass ───
+
+/// Normalize any previously inserted Perceus instructions/masks back to canonical SSA form so
+/// `perceus_ownership_pass` is strictly idempotent across repeated optimization rounds.
+fn strip_perceus_annotations(prog: &mut ControlProgram) {
+    for func in &mut prog.functions {
+        for b in &mut func.blocks {
+            b.inst_kill_masks.clear();
+            b.term_kill_mask = KillMask::Empty;
+            b.insts.retain_mut(|inst| match inst {
+                ControlInst::DropReg(_) | ControlInst::DropLocal(_) => false,
+                ControlInst::MoveLocal(d, s) | ControlInst::BorrowLocal(d, s) => {
+                    *inst = ControlInst::LoadLocal(*d, *s);
+                    true
+                }
+                ControlInst::MoveGlobal(d, g) => {
+                    *inst = ControlInst::LoadGlobal(*d, *g);
+                    true
+                }
+                _ => true,
+            });
+        }
+    }
+}
+
+/// Infer `ControlFunction::param_borrows` across `prog` via greatest fixed-point iteration
+/// (*Counting Immutable Beans*, §4 Borrow Inference).
+fn infer_param_borrows(prog: &mut ControlProgram) {
+    let mut borrows: Vec<Vec<bool>> = prog
+        .functions
+        .iter()
+        .map(|f| {
+            let allow_borrow = matches!(
+                f.kind,
+                FunctionKind::Task
+                    | FunctionKind::Closure
+                    | FunctionKind::ImplMethod
+                    | FunctionKind::TraitDefault
+            );
+            (0..f.params.len())
+                .map(|i| {
+                    allow_borrow
+                        && !f.param_has_default.get(i).copied().unwrap_or(false)
+                        && !f.shared_locals.get(i).copied().unwrap_or(false)
+                })
+                .collect()
+        })
+        .collect();
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for f_idx in 0..prog.functions.len() {
+            let func = &prog.functions[f_idx];
+            for p_idx in 0..func.params.len() {
+                if !borrows[f_idx][p_idx] {
+                    continue;
+                }
+                let p_slot = LocalSlot(p_idx as u16);
+                let mut escapes = false;
+
+                // 1. Check direct slot writes or closure captures.
+                for b in &func.blocks {
+                    for inst in &b.insts {
+                        if let ControlInst::StoreLocal(s, _) = inst
+                            && *s == p_slot
+                        {
+                            escapes = true;
+                            break;
+                        }
+                        if let ControlInst::MatchPattern { pattern, .. } = inst
+                            && pattern_mentions_local(pattern, p_slot)
+                        {
+                            escapes = true;
+                            break;
+                        }
+                        if !matches!(
+                            inst,
+                            ControlInst::LoadLocal(_, _)
+                                | ControlInst::BorrowLocal(_, _)
+                                | ControlInst::MoveLocal(_, _)
+                                | ControlInst::IsMissingArg(_, _)
+                        ) && inst_local_uses(inst).contains(&p_slot)
+                        {
+                            escapes = true;
+                            break;
+                        }
+                    }
+                    if escapes {
+                        break;
+                    }
+                }
+                if escapes {
+                    borrows[f_idx][p_idx] = false;
+                    changed = true;
+                    continue;
+                }
+
+                // 2. Compute transitive set of VRegs & unshared LocalSlots holding or projecting
+                //    `p_slot` (via LoadLocal / StoreLocal / Copy / Index / ProjectField / CFG edges).
+                let mut tainted_locals: HashSet<LocalSlot> = HashSet::new();
+                tainted_locals.insert(p_slot);
+                let mut tainted: HashSet<VReg> = HashSet::new();
+                let mut reg_changed = true;
+                while reg_changed {
+                    reg_changed = false;
+                    for b in &func.blocks {
+                        for inst in &b.insts {
+                            match inst {
+                                ControlInst::LoadLocal(d, s)
+                                | ControlInst::BorrowLocal(d, s)
+                                | ControlInst::MoveLocal(d, s)
+                                    if tainted_locals.contains(s) =>
+                                {
+                                    if tainted.insert(*d) {
+                                        reg_changed = true;
+                                    }
+                                }
+                                ControlInst::StoreLocal(s, src)
+                                    if tainted.contains(src)
+                                        && *s != p_slot
+                                        && !func
+                                            .shared_locals
+                                            .get(s.0 as usize)
+                                            .copied()
+                                            .unwrap_or(false)
+                                        && tainted_locals.insert(*s) =>
+                                {
+                                    reg_changed = true;
+                                }
+                                ControlInst::Copy(d, src)
+                                    if tainted.contains(src) && tainted.insert(*d) =>
+                                {
+                                    reg_changed = true;
+                                }
+                                ControlInst::Index(d, obj, _)
+                                    if tainted.contains(obj) && tainted.insert(*d) =>
+                                {
+                                    reg_changed = true;
+                                }
+                                ControlInst::ProjectField { dst, receiver, .. }
+                                    if tainted.contains(receiver) && tainted.insert(*dst) =>
+                                {
+                                    reg_changed = true;
+                                }
+                                ControlInst::MethodCall {
+                                    dst,
+                                    receiver,
+                                    method,
+                                    named_args,
+                                    ..
+                                } if named_args.is_empty()
+                                    && tainted.contains(receiver)
+                                    && is_projecting_method(prog.symbols.resolve(*method))
+                                    && tainted.insert(*dst) =>
+                                {
+                                    reg_changed = true;
+                                }
+                                _ => {}
+                            }
+                        }
+                        match &b.terminator {
+                            ControlTerminator::Jump { target, args } => {
+                                let params = &func.blocks[target.0 as usize].params;
+                                for (a, p) in args.iter().zip(params.iter()) {
+                                    if tainted.contains(a) && tainted.insert(*p) {
+                                        reg_changed = true;
+                                    }
+                                }
+                            }
+                            ControlTerminator::Branch {
+                                then_bb,
+                                then_args,
+                                else_bb,
+                                else_args,
+                                ..
+                            } => {
+                                let t_params = &func.blocks[then_bb.0 as usize].params;
+                                for (a, p) in then_args.iter().zip(t_params.iter()) {
+                                    if tainted.contains(a) && tainted.insert(*p) {
+                                        reg_changed = true;
+                                    }
+                                }
+                                let e_params = &func.blocks[else_bb.0 as usize].params;
+                                for (a, p) in else_args.iter().zip(e_params.iter()) {
+                                    if tainted.contains(a) && tainted.insert(*p) {
+                                        reg_changed = true;
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                // 3. Check whether any tainted LocalSlot or VReg is captured or used in an
+                //    owned/escaping position.
+                for b in &func.blocks {
+                    for inst in &b.insts {
+                        if !matches!(
+                            inst,
+                            ControlInst::LoadLocal(..)
+                                | ControlInst::BorrowLocal(..)
+                                | ControlInst::MoveLocal(..)
+                                | ControlInst::IsMissingArg(..)
+                        ) && inst_local_uses(inst)
+                            .iter()
+                            .any(|s| tainted_locals.contains(s))
+                        {
+                            escapes = true;
+                            break;
+                        }
+                        match inst {
+                            ControlInst::LoadLocal(..)
+                            | ControlInst::BorrowLocal(..)
+                            | ControlInst::MoveLocal(..)
+                            | ControlInst::IsMissingArg(..)
+                            | ControlInst::Copy(..)
+                            | ControlInst::ProjectField { .. } => {}
+                            ControlInst::StoreLocal(s, src) => {
+                                if tainted.contains(src)
+                                    && (*s == p_slot
+                                        || func
+                                            .shared_locals
+                                            .get(s.0 as usize)
+                                            .copied()
+                                            .unwrap_or(false))
+                                {
+                                    escapes = true;
+                                }
+                            }
+                            ControlInst::Unary(_, UnaryOp::Truthy | UnaryOp::Not, _)
+                            | ControlInst::GetConstGeneric { .. }
+                            | ControlInst::TryProbe(..) => {}
+                            ControlInst::Index(_, _, idx) => {
+                                if tainted.contains(idx) {
+                                    escapes = true;
+                                }
+                            }
+                            ControlInst::Binary(
+                                _,
+                                _,
+                                crate::common::BinaryOp::Equal
+                                | crate::common::BinaryOp::NotEqual
+                                | crate::common::BinaryOp::Less
+                                | crate::common::BinaryOp::LessEqual
+                                | crate::common::BinaryOp::Greater
+                                | crate::common::BinaryOp::GreaterEqual
+                                | crate::common::BinaryOp::MatMul
+                                | crate::common::BinaryOp::BitAnd
+                                | crate::common::BinaryOp::BitOr
+                                | crate::common::BinaryOp::BitXor
+                                | crate::common::BinaryOp::Shl
+                                | crate::common::BinaryOp::Shr,
+                                _,
+                            ) => {}
+                            ControlInst::Call {
+                                target: CalleeTarget::Builtin(bid),
+                                named_args,
+                                ..
+                            } if named_args.is_empty() && is_borrowing_builtin(*bid) => {}
+                            ControlInst::ModuleCall {
+                                module:
+                                    crate::value::BuiltinKind::Stats | crate::value::BuiltinKind::Linalg,
+                                method,
+                                named_args,
+                                ..
+                            } if named_args.is_empty()
+                                && matches!(
+                                    prog.symbols.resolve(*method),
+                                    "mean"
+                                        | "sum"
+                                        | "min"
+                                        | "max"
+                                        | "median"
+                                        | "stddev"
+                                        | "var"
+                                        | "norm"
+                                        | "dot"
+                                ) => {}
+                            ControlInst::Call {
+                                target: CalleeTarget::Fn(callee_id),
+                                args,
+                                named_args,
+                                ..
+                            } => {
+                                let Some(callee) = prog.functions.get(callee_id.0 as usize) else {
+                                    escapes = true;
+                                    break;
+                                };
+                                for (arg_i, r) in args.iter().enumerate() {
+                                    if tainted.contains(r)
+                                        && !borrows
+                                            .get(callee_id.0 as usize)
+                                            .and_then(|v| v.get(arg_i))
+                                            .copied()
+                                            .unwrap_or(false)
+                                    {
+                                        escapes = true;
+                                        break;
+                                    }
+                                }
+                                if !escapes {
+                                    for (kw_sym, r) in named_args {
+                                        if tainted.contains(r) {
+                                            let borrowed_kw = callee
+                                                .params
+                                                .iter()
+                                                .position(|&p| p == *kw_sym)
+                                                .and_then(|idx| {
+                                                    borrows
+                                                        .get(callee_id.0 as usize)
+                                                        .and_then(|v| v.get(idx))
+                                                        .copied()
+                                                })
+                                                .unwrap_or(false);
+                                            if !borrowed_kw {
+                                                escapes = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            ControlInst::MethodCall {
+                                receiver,
+                                method,
+                                args,
+                                named_args,
+                                ..
+                            } if named_args.is_empty() => {
+                                let recv_ok = method_receiver_borrows(
+                                    &prog.functions,
+                                    &prog.symbols,
+                                    *method,
+                                    args.len(),
+                                    Some(&borrows),
+                                );
+                                if tainted.contains(receiver) && !recv_ok {
+                                    escapes = true;
+                                }
+                                for (ai, r) in args.iter().enumerate() {
+                                    if tainted.contains(r)
+                                        && !method_arg_borrows(
+                                            &prog.functions,
+                                            &prog.symbols,
+                                            *method,
+                                            args.len(),
+                                            ai,
+                                            Some(&borrows),
+                                        )
+                                    {
+                                        escapes = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            other => {
+                                if other.input_regs().iter().any(|r| tainted.contains(r)) {
+                                    escapes = true;
+                                }
+                            }
+                        }
+                        if escapes {
+                            break;
+                        }
+                    }
+                    if escapes {
+                        break;
+                    }
+                    match &b.terminator {
+                        ControlTerminator::Jump { .. } | ControlTerminator::Branch { .. } => {}
+                        ControlTerminator::TailCall {
+                            target: CalleeTarget::Fn(callee_id),
+                            args,
+                        } => {
+                            for (arg_i, r) in args.iter().enumerate() {
+                                if tainted.contains(r)
+                                    && !borrows
+                                        .get(callee_id.0 as usize)
+                                        .and_then(|v| v.get(arg_i))
+                                        .copied()
+                                        .unwrap_or(false)
+                                {
+                                    escapes = true;
+                                    break;
+                                }
+                            }
+                        }
+                        other => {
+                            if other.input_regs().iter().any(|r| tainted.contains(r)) {
+                                escapes = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if escapes {
+                    borrows[f_idx][p_idx] = false;
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    for (func, bvec) in prog.functions.iter_mut().zip(borrows) {
+        func.param_borrows = bvec;
+    }
+}
+
+/// P6-1 Perceus / Functional-But-In-Place (FBIP) compiler pass:
+/// 1. Infers interprocedural borrowed parameter summaries (`ControlFunction::param_borrows`).
+/// 2. Upgrades final live `LoadLocal`s of unshared locals to ownership-transferring `MoveLocal`
+///    and inserts `DropLocal` on asymmetric branch edges.
+/// 3. Upgrades the final live read of a `<main>`-private global to `MoveGlobal`, transferring
+///    ownership out of its slot — unless an embedding environment captures the program globals
+///    after `<main>` returns (REPL chunk / `eval`), in which case they must stay in place.
+/// 4. Inserts `DropReg` for unused effectful destination registers and asymmetric branch edges,
+///    then computes exact arbitrary-arity `inst_kill_masks` and `term_kill_mask` bitsets.
+pub fn perceus_ownership_pass(prog: &mut ControlProgram) {
+    strip_perceus_annotations(prog);
+    infer_param_borrows(prog);
+
+    let uses_eval = program_mentions_eval(prog);
+    let private_main_globals = if uses_eval {
+        HashSet::new()
+    } else {
+        compute_private_main_globals(prog)
+    };
+    let exit_globals: HashSet<GlobalSlot> = if prog.preserve_globals_at_exit {
+        private_main_globals.clone()
+    } else {
+        HashSet::new()
+    };
+    let entry_fn = prog.entry;
+
+    for f_idx in 0..prog.functions.len() {
+        let stub = ControlFunction {
+            id: prog.functions[f_idx].id,
+            name: prog.functions[f_idx].name,
+            kind: prog.functions[f_idx].kind,
+            params: prog.functions[f_idx].params.clone(),
+            param_has_default: Vec::new(),
+            param_borrows: prog.functions[f_idx].param_borrows.clone(),
+            local_names: Vec::new(),
+            upvalues: Vec::new(),
+            n_locals: 0,
+            shared_locals: Vec::new(),
+            n_regs: 0,
+            entry: BlockId(0),
+            blocks: Vec::new(),
+            handler_arg_slots: Vec::new(),
+            handler_k_slot: None,
+        };
+        let mut func = std::mem::replace(&mut prog.functions[f_idx], stub);
+        let is_main = func.id == entry_fn;
+        apply_perceus_to_function(
+            &mut func,
+            &prog.functions,
+            &prog.symbols,
+            !uses_eval,
+            is_main,
+            &private_main_globals,
+            &exit_globals,
+        );
+        prog.functions[f_idx] = func;
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum CoalesceSlot {
+    Local(LocalSlot),
+    Global(GlobalSlot),
+}
+
+type ProjLoadCandidate = (VReg, usize, Vec<usize>);
+
+/// P6-1 Perceus/FBIP: coalesce sibling nominal `ControlInst::ProjectField` reads of a dead local
+/// or `<main>`-private global struct slot so they share a single load register.
+///
+/// Because `lower.rs` statically emits `ProjectField` exclusively for proven nominal struct fields,
+/// coalescing redundant loads lets Phase A upgrade the single remaining load to `MoveLocal` /
+/// `MoveGlobal`, and at runtime each `ProjectField` extracts its own distinct field from the
+/// uniquely-owned `StructInstance` in $O(1)$ regardless of field projection order.
+fn coalesce_struct_projection_loads(
+    func: &mut ControlFunction,
+    is_main: bool,
+    private_main_globals: &HashSet<GlobalSlot>,
+) {
+    let mut uses: HashMap<VReg, Vec<(usize, usize)>> = HashMap::new();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (pc, inst) in block.insts.iter().enumerate() {
+            for r in inst.input_regs() {
+                uses.entry(r).or_default().push((bi, pc));
+            }
+        }
+        for r in block.terminator.input_regs() {
+            uses.entry(r).or_default().push((bi, usize::MAX));
+        }
+    }
+
+    for (bi, block) in func.blocks.iter_mut().enumerate() {
+        let mut slot_epoch: HashMap<CoalesceSlot, usize> = HashMap::new();
+        let mut by_slot_epoch: BTreeMap<(CoalesceSlot, usize), Vec<ProjLoadCandidate>> =
+            BTreeMap::new();
+
+        for (pc, inst) in block.insts.iter().enumerate() {
+            match inst {
+                ControlInst::StoreLocal(s, _)
+                | ControlInst::FreshLocalCell(s)
+                | ControlInst::DropLocal(s) => {
+                    *slot_epoch.entry(CoalesceSlot::Local(*s)).or_insert(0) += 1;
+                    continue;
+                }
+                ControlInst::StoreGlobal(g, _) => {
+                    *slot_epoch.entry(CoalesceSlot::Global(*g)).or_insert(0) += 1;
+                    continue;
+                }
+                ControlInst::MatchPattern { pattern, .. } => {
+                    for idx in 0..func.n_locals {
+                        let s = LocalSlot(idx);
+                        if pattern_mentions_local(pattern, s) {
+                            *slot_epoch.entry(CoalesceSlot::Local(s)).or_insert(0) += 1;
+                        }
+                    }
+                    if is_main {
+                        let mut pg = HashSet::new();
+                        collect_pattern_globals(pattern, &mut pg);
+                        for g in pg {
+                            *slot_epoch.entry(CoalesceSlot::Global(g)).or_insert(0) += 1;
+                        }
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+
+            let (dst, cslot) = match inst {
+                ControlInst::LoadLocal(d, s) => {
+                    if func
+                        .shared_locals
+                        .get(s.0 as usize)
+                        .copied()
+                        .unwrap_or(false)
+                        || func
+                            .param_borrows
+                            .get(s.0 as usize)
+                            .copied()
+                            .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    (*d, CoalesceSlot::Local(*s))
+                }
+                ControlInst::LoadGlobal(d, g) if is_main && private_main_globals.contains(g) => {
+                    (*d, CoalesceSlot::Global(*g))
+                }
+                _ => continue,
+            };
+            let Some(user_pcs) = uses.get(&dst) else {
+                continue;
+            };
+            if user_pcs.is_empty() {
+                continue;
+            }
+            let mut projections = Vec::new();
+            let mut pure = true;
+            for &(ubi, u) in user_pcs {
+                if ubi != bi || u == usize::MAX || u <= pc {
+                    pure = false;
+                    break;
+                }
+                match &block.insts[u] {
+                    ControlInst::ProjectField { receiver, .. } if *receiver == dst => {
+                        projections.push(u);
+                    }
+                    _ => {
+                        pure = false;
+                        break;
+                    }
+                }
+            }
+            if pure && !projections.is_empty() {
+                let epoch = slot_epoch.get(&cslot).copied().unwrap_or(0);
+                by_slot_epoch
+                    .entry((cslot, epoch))
+                    .or_default()
+                    .push((dst, pc, projections));
+            }
+        }
+        if by_slot_epoch.is_empty() {
+            continue;
+        }
+
+        let mut drop_pcs: Vec<usize> = Vec::new();
+        for ((cslot, _epoch), group) in by_slot_epoch {
+            let total_projs: usize = group.iter().map(|g| g.2.len()).sum();
+            if total_projs < 2 {
+                continue;
+            }
+
+            let mut ordered_projs: Vec<(usize, SymId)> = Vec::new();
+            for (_, _, projections) in &group {
+                for &p in projections {
+                    if let ControlInst::ProjectField { field, .. } = &block.insts[p] {
+                        ordered_projs.push((p, *field));
+                    }
+                }
+            }
+            ordered_projs.sort_unstable_by_key(|&(p, _)| p);
+            let mut distinct: Vec<SymId> = ordered_projs.iter().map(|&(_, s)| s).collect();
+            distinct.sort_unstable();
+            distinct.dedup();
+            if distinct.len() != ordered_projs.len() {
+                continue;
+            }
+
+            let first_load_pc = group[0].1;
+            let last_load_pc = group.last().map(|g| g.1).unwrap_or(first_load_pc);
+            let last_proj_pc = ordered_projs
+                .last()
+                .map(|&(p, _)| p)
+                .unwrap_or(first_load_pc);
+            let span_end = last_load_pc.max(last_proj_pc);
+            let load_pcs: HashSet<usize> = group.iter().map(|g| g.1).collect();
+
+            let mut conflict = false;
+            for (pc, inst) in block
+                .insts
+                .iter()
+                .enumerate()
+                .take(span_end + 1)
+                .skip(first_load_pc)
+            {
+                match cslot {
+                    CoalesceSlot::Local(slot) => {
+                        if pc > first_load_pc
+                            && (matches!(
+                                inst,
+                                ControlInst::StoreLocal(s, _)
+                                    | ControlInst::FreshLocalCell(s)
+                                    | ControlInst::DropLocal(s)
+                                    if *s == slot
+                            ) || matches!(
+                                inst,
+                                ControlInst::MatchPattern { pattern, .. }
+                                    if pattern_mentions_local(pattern, slot)
+                            ))
+                        {
+                            conflict = true;
+                            break;
+                        }
+                        if !load_pcs.contains(&pc) && inst_local_uses(inst).contains(&slot) {
+                            conflict = true;
+                            break;
+                        }
+                    }
+                    CoalesceSlot::Global(gslot) => {
+                        if pc > first_load_pc {
+                            let pat_writes = match inst {
+                                ControlInst::MatchPattern { pattern, .. } => {
+                                    let mut pg = HashSet::new();
+                                    collect_pattern_globals(pattern, &mut pg);
+                                    pg.contains(&gslot)
+                                }
+                                _ => false,
+                            };
+                            if matches!(inst, ControlInst::StoreGlobal(g, _) if *g == gslot)
+                                || pat_writes
+                            {
+                                conflict = true;
+                                break;
+                            }
+                        }
+                        if !load_pcs.contains(&pc)
+                            && matches!(
+                                inst,
+                                ControlInst::LoadGlobal(_, g) | ControlInst::MoveGlobal(_, g)
+                                    if *g == gslot
+                            )
+                        {
+                            conflict = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if conflict {
+                continue;
+            }
+
+            let keep_dst = group[0].0;
+            for (_, load_pc, _) in &group[1..] {
+                drop_pcs.push(*load_pc);
+            }
+            for &(p_pc, f_sym) in &ordered_projs {
+                if let ControlInst::ProjectField { dst, .. } = &block.insts[p_pc] {
+                    block.insts[p_pc] = ControlInst::ProjectField {
+                        dst: *dst,
+                        receiver: keep_dst,
+                        field: f_sym,
+                    };
+                }
+            }
+        }
+
+        if !drop_pcs.is_empty() {
+            drop_pcs.sort_unstable();
+            drop_pcs.dedup();
+            for pc in drop_pcs.into_iter().rev() {
+                block.insts.remove(pc);
+            }
+        }
+    }
+}
+
+/// Rewrite still-live `LoadLocal(dst, slot)` instructions that feed exclusively borrowed
+/// call/builtin/method/tail-call sites later in the same basic block into `BorrowLocal(dst, slot)`.
+fn promote_borrowed_call_loads(
+    func: &mut ControlFunction,
+    all_funcs: &[ControlFunction],
+    symbols: &SymbolTable,
+) {
+    let mut reg_uses: HashMap<VReg, Vec<(usize, usize)>> = HashMap::new();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (pc, inst) in block.insts.iter().enumerate() {
+            for r in inst.input_regs() {
+                reg_uses.entry(r).or_default().push((bi, pc));
+            }
+        }
+        for r in block.terminator.input_regs() {
+            reg_uses.entry(r).or_default().push((bi, usize::MAX));
+        }
+    }
+
+    for (bi, block) in func.blocks.iter_mut().enumerate() {
+        let mut upgrades: Vec<(usize, VReg, LocalSlot)> = Vec::new();
+        for (pc, inst) in block.insts.iter().enumerate() {
+            let ControlInst::LoadLocal(dst, slot) = *inst else {
+                continue;
+            };
+            if func
+                .shared_locals
+                .get(slot.0 as usize)
+                .copied()
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let Some(uses) = reg_uses.get(&dst) else {
+                continue;
+            };
+            if uses.is_empty() {
+                continue;
+            }
+            let target_pc = uses[0].1;
+            if uses[0].0 != bi
+                || target_pc <= pc
+                || uses.iter().any(|&(ub, up)| ub != bi || up != target_pc)
+            {
+                continue;
+            }
+            let valid_consumer = if target_pc == usize::MAX {
+                is_valid_borrow_terminator(&block.terminator, dst, all_funcs)
+            } else {
+                is_valid_borrow_inst(&block.insts[target_pc], dst, all_funcs, symbols)
+            };
+            if !valid_consumer {
+                continue;
+            }
+            let end_excl = target_pc.saturating_add(1).min(block.insts.len());
+            let clobbered = block.insts[pc + 1..end_excl].iter().any(|inner| {
+                matches!(
+                    inner,
+                    ControlInst::StoreLocal(w, _) | ControlInst::MoveLocal(_, w) if *w == slot
+                )
+            });
+            if !clobbered {
+                upgrades.push((pc, dst, slot));
+            }
+        }
+        for (pc, dst, slot) in upgrades {
+            block.insts[pc] = ControlInst::BorrowLocal(dst, slot);
+        }
+    }
+}
+
+fn apply_perceus_to_function(
+    func: &mut ControlFunction,
+    all_funcs: &[ControlFunction],
+    symbols: &SymbolTable,
+    allow_slot_moves: bool,
+    is_main: bool,
+    private_main_globals: &HashSet<GlobalSlot>,
+    exit_globals: &HashSet<GlobalSlot>,
+) {
+    let rpo = func.rpo_order();
+    let reachable: HashSet<BlockId> = rpo.iter().copied().collect();
+
+    // ── Phase 0: coalesce sibling struct field projections so that the single
+    //    remaining load of the struct can become an ownership transfer. This must run
+    //    before Phase A, which decides which loads become transfers. ──
+    if allow_slot_moves {
+        coalesce_struct_projection_loads(func, is_main, private_main_globals);
+    }
+
+    // ── Phase A: LocalSlot & private-<main> GlobalSlot backward liveness ──
+    if allow_slot_moves {
+        let is_eligible_local = |s: LocalSlot| -> bool {
+            (s.0 as usize) < (func.n_locals as usize)
+                && !func
+                    .shared_locals
+                    .get(s.0 as usize)
+                    .copied()
+                    .unwrap_or(false)
+                && !func
+                    .param_borrows
+                    .get(s.0 as usize)
+                    .copied()
+                    .unwrap_or(false)
+        };
+
+        let no_exit_globals: HashSet<GlobalSlot> = HashSet::new();
+        let exit_seed: &HashSet<GlobalSlot> = if is_main {
+            exit_globals
+        } else {
+            &no_exit_globals
+        };
+        let SlotLiveness {
+            local_live_in,
+            local_live_out,
+            global_live_out,
+            ..
+        } = compute_slot_liveness(func, &is_eligible_local, private_main_globals, exit_seed);
+
+        let preds = func.predecessors();
+        for &bid in &rpo {
+            let mut entry_local_drops: BTreeSet<LocalSlot> = BTreeSet::new();
+            if bid != func.entry {
+                for &p in &preds[bid.0 as usize] {
+                    if !reachable.contains(&p) {
+                        continue;
+                    }
+                    for &s in &local_live_out[p.0 as usize] {
+                        if !local_live_in[bid.0 as usize].contains(&s) {
+                            entry_local_drops.insert(s);
+                        }
+                    }
+                }
+            } else {
+                for p_idx in 0..func.params.len() {
+                    let s = LocalSlot(p_idx as u16);
+                    if is_eligible_local(s) && !local_live_in[bid.0 as usize].contains(&s) {
+                        entry_local_drops.insert(s);
+                    }
+                }
+            }
+
+            let mut live_l = local_live_out[bid.0 as usize].clone();
+            let mut live_g: HashSet<GlobalSlot> = global_live_out[bid.0 as usize].clone();
+
+            let block = &mut func.blocks[bid.0 as usize];
+            for inst in block.insts.iter_mut().rev() {
+                match inst {
+                    ControlInst::StoreLocal(s, _) if is_eligible_local(*s) => {
+                        live_l.remove(s);
+                    }
+                    ControlInst::LoadLocal(dst, s) if is_eligible_local(*s) => {
+                        let d = *dst;
+                        let slot = *s;
+                        if !live_l.contains(&slot) {
+                            *inst = ControlInst::MoveLocal(d, slot);
+                        }
+                        live_l.insert(slot);
+                    }
+                    ControlInst::StoreGlobal(g, _)
+                        if is_main && private_main_globals.contains(g) =>
+                    {
+                        live_g.remove(g);
+                    }
+                    ControlInst::LoadGlobal(dst, g)
+                        if is_main && private_main_globals.contains(g) =>
+                    {
+                        let d = *dst;
+                        let slot = *g;
+                        if !live_g.contains(&slot) {
+                            *inst = ControlInst::MoveGlobal(d, slot);
+                        }
+                        live_g.insert(slot);
+                    }
+                    other => {
+                        for s in inst_local_uses(other) {
+                            if is_eligible_local(s) {
+                                live_l.insert(s);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !entry_local_drops.is_empty() {
+                let mut prefix: Vec<ControlInst> = entry_local_drops
+                    .into_iter()
+                    .map(ControlInst::DropLocal)
+                    .collect();
+                prefix.append(&mut block.insts);
+                block.insts = prefix;
+            }
+        }
+        promote_borrowed_call_loads(func, all_funcs, symbols);
+    }
+
+    // ── Phase B: VReg backward liveness, asymmetric branch & dead-dst `DropReg`, and KillMasks ──
+    let live_in = compute_vreg_live_in(func, &reachable);
+    let preds = func.predecessors();
+
+    for &bid in &rpo {
+        let mut entry_reg_drops: BTreeSet<VReg> = BTreeSet::new();
+        for &param_r in &func.blocks[bid.0 as usize].params {
+            if !live_in[bid.0 as usize].contains(&param_r) {
+                entry_reg_drops.insert(param_r);
+            }
+        }
+        if bid != func.entry {
+            for &p in &preds[bid.0 as usize] {
+                if !reachable.contains(&p) {
+                    continue;
+                }
+                let p_term = &func.blocks[p.0 as usize].terminator;
+                if let ControlTerminator::Branch {
+                    then_bb,
+                    then_args,
+                    else_bb,
+                    else_args,
+                    ..
+                } = p_term
+                {
+                    if *then_bb == bid && *else_bb != bid && reachable.contains(else_bb) {
+                        let else_blk = &func.blocks[else_bb.0 as usize];
+                        for &r in &live_in[else_bb.0 as usize] {
+                            if !else_blk.params.contains(&r)
+                                && !live_in[bid.0 as usize].contains(&r)
+                            {
+                                entry_reg_drops.insert(r);
+                            }
+                        }
+                        for &r in else_args {
+                            if !live_in[bid.0 as usize].contains(&r) {
+                                entry_reg_drops.insert(r);
+                            }
+                        }
+                    }
+                    if *else_bb == bid && *then_bb != bid && reachable.contains(then_bb) {
+                        let then_blk = &func.blocks[then_bb.0 as usize];
+                        for &r in &live_in[then_bb.0 as usize] {
+                            if !then_blk.params.contains(&r)
+                                && !live_in[bid.0 as usize].contains(&r)
+                            {
+                                entry_reg_drops.insert(r);
+                            }
+                        }
+                        for &r in then_args {
+                            if !live_in[bid.0 as usize].contains(&r) {
+                                entry_reg_drops.insert(r);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut live_after: HashSet<VReg> = HashSet::new();
+        for succ in func.blocks[bid.0 as usize].terminator.successors() {
+            if reachable.contains(&succ) {
+                let sblk = &func.blocks[succ.0 as usize];
+                for &r in &live_in[succ.0 as usize] {
+                    if !sblk.params.contains(&r) {
+                        live_after.insert(r);
+                    }
+                }
+            }
+        }
+        for r in func.blocks[bid.0 as usize].terminator.input_regs() {
+            live_after.insert(r);
+        }
+
+        let old_insts = std::mem::take(&mut func.blocks[bid.0 as usize].insts);
+        let mut rev_out: Vec<ControlInst> =
+            Vec::with_capacity(old_insts.len() + entry_reg_drops.len());
+        for inst in old_insts.into_iter().rev() {
+            let dead_dst = match (&inst, inst.dst()) {
+                (
+                    ControlInst::Const(
+                        _,
+                        ControlConst::Nil
+                        | ControlConst::Bool(_)
+                        | ControlConst::Int(_)
+                        | ControlConst::Float(_),
+                    ),
+                    _,
+                ) => None,
+                (_, Some(d)) if !live_after.contains(&d) => Some(d),
+                _ => None,
+            };
+            if let Some(d) = inst.dst() {
+                live_after.remove(&d);
+            }
+            for r in inst.input_regs() {
+                live_after.insert(r);
+            }
+            if let Some(d) = dead_dst {
+                rev_out.push(ControlInst::DropReg(d));
+            }
+            rev_out.push(inst);
+        }
+        for r in entry_reg_drops.into_iter().rev() {
+            rev_out.push(ControlInst::DropReg(r));
+        }
+        rev_out.reverse();
+        func.blocks[bid.0 as usize].insts = rev_out;
+    }
+
+    // Recompute exact `live_in` after `DropReg` insertion and populate `inst_kill_masks` & `term_kill_mask`.
+    let live_in = compute_vreg_live_in(func, &reachable);
+    for &bid in &rpo {
+        let mut live: HashSet<VReg> = HashSet::new();
+        for succ in func.blocks[bid.0 as usize].terminator.successors() {
+            if reachable.contains(&succ) {
+                let sblk = &func.blocks[succ.0 as usize];
+                for &r in &live_in[succ.0 as usize] {
+                    if !sblk.params.contains(&r) {
+                        live.insert(r);
+                    }
+                }
+            }
+        }
+
+        let term_mask = compute_terminator_kill_mask(func, bid, &reachable, &live_in, &live);
+        for r in func.blocks[bid.0 as usize].terminator.input_regs() {
+            live.insert(r);
+        }
+
+        let block = &mut func.blocks[bid.0 as usize];
+        block.term_kill_mask = term_mask;
+        let mut masks = vec![KillMask::Empty; block.insts.len()];
+        for (pc, inst) in block.insts.iter().enumerate().rev() {
+            if let ControlInst::DropReg(r) = inst {
+                live.remove(r);
+                continue;
+            }
+            if let Some(d) = inst.dst() {
+                live.remove(&d);
+            }
+            let inputs = inst.input_regs();
+            let suppress_kill = matches!(
+                inst,
+                ControlInst::Quasiquote(..) | ControlInst::Assert(..) | ControlInst::KeepAlive(..)
+            );
+            let mut m = KillMask::Empty;
+            for (k, &r) in inputs.iter().enumerate().rev() {
+                if !suppress_kill && !live.contains(&r) {
+                    m.set(k);
+                }
+                live.insert(r);
+            }
+            masks[pc] = m;
+        }
+        block.inst_kill_masks = masks;
+    }
 }

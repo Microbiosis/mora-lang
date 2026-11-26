@@ -14,6 +14,7 @@
 pub mod builtins;
 pub mod continuation;
 pub mod engine;
+pub(crate) mod loans;
 pub mod value_ops;
 
 use std::sync::Arc;
@@ -38,6 +39,14 @@ pub use engine::{VmEngine, VmOutcome, VmYield, collect_env_names};
 pub use value_ops::{index_assign_value, index_value};
 
 /// Execute a compiled [`ControlProgram`] entry function (`<main>`) and return `(result, globals)`.
+///
+/// The returned globals hold **the values that remain after `<main>` returned**. A script's
+/// top-level binding dies with `<main>`: the P6-1 Perceus ownership pass transfers its
+/// ownership out of the global slot at the binding's final read, so the slot is empty once the
+/// value has been consumed. A host that must observe the globals' values after execution (the
+/// REPL captures every global of a chunk into the session environment) compiles with
+/// [`ControlProgram::preserve_globals_at_exit`], which keeps every `<main>`-private global in
+/// its slot.
 pub fn execute_program(
     prog: Arc<ControlProgram>,
     core: &mut CoreRuntime,

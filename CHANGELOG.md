@@ -2,6 +2,54 @@
 
 All notable changes to Mora will be documented in this file.
 
+## [Unreleased] — Phase P6-1：Lean 4 Perceus / FBIP 最后使用所有权转移与零拷贝原地复用
+
+### P6-1：Perceus / FBIP 最后使用所有权、借用推断与原地复用（`tests/p6_perceus_fbip_reuse.rs`）
+
+- 方法分派统一解析借用和独占接收者。零维张量的 `.len()` 返回 0，自定义枚举的同名方法按其 `impl` 执行。成功且独占的模式分支可移动绑定，字符串追加复用左侧容量，异长列表拼接复用独占块。
+- SSA 的最后使用标记可跨多个 64 位字。只读参数以**帧槽地址借用**（`FrameLoans` + `SlotAddress`）向下传递：调用点不再克隆 16 字节寄存器里的外层 `Arc<Value>`，被借用的槽由调用者持有；按值读取、闭包/`spawn`/`select` 捕获、续延截取（`snapshot_loans`）与尾调用（`inherit_tail_owners`）时物化为拥有的槽。指令级物化只在唯一分发点 `VmEngine::step_script` 执行，`inst_local_uses` 对未来新增指令**穷举分类**（无兜底分支，新增 `ControlInst` 必须显式表态）。效应处理屏障维护常数时间计数并保护所有权移动。
+- `rms_norm` 和 `layer_norm` 共用**同一份与内存布局无关的数值定义**（先平移 origin、再按 magnitude 缩放后累计矩），CPU 主机路径与 CUDA/Vulkan/Metal 行内核按同一约定实现：对称矩阵与其转置视图、超大偏移（`65536.0±0.0039`）与 `[1e20, -1e20]` 溢出输入在 CPU / GPU 上给出一致结果；可复用独占、连续且未挂接任何活跃微分磁带的输入。专项测试同时检查反向梯度、前向方向导数、图追踪、布局/溢出不变性，以及标准库 AdamW 更新与 Transformer 推理。
+- **零拷贝原地复用快路径（`src/value/`、`src/runtime/builtins/math.rs`）**：`Value::StructInstance.fields` 升级为 `Arc` 写时复制 `Dict`（克隆 $O(1)$）；`dict.set` / `dict.remove` / `list.push` / `list.set` 在 `Arc::strong_count == 1` 时原地改写底层 `HashMap` / 链表脊；`Tensor` 单元算子（含新增实例方法 `.log()` / `.sin()` / `.cos()` 及 `math.log` / `math.exp` / `math.sin` / `math.cos` / `math.sqrt` / `math.abs` / `math.tanh` 所有权流转路径 `call_math_method_fbip`）与二元算子在 5 项安全判据（唯一持有 / 连续独占 / 未被 autograd 磁带跟踪 / 非共享 KV CoW 页 / dtype·shape·device 一致）全部成立时复用 64B 主机缓冲或 GPU VRAM 缓冲。
+- **`<main>` 全局槽所有权转移（本里程碑收口项）**：新增 `ControlProgram::preserve_globals_at_exit` 一等属性 —— 脚本 / AOT / 模块初始化器的全局在 `<main>` 返回后即死亡（可搬移），REPL chunk 与 `eval` 会把全局捕获进宿主环境（须保留）。据此 `let x = …; f(x)` 在 `x` 死亡后把所有权搬出全局槽，调用方由此获得唯一持有并触发原地复用；`std/mcp.mora` 的 `McpServer.tool` / `resource` / `prompt` 构建链据此由 O(n²) 降为 O(n)。
+- **槽位活跃性共享分析 + 编译期安全网（`src/mir/control/liveness.rs`）**：优化器与 `verify_program` 共用同一份 `LocalSlot` / `GlobalSlot` 反向活跃性分析，任何会杀死仍存活槽位的所有权转移都在编译期报错，而非在运行期静默丢值。
+
+#### 破坏性语义变更：脚本顶层绑定随 `<main>` 消亡
+
+- `execute_program` 返回的 globals 现在持有 **`<main>` 返回后仍然存在的值**。脚本的顶层绑定在其最后一次读取处被 Perceus 所有权转移搬出全局槽，因此**脚本顶层绑定随 `<main>` 一同消亡** —— 这正是「`let x = …; f(x)` 复用 `x` 的缓冲区」得以成立的前提。
+- **需要执行后仍能读到全局值的宿主走保留全局的路径**：REPL chunk 与 `eval` 经 `lower_program_with_dyn_globals` 编译，`ControlProgram::preserve_globals_at_exit` 为真，全部 `<main>` 私有全局留在槽内不变。
+- 受影响的仓库内观察通道：`tests/executor_switch.rs::switch_while_break` 改为观察**程序返回值**（fixture 末表达式 `total + 1000i` → 1010），比原先回读全局更强地断言了 break 行为。
+#### 随之重新评估的「否定性判据」
+
+- `tests/index_read_matrix.rs::d361_index_assignment_has_no_reachable_syntax`：P6-1 为 `list` 实现了 `set(i, v)` 值语义方法后，原第四个候选写法 `xs.set(0, 9)` **不再**是「索引赋值的候选写法」（它是普通方法调用，不经过 `IndexAssign` 链路）。判据收敛为三种真正表达下标赋值的写法（`xs[0] = 9` / `xs.at(0) = 9` / `m["a"] = 2`）仍然不可达，并新增 `d361_list_set_is_a_value_semantics_method_not_index_assignment` 钉住 `list.set` 的值语义（原列表不变、返回新列表）。
+- `tests/tier2_mir_expr_pipeline.rs`：变量的**最后一次**读取现在是所有权转移指令（`MoveGlobal` / `MoveLocal`），「变量引用降低为变量读取指令」的判据相应纳入这两条指令。
+- `tests/signature_parity.rs`：新增的 `fbip_stats` / `fbip_reset_stats`（P6-1）与 `Ok` / `Err` / `try_call`（一等 `result<T, E>`）补进逐条对拍清单，签名表不再有未覆盖条目。
+- `tests/spec_code_block_census.rs::d110_result_generic_annotation_is_rejected_not_silently_dropped`：`result<…>` 泛型标注现已**受支持且被 typeck 强制**（此前是被明确报错），判据随之改为「受支持 + 被强制」，并保留「不得静默丢弃」这一核心不变式。
+
+#### P6-1 收尾：清除本次变更引入的零调用公开面，并偿还上游欠账
+
+- **零调用 public API 一律不留（AGENTS.md §0）**：本里程碑新增的 `Dict` 类型有 10 个公开方法，其中 **5 个零调用**（`new` / `with_capacity` / `is_unique` / `id` / `as_hashmap`）；`List::is_unique` 同样零调用；另有一个被 P6-1 的 `eval_binary_fbip` 取代后**零调用**的孤儿 `flow::eval_binary_tracked`。三者一并删除 —— `as_hashmap` 与 `Deref<Target = HashMap>` 完全重复；`is_unique` 的唯一性判定已在 `set_owned` / `push_owned` 内部以 `Arc::get_mut` 实现；`eval_binary_tracked` 留下即是重复路径。删除后全仓 `pub fn` 从 538 降到 **535**，零引用集合（22 个）与 P6-1 之前**完全相同** —— P6-1 净增 20 个 public API 名称，**零引用增量为零**。
+- **`tests/pub_fn_zero_ref_census.rs`**：按该文件自身契约（超上界 ⇒ 重做「零引用」分类）完成 P6-1 的二次分类 —— 逐个核实调用点（普查按名字计数，同名方法会互相遮蔽，故必须逐点核实）后确认新增 API 全部已接线；上界由 520 提到 **540**，保持「超界即触发重新分类」的紧箍咒而非一路放宽；文件头把 v0.104.6 的历史快照（含已删除的 `interpreter/` 等模块）与当前实测**分开记载**。
+- **偿还 `145e15d`（一等 `result<T, E>`）遗留的测试欠账**：`tests/mora_syntax_forms.rs` 的语法形态速查表仍把 `result<number, string>` 标注记作 `Rejected` —— 改为 `Form::Ok`（解析层已支持），并**新增**一条真正不受支持的泛型样本 `map<number, number>`，继续钉住 D110「不受支持的泛型必须报错」这一不变式（速查表 `Rejected` 样本数保持 8 条，`d139_table_is_not_vacuous` 仍有余量）。
+- **文档漂移修正**：`docs/mora-spec.md` §8.2 仍写「后缀 `?` 产生式……当前版本尚未启用」，实测 v0.112.0 G2 起 `result` / `option` / nullable 的后缀 `?` 错误传播**已完整接通**（Parser → HM → Control SSA IR → MORABC02 → VM；实测 `Err` 原样上抛、`Ok` 解包后继续），已改为准确描述；`tests/spec_ebnf_surface.rs` 的文件头同步修正（含两处指向已不存在的测试名的引用）。
+
+- **GPU 用例在无硬件环境下正确跳过**：`Tensor::devices()` 只列出**真实硬件**，但被列出的设备仍可能因软件 Vulkan ICD / 驱动半装而**原生管线根本跑不起来**（上游 CI 的失败形态正是「vulkan:0 编译 SPIR-V 管线失败」）。实机 VRAM 复用断言之前先跑一个最小 kernel **探针**：设备未列出、或探针失败（即环境不具备条件）都跳过实机断言并打印原因；探针通过后才断言 —— 探针只判**环境可用性**，FBIP 链路一旦出错仍照常失败，不会把产品缺陷吞掉。`MORA_FORCE_CPU_EMULATION=1` 可在本地复现「无 GPU」形态。
+
+- **结构体字段级所有权转移（`ControlInst::ProjectField { dst, receiver, field }`，取代旧的运行期探测式提取）**：`Value::StructInstance` 收敛为 `fields: Arc` 写时复制 `Dict`、`const_args: Arc<[(String, i64)]>` 与 `def: Arc<StructDefRuntime>`（克隆为 $O(1)$ `Arc::clone`）；`lower.rs` 在编译期携带名义结构体类型表（`struct_fields`、`task` 返回类型、`impl self` 目标、`let`/`assign`/构造器/链式投影推导），把**已证明**的结构体字段读直接降为 `ProjectField`（`MORABC02` opcode 59，无 `siblings` 数组、无运行期表探测）；`coalesce_struct_projection_loads` 合并 `<main>` 私有全局与函数局部槽的块内兄弟投影；运行时 `ProjectField` 经 `Arc::get_mut` 在唯一持有时以 `fields.remove_if_unique` 原地摘出字段，共享或在多发续延屏障下自动 $O(1)$ 克隆。零参 `impl` 方法与投影顺序无关性由 `p6_1_struct_projection_with_zero_arg_impl_method_and_continuation_is_sound` / `p6_1_struct_field_reuse_is_independent_of_projection_order` 钉住。
+- **主计划判据逐条对齐**：① 「绝不修改共享的 RadixAttention CoW KV 页」在 Mora 的存储模型里是**结构性成立** —— KV 分配器只持有原始字节页（`AlignedByteBuffer` / `Arc<dyn DeviceVramBuffer>`），`write_kv` 经 `&Tensor` 借用**拷贝**写入，`read_kv` 用 `Tensor::from_raw` 物化新张量，`Tensor` 存储在所有权边界上不可能别名 KV 页。该事实已写进 `can_reuse_tensor_in_place` 的判据说明（原文自称 5 条却只列了 4 条），并落为可执行不变量 `p6_1_fbip_tensor_reuse_never_corrupts_shared_kv_cache_pages`（FBIP 复用链跑完后 KV 页必须逐位不变）。② 输出 `(dtype, shape, device)` 与候选缓冲的匹配在**调用点**落实：`eval_tensor_binary_fbip` 前置拒绝 dtype / device 不一致并比对 `a.shape == out_shape`，一元路径原地改写天然同形同型。③ 新增 `p6_1_std_http_router_builder_chain_reuses_route_spine_in_place` 与 `p6_1_fbip_reuse_keeps_branch_and_closure_aliases_intact`（分支 / 闭包别名零串写，且别名存活时 `dict_inplace_reuses` 必须为 0 —— 证明走的是拷贝路径）。
+
+- **stdlib 绕法写法全部撤销，源码恢复自然形态**：既然原语到位，`std/net/http` 的 `Router.route` / `Router.use_middleware` 与 `std/mcp.mora` 的 `McpServer.tool` / `resource` / `prompt` 都不再需要「把字段提到局部量、并把被改字段放到最后读」的书写约束，全部恢复成 `Router(routes = self.routes.push(entry), middlewares = self.middlewares)` / `McpServer(name=self.name, …, tools=self.tools.set(name, t), …)` 这样的自然写法。实测：Router 64 条路由的构建链 `list_inplace_reuses` = **64**，McpServer 64 个 tool 的链 `dict_inplace_reuses` ≥ **60** —— 与绕法版本持平，但不再依赖源码顺序。
+- **新增不变量 `p6_1_struct_field_reuse_is_independent_of_projection_order`**：同一个「被改字段先读 / 后读」的两份等价源码必须给出**完全相同**的原地复用次数（当前均为 64），把「复用行为不得由源码顺序决定」钉成可执行判据。
+
+#### P6-1 收口：一致性重整与验收反例闭合（本轮）
+
+- **单一真值源（借用物化）**：借入参数的按值物化从三处执行器（`exec_inst` / `exec_spawn` / `exec_select`）收敛到唯一指令分发点 `VmEngine::step_script`；`inst_local_uses` 改为对 `ControlInst` **穷举匹配**（61 个变体全部显式分类，删除 `_ => {}` 兜底），未来新增指令若未表态则编译失败。`Select` 的 `parent_locals` 快照与 `spawn`/闭包捕获均在物化之后取。
+- **方法借用摘要单一真值源**：`liveness::method_receiver_borrows` / `method_arg_borrows` 同时供 `infer_param_borrows` 与 `verify_program` 使用；用户 `impl` 的 `param_borrows` 优先于内建方法名表，因此 `impl Verdict { task is_ok(self): Verdict }` 返回 `self` 时，包装函数 `return x.is_ok()` 的形参不再被误判为借用（`p6_1_custom_impl_method_borrow_summary_matches_runtime_dispatch`）。
+- **借用零外层 `Arc` 克隆可观测**：`RegSlot` 手写 `Clone`，debug 构建对 `Heap(Arc<Value>)` 克隆做线程本地计数，并以 `fbip_stats().get("regslot_heap_clones")` 暴露（release 构建编译为空、恒为 0，避免热路径开销）；`p6_1_borrowed_calls_do_not_clone_the_outer_arc` 断言 9 次借入调用后计数为 0 且 `borrowed_call_elisions >= 9`。
+- **`.morac` 格式边界显式化（破坏性变更）**：P6-1 为字节码增加逐函数借用摘要与任意元数 kill mask 后，`BYTECODE_VERSION` 由 `2` 升为 **`3`**；解码器版本不匹配时直接报 `unsupported bytecode version N (expected 3)`，不再把旧布局解码成错误入口。`v2` 产物必须从源码重建（`p6_1_morac_aot_bytecode_preserves_fbip_reuse` + `stale_bytecode_version_is_rejected_before_any_decode`）。
+- **主机计算写回原显存**：对后端无原生内核的精度（如 Vulkan `f64`），`reuse_storage` 在保留 `DeviceVramBuffer` 的前提下经主机计算写回同一显存缓冲并计入 `tensor_vram_reuses`；`p6_1_gpu_unary_reuse_holds_for_every_supported_dtype` 在 CUDA/Vulkan × `f32/f64/f16/bf16` 全矩阵断言存储身份不变且复用计数为 1。
+- **共享载荷零复制**：新增 `tests/p6_shared_payloads.rs`（3 项）以 100,003 字节载荷的全局分配计数证明内建 `result.is_ok()`、共享枚举 `Packet::Data(_)` 通配匹配与成功绑定分支都不复制载荷；模式解构收敛到 `src/runtime/vm/value_ops/pattern.rs` 的「先整体结构检查、成功后沿同一组投影收集绑定，仅独占字段允许移动」。
+- **测试规模**：`tests/p6_perceus_fbip_reuse.rs` 由 19 项扩至 **29 项**，加 `tests/p6_shared_payloads.rs` 3 项，P6-1 专项共 **32 项**；新增 GPU 行归一化布局/溢出不变性与全精度/全设备一元复用回归。
+
 ## [0.112.0] — Phase P5 生产级端到端 LLM 栈：GPU `kernel` v2、RadixAttention 前缀缓存与 AVX2+FMA GEMM JIT、分布式 `ProcessGroup` v2、纯 Mora `std/nn/` 全栈与 `mora profile`/`mora bench` 工具链
 
 在不引入任何外部 Cargo 依赖（保持 `Cargo.toml` / `Cargo.lock` 唯一 1 包、**0 生产依赖 / 0 测试依赖**）与严格 Rust stable 通道的前提下，完成 `v0.112.0`（Phase P5）全部五个核心里程碑（P5-1A/1B ~ P5-5），达成从零依赖纯 Mora BPE 分词、Transformer 训练、Safetensors/GGUF 权重序列化到 RadixAttention + OpenAI HTTP/SSE + MCP 服务的端到端生产闭环。

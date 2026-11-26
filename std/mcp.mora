@@ -289,8 +289,7 @@ end
 export impl McpServer
   task tool(self, name: string, description: string, schema: dict<string, any>, handler: any): McpServer
     let t = McpTool(name=name, description=description, schema=schema, handler=handler)
-    let next_tools = self.tools.set(name, t)
-    return McpServer(name=self.name, version=self.version, tools=next_tools, resources=self.resources, prompts=self.prompts)
+    return McpServer(name=self.name, version=self.version, tools=self.tools.set(name, t), resources=self.resources, prompts=self.prompts)
   end
 
   task typed_tool(self, name: string, description: string, struct_schema: dict<string, any>, handler: any): McpServer
@@ -300,14 +299,12 @@ export impl McpServer
 
   task resource(self, uri: string, name: string, description: string, mime_type: string, reader: any): McpServer
     let res = McpResource(uri=uri, name=name, description=description, mime_type=mime_type, reader=reader)
-    let next_res = self.resources.set(uri, res)
-    return McpServer(name=self.name, version=self.version, tools=self.tools, resources=next_res, prompts=self.prompts)
+    return McpServer(name=self.name, version=self.version, tools=self.tools, resources=self.resources.set(uri, res), prompts=self.prompts)
   end
 
   task prompt(self, name: string, description: string, arguments: list<dict<string, any>>, handler: any): McpServer
     let p = McpPrompt(name=name, description=description, arguments=arguments, handler=handler)
-    let next_prompts = self.prompts.set(name, p)
-    return McpServer(name=self.name, version=self.version, tools=self.tools, resources=self.resources, prompts=next_prompts)
+    return McpServer(name=self.name, version=self.version, tools=self.tools, resources=self.resources, prompts=self.prompts.set(name, p))
   end
 
   task handle_jsonrpc(self, raw_json: string): string

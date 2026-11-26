@@ -321,8 +321,9 @@ impl ParserV3 {
         Vec<crate::mir::witness::MirWitness>,
     )> {
         let witnesses = Self::parse_witnesses_with_modules(source, virtual_modules)?;
-        // 单一路径直出 ControlProgram：witness → lowering，无中间 IR 层。
-        let prog = crate::mir::control::lower_program(&witnesses)?;
+        // 单一路径直出 ControlProgram：witness → 纯语法降级 → 默认 Perceus 所有权标注。
+        let mut prog = crate::mir::control::lower_program(&witnesses)?;
+        crate::mir::control::optimize_program(&mut prog, crate::mir::control::OptLevel::None);
         Ok((prog, witnesses))
     }
 

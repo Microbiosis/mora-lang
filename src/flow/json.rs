@@ -98,7 +98,7 @@ impl JsonBuilder for FlowJsonBuilder {
     }
 
     fn finish_object(obj: Self::ObjectAcc) -> Self::Output {
-        Value::Dict(obj)
+        Value::Dict(obj.into())
     }
 }
 
@@ -682,25 +682,20 @@ pub fn value_to_json(value: &Value) -> String {
                 Value::StructType(def) => {
                     stack.push(SerStep::Val(Cow::Owned(def.to_schema_value()), atom_depth));
                 }
-                Value::StructInstance {
-                    fields,
-                    field_order,
-                    def,
-                    ..
-                } => {
+                Value::StructInstance { fields, def, .. } => {
                     out.push('{');
                     stack.push(SerStep::Raw("}"));
                     let mut projected: Vec<(String, Value)> = Vec::new();
-                    for fname in field_order {
+                    for fdef in &def.fields {
+                        let fname = &fdef.name;
                         let Some(val) = fields.get(fname) else {
                             continue;
                         };
-                        let json_tag = def.fields.iter().find(|f| &f.name == fname).and_then(|f| {
-                            f.tags
-                                .iter()
-                                .find(|(k, _)| k == "json")
-                                .map(|(_, v)| v.as_str())
-                        });
+                        let json_tag = fdef
+                            .tags
+                            .iter()
+                            .find(|(k, _)| k == "json")
+                            .map(|(_, v)| v.as_str());
                         let mut key = fname.clone();
                         let mut omit_empty = false;
                         if let Some(tag) = json_tag {
@@ -1191,7 +1186,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("x".to_string(), Value::Int(42));
         map.insert("y".to_string(), Value::Float(1.5));
-        let v = Value::Dict(map);
+        let v = Value::Dict(map.into());
         let json = value_to_json(&v);
         let v2 = json_to_value(&json).unwrap();
         match v2 {

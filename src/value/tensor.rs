@@ -16,6 +16,9 @@
 //!    when `requires_grad` is active or when the storage is aliased by multiple views
 //!    (`Arc::strong_count(&storage) > 1 || is_view`).
 
+mod normalization;
+pub(crate) use normalization::RowNorm;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1322,6 +1325,15 @@ impl Tensor {
         self.offset == 0 && self.strides == contiguous_strides(&self.shape)
     }
 
+    /// Physical buffer identity (GPU VRAM handle when VRAM-resident without triggering D2H sync,
+    /// or 64-byte aligned host pointer otherwise) for deterministic zero-copy & FBIP verification.
+    pub fn storage_id(&self) -> i64 {
+        if let Some(vbuf) = self.storage.vram_buffer() {
+            return vbuf.raw_handle() as i64;
+        }
+        self.storage.aligned_byte_ptr() as usize as i64
+    }
+
     /// Read the element at multi-dimensional `coords` as `f64`.
     pub fn get_at(&self, coords: &[usize]) -> f64 {
         let mut idx = self.offset as isize;
@@ -1754,62 +1766,12 @@ impl Tensor {
 
     /// Root Mean Square Layer Normalization (`RMSNorm`) along the last axis.
     pub fn rms_norm(&self, eps: f64) -> MoraResult<Arc<Self>> {
-        if !self.dtype.is_float() {
-            return Err(MoraError::Runtime(format!(
-                "Tensor.rms_norm requires a floating-point dtype, got {}",
-                self.dtype
-            )));
-        }
-        let last_dim = *self.shape.last().unwrap_or(&1);
-        let mut flat = self.to_flat_vec();
-        for row in flat.chunks_mut(last_dim) {
-            let mean_sq = row.iter().map(|v| v * v).sum::<f64>() / (last_dim as f64);
-            let inv_rms = 1.0 / (mean_sq + eps).sqrt();
-            for v in row.iter_mut() {
-                *v = quantize_for_dtype(*v * inv_rms, self.dtype);
-            }
-        }
-        Self::from_raw(
-            flat,
-            self.shape.clone(),
-            self.dtype,
-            self.device.clone(),
-            self.requires_grad,
-        )
+        RowNorm::Rms.allocated(self, eps)
     }
 
-    /// Standard Layer Normalization (`LayerNorm`) along the last axis.
+    /// 沿最后一维执行 LayerNorm。
     pub fn layer_norm(&self, eps: f64) -> MoraResult<Arc<Self>> {
-        if !self.dtype.is_float() {
-            return Err(MoraError::Runtime(format!(
-                "Tensor.layer_norm requires a floating-point dtype, got {}",
-                self.dtype
-            )));
-        }
-        let last_dim = *self.shape.last().unwrap_or(&1);
-        let mut flat = self.to_flat_vec();
-        for row in flat.chunks_mut(last_dim) {
-            let mean = row.iter().sum::<f64>() / (last_dim as f64);
-            let var = row
-                .iter()
-                .map(|v| {
-                    let d = *v - mean;
-                    d * d
-                })
-                .sum::<f64>()
-                / (last_dim as f64);
-            let inv_std = 1.0 / (var + eps).sqrt();
-            for v in row.iter_mut() {
-                *v = quantize_for_dtype((*v - mean) * inv_std, self.dtype);
-            }
-        }
-        Self::from_raw(
-            flat,
-            self.shape.clone(),
-            self.dtype,
-            self.device.clone(),
-            self.requires_grad,
-        )
+        RowNorm::Layer.allocated(self, eps)
     }
 
     /// Index along axis 0 (`t[idx]`): supports negative indices and optional multi-tape autograd tracking.
@@ -2488,7 +2450,7 @@ pub fn call_tensor_associated(
                     .into_iter()
                     .map(|(k, v)| (k, Value::String(v)))
                     .collect();
-            Ok(Value::Dict(map))
+            Ok(Value::Dict(map.into()))
         }
         "zeros" => {
             let shape_val = args.first().ok_or_else(|| {
@@ -2746,6 +2708,145 @@ pub fn call_tensor_associated(
     }
 }
 
+/// 复用必须保留物理布局与结果类型。嵌套 no_grad 暂停记录，但外层磁带仍可读取旧值。
+/// 没有上下文的宿主调用无法判断已有节点的磁带寿命，保留这些节点。
+fn can_reuse_tensor_in_place(
+    t: &Arc<Tensor>,
+    autograd: Option<&AutogradContext>,
+    dtype: DType,
+    shape: &[usize],
+    device: &Device,
+) -> bool {
+    t.dtype == dtype
+        && t.shape == shape
+        && &t.device == device
+        && !t.is_view
+        && Arc::strong_count(t) == 1
+        && Arc::strong_count(&t.storage) == 1
+        && t.storage
+            .vram
+            .read()
+            .as_ref()
+            .is_none_or(|buffer| Arc::strong_count(buffer) == 1)
+        && t.is_contiguous()
+        && t.storage.byte_len() == t.nbytes()
+        && autograd.map_or_else(|| t.grad_nodes.is_empty(), |ag| !ag.has_live_tape_node(t))
+}
+
+#[inline]
+fn prepare_reused_tensor_meta(t: &mut Arc<Tensor>, requires_grad: bool) {
+    if (!t.grad_nodes.is_empty() || t.requires_grad != requires_grad)
+        && let Some(inner) = Arc::get_mut(t)
+    {
+        inner.grad_nodes.clear();
+        inner.requires_grad = requires_grad;
+    }
+}
+
+/// Shared read-only inspection / reduction dispatch on `&Tensor` (0 arguments) used by BOTH
+/// [`call_tensor_method_fbip`] and borrowed `RegSlot` method dispatch (`method.rs`).
+pub(crate) fn eval_tensor_readonly(
+    t: &Arc<Tensor>,
+    method: &str,
+    arity: usize,
+    is_tracked: bool,
+) -> Option<MoraResult<Value>> {
+    if arity != 0
+        && matches!(
+            method,
+            "storage_id" | "is_vram_resident" | "to_bytes" | "to_utf8"
+        )
+    {
+        return Some(Err(MoraError::Runtime(format!(
+            "Tensor.{method}() expects 0 arguments, got {arity}"
+        ))));
+    }
+    match method {
+        "shape" => Some(Ok(Value::List(
+            t.shape
+                .iter()
+                .map(|&d| Value::Int(d as i64))
+                .collect::<Vec<_>>()
+                .into(),
+        ))),
+        "ndim" | "rank" => Some(Ok(Value::Int(t.rank() as i64))),
+        "numel" => Some(Ok(Value::Int(t.numel() as i64))),
+        "nbytes" | "byte_len" => Some(Ok(Value::Int(t.nbytes() as i64))),
+        "storage_id" => Some(Ok(Value::Int(t.storage_id()))),
+        "len" => Some(Ok(Value::Int(t.shape.first().copied().unwrap_or(0) as i64))),
+        "dtype" => Some(Ok(Value::String(t.dtype.short_name().to_string()))),
+        "device" => Some(Ok(Value::String(t.device.to_string()))),
+        "is_contiguous" => Some(Ok(Value::Bool(t.is_contiguous()))),
+        "is_vram_resident" => Some(Ok(Value::Bool(t.is_vram_resident()))),
+        "requires_grad" => Some(Ok(Value::Bool(t.requires_grad))),
+        "to_bytes" => Some(t.to_bytes().map(Value::Tensor)),
+        "to_utf8" => Some(t.to_utf8().map(Value::String)),
+        "to_list" => Some(Ok(t.to_nested_list())),
+        "item" => {
+            if t.numel() != 1 {
+                Some(Err(MoraError::Runtime(format!(
+                    "Tensor.item() requires a 1-element tensor, got {} elements (shape {:?})",
+                    t.numel(),
+                    t.shape
+                ))))
+            } else {
+                Some(Ok(t.get_linear_value(0)))
+            }
+        }
+        "sum" if !is_tracked => {
+            let s: f64 = t.to_flat_vec().iter().sum();
+            Some(Ok(scalar_value_for_dtype(s, t.dtype)))
+        }
+        "mean" if !is_tracked => {
+            let flat = t.to_flat_vec();
+            if flat.is_empty() {
+                Some(Err(MoraError::Runtime(
+                    "Tensor.mean() cannot be called on an empty tensor".to_string(),
+                )))
+            } else {
+                let m = flat.iter().sum::<f64>() / (flat.len() as f64);
+                let dt = if t.dtype.is_float() {
+                    t.dtype
+                } else {
+                    DType::F64
+                };
+                Some(Ok(scalar_value_for_dtype(m, dt)))
+            }
+        }
+        "max" => {
+            let flat = t.to_flat_vec();
+            match flat.first() {
+                None => Some(Err(MoraError::Runtime(
+                    "Tensor.max() cannot be called on an empty tensor".to_string(),
+                ))),
+                Some(&first) => {
+                    let m = flat.iter().copied().fold(first, f64::max);
+                    Some(Ok(scalar_value_for_dtype(m, t.dtype)))
+                }
+            }
+        }
+        "min" => {
+            let flat = t.to_flat_vec();
+            match flat.first() {
+                None => Some(Err(MoraError::Runtime(
+                    "Tensor.min() cannot be called on an empty tensor".to_string(),
+                ))),
+                Some(&first) => {
+                    let m = flat.iter().copied().fold(first, f64::min);
+                    Some(Ok(scalar_value_for_dtype(m, t.dtype)))
+                }
+            }
+        }
+        _ => None,
+    }
+}
+/// Sentinel error returned when a tensor method name is not a built-in `Tensor` method, returning
+/// ownership of `Arc<Tensor>` intact (`strong_count` preserved) for user `impl` lookup.
+pub(crate) enum TensorMethodDispatch {
+    Handled(MoraResult<Value>),
+    UnknownMethod(Arc<Tensor>, MoraError),
+}
+
 /// Dispatch `t.<method>(args...)` instance method calls on [`Value::Tensor`].
 pub fn call_tensor_method(t: &Arc<Tensor>, method: &str, args: &[Value]) -> MoraResult<Value> {
     call_tensor_method_tracked(t, method, args, None)
@@ -2756,63 +2857,74 @@ pub fn call_tensor_method_tracked(
     t: &Arc<Tensor>,
     method: &str,
     args: &[Value],
-    mut autograd: Option<&mut AutogradContext>,
+    autograd: Option<&mut AutogradContext>,
 ) -> MoraResult<Value> {
-    let is_tracked = autograd.as_ref().is_some_and(|ag| ag.is_tracked(t));
-    match method {
-        "shape" => Ok(Value::List(
-            t.shape
-                .iter()
-                .map(|&d| Value::Int(d as i64))
-                .collect::<Vec<_>>()
-                .into(),
-        )),
-        "ndim" | "rank" => Ok(Value::Int(t.rank() as i64)),
-        "numel" => Ok(Value::Int(t.numel() as i64)),
-        "nbytes" | "byte_len" => Ok(Value::Int(t.nbytes() as i64)),
-        "len" => Ok(Value::Int(t.shape.first().copied().unwrap_or(0) as i64)),
-        "dtype" => Ok(Value::String(t.dtype.short_name().to_string())),
-        "device" => Ok(Value::String(t.device.to_string())),
-        "is_contiguous" => Ok(Value::Bool(t.is_contiguous())),
-        "is_vram_resident" => {
-            if !args.is_empty() {
-                return Err(MoraError::Runtime(format!(
-                    "Tensor.is_vram_resident() expects 0 arguments, got {}",
-                    args.len()
-                )));
-            }
-            Ok(Value::Bool(t.is_vram_resident()))
-        }
-        "to_bytes" => {
-            if !args.is_empty() {
-                return Err(MoraError::Runtime(format!(
-                    "Tensor.to_bytes() expects 0 arguments, got {}",
-                    args.len()
-                )));
-            }
-            Ok(Value::Tensor(t.to_bytes()?))
-        }
-        "to_utf8" => {
-            if !args.is_empty() {
-                return Err(MoraError::Runtime(format!(
-                    "Tensor.to_utf8() expects 0 arguments, got {}",
-                    args.len()
-                )));
-            }
-            Ok(Value::String(t.to_utf8()?))
-        }
+    match call_tensor_method_fbip(Arc::clone(t), method, args, autograd, None) {
+        TensorMethodDispatch::Handled(res) => res,
+        TensorMethodDispatch::UnknownMethod(_, err) => Err(err),
+    }
+}
+
+/// P6-1 Perceus/FBIP: Dispatch `t.<method>(args...)` consuming `t: Arc<Tensor>` by ownership so
+/// uniquely-owned contiguous tensors reuse their physical 64B host or GPU VRAM buffer in place.
+pub(crate) fn call_tensor_method_fbip(
+    mut t: Arc<Tensor>,
+    method: &str,
+    args: &[Value],
+    mut autograd: Option<&mut AutogradContext>,
+    fbip_stats: Option<&crate::runtime::fbip::FbipCounters>,
+) -> TensorMethodDispatch {
+    let is_tracked = autograd.as_ref().is_some_and(|ag| ag.is_tracked(&t));
+    if let Some(result) = eval_tensor_readonly(&t, method, args.len(), is_tracked) {
+        return TensorMethodDispatch::Handled(result);
+    }
+    if !matches!(
+        method,
+        "contiguous"
+            | "with_grad"
+            | "reshape"
+            | "transpose"
+            | "to_dtype"
+            | "to_device"
+            | "to"
+            | "fill_"
+            | "add_"
+            | "mul_"
+            | "sum"
+            | "mean"
+            | "abs"
+            | "sqrt"
+            | "exp"
+            | "ln"
+            | "log"
+            | "sin"
+            | "cos"
+            | "relu"
+            | "gelu"
+            | "silu"
+            | "tanh"
+            | "sigmoid"
+            | "softmax"
+            | "rms_norm"
+            | "layer_norm"
+    ) {
+        return TensorMethodDispatch::UnknownMethod(
+            t,
+            MoraError::Runtime(format!("Tensor has no method: {method}")),
+        );
+    }
+    let res: MoraResult<Value> = (|| match method {
         "contiguous" => {
             let out = t.contiguous()?;
             if let Some(ag) = autograd.as_deref_mut()
                 && is_tracked
             {
                 return Ok(Value::Tensor(
-                    ag.record_unary(t, out, |src| TapeOp::Identity { a: src }),
+                    ag.record_unary(&t, out, |src| TapeOp::Identity { a: src }),
                 ));
             }
             Ok(Value::Tensor(out))
         }
-        "requires_grad" => Ok(Value::Bool(t.requires_grad)),
         "with_grad" => {
             let enabled = match args.first() {
                 None => true,
@@ -2853,7 +2965,7 @@ pub fn call_tensor_method_tracked(
                 && is_tracked
             {
                 let orig = t.shape.clone();
-                return Ok(Value::Tensor(ag.record_unary(t, out, |src| {
+                return Ok(Value::Tensor(ag.record_unary(&t, out, |src| {
                     TapeOp::Reshape {
                         a: src,
                         orig_shape: orig.clone(),
@@ -2895,7 +3007,7 @@ pub fn call_tensor_method_tracked(
                 && is_tracked
             {
                 let orig = t.shape.clone();
-                return Ok(Value::Tensor(ag.record_unary(t, out, |src| {
+                return Ok(Value::Tensor(ag.record_unary(&t, out, |src| {
                     TapeOp::Transpose {
                         a: src,
                         dim0: eff_d0,
@@ -2920,7 +3032,7 @@ pub fn call_tensor_method_tracked(
                 && is_tracked
             {
                 return Ok(Value::Tensor(
-                    ag.record_unary(t, out, |src| TapeOp::Identity { a: src }),
+                    ag.record_unary(&t, out, |src| TapeOp::Identity { a: src }),
                 ));
             }
             Ok(Value::Tensor(out))
@@ -2937,7 +3049,7 @@ pub fn call_tensor_method_tracked(
                 && is_tracked
             {
                 return Ok(Value::Tensor(
-                    ag.record_unary(t, out, |src| TapeOp::Identity { a: src }),
+                    ag.record_unary(&t, out, |src| TapeOp::Identity { a: src }),
                 ));
             }
             Ok(Value::Tensor(out))
@@ -2948,7 +3060,7 @@ pub fn call_tensor_method_tracked(
                     "Tensor.to(dtype_or_device, second?) requires a string argument".to_string(),
                 ));
             };
-            let mut cur = Arc::clone(t);
+            let mut cur = Arc::clone(&t);
             if let Some(dt) = DType::from_name(first) {
                 cur = cur.to_dtype(dt)?;
             } else {
@@ -2967,7 +3079,7 @@ pub fn call_tensor_method_tracked(
                 && is_tracked
             {
                 return Ok(Value::Tensor(
-                    ag.record_unary(t, cur, |src| TapeOp::Identity { a: src }),
+                    ag.record_unary(&t, cur, |src| TapeOp::Identity { a: src }),
                 ));
             }
             Ok(Value::Tensor(cur))
@@ -2977,7 +3089,7 @@ pub fn call_tensor_method_tracked(
                 MoraError::Runtime("Tensor.fill_(value) requires 1 scalar argument".to_string())
             })?;
             t.fill_inplace(v)?;
-            Ok(Value::Tensor(Arc::clone(t)))
+            Ok(Value::Tensor(t))
         }
         "add_" => {
             let v = args.first().ok_or_else(|| {
@@ -2991,7 +3103,7 @@ pub fn call_tensor_method_tracked(
                     t.add_inplace(v)?;
                 }
             }
-            Ok(Value::Tensor(Arc::clone(t)))
+            Ok(Value::Tensor(t))
         }
         "mul_" => {
             let v = args.first().ok_or_else(|| {
@@ -3005,7 +3117,7 @@ pub fn call_tensor_method_tracked(
                     t.mul_inplace(v)?;
                 }
             }
-            Ok(Value::Tensor(Arc::clone(t)))
+            Ok(Value::Tensor(t))
         }
         "sum" => {
             let flat = t.to_flat_vec();
@@ -3015,7 +3127,7 @@ pub fn call_tensor_method_tracked(
             {
                 let out = Tensor::from_raw(vec![s], Vec::new(), t.dtype, t.device.clone(), true)?;
                 let a_shape = t.shape.clone();
-                return Ok(Value::Tensor(ag.record_unary(t, out, |src| TapeOp::Sum {
+                return Ok(Value::Tensor(ag.record_unary(&t, out, |src| TapeOp::Sum {
                     a: src,
                     a_shape: a_shape.clone(),
                 })));
@@ -3040,54 +3152,64 @@ pub fn call_tensor_method_tracked(
             {
                 let out = Tensor::from_raw(vec![m], Vec::new(), dt, t.device.clone(), true)?;
                 let a_shape = t.shape.clone();
-                return Ok(Value::Tensor(ag.record_unary(t, out, |src| TapeOp::Mean {
-                    a: src,
-                    a_shape: a_shape.clone(),
+                return Ok(Value::Tensor(ag.record_unary(&t, out, |src| {
+                    TapeOp::Mean {
+                        a: src,
+                        a_shape: a_shape.clone(),
+                    }
                 })));
             }
             Ok(scalar_value_for_dtype(m, dt))
         }
-        "max" => {
-            let flat = t.to_flat_vec();
-            let Some(&first) = flat.first() else {
-                return Err(MoraError::Runtime(
-                    "Tensor.max() cannot be called on an empty tensor".to_string(),
-                ));
-            };
-            let m = flat.iter().copied().fold(first, f64::max);
-            Ok(scalar_value_for_dtype(m, t.dtype))
-        }
-        "min" => {
-            let flat = t.to_flat_vec();
-            let Some(&first) = flat.first() else {
-                return Err(MoraError::Runtime(
-                    "Tensor.min() cannot be called on an empty tensor".to_string(),
-                ));
-            };
-            let m = flat.iter().copied().fold(first, f64::min);
-            Ok(scalar_value_for_dtype(m, t.dtype))
-        }
-        "item" => {
-            if t.numel() != 1 {
-                return Err(MoraError::Runtime(format!(
-                    "Tensor.item() requires a 1-element tensor, got {} elements (shape {:?})",
-                    t.numel(),
-                    t.shape
-                )));
-            }
-            Ok(t.get_linear_value(0))
-        }
-        "abs" | "sqrt" | "exp" | "ln" | "relu" | "gelu" | "silu" | "tanh" | "sigmoid" => {
-            eval_tensor_math_unary_tracked(t, method, autograd)
-        }
+        "abs" | "sqrt" | "exp" | "ln" | "log" | "sin" | "cos" | "relu" | "gelu" | "silu"
+        | "tanh" | "sigmoid" => eval_tensor_math_unary_fbip(t, method, autograd, fbip_stats),
         "softmax" => {
+            if can_reuse_tensor_in_place(&t, autograd.as_deref(), t.dtype, &t.shape, &t.device)
+                && t.dtype.is_float()
+                && !t.is_vram_resident()
+            {
+                let last_dim = *t.shape.last().unwrap_or(&1);
+                let dt = t.dtype;
+                let mut guard = t.storage.write_host();
+                let n = guard.len();
+                let mut row_buf = vec![0.0; last_dim];
+                let mut base = 0usize;
+                while base < n {
+                    let take = (n - base).min(last_dim);
+                    let mut max_v = f64::NEG_INFINITY;
+                    for (i, slot) in row_buf.iter_mut().enumerate().take(take) {
+                        let v = guard.get_f64(base + i);
+                        *slot = v;
+                        if v > max_v {
+                            max_v = v;
+                        }
+                    }
+                    let mut sum = 0.0;
+                    for v in row_buf.iter_mut().take(take) {
+                        *v = (*v - max_v).exp();
+                        sum += *v;
+                    }
+                    for (i, &v) in row_buf.iter().take(take).enumerate() {
+                        let out = if sum > 0.0 { v / sum } else { v };
+                        guard.set_f64(base + i, quantize_for_dtype(out, dt));
+                    }
+                    base += take;
+                }
+                drop(guard);
+                let keep_grad = t.requires_grad;
+                prepare_reused_tensor_meta(&mut t, keep_grad);
+                if let Some(stats) = fbip_stats {
+                    stats.on_tensor_host_reuse();
+                }
+                return Ok(Value::Tensor(t));
+            }
             let out = t.softmax()?;
             if let Some(ag) = autograd.as_deref_mut()
                 && is_tracked
             {
                 let last_dim = t.shape.last().copied().unwrap_or(1);
                 let out_vals = out.to_flat_vec();
-                return Ok(Value::Tensor(ag.record_unary(t, out, |src| {
+                return Ok(Value::Tensor(ag.record_unary(&t, out, |src| {
                     TapeOp::Softmax {
                         a: src,
                         out_vals: out_vals.clone(),
@@ -3097,55 +3219,169 @@ pub fn call_tensor_method_tracked(
             }
             Ok(Value::Tensor(out))
         }
-        "rms_norm" => {
+        "rms_norm" | "layer_norm" => {
+            let norm = if method == "rms_norm" {
+                RowNorm::Rms
+            } else {
+                RowNorm::Layer
+            };
             let eps = match args.first() {
                 None | Some(Value::Nil) => 1e-5,
-                Some(v) => parse_num_arg(v, "Tensor.rms_norm")?,
+                Some(v) => parse_num_arg(v, &format!("Tensor.{method}"))?,
             };
-            let out = t.rms_norm(eps)?;
-            if let Some(ag) = autograd.as_deref_mut()
-                && is_tracked
-            {
-                let last_dim = t.shape.last().copied().unwrap_or(1);
-                let a_vals = t.to_flat_vec();
-                return Ok(Value::Tensor(ag.record_unary(t, out, |src| {
-                    TapeOp::RmsNorm {
-                        a: src,
-                        a_vals: a_vals.clone(),
-                        last_dim,
-                        eps,
-                    }
-                })));
+            if can_reuse_tensor_in_place(&t, autograd.as_deref(), t.dtype, &t.shape, &t.device) {
+                norm.reuse(&t, eps, fbip_stats)?;
+                let keep_grad = t.requires_grad;
+                prepare_reused_tensor_meta(&mut t, keep_grad);
+                return Ok(Value::Tensor(t));
             }
-            Ok(Value::Tensor(out))
-        }
-        "layer_norm" => {
-            let eps = match args.first() {
-                None | Some(Value::Nil) => 1e-5,
-                Some(v) => parse_num_arg(v, "Tensor.layer_norm")?,
-            };
-            let out = t.layer_norm(eps)?;
+            let out = norm.allocated(&t, eps)?;
             if let Some(ag) = autograd
                 && is_tracked
             {
                 let last_dim = t.shape.last().copied().unwrap_or(1);
                 let a_vals = t.to_flat_vec();
-                return Ok(Value::Tensor(ag.record_unary(t, out, |src| {
-                    TapeOp::LayerNorm {
-                        a: src,
+                return Ok(Value::Tensor(ag.record_unary(&t, out, |a| match norm {
+                    RowNorm::Rms => TapeOp::RmsNorm {
+                        a,
                         a_vals: a_vals.clone(),
                         last_dim,
                         eps,
-                    }
+                    },
+                    RowNorm::Layer => TapeOp::LayerNorm {
+                        a,
+                        a_vals: a_vals.clone(),
+                        last_dim,
+                        eps,
+                    },
                 })));
             }
             Ok(Value::Tensor(out))
         }
-        "to_list" => Ok(t.to_nested_list()),
-        _ => Err(MoraError::Runtime(format!(
-            "Tensor has no method: {method}"
-        ))),
+        _ => unreachable!("checked recognized Tensor method set above"),
+    })();
+
+    TensorMethodDispatch::Handled(res)
+}
+
+fn unary_op_to_fused_step(op: &str) -> Option<crate::runtime::compute_dag::FusedEwStep> {
+    use crate::runtime::compute_dag::FusedEwStep;
+    match op {
+        "neg" => Some(FusedEwStep::Neg(0)),
+        "abs" => Some(FusedEwStep::Abs(0)),
+        "sqrt" => Some(FusedEwStep::Sqrt(0)),
+        "exp" => Some(FusedEwStep::Exp(0)),
+        "ln" | "log" => Some(FusedEwStep::Ln(0)),
+        "sin" => Some(FusedEwStep::Sin(0)),
+        "cos" => Some(FusedEwStep::Cos(0)),
+        "relu" => Some(FusedEwStep::Relu(0)),
+        "gelu" => Some(FusedEwStep::Gelu(0)),
+        "silu" => Some(FusedEwStep::Silu(0)),
+        "tanh" => Some(FusedEwStep::Tanh(0)),
+        "sigmoid" => Some(FusedEwStep::Sigmoid(0)),
+        _ => None,
     }
+}
+
+fn binary_op_to_fused_step(
+    op: &BinaryOp,
+    lhs_idx: usize,
+    rhs_idx: usize,
+) -> Option<crate::runtime::compute_dag::FusedEwStep> {
+    use crate::runtime::compute_dag::FusedEwStep;
+    match op {
+        BinaryOp::Add => Some(FusedEwStep::Add(lhs_idx, rhs_idx)),
+        BinaryOp::Sub => Some(FusedEwStep::Sub(lhs_idx, rhs_idx)),
+        BinaryOp::Mul => Some(FusedEwStep::Mul(lhs_idx, rhs_idx)),
+        BinaryOp::Div => Some(FusedEwStep::Div(lhs_idx, rhs_idx)),
+        BinaryOp::Pow => Some(FusedEwStep::Pow(lhs_idx, rhs_idx)),
+        _ => None,
+    }
+}
+
+fn binary_scalar_op_to_fused_step(
+    op: &BinaryOp,
+    scalar: f64,
+    reversed: bool,
+) -> Option<crate::runtime::compute_dag::FusedEwStep> {
+    use crate::runtime::compute_dag::FusedEwStep;
+    match op {
+        BinaryOp::Add => Some(FusedEwStep::AddScalar(0, scalar)),
+        BinaryOp::Sub => Some(FusedEwStep::SubScalar(0, scalar, reversed)),
+        BinaryOp::Mul => Some(FusedEwStep::MulScalar(0, scalar)),
+        BinaryOp::Div => Some(FusedEwStep::DivScalar(0, scalar, reversed)),
+        BinaryOp::Pow => Some(FusedEwStep::PowScalar(0, scalar, reversed)),
+        _ => None,
+    }
+}
+
+/// Update an exclusively owned allocation. Without a native kernel for the requested
+/// precision, retain the device allocation and propagate errors from both transfers.
+fn reuse_storage(
+    t: &Tensor,
+    stats: Option<&crate::runtime::fbip::FbipCounters>,
+    native: impl FnOnce(&Arc<dyn DeviceVramBuffer>) -> MoraResult<bool>,
+    host: impl FnOnce(&mut AlignedByteBuffer) -> MoraResult<()>,
+) -> MoraResult<()> {
+    if let Some(buffer) = t.storage.vram_buffer() {
+        if native(&buffer)? {
+            t.storage.mark_host_stale();
+        } else {
+            let mut shadow = t.storage.data.write();
+            if t.storage.host_stale.load(Ordering::Acquire) {
+                let mut bytes = vec![0u8; buffer.byte_len()];
+                buffer.download_bytes(&mut bytes)?;
+                *shadow = AlignedByteBuffer::from_raw_bytes(&bytes, t.numel(), t.dtype)?;
+            }
+            // A failed operation or transfer leaves VRAM authoritative.
+            t.storage.host_stale.store(true, Ordering::Release);
+            host(&mut shadow)?;
+            buffer.upload_bytes(&shadow.copy_bytes_out())?;
+            t.storage.host_stale.store(false, Ordering::Release);
+        }
+        if let Some(stats) = stats {
+            stats.on_tensor_vram_reuse();
+        }
+    } else {
+        host(&mut t.storage.write_host())?;
+        if let Some(stats) = stats {
+            stats.on_tensor_host_reuse();
+        }
+    }
+    Ok(())
+}
+
+fn reuse_elementwise(
+    t: &Tensor,
+    step: Option<crate::runtime::compute_dag::FusedEwStep>,
+    stats: Option<&crate::runtime::fbip::FbipCounters>,
+    mut value: impl FnMut(f64) -> MoraResult<f64>,
+) -> MoraResult<()> {
+    reuse_storage(
+        t,
+        stats,
+        |buffer| {
+            let Some(step) = step else { return Ok(false) };
+            let backend = crate::runtime::compute_dag::backend_for_device(&t.device);
+            Ok(backend
+                .run_fused_elementwise_vram(
+                    &[buffer.as_ref()],
+                    &[&t.shape],
+                    &[step],
+                    &t.shape,
+                    t.numel(),
+                    t.dtype,
+                    Some(Arc::clone(buffer)),
+                )?
+                .is_some())
+        },
+        |data| {
+            for i in 0..data.len() {
+                data.set_f64(i, value(data.get_f64(i))?);
+            }
+            Ok(())
+        },
+    )
 }
 
 /// Evaluate unary mathematical / activation functions on a [`Tensor`] with optional multi-tape autograd tracking.
@@ -3154,28 +3390,48 @@ pub fn eval_tensor_math_unary_tracked(
     op: &str,
     autograd: Option<&mut AutogradContext>,
 ) -> MoraResult<Value> {
-    let is_tracked = autograd.as_ref().is_some_and(|ag| ag.is_tracked(t));
-    let out = match op {
-        "abs" => t.map_unary(|x| x.abs())?,
-        "sqrt" => t.map_unary(|x| x.sqrt())?,
-        "exp" => t.map_unary(|x| x.exp())?,
-        "ln" | "log" => t.map_unary(|x| x.ln())?,
-        "sin" => t.map_unary(|x| x.sin())?,
-        "cos" => t.map_unary(|x| x.cos())?,
-        "relu" => t.map_unary(|x| x.max(0.0))?,
-        "gelu" => t.map_unary(|x| {
+    eval_tensor_math_unary_fbip(Arc::clone(t), op, autograd, None)
+}
+
+/// P6-1 Perceus/FBIP: Evaluate unary mathematical / activation functions consuming `t: Arc<Tensor>`
+/// by ownership so dead contiguous inputs reuse their 64B host or GPU VRAM buffer in place.
+pub fn eval_tensor_math_unary_fbip(
+    mut t: Arc<Tensor>,
+    op: &str,
+    autograd: Option<&mut AutogradContext>,
+    fbip_stats: Option<&crate::runtime::fbip::FbipCounters>,
+) -> MoraResult<Value> {
+    let is_tracked = autograd.as_ref().is_some_and(|ag| ag.is_tracked(&t));
+    let evaluate: fn(f64) -> f64 = match op {
+        "abs" => f64::abs,
+        "sqrt" => f64::sqrt,
+        "exp" => f64::exp,
+        "ln" | "log" => f64::ln,
+        "sin" => f64::sin,
+        "cos" => f64::cos,
+        "relu" => |x| x.max(0.0),
+        "gelu" => |x| {
             let c = (2.0 / std::f64::consts::PI).sqrt();
             0.5 * x * (1.0 + (c * (x + 0.044715 * x.powi(3))).tanh())
-        })?,
-        "silu" => t.map_unary(|x| x / (1.0 + (-x).exp()))?,
-        "tanh" => t.map_unary(|x| x.tanh())?,
-        "sigmoid" => t.map_unary(|x| 1.0 / (1.0 + (-x).exp()))?,
-        other => {
+        },
+        "silu" => |x| x / (1.0 + (-x).exp()),
+        "tanh" => f64::tanh,
+        "sigmoid" => |x| 1.0 / (1.0 + (-x).exp()),
+        _ => {
             return Err(MoraError::Runtime(format!(
-                "Tensor has no unary math operation '{other}'"
+                "Tensor has no unary math operation '{op}'"
             )));
         }
     };
+    if can_reuse_tensor_in_place(&t, autograd.as_deref(), t.dtype, &t.shape, &t.device) {
+        reuse_elementwise(&t, unary_op_to_fused_step(op), fbip_stats, |x| {
+            Ok(evaluate(x))
+        })?;
+        let keep_grad = t.requires_grad;
+        prepare_reused_tensor_meta(&mut t, keep_grad);
+        return Ok(Value::Tensor(t));
+    }
+    let out = t.map_unary(evaluate)?;
     if let Some(ag) = autograd
         && is_tracked
     {
@@ -3183,7 +3439,7 @@ pub fn eval_tensor_math_unary_tracked(
             "sqrt" | "exp" | "tanh" | "sigmoid" => out.to_flat_vec(),
             _ => t.to_flat_vec(),
         };
-        let tracked = ag.record_unary(t, out, |src| match op {
+        let tracked = ag.record_unary(&t, out, |src| match op {
             "abs" => TapeOp::Abs {
                 a: src,
                 a_vals: payload.clone(),
@@ -3240,18 +3496,34 @@ pub fn eval_tensor_neg_tracked(
     t: &Arc<Tensor>,
     autograd: Option<&mut AutogradContext>,
 ) -> MoraResult<Value> {
+    eval_tensor_neg_fbip(Arc::clone(t), autograd, None)
+}
+
+/// P6-1 Perceus/FBIP: Evaluate unary `-tensor` consuming `t: Arc<Tensor>` by ownership.
+pub fn eval_tensor_neg_fbip(
+    mut t: Arc<Tensor>,
+    autograd: Option<&mut AutogradContext>,
+    fbip_stats: Option<&crate::runtime::fbip::FbipCounters>,
+) -> MoraResult<Value> {
     if t.dtype.is_unsigned_int() || t.dtype.is_bool() {
         return Err(MoraError::Runtime(format!(
             "cannot negate Tensor<{}> (unsigned or bool dtype)",
             t.dtype
         )));
     }
+    let is_tracked = autograd.as_ref().is_some_and(|ag| ag.is_tracked(&t));
+    if can_reuse_tensor_in_place(&t, autograd.as_deref(), t.dtype, &t.shape, &t.device) {
+        reuse_elementwise(&t, unary_op_to_fused_step("neg"), fbip_stats, |x| Ok(-x))?;
+        let keep_grad = t.requires_grad;
+        prepare_reused_tensor_meta(&mut t, keep_grad);
+        return Ok(Value::Tensor(t));
+    }
     let out = t.map_unary(|x| -x)?;
     if let Some(ag) = autograd
-        && ag.is_tracked(t)
+        && is_tracked
     {
         return Ok(Value::Tensor(
-            ag.record_unary(t, out, |src| TapeOp::Neg { a: src }),
+            ag.record_unary(&t, out, |src| TapeOp::Neg { a: src }),
         ));
     }
     Ok(Value::Tensor(out))
@@ -3380,10 +3652,22 @@ pub fn eval_tensor_binary_tracked(
     op: &BinaryOp,
     left: &Value,
     right: &Value,
+    autograd: Option<&mut AutogradContext>,
+) -> MoraResult<Value> {
+    eval_tensor_binary_fbip(op, left.clone(), right.clone(), autograd, None)
+}
+
+/// P6-1 Perceus/FBIP: Evaluate binary operator `op` consuming `left` and `right` by ownership so
+/// uniquely-owned contiguous tensors reuse their physical 64B host or GPU VRAM buffer in place.
+pub fn eval_tensor_binary_fbip(
+    op: &BinaryOp,
+    left: Value,
+    right: Value,
     mut autograd: Option<&mut AutogradContext>,
+    fbip_stats: Option<&crate::runtime::fbip::FbipCounters>,
 ) -> MoraResult<Value> {
     if matches!(op, BinaryOp::MatMul) {
-        return eval_tensor_matmul_tracked(left, right, autograd);
+        return eval_tensor_matmul_tracked(&left, &right, autograd);
     }
 
     match (left, right) {
@@ -3400,24 +3684,93 @@ pub fn eval_tensor_binary_tracked(
                     a.dtype, b.dtype
                 )));
             }
+            if a.dtype.is_bool() {
+                return Err(MoraError::Runtime(format!(
+                    "Arithmetic operator {:?} is not supported on Tensor<bool>",
+                    op
+                )));
+            }
             let out_shape = broadcast_runtime_shapes(&a.shape, &b.shape)?;
             let numel = checked_numel(&out_shape)?;
-            let mut out = Vec::with_capacity(numel);
-            for idx in 0..numel {
-                let va = read_broadcast_elem(a, &out_shape, idx);
-                let vb = read_broadcast_elem(b, &out_shape, idx);
-                out.push(apply_scalar_op(op, va, vb, a.dtype)?);
-            }
             let tracked_any = autograd
                 .as_ref()
-                .is_some_and(|ag| ag.is_tracked(a) || ag.is_tracked(b));
-            let t = Tensor::from_raw(
-                out.clone(),
-                out_shape,
-                a.dtype,
-                a.device.clone(),
-                tracked_any || a.requires_grad || b.requires_grad,
-            )?;
+                .is_some_and(|ag| ag.is_tracked(&a) || ag.is_tracked(&b));
+            let req_grad = tracked_any || a.requires_grad || b.requires_grad;
+
+            if !tracked_any {
+                let reuse_a = can_reuse_tensor_in_place(
+                    &a,
+                    autograd.as_deref(),
+                    a.dtype,
+                    &out_shape,
+                    &a.device,
+                );
+                let reuse_b = !reuse_a
+                    && can_reuse_tensor_in_place(
+                        &b,
+                        autograd.as_deref(),
+                        a.dtype,
+                        &out_shape,
+                        &a.device,
+                    );
+
+                let gpu_binary = |dst: Option<Arc<dyn DeviceVramBuffer>>| {
+                    let (Some(va), Some(vb), Some(step)) = (
+                        a.vram_buffer_if_contiguous(),
+                        b.vram_buffer_if_contiguous(),
+                        binary_op_to_fused_step(op, 0, 1),
+                    ) else {
+                        return Ok(None);
+                    };
+                    crate::runtime::compute_dag::backend_for_device(&a.device)
+                        .run_fused_elementwise_vram(
+                            &[va.as_ref(), vb.as_ref()],
+                            &[&a.shape, &b.shape],
+                            &[step],
+                            &out_shape,
+                            numel,
+                            a.dtype,
+                            dst,
+                        )
+                };
+                if reuse_a || reuse_b {
+                    let (dst, other) = if reuse_a { (&a, &b) } else { (&b, &a) };
+                    reuse_storage(
+                        dst,
+                        fbip_stats,
+                        |buffer| Ok(gpu_binary(Some(Arc::clone(buffer)))?.is_some()),
+                        |data| {
+                            for idx in 0..numel {
+                                let old = data.get_f64(idx);
+                                let value = read_broadcast_elem(other, &out_shape, idx);
+                                let (lhs, rhs) = if reuse_a { (old, value) } else { (value, old) };
+                                data.set_f64(idx, apply_scalar_op(op, lhs, rhs, dst.dtype)?);
+                            }
+                            Ok(())
+                        },
+                    )?;
+                    let mut result = if reuse_a { a } else { b };
+                    prepare_reused_tensor_meta(&mut result, req_grad);
+                    return Ok(Value::Tensor(result));
+                }
+                if let Some(output) = gpu_binary(None)? {
+                    return Ok(Value::Tensor(Tensor::from_vram_output(
+                        output,
+                        out_shape,
+                        a.dtype,
+                        a.device.clone(),
+                        req_grad,
+                    )?));
+                }
+            }
+
+            let mut out = Vec::with_capacity(numel);
+            for idx in 0..numel {
+                let va = read_broadcast_elem(&a, &out_shape, idx);
+                let vb = read_broadcast_elem(&b, &out_shape, idx);
+                out.push(apply_scalar_op(op, va, vb, a.dtype)?);
+            }
+            let t = Tensor::from_raw(out.clone(), out_shape, a.dtype, a.device.clone(), req_grad)?;
             if tracked_any
                 && let Some(ag) = autograd.as_deref_mut()
                 && matches!(
@@ -3429,7 +3782,7 @@ pub fn eval_tensor_binary_tracked(
                 let b_vals = b.to_flat_vec();
                 let a_shape = a.shape.clone();
                 let b_shape = b.shape.clone();
-                let tracked = ag.record_binary(a, b, t, |na, nb| match op {
+                let tracked = ag.record_binary(&a, &b, t, |na, nb| match op {
                     BinaryOp::Add => TapeOp::Add {
                         a: na,
                         b: nb,
@@ -3493,13 +3846,12 @@ pub fn eval_tensor_binary_tracked(
             }
             Ok(Value::Tensor(t))
         }
-        (Value::Tensor(t), scalar) => {
-            let Some((s_dt, s_val)) = scalar_val_dtype_and_f64(scalar) else {
+        (Value::Tensor(mut t), scalar) => {
+            let Some((s_dt, s_val)) = scalar_val_dtype_and_f64(&scalar) else {
                 return Err(MoraError::Runtime(format!(
-                    "Unsupported tensor binary operands: {} {:?} {}",
-                    crate::flow::type_name(left),
+                    "Unsupported tensor binary operands: tensor {:?} {}",
                     op,
-                    crate::flow::type_name(right)
+                    crate::flow::type_name(&scalar)
                 )));
             };
             if t.dtype != s_dt {
@@ -3508,12 +3860,29 @@ pub fn eval_tensor_binary_tracked(
                     t.dtype, s_dt
                 )));
             }
+            if t.dtype.is_bool() {
+                return Err(MoraError::Runtime(format!(
+                    "Arithmetic operator {:?} is not supported on Tensor<bool>",
+                    op
+                )));
+            }
+            let tracked_t = autograd.as_ref().is_some_and(|ag| ag.is_tracked(&t));
+            if can_reuse_tensor_in_place(&t, autograd.as_deref(), t.dtype, &t.shape, &t.device) {
+                reuse_elementwise(
+                    &t,
+                    binary_scalar_op_to_fused_step(op, s_val, false),
+                    fbip_stats,
+                    |v| apply_scalar_op(op, v, s_val, t.dtype),
+                )?;
+                let keep_grad = t.requires_grad;
+                prepare_reused_tensor_meta(&mut t, keep_grad);
+                return Ok(Value::Tensor(t));
+            }
             let flat = t.to_flat_vec();
             let mut out = Vec::with_capacity(flat.len());
             for &v in &flat {
                 out.push(apply_scalar_op(op, v, s_val, t.dtype)?);
             }
-            let tracked_t = autograd.as_ref().is_some_and(|ag| ag.is_tracked(t));
             let res = Tensor::from_raw(
                 out.clone(),
                 t.shape.clone(),
@@ -3528,7 +3897,7 @@ pub fn eval_tensor_binary_tracked(
                     BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Pow
                 )
             {
-                let tracked = ag.record_unary(t, res, |ia| match op {
+                let tracked = ag.record_unary(&t, res, |ia| match op {
                     BinaryOp::Add => TapeOp::AddScalar {
                         a: ia,
                         scalar: s_val,
@@ -3561,13 +3930,12 @@ pub fn eval_tensor_binary_tracked(
             }
             Ok(Value::Tensor(res))
         }
-        (scalar, Value::Tensor(t)) => {
-            let Some((s_dt, s_val)) = scalar_val_dtype_and_f64(scalar) else {
+        (scalar, Value::Tensor(mut t)) => {
+            let Some((s_dt, s_val)) = scalar_val_dtype_and_f64(&scalar) else {
                 return Err(MoraError::Runtime(format!(
-                    "Unsupported tensor binary operands: {} {:?} {}",
-                    crate::flow::type_name(left),
-                    op,
-                    crate::flow::type_name(right)
+                    "Unsupported tensor binary operands: {} {:?} tensor",
+                    crate::flow::type_name(&scalar),
+                    op
                 )));
             };
             if t.dtype != s_dt {
@@ -3576,12 +3944,29 @@ pub fn eval_tensor_binary_tracked(
                     s_dt, t.dtype
                 )));
             }
+            if t.dtype.is_bool() {
+                return Err(MoraError::Runtime(format!(
+                    "Arithmetic operator {:?} is not supported on Tensor<bool>",
+                    op
+                )));
+            }
+            let tracked_t = autograd.as_ref().is_some_and(|ag| ag.is_tracked(&t));
+            if can_reuse_tensor_in_place(&t, autograd.as_deref(), t.dtype, &t.shape, &t.device) {
+                reuse_elementwise(
+                    &t,
+                    binary_scalar_op_to_fused_step(op, s_val, true),
+                    fbip_stats,
+                    |v| apply_scalar_op(op, s_val, v, t.dtype),
+                )?;
+                let keep_grad = t.requires_grad;
+                prepare_reused_tensor_meta(&mut t, keep_grad);
+                return Ok(Value::Tensor(t));
+            }
             let flat = t.to_flat_vec();
             let mut out = Vec::with_capacity(flat.len());
             for &v in &flat {
                 out.push(apply_scalar_op(op, s_val, v, t.dtype)?);
             }
-            let tracked_t = autograd.as_ref().is_some_and(|ag| ag.is_tracked(t));
             let res = Tensor::from_raw(
                 out.clone(),
                 t.shape.clone(),
@@ -3596,7 +3981,7 @@ pub fn eval_tensor_binary_tracked(
                     BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Pow
                 )
             {
-                let tracked = ag.record_unary(t, res, |ia| match op {
+                let tracked = ag.record_unary(&t, res, |ia| match op {
                     BinaryOp::Add => TapeOp::AddScalar {
                         a: ia,
                         scalar: s_val,
@@ -3629,11 +4014,11 @@ pub fn eval_tensor_binary_tracked(
             }
             Ok(Value::Tensor(res))
         }
-        _ => Err(MoraError::Runtime(format!(
+        (l, r) => Err(MoraError::Runtime(format!(
             "Unsupported tensor binary operands: {} {:?} {}",
-            crate::flow::type_name(left),
+            crate::flow::type_name(&l),
             op,
-            crate::flow::type_name(right)
+            crate::flow::type_name(&r)
         ))),
     }
 }

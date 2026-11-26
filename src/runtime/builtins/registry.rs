@@ -19,6 +19,8 @@ pub const RUNTIME_BUILTIN_NAMES: &[&str] = &[
     "deref",
     "Err",
     "eval",
+    "fbip_reset_stats",
+    "fbip_stats",
     "float",
     "gensym",
     "grad",

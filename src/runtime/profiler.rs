@@ -238,8 +238,8 @@ pub(crate) fn events_to_mora_value(events: &[TraceEvent]) -> Value {
             for (k, v) in &ev.args {
                 am.insert(k.clone(), Value::String(v.clone()));
             }
-            m.insert("args".to_string(), Value::Dict(am));
-            Value::Dict(m)
+            m.insert("args".to_string(), Value::Dict(am.into()));
+            Value::Dict(m.into())
         })
         .collect();
     Value::List(list.into())
@@ -284,9 +284,9 @@ pub(crate) fn summary_to_mora_value(events: &[TraceEvent]) -> Value {
         .into_iter()
         .map(|(k, v)| (k, Value::Float(v)))
         .collect();
-    m.insert("categories".to_string(), Value::Dict(counts_map));
-    m.insert("category_dur_us".to_string(), Value::Dict(dur_map));
-    Value::Dict(m)
+    m.insert("categories".to_string(), Value::Dict(counts_map.into()));
+    m.insert("category_dur_us".to_string(), Value::Dict(dur_map.into()));
+    Value::Dict(m.into())
 }
 
 impl TraceProfilerHandle {

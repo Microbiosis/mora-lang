@@ -11,6 +11,7 @@
 //! - A [`CapturedContinuation`] is multi-shot: it owns the frames stacked above the matching
 //!   [`HandleBarrierState`], and resuming clones them back instead of consuming the capture.
 
+use super::loans::{CallArg, FrameLoans};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -23,20 +24,45 @@ use crate::mir::control::{
 };
 use crate::value::{Environment, Value};
 
-/// P4-2: Compact 16-byte hybrid unboxed VM register slot replacing full `Value` in
+/// P4-2 + P6-1: Safe 16-byte hybrid unboxed VM register slot replacing full `Value` in
 /// `ScriptFrame.regs` and unshared `LocalCell`s.
 ///
 /// Primitives (`Nil`, `Bool`, `Int`, `Float`) live completely inline inside the 16-byte slot
 /// with zero heap allocations on hot numeric, comparison, and control-flow paths; heap-backed
 /// values (`String`, `List`, `Dict`, `Tensor`, `StructInstance`, closures, etc.) are stored
-/// behind an 8-byte `Box<Value>` pointer.
-#[derive(Debug, Clone)]
+/// behind an 8-byte `Arc<Value>` pointer:
+/// - `BorrowLocal` 指向帧内本地槽，读取期间不增加强引用。
+/// - `LoadLocal` / `Copy` clone only the outer `Arc<Value>` (**0 heap allocations**,
+///   **0 inner `Tensor` / `Dict` / `List` refcount bumps**, **0 `unsafe`**, automatic `Send + Sync`
+///   across M:N fibers, `parallel` workers, and multi-shot `CapturedContinuation`s).
+/// - At last-use consumption (`take_value`), `Arc::unwrap_or_clone` unwraps `Value` in $O(1)$
+///   when uniquely owned (`Arc::strong_count == 1`), preserving `Arc::strong_count == 1` on the
+///   inner `Tensor` / `Dict` / `List` / `String` for FBIP in-place mutation.
+#[derive(Debug)]
 pub enum RegSlot {
     Nil,
     Bool(bool),
     Int(i64),
     Float(f64),
-    Boxed(Box<Value>),
+    Heap(Arc<Value>),
+}
+
+impl Clone for RegSlot {
+    #[inline]
+    fn clone(&self) -> Self {
+        match self {
+            Self::Nil => Self::Nil,
+            Self::Bool(value) => Self::Bool(*value),
+            Self::Int(value) => Self::Int(*value),
+            Self::Float(value) => Self::Float(*value),
+            Self::Heap(value) => {
+                // Debug-build-only trace: a borrowed call must pass the caller's slot by address,
+                // so any outer `Arc<Value>` clone here means the borrow path degraded to a copy.
+                crate::runtime::fbip::note_regslot_heap_clone();
+                Self::Heap(Arc::clone(value))
+            }
+        }
+    }
 }
 
 const _: () = assert!(std::mem::size_of::<RegSlot>() == 16);
@@ -50,7 +76,7 @@ impl RegSlot {
             Value::Bool(b) => Self::Bool(b),
             Value::Int(i) => Self::Int(i),
             Value::Float(f) => Self::Float(f),
-            other => Self::Boxed(Box::new(other)),
+            other => Self::Heap(Arc::new(other)),
         }
     }
 
@@ -62,11 +88,12 @@ impl RegSlot {
             Self::Bool(b) => Value::Bool(*b),
             Self::Int(i) => Value::Int(*i),
             Self::Float(f) => Value::Float(*f),
-            Self::Boxed(v) => (**v).clone(),
+            Self::Heap(v) => (**v).clone(),
         }
     }
 
-    /// Consume this register slot into a full [`Value`].
+    /// Consume this register slot into a full [`Value`], unwrapping in $O(1)$ without touching
+    /// inner `Arc` reference counts when `Arc::strong_count == 1`.
     #[inline]
     pub(crate) fn take_value(self) -> Value {
         match self {
@@ -74,7 +101,7 @@ impl RegSlot {
             Self::Bool(b) => Value::Bool(b),
             Self::Int(i) => Value::Int(i),
             Self::Float(f) => Value::Float(f),
-            Self::Boxed(v) => *v,
+            Self::Heap(v) => Arc::unwrap_or_clone(v),
         }
     }
 
@@ -86,15 +113,15 @@ impl RegSlot {
             Self::Bool(b) => *b,
             Self::Int(i) => *i != 0,
             Self::Float(f) => *f != 0.0 && !f.is_nan(),
-            Self::Boxed(v) => crate::flow::is_truthy(v),
+            Self::Heap(v) => crate::flow::is_truthy(v),
         }
     }
 
-    /// Borrow the inner [`Value`] when this slot is heap-boxed.
+    /// Borrow the inner [`Value`] when this slot holds a heap-allocated value.
     #[inline]
-    pub(crate) fn as_boxed(&self) -> Option<&Value> {
+    pub(crate) fn as_heap(&self) -> Option<&Value> {
         match self {
-            Self::Boxed(v) => Some(v),
+            Self::Heap(v) => Some(v),
             _ => None,
         }
     }
@@ -206,13 +233,50 @@ impl LocalCell {
         }
     }
 
-    /// Read this local directly into a 16-byte [`RegSlot`] without boxing primitives.
+    /// Read this local directly into a 16-byte [`RegSlot`] without boxing primitives
+    /// (cloning only the outer `Arc<Value>` for heap values).
     #[inline]
     pub(crate) fn get_slot(&self) -> RegSlot {
         match self {
             Self::Val(s) => s.clone(),
             Self::Shared(cell) => RegSlot::from_value(cell.lock().clone()),
         }
+    }
+
+    /// P6-1 Perceus/FBIP: Transfer ownership out of an unshared `LocalCell::Val` (clearing to `Nil`),
+    /// or clone out of `LocalCell::Shared`.
+    #[inline]
+    pub(crate) fn take_slot(&mut self) -> RegSlot {
+        match self {
+            Self::Val(s) => std::mem::replace(s, RegSlot::Nil),
+            Self::Shared(cell) => RegSlot::from_value(cell.lock().clone()),
+        }
+    }
+
+    /// P6-1 Perceus/FBIP: Drop the value stored in an unshared `LocalCell::Val`.
+    #[inline]
+    pub(crate) fn drop_slot(&mut self) {
+        if let Self::Val(s) = self {
+            *s = RegSlot::Nil;
+        }
+    }
+
+    /// Return true when this local holds a heap container/tensor/string/ADT eligible for FBIP reuse.
+    #[inline]
+    pub(crate) fn holds_fbip_candidate(&self) -> bool {
+        matches!(
+            self,
+            Self::Val(RegSlot::Heap(v))
+                if matches!(
+                    **v,
+                    Value::Dict(_)
+                        | Value::List(_)
+                        | Value::Tensor(_)
+                        | Value::String(_)
+                        | Value::StructInstance { .. }
+                        | Value::EnumVariant { .. }
+                )
+        )
     }
 
     /// Write a [`Value`] into this local slot, preserving shared cell identity.
@@ -252,6 +316,7 @@ pub struct ScriptFrame {
     pub globals: ModuleGlobals,
     pub upvalues: Arc<Vec<UpvalueValue>>,
     pub locals: Vec<LocalCell>,
+    pub(crate) loans: FrameLoans,
     /// P4-2: 16-byte hybrid unboxed register file.
     pub regs: Vec<RegSlot>,
     pub block_id: BlockId,
@@ -272,6 +337,74 @@ impl ScriptFrame {
     #[inline]
     pub(crate) fn get_val(&self, r: VReg) -> Value {
         self.regs[r.0 as usize].to_value()
+    }
+
+    /// P6-1 Perceus/FBIP: Project a nominal struct field **in place** out of register `r`
+    /// when `r` uniquely owns both its outer `Arc<Value>` and `StructInstance.fields`
+    /// (`Arc::strong_count == 1`), keeping remaining fields in `r` for sibling projections.
+    #[inline]
+    pub(crate) fn take_struct_field(&mut self, r: VReg, name: &str) -> Option<Value> {
+        let RegSlot::Heap(arc_v) = &mut self.regs[r.0 as usize] else {
+            return None;
+        };
+        let Value::StructInstance { fields, .. } = Arc::get_mut(arc_v)? else {
+            return None;
+        };
+        fields.remove_if_unique(name)
+    }
+
+    /// Drop the value held by virtual register `r`.
+    #[inline]
+    pub(crate) fn clear_reg(&mut self, r: VReg) {
+        self.regs[r.0 as usize] = RegSlot::Nil;
+    }
+
+    /// P6-1 Perceus/FBIP: Read or destructively take virtual register `r` as a full [`Value`].
+    #[inline]
+    pub(crate) fn read_or_take_val(
+        &mut self,
+        r: VReg,
+        kill: bool,
+        can_move: bool,
+        fbip_stats: &crate::runtime::fbip::FbipCounters,
+    ) -> Value {
+        if kill {
+            if can_move {
+                return std::mem::replace(&mut self.regs[r.0 as usize], RegSlot::Nil).take_value();
+            }
+            if matches!(
+                &self.regs[r.0 as usize],
+                RegSlot::Heap(v)
+                    if matches!(**v, Value::Dict(_) | Value::List(_) | Value::Tensor(_))
+            ) {
+                fbip_stats.on_continuation_copy_fallback();
+            }
+        }
+        self.regs[r.0 as usize].to_value()
+    }
+
+    /// P6-1 Perceus/FBIP: Read or destructively take virtual register `r` as a 16-byte [`RegSlot`].
+    #[inline]
+    pub(crate) fn read_or_take_slot(
+        &mut self,
+        r: VReg,
+        kill: bool,
+        can_move: bool,
+        fbip_stats: &crate::runtime::fbip::FbipCounters,
+    ) -> RegSlot {
+        if kill {
+            if can_move {
+                return std::mem::replace(&mut self.regs[r.0 as usize], RegSlot::Nil);
+            }
+            if matches!(
+                &self.regs[r.0 as usize],
+                RegSlot::Heap(v)
+                    if matches!(**v, Value::Dict(_) | Value::List(_) | Value::Tensor(_))
+            ) {
+                fbip_stats.on_continuation_copy_fallback();
+            }
+        }
+        self.regs[r.0 as usize].clone()
     }
 
     /// Write a full [`Value`] into a virtual register (unboxing primitives inline).
@@ -588,29 +721,18 @@ pub(crate) fn clone_worker_upvalues(
         .collect()
 }
 
-/// Construct a new [`ScriptFrame`] for calling `func_id`, verifying arity for Tasks/Closures/Macros.
-pub fn materialize_frame(
+/// Construct a new [`ScriptFrame`] directly from positional + optional named [`RegSlot`]s,
+/// preserving `RegSlot::Heap(Arc<Value>)` identity for borrowed and moved arguments without
+/// intermediate `Vec<Value>` materialization.
+pub(crate) fn materialize_frame_slots_named(
     program: Arc<ControlProgram>,
     func_id: FnId,
     globals: ModuleGlobals,
     upvalues: Arc<Vec<UpvalueValue>>,
-    args: &[Value],
+    args: Vec<CallArg<'_>>,
+    named_args: Vec<(String, CallArg<'_>)>,
 ) -> MoraResult<ScriptFrame> {
-    materialize_frame_named(program, func_id, globals, upvalues, args, &[])
-}
-
-/// Construct a new [`ScriptFrame`] with positional + optional named keyword arguments,
-/// reordering named arguments into parameter slots and populating omitted defaulted parameters
-/// with [`Value::MissingArg`] for the callee's entry prologue.
-pub(crate) fn materialize_frame_named(
-    program: Arc<ControlProgram>,
-    func_id: FnId,
-    globals: ModuleGlobals,
-    upvalues: Arc<Vec<UpvalueValue>>,
-    args: &[Value],
-    named_args: &[(String, Value)],
-) -> MoraResult<ScriptFrame> {
-    let (locals, regs, block_id) = {
+    let (locals, regs, block_id, loans) = {
         let func = program.func(func_id);
         let needs_arity_check = matches!(
             func.kind,
@@ -628,9 +750,10 @@ pub(crate) fn materialize_frame_named(
             _ => "function",
         };
 
-        let resolved_args: Vec<Value> = if needs_arity_check {
+        let resolved_slots: Vec<CallArg<'_>> = if needs_arity_check {
             let n_params = func.params.len();
-            if args.len() > n_params {
+            let pos_len = args.len();
+            if pos_len > n_params {
                 if func.kind == FunctionKind::Macro {
                     let mname = func
                         .name
@@ -638,25 +761,23 @@ pub(crate) fn materialize_frame_named(
                         .unwrap_or("<macro>");
                     return Err(MoraError::Runtime(format!(
                         "macro '{}' expects {} args, got {}",
-                        mname,
-                        n_params,
-                        args.len()
+                        mname, n_params, pos_len
                     )));
                 }
                 return Err(MoraError::Runtime(format!(
                     "{kind_label} expects {} args, got {}",
-                    n_params,
-                    args.len()
+                    n_params, pos_len
                 )));
             }
-            if named_args.is_empty() && args.len() == n_params {
-                args.to_vec()
+            if named_args.is_empty() && pos_len == n_params {
+                args
             } else {
-                let mut slots: Vec<Option<Value>> = vec![None; n_params];
-                for (i, v) in args.iter().enumerate() {
-                    slots[i] = Some(v.clone());
+                let mut slots: Vec<_> = (0..n_params).map(|_| None).collect();
+                for (i, slot) in args.into_iter().enumerate() {
+                    slots[i] = Some(slot);
                 }
-                for (kw, val) in named_args {
+                let had_named = !named_args.is_empty();
+                for (kw, slot) in named_args {
                     let pos = func
                         .params
                         .iter()
@@ -671,15 +792,15 @@ pub(crate) fn materialize_frame_named(
                             "{kind_label} got multiple values for argument '{kw}'"
                         )));
                     }
-                    slots[idx] = Some(val.clone());
+                    slots[idx] = Some(slot);
                 }
                 let mut out = Vec::with_capacity(n_params);
-                for (idx, slot) in slots.into_iter().enumerate() {
-                    if let Some(v) = slot {
-                        out.push(v);
+                for (idx, maybe_slot) in slots.into_iter().enumerate() {
+                    if let Some(s) = maybe_slot {
+                        out.push(s);
                     } else if func.param_has_default.get(idx).copied().unwrap_or(false) {
-                        out.push(Value::MissingArg);
-                    } else if named_args.is_empty() {
+                        out.push(CallArg::from_value(Value::MissingArg));
+                    } else if !had_named {
                         if func.kind == FunctionKind::Macro {
                             let mname = func
                                 .name
@@ -687,15 +808,12 @@ pub(crate) fn materialize_frame_named(
                                 .unwrap_or("<macro>");
                             return Err(MoraError::Runtime(format!(
                                 "macro '{}' expects {} args, got {}",
-                                mname,
-                                n_params,
-                                args.len()
+                                mname, n_params, pos_len
                             )));
                         }
                         return Err(MoraError::Runtime(format!(
                             "{kind_label} expects {} args, got {}",
-                            n_params,
-                            args.len()
+                            n_params, pos_len
                         )));
                     } else {
                         let pname = program.symbols.resolve(func.params[idx]);
@@ -707,7 +825,7 @@ pub(crate) fn materialize_frame_named(
                 out
             }
         } else {
-            args.to_vec()
+            args
         };
 
         let n_locals = func.n_locals as usize;
@@ -720,14 +838,21 @@ pub(crate) fn materialize_frame_named(
             }
         }
 
-        for (slot_idx, val) in resolved_args.iter().enumerate() {
+        let mut loans = FrameLoans::default();
+        for (slot_idx, slot) in resolved_slots.into_iter().enumerate() {
             if slot_idx < locals.len() {
-                locals[slot_idx].set(val.clone());
+                let borrowed = func.param_borrows.get(slot_idx) == Some(&true)
+                    && matches!(locals[slot_idx], LocalCell::Val(_));
+                locals[slot_idx].set_slot(slot.bind_parameter(
+                    LocalSlot(slot_idx as u16),
+                    borrowed,
+                    &mut loans,
+                ));
             }
         }
 
         let regs = vec![RegSlot::Nil; func.n_regs as usize];
-        (locals, regs, func.entry)
+        (locals, regs, func.entry, loans)
     };
 
     Ok(ScriptFrame {
@@ -736,12 +861,42 @@ pub(crate) fn materialize_frame_named(
         globals,
         upvalues,
         locals,
+        loans,
         regs,
         block_id,
         pc: 0,
         resume_dst: None,
         defers: Vec::new(),
     })
+}
+
+/// Construct a new [`ScriptFrame`] for calling `func_id`, verifying arity for Tasks/Closures/Macros.
+pub fn materialize_frame(
+    program: Arc<ControlProgram>,
+    func_id: FnId,
+    globals: ModuleGlobals,
+    upvalues: Arc<Vec<UpvalueValue>>,
+    args: &[Value],
+) -> MoraResult<ScriptFrame> {
+    materialize_frame_named(program, func_id, globals, upvalues, args, &[])
+}
+
+/// Construct a new [`ScriptFrame`] from `&[Value]` + `&[(String, Value)]` by delegating to
+/// [`materialize_frame_slots_named`].
+pub(crate) fn materialize_frame_named(
+    program: Arc<ControlProgram>,
+    func_id: FnId,
+    globals: ModuleGlobals,
+    upvalues: Arc<Vec<UpvalueValue>>,
+    args: &[Value],
+    named_args: &[(String, Value)],
+) -> MoraResult<ScriptFrame> {
+    let slot_args = args.iter().cloned().map(CallArg::from_value).collect();
+    let slot_named = named_args
+        .iter()
+        .map(|(k, v)| (k.clone(), CallArg::from_value(v.clone())))
+        .collect();
+    materialize_frame_slots_named(program, func_id, globals, upvalues, slot_args, slot_named)
 }
 
 /// Bind `perform` arguments and captured [`CapturedContinuation`] into a `HandleHandler` frame.

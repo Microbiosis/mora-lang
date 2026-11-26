@@ -48,9 +48,14 @@ use std::sync::Arc as Rc;
 ///
 /// 即：本类型把累积建表那一段从「数十秒」压到「几十毫秒」。
 #[derive(Clone)]
-pub struct List {
+struct ListInner {
     chunks: Vec<Rc<[Value; 32]>>,
     count: usize,
+}
+
+#[derive(Clone)]
+pub struct List {
+    inner: Rc<ListInner>,
 }
 
 const B: usize = 32;
@@ -64,17 +69,21 @@ impl Default for List {
 impl List {
     pub fn new() -> Self {
         Self {
-            chunks: Vec::new(),
-            count: 0,
+            inner: Rc::new(ListInner {
+                chunks: Vec::new(),
+                count: 0,
+            }),
         }
     }
 
+    #[inline]
     pub fn len(&self) -> usize {
-        self.count
+        self.inner.count
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
-        self.count == 0
+        self.inner.count == 0
     }
 
     /// 从 `Vec` 构造：一次全量分块，之后所有 push 都是 O(1)。
@@ -95,15 +104,17 @@ impl List {
         if n > 0 {
             chunks.push(Rc::new(cur));
         }
-        Self { chunks, count }
+        Self {
+            inner: Rc::new(ListInner { chunks, count }),
+        }
     }
 
     /// 追加一个元素，返回**新**列表；原列表不变。
     pub fn push(&self, value: Value) -> Self {
-        let mut chunks = self.chunks.clone();
-        let new_count = self.count + 1;
-        let ci = self.count / B;
-        let off = self.count % B;
+        let mut chunks = self.inner.chunks.clone();
+        let new_count = self.inner.count + 1;
+        let ci = self.inner.count / B;
+        let off = self.inner.count % B;
         if off == 0 {
             // 新开一片
             let mut fresh: [Value; B] = std::array::from_fn(|_| Value::Nil);
@@ -111,31 +122,67 @@ impl List {
             chunks.push(Rc::new(fresh));
         } else {
             // 复制**当前最后一片**（32 个元素），不动其它片
-            let last: [Value; B] = (*chunks[ci]).clone();
-            let mut fresh = last;
+            let mut fresh: [Value; B] = (*chunks[ci]).clone();
             fresh[off] = value;
             let n = chunks.len();
             chunks[n - 1] = Rc::new(fresh);
         }
         Self {
-            chunks,
-            count: new_count,
+            inner: Rc::new(ListInner {
+                chunks,
+                count: new_count,
+            }),
+        }
+    }
+
+    /// P6-1 Perceus/FBIP: 追加元素并消费所有权 —— 当列表脊柱唯一持有（`Arc::strong_count == 1`）时
+    /// **原地 O(1) 摊还推入**（若尾片也唯一持有则零拷贝原地写槽），返回 `(new_list, reused)`。
+    #[inline]
+    pub fn push_owned(mut self, value: Value) -> (Self, bool) {
+        if let Some(inner) = Rc::get_mut(&mut self.inner) {
+            let ci = inner.count / B;
+            let off = inner.count % B;
+            if off == 0 {
+                let mut fresh: [Value; B] = std::array::from_fn(|_| Value::Nil);
+                fresh[0] = value;
+                inner.chunks.push(Rc::new(fresh));
+            } else if let Some(tail) = Rc::get_mut(&mut inner.chunks[ci]) {
+                tail[off] = value;
+            } else {
+                let mut fresh: [Value; B] = (*inner.chunks[ci]).clone();
+                fresh[off] = value;
+                inner.chunks[ci] = Rc::new(fresh);
+            }
+            inner.count += 1;
+            (self, true)
+        } else {
+            (self.push(value), false)
         }
     }
 
     /// 按绝对下标取元素 —— O(1)。
+    #[inline]
     pub fn get(&self, i: usize) -> Option<&Value> {
-        if i >= self.count {
+        if i >= self.inner.count {
             return None;
         }
-        self.chunks.get(i / B).and_then(|c| c.get(i % B))
+        self.inner.chunks.get(i / B).and_then(|c| c.get(i % B))
+    }
+
+    /// 解构只可移动独占脊柱上独占块中的元素。
+    pub(crate) fn get_mut_if_unique(&mut self, i: usize) -> Option<&mut Value> {
+        let inner = Rc::get_mut(&mut self.inner)?;
+        if i >= inner.count {
+            return None;
+        }
+        Rc::get_mut(&mut inner.chunks[i / B]).map(|chunk| &mut chunk[i % B])
     }
 
     pub fn iter(&self) -> ListIter<'_> {
         ListIter {
             list: self,
             front: 0,
-            back: self.count,
+            back: self.inner.count,
         }
     }
 
@@ -148,10 +195,10 @@ impl List {
     }
 
     pub fn last(&self) -> Option<&Value> {
-        if self.count == 0 {
+        if self.inner.count == 0 {
             None
         } else {
-            self.get(self.count - 1)
+            self.get(self.inner.count - 1)
         }
     }
 
@@ -160,12 +207,12 @@ impl List {
     }
 
     pub fn slice(&self, start: usize, end: usize) -> List {
-        let end = end.min(self.count);
+        let end = end.min(self.inner.count);
         let start = start.min(end);
         let mut out = List::new();
         for i in start..end {
             if let Some(v) = self.get(i) {
-                out = out.push(v.clone());
+                out = out.push_owned(v.clone()).0;
             }
         }
         out
@@ -221,12 +268,35 @@ impl List {
         List::from_vec(v)
     }
 
+    /// P6-1 Perceus/FBIP: 拼接两个列表并消费 `self` 所有权 —— 当 `self` 唯一持有（`Arc::strong_count == 1`）时
+    /// 原地扩展块脊柱与尾块（若 `self` 恰好块对齐则直接 O(chunks) 共享追加 `other` 的块指针），返回 `(merged, reused)`。
+    pub fn extend_owned(mut self, other: List) -> (Self, bool) {
+        if other.is_empty() {
+            return (self, false);
+        }
+        if self.is_empty() {
+            return (other, false);
+        }
+        let reused = Rc::get_mut(&mut self.inner).is_some();
+        let inner = Rc::make_mut(&mut self.inner);
+        if inner.count.is_multiple_of(B) {
+            let rhs = Rc::unwrap_or_clone(other.inner);
+            inner.count += rhs.count;
+            inner.chunks.extend(rhs.chunks);
+        } else {
+            for value in other {
+                self = self.push_owned(value).0;
+            }
+        }
+        (self, reused)
+    }
+
     /// 取出末元素（不改列表）。对应 `Vec::pop` 的取值部分。
     pub fn pop_last(&self) -> Option<Value> {
-        if self.count == 0 {
+        if self.inner.count == 0 {
             None
         } else {
-            self.get(self.count - 1).cloned()
+            self.get(self.inner.count - 1).cloned()
         }
     }
 
@@ -237,8 +307,8 @@ impl List {
         }
         let mut out = Vec::new();
         let mut i = 0;
-        while i < self.count {
-            let end = (i + n).min(self.count);
+        while i < self.inner.count {
+            let end = (i + n).min(self.inner.count);
             out.push(self.to_vec()[i..end].to_vec());
             i = end;
         }
@@ -250,30 +320,48 @@ impl List {
     }
 
     /// **不可变**按下标写入，返回新列表（原列表不变）。
-    ///
-    /// 值语义下「原地改」只能表达成「产出新列表」。调用点要接住返回值。
-    /// （`runtime/vm/value_ops.rs` 的 `list[i] = v` 两处已改写为
-    /// `list = list.set(i, v)`。）
     pub fn set(&self, i: usize, value: Value) -> List {
-        let mut out = self.clone();
+        let mut chunks = self.inner.chunks.clone();
         let ci = i / B;
         let off = i % B;
-        if let Some(chunk) = out.chunks.get_mut(ci) {
+        if let Some(chunk) = chunks.get_mut(ci) {
             let mut fresh: [Value; B] = (**chunk).clone();
             fresh[off] = value;
             *chunk = std::sync::Arc::new(fresh);
         }
-        out
+        Self {
+            inner: Rc::new(ListInner {
+                chunks,
+                count: self.inner.count,
+            }),
+        }
     }
 
-    /// 稳定身份 —— 用 `chunks` 缓冲区的地址标识一个列表实例。
-    ///
-    /// 分块实现没有单一连续缓冲区，但 `chunks` 这个 `Vec` 本身有稳定地址，
-    /// 且每个列表实例各持一份 → 可作身份。**注意**：这依赖「不同实例不共享
-    /// 同一个 `Vec`」—— 结构性共享发生在**块**层面（`Arc`），`chunks` 每次
-    /// `push` 都新分配，故身份始终唯一。
+    /// P6-1 Perceus/FBIP: 按下标写入并消费所有权 —— 唯一持有时原地 O(1) 写回。
+    #[inline]
+    pub fn set_owned(mut self, i: usize, value: Value) -> (Self, bool) {
+        if let Some(inner) = Rc::get_mut(&mut self.inner) {
+            let ci = i / B;
+            let off = i % B;
+            if let Some(chunk) = inner.chunks.get_mut(ci) {
+                if let Some(arr) = Rc::get_mut(chunk) {
+                    arr[off] = value;
+                } else {
+                    let mut fresh: [Value; B] = (**chunk).clone();
+                    fresh[off] = value;
+                    *chunk = Rc::new(fresh);
+                }
+            }
+            (self, true)
+        } else {
+            (self.set(i, value), false)
+        }
+    }
+
+    /// 稳定身份 —— 用外层 `Arc<ListInner>` 地址标识列表实例（原地复用时保持同一 `id()`）。
+    #[inline]
     pub fn id(&self) -> usize {
-        self.chunks.as_ptr() as usize
+        Rc::as_ptr(&self.inner) as usize
     }
 
     pub fn any(&self, p: impl FnMut(&Value) -> bool) -> bool {
@@ -362,7 +450,37 @@ impl IntoIterator for List {
     type Item = Value;
     type IntoIter = std::vec::IntoIter<Value>;
     fn into_iter(self) -> Self::IntoIter {
-        self.to_vec().into_iter()
+        match Rc::try_unwrap(self.inner) {
+            Ok(inner) => {
+                let mut out = Vec::with_capacity(inner.count);
+                let mut rem = inner.count;
+                for chunk in inner.chunks {
+                    let take = rem.min(B);
+                    match Rc::try_unwrap(chunk) {
+                        Ok(arr) => out.extend(arr.into_iter().take(take)),
+                        Err(rc) => out.extend(rc.iter().take(take).cloned()),
+                    }
+                    rem -= take;
+                    if rem == 0 {
+                        break;
+                    }
+                }
+                out.into_iter()
+            }
+            Err(rc) => {
+                let mut out = Vec::with_capacity(rc.count);
+                for ci in 0..rc.chunks.len() {
+                    for off in 0..B {
+                        let idx = ci * B + off;
+                        if idx >= rc.count {
+                            break;
+                        }
+                        out.push(rc.chunks[ci][off].clone());
+                    }
+                }
+                out.into_iter()
+            }
+        }
     }
 }
 
@@ -380,20 +498,20 @@ impl From<List> for Vec<Value> {
 
 impl FromIterator<Value> for List {
     fn from_iter<T: IntoIterator<Item = Value>>(iter: T) -> Self {
-        let mut out = List::new();
-        for v in iter {
-            out = out.push(v);
-        }
-        out
+        let v: Vec<Value> = iter.into_iter().collect();
+        List::from_vec(v)
     }
 }
 
 impl PartialEq for List {
     fn eq(&self, other: &Self) -> bool {
-        if self.count != other.count {
+        if Rc::ptr_eq(&self.inner, &other.inner) {
+            return true;
+        }
+        if self.inner.count != other.inner.count {
             return false;
         }
-        (0..self.count).all(|i| self.get(i) == other.get(i))
+        (0..self.inner.count).all(|i| self.get(i) == other.get(i))
     }
 }
 
@@ -405,7 +523,7 @@ impl std::fmt::Debug for List {
     /// `Debug` 文本的地方（测试断言、错误信息）都会被这堆内部细节污染。
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_list()
-            .entries((0..self.count).filter_map(|i| self.get(i)))
+            .entries((0..self.inner.count).filter_map(|i| self.get(i)))
             .finish()
     }
 }

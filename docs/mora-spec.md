@@ -731,7 +731,7 @@ end
 
 ### 8.2 错误传播与解构
 
-通过 `match ... with` 对 `Ok(v)` 与 `Err(e)` 分支进行显式解构与传播（后缀 `?` 产生式在语法表中保留，当前版本尚未启用，详见 `tests/spec_ebnf_surface.rs`）：
+通过 `match ... with` 对 `Ok(v)` 与 `Err(e)` 分支进行显式解构与传播；后缀 `?` 产生式自 v0.112.0 G2 起**已启用**，用于 `result<T, E>` 的错误传播 —— `Ok(v)?` 取 `v` 继续执行，`Err(e)?` 把 `Err` 原样向上传播（详见 `tests/spec_ebnf_surface.rs`）：
 
 ```mora
 task safe_divide(a: number, b: number)

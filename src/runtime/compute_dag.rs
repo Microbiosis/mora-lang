@@ -33,7 +33,7 @@ use crate::runtime::autograd::{
     AutogradTape, TapeOp, scatter_add_flat, sum_axis_flat, transpose_flat,
 };
 use crate::runtime::simd_kernels;
-use crate::value::tensor::{AlignedByteBuffer, Tensor, checked_numel, quantize_for_dtype};
+use crate::value::tensor::{AlignedByteBuffer, RowNorm, Tensor, checked_numel, quantize_for_dtype};
 
 /// Live VRAM residency, transfer, and native low-precision dispatch counters for a [`DeviceBackend`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -3570,43 +3570,17 @@ fn eval_node_into(
             }
             Ok(())
         }
-        DagOp::RmsNorm(a, eps) => {
+        DagOp::RmsNorm(a, eps) | DagOp::LayerNorm(a, eps) => {
+            let norm = if matches!(node.op, DagOp::RmsNorm(..)) {
+                RowNorm::Rms
+            } else {
+                RowNorm::Layer
+            };
             let src = get(*a);
-            let d = node.shape.last().copied().unwrap_or(1).max(1);
-            let d_f = d as f64;
+            let width = node.shape.last().copied().unwrap_or(1);
             dst.resize(src.len(), 0.0);
-            for row in 0..(src.len() / d) {
-                let base = row * d;
-                let row_in = &src[base..base + d];
-                let ms = simd_kernels::sum_sq_f64(row_in) / d_f;
-                let inv_rms = 1.0 / (ms + *eps).sqrt();
-                for j in 0..d {
-                    dst[base + j] = quantize_for_dtype(row_in[j] * inv_rms, node.dtype);
-                }
-            }
-            Ok(())
-        }
-        DagOp::LayerNorm(a, eps) => {
-            let src = get(*a);
-            let d = node.shape.last().copied().unwrap_or(1).max(1);
-            let d_f = d as f64;
-            dst.resize(src.len(), 0.0);
-            for row in 0..(src.len() / d) {
-                let base = row * d;
-                let row_in = &src[base..base + d];
-                let mean = row_in.iter().sum::<f64>() / d_f;
-                let var = row_in
-                    .iter()
-                    .map(|x| {
-                        let c = x - mean;
-                        c * c
-                    })
-                    .sum::<f64>()
-                    / d_f;
-                let inv_std = 1.0 / (var + *eps).sqrt();
-                for j in 0..d {
-                    dst[base + j] = quantize_for_dtype((row_in[j] - mean) * inv_std, node.dtype);
-                }
+            for (row, out) in src.chunks_exact(width).zip(dst.chunks_exact_mut(width)) {
+                norm.write_row(row, *eps, node.dtype, out);
             }
             Ok(())
         }

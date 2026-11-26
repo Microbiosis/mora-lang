@@ -5,8 +5,6 @@
 //! - `construct_trait_instance_core`: `Trait::new("ForType")` 构造 trait instance
 //! - `collect_required_methods` / `collect_parent_traits`: trait 继承链辅助
 
-use std::collections::HashMap;
-
 use crate::common::Span;
 use crate::common::trait_info::{TraitInfo, default_impl_method_key, impl_method_key};
 use crate::error::{MoraError, MoraResult};
@@ -188,13 +186,14 @@ pub(crate) fn resolve_trait_method_call(
     )))
 }
 
-/// Pure lookup for inherent or trait `impl` method on a concrete (unboxed) receiver value.
-pub(crate) fn resolve_concrete_impl_method(
+/// Pure lookup returning `(callee_fn, has_self)` for an inherent or trait `impl` method on `receiver`
+/// without cloning `receiver` or arguments, allowing `RegSlot`-based dispatch to pass borrowed `self`
+/// directly into `materialize_frame_slots_named`.
+pub(crate) fn lookup_concrete_impl_callee(
     core: &crate::runtime::CoreRuntime,
     receiver: &Value,
     method: &str,
-    args: &[Value],
-) -> Option<(Value, Vec<Value>)> {
+) -> Option<(Value, bool)> {
     let type_key = crate::flow::dynamic_type_name(receiver);
     let lower_key = type_key.to_lowercase();
 
@@ -217,14 +216,8 @@ pub(crate) fn resolve_concrete_impl_method(
                 .find(|((tgt, m), _)| m == method && target_matches(tgt))
                 .map(|(_, v)| v.clone())
         });
-    if let Some((func, has_self)) = inherent {
-        let mut all_args = if has_self {
-            vec![receiver.clone()]
-        } else {
-            Vec::new()
-        };
-        all_args.extend(args.iter().cloned());
-        return Some((func, all_args));
+    if inherent.is_some() {
+        return inherent;
     }
 
     // 2. Trait `impl Trait for TargetType` methods
@@ -234,14 +227,8 @@ pub(crate) fn resolve_concrete_impl_method(
         .iter()
         .find(|((_, tgt, m), _)| m == method && target_matches(tgt))
         .map(|(_, v)| v.clone());
-    if let Some((func, has_self)) = trait_direct {
-        let mut all_args = if has_self {
-            vec![receiver.clone()]
-        } else {
-            Vec::new()
-        };
-        all_args.extend(args.iter().cloned());
-        return Some((func, all_args));
+    if trait_direct.is_some() {
+        return trait_direct;
     }
 
     // 3. Default method on any trait implemented by `TargetType` (or its parent traits)
@@ -258,23 +245,33 @@ pub(crate) fn resolve_concrete_impl_method(
     }
     for tr in implemented_traits {
         for anc in collect_parent_traits(&core.registry.trait_registry, &tr) {
-            if let Some((func, has_self)) = core
+            if let Some(entry) = core
                 .registry
                 .trait_defaults
                 .get(&(anc, method.to_string()))
                 .cloned()
             {
-                let mut all_args = if has_self {
-                    vec![receiver.clone()]
-                } else {
-                    Vec::new()
-                };
-                all_args.extend(args.iter().cloned());
-                return Some((func, all_args));
+                return Some(entry);
             }
         }
     }
     None
+}
+
+/// Pure lookup for inherent or trait `impl` method on a concrete (unboxed) receiver value.
+pub(crate) fn resolve_concrete_impl_method(
+    core: &crate::runtime::CoreRuntime,
+    receiver: &Value,
+    method: &str,
+    args: &[Value],
+) -> Option<(Value, Vec<Value>)> {
+    let (func, has_self) = lookup_concrete_impl_callee(core, receiver, method)?;
+    let mut all_args = Vec::with_capacity(usize::from(has_self) + args.len());
+    if has_self {
+        all_args.push(receiver.clone());
+    }
+    all_args.extend_from_slice(args);
+    Some((func, all_args))
 }
 
 /// Pure helper constructing a `TraitObject` instance for `Trait::new("ForType")`.
@@ -310,6 +307,6 @@ pub(crate) fn construct_trait_instance_core(
         trait_generics: trait_generics.to_vec(),
         for_type: for_type.to_string(),
         trait_name: trait_name.to_string(),
-        data: Box::new(Value::Dict(HashMap::new())),
+        data: Box::new(Value::Dict(Default::default())),
     })
 }

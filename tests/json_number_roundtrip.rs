@@ -27,8 +27,6 @@
 //!
 //! ⚠ 若将来线格式改为能表达非有限值，本条会**红**（那时删掉该例外即可）。
 
-use std::collections::HashMap;
-
 use mora::flow::{json_to_value, value_to_json};
 use mora::value::Value;
 
@@ -168,7 +166,7 @@ fn d290_numbers_inside_containers_behave_the_same() {
             ("f".to_string(), Value::Float(1.5)),
             ("i".to_string(), Value::Int(-42)),
             ("n".to_string(), Value::Float(f64::NAN)),
-            ("e".to_string(), Value::Dict(HashMap::new())),
+            ("e".to_string(), Value::Dict(Default::default())),
             (
                 "l".to_string(),
                 lst(vec![Value::Int(1), Value::Float(-0.5)]),
@@ -189,7 +187,7 @@ fn d290_numbers_inside_containers_behave_the_same() {
             assert_eq!(m.get("i"), Some(&Value::Int(-42)), "i 丢失：{json}");
             assert_eq!(
                 m.get("e"),
-                Some(&Value::Dict(HashMap::new())),
+                Some(&Value::Dict(Default::default())),
                 "e 丢失：{json}"
             );
             // NaN 降级成 Nil（null）

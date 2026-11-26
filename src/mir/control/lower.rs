@@ -24,9 +24,9 @@ use super::ir::{
     BasicBlock, BlockId, BuiltinFnId, CalleeTarget, CaptureSource, CompiledPattern, ControlConst,
     ControlFunction, ControlImplMethod, ControlInst, ControlProgram, ControlQqSegment,
     ControlSelectArm, ControlSliceAxis, ControlSpawnTarget, ControlStructField, ControlTerminator,
-    ControlTraitMethod, FnId, FunctionKind, GlobalKind, GlobalMeta, GlobalSlot, LocalSlot,
-    ParallelSegment, PatternTarget, SymId, SymbolTable, UnaryOp, UpvalueDesc, UpvalueSlot, VReg,
-    verify_program,
+    ControlTraitMethod, FnId, FunctionKind, GlobalKind, GlobalMeta, GlobalSlot, KillMask,
+    LocalSlot, ParallelSegment, PatternTarget, SymId, SymbolTable, UnaryOp, UpvalueDesc,
+    UpvalueSlot, VReg, verify_program,
 };
 
 /// Outcome of lowering a statement/expression inside the current basic block.
@@ -60,6 +60,24 @@ struct ProgramLowerer {
     /// P4-1A: Nominal struct generic metadata `(type_params, const_params)` for lowering
     /// explicit const-generic calls (`Linear<4, 3>(...)`) and `impl` const-param prologues.
     struct_const_meta: HashMap<String, (Vec<String>, Vec<String>)>,
+    /// P6-1: Compile-time nominal struct field map `struct_name -> { field_name -> Option<nested_base_type> }`
+    /// enabling direct lowering of proven struct field reads to `ControlInst::ProjectField`.
+    struct_fields: HashMap<String, HashMap<String, Option<String>>>,
+    /// P6-1: Return nominal type name declared on top-level `task`s (`task_name -> base_type`).
+    task_return_type: HashMap<String, String>,
+    /// P6-1: Static nominal struct type tracked for `<main>` global slots.
+    global_struct_ty: HashMap<GlobalSlot, String>,
+    scanned_std_imports: HashSet<String>,
+}
+
+fn hint_base_type_name(hint: &crate::mir::hint::TypeHint) -> String {
+    hint.to_type()
+        .name()
+        .split('<')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string()
 }
 
 impl ProgramLowerer {
@@ -73,6 +91,48 @@ impl ProgramLowerer {
             parent_edges: Vec::new(),
             task_param_specs: HashMap::new(),
             struct_const_meta: HashMap::new(),
+            struct_fields: HashMap::new(),
+            task_return_type: HashMap::new(),
+            global_struct_ty: HashMap::new(),
+            scanned_std_imports: HashSet::new(),
+        }
+    }
+
+    fn scan_imported_struct_meta(&mut self, witnesses: &[MirWitness]) {
+        for w in witnesses {
+            match &w.kind {
+                WitnessKind::StructDef { name, fields, .. } => {
+                    let mut fmap = HashMap::with_capacity(fields.len());
+                    for f in fields {
+                        let bt = hint_base_type_name(&f.type_hint);
+                        fmap.insert(f.name.clone(), (!bt.is_empty()).then_some(bt));
+                    }
+                    self.struct_fields.insert(name.clone(), fmap);
+                }
+                WitnessKind::FnDef {
+                    name,
+                    return_type: Some(rt),
+                    ..
+                } => {
+                    let bt = hint_base_type_name(rt);
+                    if !bt.is_empty() {
+                        self.task_return_type.insert(name.clone(), bt);
+                    }
+                }
+                WitnessKind::Export { decl, .. } => {
+                    self.scan_imported_struct_meta(std::slice::from_ref(decl))
+                }
+                WitnessKind::Sequence(items) => self.scan_imported_struct_meta(items),
+                WitnessKind::Import(path) => {
+                    if self.scanned_std_imports.insert(path.clone())
+                        && let Some(std_src) = crate::resolve_std_module(path)
+                        && let Ok(std_w) = crate::parser_v3::ParserV3::parse_witnesses(std_src)
+                    {
+                        self.scan_imported_struct_meta(&std_w);
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
@@ -88,6 +148,7 @@ impl ProgramLowerer {
             kind: FunctionKind::Closure,
             params: Vec::new(),
             param_has_default: Vec::new(),
+            param_borrows: Vec::new(),
             upvalues: Vec::new(),
             shared_locals: Vec::new(),
             local_names: Vec::new(),
@@ -131,7 +192,18 @@ impl ProgramLowerer {
 
     fn pre_scan_stmt(&mut self, w: &MirWitness, in_loop: bool) {
         match &w.kind {
-            WitnessKind::FnDef { name, params, .. } => {
+            WitnessKind::FnDef {
+                name,
+                params,
+                return_type,
+                ..
+            } => {
+                if let Some(rt) = return_type {
+                    let bt = hint_base_type_name(rt);
+                    if !bt.is_empty() {
+                        self.task_return_type.insert(name.clone(), bt);
+                    }
+                }
                 if let Some(&existing) = self.global_by_name.get(name)
                     && let GlobalKind::Task(fn_id) = self.globals[existing.0 as usize].kind
                 {
@@ -173,11 +245,25 @@ impl ProgramLowerer {
                 name,
                 type_params,
                 const_params,
-                ..
+                fields,
             } => {
                 self.struct_const_meta
                     .insert(name.clone(), (type_params.clone(), const_params.clone()));
+                let mut fmap = HashMap::with_capacity(fields.len());
+                for f in fields {
+                    let bt = hint_base_type_name(&f.type_hint);
+                    fmap.insert(f.name.clone(), (!bt.is_empty()).then_some(bt));
+                }
+                self.struct_fields.insert(name.clone(), fmap);
                 self.alloc_global(name, GlobalKind::Struct);
+            }
+            WitnessKind::Import(path) => {
+                if self.scanned_std_imports.insert(path.clone())
+                    && let Some(std_src) = crate::resolve_std_module(path)
+                    && let Ok(std_w) = crate::parser_v3::ParserV3::parse_witnesses(std_src)
+                {
+                    self.scan_imported_struct_meta(&std_w);
+                }
             }
             WitnessKind::KernelDef { name, .. } => {
                 self.alloc_global(name, GlobalKind::Kernel);
@@ -324,6 +410,9 @@ struct FuncScope {
     branch_depth: usize,
     handler_k_slot: Option<LocalSlot>,
     handler_arg_slots: Vec<Option<LocalSlot>>,
+    /// P6-1: Static nominal struct types known for local slots and SSA registers in this function.
+    local_struct_ty: HashMap<LocalSlot, String>,
+    reg_struct_ty: HashMap<VReg, String>,
 }
 
 impl FuncScope {
@@ -344,6 +433,8 @@ impl FuncScope {
                 id: BlockId(0),
                 params: Vec::new(),
                 insts: Vec::new(),
+                inst_kill_masks: Vec::new(),
+                term_kill_mask: KillMask::Empty,
                 terminator: ControlTerminator::Unreachable,
             }],
             cur_bb: BlockId(0),
@@ -361,6 +452,8 @@ impl FuncScope {
             branch_depth: 0,
             handler_k_slot: None,
             handler_arg_slots: Vec::new(),
+            local_struct_ty: HashMap::new(),
+            reg_struct_ty: HashMap::new(),
         };
         for p in params {
             let sym = prog.intern(p);
@@ -394,6 +487,8 @@ impl FuncScope {
             id,
             params: params.clone(),
             insts: Vec::new(),
+            inst_kill_masks: Vec::new(),
+            term_kill_mask: KillMask::Empty,
             terminator: ControlTerminator::Unreachable,
         });
         (id, params)
@@ -479,12 +574,14 @@ impl FuncScope {
                 self.shared_locals[slot.0 as usize] = true;
             }
         }
+        let param_borrows = vec![false; self.param_syms.len()];
         ControlFunction {
             id: self.fn_id,
             name: self.name_sym,
             kind: self.kind,
             params: self.param_syms,
             param_has_default: self.param_has_default,
+            param_borrows,
             upvalues: self.upvalues,
             shared_locals: self.shared_locals,
             local_names: self.local_names.clone(),
@@ -499,15 +596,32 @@ impl FuncScope {
 }
 
 /// Lower a compiled program's syntax witnesses into verified canonical Control SSA IR.
+///
+/// The program's `<main>`-private globals are dead once `<main>` returns (scripts, AOT
+/// binaries, module initializers), so the Perceus ownership pass may transfer their ownership
+/// out of their slots at their final read.
 pub fn lower_program(witnesses: &[MirWitness]) -> MoraResult<ControlProgram> {
-    lower_program_with_dyn_globals(witnesses, &[])
+    lower_program_inner(witnesses, &[], false)
 }
 
 /// Lower a compiled program with an explicit list of pre-existing dynamic/REPL global
 /// symbol names so incremental chunks resolve them via `LoadDyn`/`AssignDyn`.
+///
+/// The dynamic globals are exactly the case where an embedding environment captures the
+/// program's globals after execution — the REPL copies every global of a chunk into the session
+/// environment, and `eval` restores the caller's environment. Such globals must keep their
+/// value, so the Perceus ownership pass leaves them in their slots.
 pub fn lower_program_with_dyn_globals(
     witnesses: &[MirWitness],
     dyn_names: &[String],
+) -> MoraResult<ControlProgram> {
+    lower_program_inner(witnesses, dyn_names, true)
+}
+
+fn lower_program_inner(
+    witnesses: &[MirWitness],
+    dyn_names: &[String],
+    preserve_globals_at_exit: bool,
 ) -> MoraResult<ControlProgram> {
     let mut prog = ProgramLowerer::new(dyn_names);
     let main_id = prog.reserve_fn();
@@ -538,6 +652,7 @@ pub fn lower_program_with_dyn_globals(
         functions: prog.functions,
         entry: main_id,
         globals: prog.globals,
+        preserve_globals_at_exit,
     };
     verify_program(&out)?;
     Ok(out)
@@ -641,22 +756,52 @@ fn try_capture_from_chain(
     Some(u_slot)
 }
 
-fn emit_load_binding(scope: &mut FuncScope, binding: VarBinding) -> VReg {
+fn emit_load_binding(scope: &mut FuncScope, prog: &ProgramLowerer, binding: VarBinding) -> VReg {
     let dst = scope.alloc_reg();
     match binding {
-        VarBinding::Local(slot) => scope.emit(ControlInst::LoadLocal(dst, slot)),
+        VarBinding::Local(slot) => {
+            if let Some(st) = scope.local_struct_ty.get(&slot).cloned() {
+                scope.reg_struct_ty.insert(dst, st);
+            }
+            scope.emit(ControlInst::LoadLocal(dst, slot));
+        }
         VarBinding::Upvalue(slot) => scope.emit(ControlInst::LoadUpvalue(dst, slot)),
-        VarBinding::Global(slot) => scope.emit(ControlInst::LoadGlobal(dst, slot)),
+        VarBinding::Global(slot) => {
+            if let Some(st) = prog.global_struct_ty.get(&slot).cloned() {
+                scope.reg_struct_ty.insert(dst, st);
+            }
+            scope.emit(ControlInst::LoadGlobal(dst, slot));
+        }
         VarBinding::Dyn(sym) => scope.emit(ControlInst::LoadDyn(dst, sym)),
     }
     dst
 }
 
-fn emit_store_binding(scope: &mut FuncScope, binding: VarBinding, val: VReg) {
+fn emit_store_binding(
+    scope: &mut FuncScope,
+    prog: &mut ProgramLowerer,
+    binding: VarBinding,
+    val: VReg,
+) {
+    let val_sty = scope.reg_struct_ty.get(&val).cloned();
     match binding {
-        VarBinding::Local(slot) => scope.emit(ControlInst::StoreLocal(slot, val)),
+        VarBinding::Local(slot) => {
+            if let Some(st) = val_sty {
+                scope.local_struct_ty.insert(slot, st);
+            } else {
+                scope.local_struct_ty.remove(&slot);
+            }
+            scope.emit(ControlInst::StoreLocal(slot, val));
+        }
         VarBinding::Upvalue(slot) => scope.emit(ControlInst::StoreUpvalue(slot, val)),
-        VarBinding::Global(slot) => scope.emit(ControlInst::StoreGlobal(slot, val)),
+        VarBinding::Global(slot) => {
+            if let Some(st) = val_sty {
+                prog.global_struct_ty.insert(slot, st);
+            } else {
+                prog.global_struct_ty.remove(&slot);
+            }
+            scope.emit(ControlInst::StoreGlobal(slot, val));
+        }
         VarBinding::Dyn(sym) => scope.emit(ControlInst::AssignDyn(sym, val)),
     }
 }
@@ -707,7 +852,7 @@ impl ScopeStack {
     /// and falling back to built-in values (`print`, `str`, `math`, ...) or `DynGlobal`.
     fn emit_read_var(&mut self, prog: &mut ProgramLowerer, name: &str) -> VReg {
         if let Some(binding) = self.resolve_binding(prog, name, false) {
-            return emit_load_binding(self.current_mut(), binding);
+            return emit_load_binding(self.current_mut(), prog, binding);
         }
         if let Some(bfn) = BuiltinFnId::from_name(name) {
             return self.current_mut().emit_const(ControlConst::BuiltinFn(bfn));
@@ -746,6 +891,7 @@ impl ScopeStack {
             params,
             &[],
             false,
+            None,
             body,
             handler_setup,
             capture_parent,
@@ -762,6 +908,7 @@ impl ScopeStack {
         params: &[WitnessParam],
         const_params: &[String],
         has_self: bool,
+        impl_self_struct: Option<&str>,
         body: &MirWitness,
         handler_setup: Option<(&str, usize)>,
         capture_parent: bool,
@@ -775,6 +922,20 @@ impl ScopeStack {
         let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
         let mut child = FuncScope::new(fn_id, kind, name_sym, &param_names, prog);
         child.param_has_default = params.iter().map(|p| p.default.is_some()).collect();
+        if has_self
+            && let Some(st) = impl_self_struct
+            && prog.struct_fields.contains_key(st)
+        {
+            child.local_struct_ty.insert(LocalSlot(0), st.to_string());
+        }
+        for (idx, wp) in params.iter().enumerate() {
+            if let Some(th) = &wp.type_hint {
+                let bt = hint_base_type_name(th);
+                if prog.struct_fields.contains_key(&bt) {
+                    child.local_struct_ty.insert(LocalSlot(idx as u16), bt);
+                }
+            }
+        }
 
         if let Some((k_param, arg_count)) = handler_setup {
             let arg_slots: Vec<Option<LocalSlot>> = (0..arg_count)
@@ -1424,13 +1585,31 @@ fn lower_expr_chain(
                 let recv_reg = vals.pop().expect("method receiver reg present");
                 let dst = stack.current_mut().alloc_reg();
                 let method_sym = prog.intern(method);
-                stack.current_mut().emit(ControlInst::MethodCall {
-                    dst,
-                    receiver: recv_reg,
-                    method: method_sym,
-                    args: arg_regs,
-                    named_args,
-                });
+                if arg_regs.is_empty()
+                    && named_args.is_empty()
+                    && let Some(sname) = stack.current_mut().reg_struct_ty.get(&recv_reg).cloned()
+                    && let Some(fmap) = prog.struct_fields.get(&sname)
+                    && let Some(nested_opt) = fmap.get(method).cloned()
+                {
+                    if let Some(nested) = nested_opt
+                        && prog.struct_fields.contains_key(&nested)
+                    {
+                        stack.current_mut().reg_struct_ty.insert(dst, nested);
+                    }
+                    stack.current_mut().emit(ControlInst::ProjectField {
+                        dst,
+                        receiver: recv_reg,
+                        field: method_sym,
+                    });
+                } else {
+                    stack.current_mut().emit(ControlInst::MethodCall {
+                        dst,
+                        receiver: recv_reg,
+                        method: method_sym,
+                        args: arg_regs,
+                        named_args,
+                    });
+                }
                 vals.push(dst);
             }
             ChainTask::StartShortCircuit {
@@ -1725,14 +1904,19 @@ fn lower_expr_single(
 
         WitnessKind::LetBinding {
             name,
+            type_hint,
             value,
             init_body,
-            ..
         } => {
             let val_reg = match lower_expr(stack, prog, value, false)? {
                 FlowState::Active(r) => r,
                 FlowState::Terminated => return Ok(FlowState::Terminated),
             };
+            let inferred_sty = type_hint
+                .as_ref()
+                .map(hint_base_type_name)
+                .filter(|bt| prog.struct_fields.contains_key(bt))
+                .or_else(|| stack.current_mut().reg_struct_ty.get(&val_reg).cloned());
             // P5-1A: Go-1.22-style per-iteration loop variable scoping.
             // Any `let` binding newly declared inside a `while`/`for` loop body (not already
             // defined outside the loop) gets a loop-scoped `LocalSlot` with `FreshLocalCell`,
@@ -1760,17 +1944,32 @@ fn lower_expr_single(
                     None
                 };
             if let Some(slot) = loop_local_slot {
+                if let Some(st) = inferred_sty {
+                    stack.current_mut().local_struct_ty.insert(slot, st);
+                } else {
+                    stack.current_mut().local_struct_ty.remove(&slot);
+                }
                 stack.current_mut().emit(ControlInst::FreshLocalCell(slot));
                 stack
                     .current_mut()
                     .emit(ControlInst::StoreLocal(slot, val_reg));
             } else if stack.is_module_top_level() {
                 let g_slot = prog.alloc_global(name, GlobalKind::Var);
+                if let Some(st) = inferred_sty {
+                    prog.global_struct_ty.insert(g_slot, st);
+                } else {
+                    prog.global_struct_ty.remove(&g_slot);
+                }
                 stack
                     .current_mut()
                     .emit(ControlInst::StoreGlobal(g_slot, val_reg));
             } else {
                 let slot = stack.current_mut().bind_let_local(name, prog);
+                if let Some(st) = inferred_sty {
+                    stack.current_mut().local_struct_ty.insert(slot, st);
+                } else {
+                    stack.current_mut().local_struct_ty.remove(&slot);
+                }
                 stack
                     .current_mut()
                     .emit(ControlInst::StoreLocal(slot, val_reg));
@@ -1791,7 +1990,7 @@ fn lower_expr_single(
                 if let VarBinding::Local(slot) = binding {
                     stack.current_mut().mutated_local_slots.insert(slot);
                 }
-                emit_store_binding(stack.current_mut(), binding, val_reg);
+                emit_store_binding(stack.current_mut(), prog, binding, val_reg);
             } else {
                 let sym = prog.intern(target);
                 stack
@@ -2187,6 +2386,7 @@ fn lower_expr_single(
                     &m.params,
                     &active_consts,
                     m.has_self,
+                    Some(target_type.as_str()),
                     &m.body,
                     None,
                     false,
@@ -2554,12 +2754,12 @@ fn resolve_callee_target(
                             Ok(Some(ResolvedCallee::Target(CalleeTarget::Fn(fn_id))))
                         }
                         _ => {
-                            let creg = emit_load_binding(stack.current_mut(), binding);
+                            let creg = emit_load_binding(stack.current_mut(), prog, binding);
                             Ok(Some(ResolvedCallee::Target(CalleeTarget::Value(creg))))
                         }
                     },
                     _ => {
-                        let creg = emit_load_binding(stack.current_mut(), binding);
+                        let creg = emit_load_binding(stack.current_mut(), prog, binding);
                         Ok(Some(ResolvedCallee::Target(CalleeTarget::Value(creg))))
                     }
                 }
@@ -2866,15 +3066,67 @@ fn lower_call(
         }
         let dst = stack.current_mut().alloc_reg();
         let method_sym = prog.intern(method);
-        stack.current_mut().emit(ControlInst::MethodCall {
-            dst,
-            receiver: recv_reg,
-            method: method_sym,
-            args: arg_regs,
-            named_args: named_regs,
-        });
+        if arg_regs.is_empty()
+            && named_regs.is_empty()
+            && let Some(sname) = stack.current_mut().reg_struct_ty.get(&recv_reg).cloned()
+            && let Some(fmap) = prog.struct_fields.get(&sname)
+            && let Some(nested_opt) = fmap.get(method).cloned()
+        {
+            if let Some(nested) = nested_opt
+                && prog.struct_fields.contains_key(&nested)
+            {
+                stack.current_mut().reg_struct_ty.insert(dst, nested);
+            }
+            stack.current_mut().emit(ControlInst::ProjectField {
+                dst,
+                receiver: recv_reg,
+                field: method_sym,
+            });
+        } else if (method == "new" || method == "from_dict")
+            && let WitnessCallee::Method(obj, _) = callee
+            && prog.struct_fields.contains_key(obj)
+        {
+            stack.current_mut().reg_struct_ty.insert(dst, obj.clone());
+            stack.current_mut().emit(ControlInst::MethodCall {
+                dst,
+                receiver: recv_reg,
+                method: method_sym,
+                args: arg_regs,
+                named_args: named_regs,
+            });
+        } else {
+            stack.current_mut().emit(ControlInst::MethodCall {
+                dst,
+                receiver: recv_reg,
+                method: method_sym,
+                args: arg_regs,
+                named_args: named_regs,
+            });
+        }
         return Ok(FlowState::Active(dst));
     }
+
+    let callee_struct_out: Option<String> = match callee {
+        WitnessCallee::Name(n)
+        | WitnessCallee::GenericName { name: n, .. }
+        | WitnessCallee::Var(n) => {
+            let ctor_cand = match n.split_once("::") {
+                Some((t, "new" | "from_dict")) => Some(t),
+                None => Some(n.as_str()),
+                _ => None,
+            };
+            ctor_cand
+                .filter(|t| prog.struct_fields.contains_key(*t))
+                .map(str::to_string)
+                .or_else(|| {
+                    prog.task_return_type
+                        .get(n.as_str())
+                        .filter(|t| prog.struct_fields.contains_key(*t))
+                        .cloned()
+                })
+        }
+        _ => None,
+    };
 
     // P4-1A: Explicit generic/const constructor call `Linear<4, 3>(w, b)` or `Linear<4, 3>::new(w, b)`.
     if let WitnessCallee::GenericName { name, type_args } = callee {
@@ -2908,6 +3160,9 @@ fn lower_call(
         }
         if let ResolvedCallee::Target(target) = resolved {
             let dst = stack.current_mut().alloc_reg();
+            if let Some(st) = callee_struct_out {
+                stack.current_mut().reg_struct_ty.insert(dst, st);
+            }
             stack.current_mut().emit(ControlInst::CallGeneric {
                 dst,
                 target,
@@ -3045,6 +3300,9 @@ fn lower_call(
                 return Ok(FlowState::Terminated);
             }
             let dst = stack.current_mut().alloc_reg();
+            if let Some(st) = callee_struct_out {
+                stack.current_mut().reg_struct_ty.insert(dst, st);
+            }
             stack.current_mut().emit(ControlInst::Call {
                 dst,
                 target,

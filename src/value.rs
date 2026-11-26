@@ -5,6 +5,8 @@ use crate::common::sync::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+// P6-1: Perceus / FBIP `Arc`-backed copy-on-write dictionary —— `Value::Dict` 的实际表示。
+pub mod dict;
 // 不可变分块列表（块用 `Arc` 共享）—— `Value::List` 的实际表示。
 pub mod list;
 /// Wave 3 — Stage 3B: 一等连续对齐内存 `Tensor<DType, Shape, Device>` 与零拷贝步幅视图。
@@ -169,8 +171,8 @@ impl StructDefRuntime {
                 for (k, v) in &f.tags {
                     tag_map.insert(k.clone(), Value::String(v.clone()));
                 }
-                fdict.insert("tags".to_string(), Value::Dict(tag_map));
-                Value::Dict(fdict)
+                fdict.insert("tags".to_string(), Value::Dict(tag_map.into()));
+                Value::Dict(fdict.into())
             })
             .collect();
         let mut out = HashMap::new();
@@ -186,7 +188,7 @@ impl StructDefRuntime {
             ),
         );
         out.insert("fields".to_string(), Value::List(field_vals.into()));
-        Value::Dict(out)
+        Value::Dict(out.into())
     }
 
     /// Build a Mora `Value::Dict` mapping `field_name -> { tag_key: tag_val, ... }`.
@@ -197,9 +199,9 @@ impl StructDefRuntime {
             for (k, v) in &f.tags {
                 tag_map.insert(k.clone(), Value::String(v.clone()));
             }
-            out.insert(f.name.clone(), Value::Dict(tag_map));
+            out.insert(f.name.clone(), Value::Dict(tag_map.into()));
         }
-        Value::Dict(out)
+        Value::Dict(out.into())
     }
 }
 
@@ -229,7 +231,7 @@ pub enum Value {
     Bool(bool),
     Nil,
     List(list::List),
-    Dict(HashMap<String, Value>),
+    Dict(dict::Dict),
     Task {
         name: String,
         params: Vec<String>,
@@ -314,11 +316,12 @@ pub enum Value {
     /// Wave 3 — Stage 3C: First-class nominal struct type constructor & metadata object.
     StructType(Arc<StructDefRuntime>),
     /// Wave 3 — Stage 3C: First-class nominal struct instance preserving field order, const args & `@tag` schema.
+    /// P6-1: `fields` uses `Arc`-backed [`dict::Dict`], `const_args` uses `Arc<[(String, i64)]>`,
+    /// and type/field metadata lives on `def: Arc<StructDefRuntime>`, so cloning a struct instance
+    /// is pure $O(1)$ `Arc::clone` and uniquely-owned struct projections extract fields in place.
     StructInstance {
-        type_name: String,
-        fields: HashMap<String, Value>,
-        field_order: Vec<String>,
-        const_args: Vec<(String, i64)>,
+        fields: dict::Dict,
+        const_args: Arc<[(String, i64)]>,
         def: Arc<StructDefRuntime>,
     },
     /// Wave 3 — Stage 3C: First-class nominal enum type descriptor.
@@ -389,16 +392,16 @@ impl PartialEq for Value {
             (Value::StructType(a), Value::StructType(b)) => Arc::ptr_eq(a, b) || a.name == b.name,
             (
                 Value::StructInstance {
-                    type_name: ta,
                     fields: fa,
-                    ..
+                    const_args: ca,
+                    def: da,
                 },
                 Value::StructInstance {
-                    type_name: tb,
                     fields: fb,
-                    ..
+                    const_args: cb,
+                    def: db,
                 },
-            ) => ta == tb && fa == fb,
+            ) => (Arc::ptr_eq(da, db) || da.name == db.name) && ca == cb && fa == fb,
             (Value::EnumType(a), Value::EnumType(b)) => Arc::ptr_eq(a, b) || a.name == b.name,
             (
                 Value::EnumVariant {
@@ -733,6 +736,9 @@ impl Value {
                 "sqrt",
                 "exp",
                 "ln",
+                "log",
+                "sin",
+                "cos",
                 "relu",
                 "gelu",
                 "silu",
@@ -784,8 +790,9 @@ impl Value {
             },
             MergeStrategy::DictUnion => match (parent, child) {
                 (Value::Dict(mut a), Value::Dict(b)) => {
+                    let map = a.make_mut();
                     for (k, v) in b {
-                        a.insert(k, v);
+                        map.insert(k, v);
                     }
                     Value::Dict(a)
                 }
@@ -803,8 +810,9 @@ impl Value {
                     Value::List(acc.into())
                 }
                 (Value::Dict(mut a), Value::Dict(b)) => {
+                    let map = a.make_mut();
                     for (k, v) in b {
-                        a.entry(k).or_insert(v);
+                        map.entry(k).or_insert(v);
                     }
                     Value::Dict(a)
                 }
@@ -1117,8 +1125,12 @@ mod tests {
         expected.insert("x".into(), Value::Int(1));
         expected.insert("y".into(), Value::Int(2));
         assert_eq!(
-            Value::merge(Value::Dict(a), Value::Dict(b), &MergeStrategy::DictUnion),
-            Value::Dict(expected)
+            Value::merge(
+                Value::Dict(a.into()),
+                Value::Dict(b.into()),
+                &MergeStrategy::DictUnion
+            ),
+            Value::Dict(expected.into())
         );
     }
 

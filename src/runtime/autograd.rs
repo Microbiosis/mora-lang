@@ -578,7 +578,7 @@ impl AutogradTape {
                 }
                 TapeOp::Mean { a, a_shape } => {
                     let n = checked_numel(a_shape)?;
-                    let g0 = g_out.first().copied().unwrap_or(0.0) / (n as f64);
+                    let g0 = g_out.first().copied().unwrap_or(0.0) / (n.max(1) as f64);
                     accum_grad(&mut grads, *a, &vec![g0; n]);
                 }
                 TapeOp::Reshape { a, .. } | TapeOp::Identity { a } => {

@@ -4268,7 +4268,7 @@ fn eval_node_into(
                 RowNorm::Layer
             };
             let src = get(*a);
-            let width = node.shape.last().copied().unwrap_or(1);
+            let width = node.shape.last().copied().unwrap_or(1).max(1);
             dst.resize(src.len(), 0.0);
             for (row, out) in src.chunks_exact(width).zip(dst.chunks_exact_mut(width)) {
                 norm.write_row(row, *eps, node.dtype, out);

@@ -171,7 +171,7 @@ fn emit_rms_norm_vjp(
     let sh = b.shape(a);
     let rank = sh.len();
     let last_ax = rank.saturating_sub(1);
-    let d = sh.last().copied().unwrap_or(1) as f64;
+    let d = sh.last().copied().unwrap_or(1).max(1) as f64;
     let a2 = b.mul(a, a)?;
     let sum_a2 = if rank == 0 {
         a2
@@ -192,6 +192,59 @@ fn emit_rms_norm_vjp(
     let proj = b.mul(y, mean_gy)?;
     let diff = b.sub(g, proj)?;
     b.mul(inv_rms, diff)
+}
+
+/// Emit `LayerNorm(a, eps)` VJP: `da = inv_std * (g - mean(g) - y * mean(g * y))`.
+fn emit_layer_norm_vjp(
+    b: &mut DagIrBuilder,
+    a: usize,
+    y: usize,
+    eps: f64,
+    g: usize,
+    structural_ones: &HashSet<usize>,
+) -> MoraResult<usize> {
+    let sh = b.shape(a);
+    let rank = sh.len();
+    let last_ax = rank.saturating_sub(1);
+    let d = sh.last().copied().unwrap_or(1).max(1) as f64;
+    let sum_a = if rank == 0 {
+        a
+    } else {
+        b.sum_axis(a, last_ax, true)
+    };
+    let mean = b.unary(DagOp::MulScalar(sum_a, 1.0 / d), sum_a);
+    let centered = b.sub(a, mean)?;
+    let c2 = b.mul(centered, centered)?;
+    let sum_c2 = if rank == 0 {
+        c2
+    } else {
+        b.sum_axis(c2, last_ax, true)
+    };
+    let var = b.unary(DagOp::MulScalar(sum_c2, 1.0 / d), sum_c2);
+    let var_eps = b.unary(DagOp::AddScalar(var, eps), var);
+    let std = b.unary(DagOp::Sqrt(var_eps), var_eps);
+    let inv_std = b.unary(DagOp::DivScalar(std, 1.0, true), std);
+    let sum_g = if rank == 0 {
+        g
+    } else {
+        b.sum_axis(g, last_ax, true)
+    };
+    let mean_g = b.unary(DagOp::MulScalar(sum_g, 1.0 / d), sum_g);
+    let gy = if structural_ones.contains(&g) && b.nodes[g].shape == b.nodes[y].shape {
+        y
+    } else {
+        b.mul(g, y)?
+    };
+    let sum_gy = if rank == 0 {
+        gy
+    } else {
+        b.sum_axis(gy, last_ax, true)
+    };
+    let mean_gy = b.unary(DagOp::MulScalar(sum_gy, 1.0 / d), sum_gy);
+    let g_centered = b.sub(g, mean_g)?;
+    let y_term = b.mul(y, mean_gy)?;
+    let diff = b.sub(g_centered, y_term)?;
+    b.mul(inv_std, diff)
 }
 
 /// Emit `MatMul(a, b_id)` VJP into `da` and/or `db` guarded by `need_a`/`need_b`.
@@ -572,21 +625,25 @@ impl TensorComputeDag {
                 }
                 DagOp::PowScalar(a, c, rev) => {
                     if depends_on_wrt[a] {
-                        let da = if rev {
-                            let scale = c.ln();
-                            let gy = mul_opt(&mut b, g, idx, &structural_ones)?;
-                            b.unary(DagOp::MulScalar(gy, scale), gy)
+                        if rev {
+                            if c > 0.0 && c != 1.0 {
+                                let scale = c.ln();
+                                let gy = mul_opt(&mut b, g, idx, &structural_ones)?;
+                                let da = b.unary(DagOp::MulScalar(gy, scale), gy);
+                                acc(&mut adj, a, da, &mut b)?;
+                            }
                         } else if c == 2.0 {
                             let two_a = b.unary(DagOp::MulScalar(a, 2.0), a);
-                            mul_opt(&mut b, g, two_a, &structural_ones)?
+                            let da = mul_opt(&mut b, g, two_a, &structural_ones)?;
+                            acc(&mut adj, a, da, &mut b)?;
                         } else if c == 1.0 {
-                            g
-                        } else {
+                            acc(&mut adj, a, g, &mut b)?;
+                        } else if c != 0.0 {
                             let a_cm1 = b.unary(DagOp::PowScalar(a, c - 1.0, false), a);
                             let coeff = b.unary(DagOp::MulScalar(a_cm1, c), a_cm1);
-                            mul_opt(&mut b, g, coeff, &structural_ones)?
-                        };
-                        acc(&mut adj, a, da, &mut b)?;
+                            let da = mul_opt(&mut b, g, coeff, &structural_ones)?;
+                            acc(&mut adj, a, da, &mut b)?;
+                        }
                     }
                 }
                 DagOp::Neg(a) => {
@@ -767,44 +824,7 @@ impl TensorComputeDag {
                 }
                 DagOp::LayerNorm(a, eps) => {
                     if depends_on_wrt[a] {
-                        let sh = b.shape(a);
-                        let rank = sh.len();
-                        let last_ax = rank.saturating_sub(1);
-                        let d = sh.last().copied().unwrap_or(1) as f64;
-                        let sum_a = if rank == 0 {
-                            a
-                        } else {
-                            b.sum_axis(a, last_ax, true)
-                        };
-                        let mean = b.unary(DagOp::MulScalar(sum_a, 1.0 / d), sum_a);
-                        let centered = b.sub(a, mean)?;
-                        let c2 = b.mul(centered, centered)?;
-                        let sum_c2 = if rank == 0 {
-                            c2
-                        } else {
-                            b.sum_axis(c2, last_ax, true)
-                        };
-                        let var = b.unary(DagOp::MulScalar(sum_c2, 1.0 / d), sum_c2);
-                        let var_eps = b.unary(DagOp::AddScalar(var, eps), var);
-                        let std = b.unary(DagOp::Sqrt(var_eps), var_eps);
-                        let inv_std = b.unary(DagOp::DivScalar(std, 1.0, true), std);
-                        let sum_g = if rank == 0 {
-                            g
-                        } else {
-                            b.sum_axis(g, last_ax, true)
-                        };
-                        let mean_g = b.unary(DagOp::MulScalar(sum_g, 1.0 / d), sum_g);
-                        let gy = mul_opt(&mut b, g, idx, &structural_ones)?;
-                        let sum_gy = if rank == 0 {
-                            gy
-                        } else {
-                            b.sum_axis(gy, last_ax, true)
-                        };
-                        let mean_gy = b.unary(DagOp::MulScalar(sum_gy, 1.0 / d), sum_gy);
-                        let g_centered = b.sub(g, mean_g)?;
-                        let y_term = b.mul(idx, mean_gy)?;
-                        let diff = b.sub(g_centered, y_term)?;
-                        let da = b.mul(inv_std, diff)?;
+                        let da = emit_layer_norm_vjp(&mut b, a, idx, eps, g, &structural_ones)?;
                         acc(&mut adj, a, da, &mut b)?;
                     }
                 }
@@ -1080,5 +1100,136 @@ impl TensorComputeDag {
             rematerialized_nodes: 0,
             compiled_plan: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::{DType, Device};
+
+    fn make_node(op: DagOp, shape: Vec<usize>) -> DagNode {
+        DagNode {
+            op,
+            shape,
+            dtype: DType::F64,
+            device: Device::Cpu,
+            no_cse: false,
+        }
+    }
+
+    fn assert_all_dag_scalars_finite(dag: &TensorComputeDag, label: &str) {
+        for (idx, node) in dag.nodes.iter().enumerate() {
+            match &node.op {
+                DagOp::AddScalar(_, c)
+                | DagOp::SubScalar(_, c, _)
+                | DagOp::MulScalar(_, c)
+                | DagOp::DivScalar(_, c, _)
+                | DagOp::PowScalar(_, c, _) => {
+                    assert!(
+                        c.is_finite(),
+                        "{label}: node {idx} ({}) has non-finite scalar {c}",
+                        node.op.name()
+                    );
+                }
+                DagOp::FusedElementwise { steps, .. } => {
+                    for (si, step) in steps.iter().enumerate() {
+                        match *step {
+                            FusedEwStep::AddScalar(_, c)
+                            | FusedEwStep::SubScalar(_, c, _)
+                            | FusedEwStep::MulScalar(_, c)
+                            | FusedEwStep::DivScalar(_, c, _)
+                            | FusedEwStep::PowScalar(_, c, _) => {
+                                assert!(
+                                    c.is_finite(),
+                                    "{label}: node {idx} fused step {si} has non-finite scalar {c}"
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn autodiff_pow_scalar_nonpositive_rev_and_zero_exp_never_emit_nan_or_inf() {
+        for (c, rev, label) in [
+            (-2.0, true, "(-2.0) ** x"),
+            (0.0, true, "0.0 ** x"),
+            (1.0, true, "1.0 ** x"),
+            (2.5, true, "2.5 ** x"),
+            (0.0, false, "x ** 0.0"),
+        ] {
+            let dag = TensorComputeDag {
+                input_specs: vec![(vec![3], DType::F64, Device::Cpu)],
+                nodes: vec![
+                    make_node(DagOp::Input(0), vec![3]),
+                    make_node(DagOp::PowScalar(0, c, rev), vec![3]),
+                    make_node(DagOp::Sum(1), vec![]),
+                ],
+                outputs: vec![2],
+                fused: false,
+                algebraic_rewrites: 0,
+                rematerialized_nodes: 0,
+                compiled_plan: None,
+            };
+            let joint = dag.autodiff(None).expect("autodiff pow_scalar");
+            assert_all_dag_scalars_finite(&joint, label);
+        }
+    }
+
+    #[test]
+    fn autodiff_rms_norm_and_layer_norm_zero_width_dim_never_emits_inf_scale() {
+        for (is_rms, label) in [(true, "RmsNorm [2, 0]"), (false, "LayerNorm [2, 0]")] {
+            let mut b = DagIrBuilder::new();
+            let a = b.push(DagOp::Input(0), vec![2, 0], DType::F64, Device::Cpu);
+            let y = b.push(
+                if is_rms {
+                    DagOp::RmsNorm(a, 1e-5)
+                } else {
+                    DagOp::LayerNorm(a, 1e-5)
+                },
+                vec![2, 0],
+                DType::F64,
+                Device::Cpu,
+            );
+            let g = b.push(DagOp::Input(1), vec![2, 0], DType::F64, Device::Cpu);
+            let ones = HashSet::new();
+            let da = if is_rms {
+                emit_rms_norm_vjp(&mut b, a, y, 1e-5, g).expect("emit_rms_norm_vjp [2, 0]")
+            } else {
+                emit_layer_norm_vjp(&mut b, a, y, 1e-5, g, &ones)
+                    .expect("emit_layer_norm_vjp [2, 0]")
+            };
+            let dag = TensorComputeDag {
+                input_specs: vec![
+                    (vec![2, 0], DType::F64, Device::Cpu),
+                    (vec![2, 0], DType::F64, Device::Cpu),
+                ],
+                nodes: b.nodes,
+                outputs: vec![da],
+                fused: false,
+                algebraic_rewrites: 0,
+                rematerialized_nodes: 0,
+                compiled_plan: None,
+            };
+            assert_all_dag_scalars_finite(&dag, label);
+            let mul_scales: Vec<f64> = dag
+                .nodes
+                .iter()
+                .filter_map(|n| match n.op {
+                    DagOp::MulScalar(_, c) => Some(c),
+                    _ => None,
+                })
+                .collect();
+            assert!(!mul_scales.is_empty(), "{label}: expected 1/d scale nodes");
+            assert!(
+                mul_scales.iter().all(|&c| (c - 1.0).abs() < 1e-12),
+                "{label}: expected guarded 1/max(0, 1) == 1.0, got {mul_scales:?}"
+            );
+        }
     }
 }

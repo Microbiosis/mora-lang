@@ -742,3 +742,55 @@ true
         );
     }
 }
+
+#[test]
+fn p6_2_pow_scalar_nonpositive_base_and_zero_exponent_guards() {
+    let src = r#"
+-- Integer exponents so (-2.0) ** x and 0.0 ** x produce finite forward values;
+-- symbolic autodiff must guard c <= 0.0 (avoiding c.ln() => NaN / -inf)
+-- and x ** 0.0 at x == 0.0 (avoiding 0.0 ** -1.0 * 0.0 => NaN).
+let x = tensor([2.0, 3.0, 4.0])
+let x_with_zero = tensor([0.0, 2.0, -3.0])
+
+let f_neg_base = fn(a: Tensor<f64, [3], cpu>) ((-2.0) ** a).sum() end
+let d_neg = trace_dag(f_neg_base, x).fuse().autodiff()
+let r_neg = d_neg.run_multi(x)
+let e_neg = value_and_grad(f_neg_base)(x)
+assert(math.abs(float(r_neg[0].item()) - float(e_neg[0])) < 1e-12)
+assert(float((r_neg[1] - e_neg[1]).abs().max()) < 1e-12)
+assert_eq(r_neg[1].to_list(), [0.0, 0.0, 0.0])
+
+let f_zero_base = fn(a: Tensor<f64, [3], cpu>) (0.0 ** a).sum() end
+let d_zero = trace_dag(f_zero_base, x).fuse().autodiff()
+let r_zero = d_zero.run_multi(x)
+let e_zero = value_and_grad(f_zero_base)(x)
+assert(math.abs(float(r_zero[0].item()) - float(e_zero[0])) < 1e-12)
+assert(float((r_zero[1] - e_zero[1]).abs().max()) < 1e-12)
+assert_eq(r_zero[1].to_list(), [0.0, 0.0, 0.0])
+
+let f_one_base = fn(a: Tensor<f64, [3], cpu>) (1.0 ** a).sum() end
+let d_one = trace_dag(f_one_base, x).fuse().autodiff()
+let r_one = d_one.run_multi(x)
+assert_eq(r_one[1].to_list(), [0.0, 0.0, 0.0])
+
+let f_pos_base = fn(a: Tensor<f64, [3], cpu>) (2.5 ** a).sum() end
+let d_pos = trace_dag(f_pos_base, x).fuse().autodiff()
+let r_pos = d_pos.run_multi(x)
+let e_pos = value_and_grad(f_pos_base)(x)
+assert(math.abs(float(r_pos[0].item()) - float(e_pos[0])) < 1e-10)
+assert(float((r_pos[1] - e_pos[1]).abs().max()) < 1e-10)
+
+let f_zero_exp = fn(a: Tensor<f64, [3], cpu>) (a ** 0.0).sum() end
+let d_zexp = trace_dag(f_zero_exp, x_with_zero).fuse().autodiff()
+let r_zexp = d_zexp.run_multi(x_with_zero)
+let e_zexp = value_and_grad(f_zero_exp)(x_with_zero)
+assert(math.abs(float(r_zexp[0].item()) - float(e_zexp[0])) < 1e-12)
+assert(float((r_zexp[1] - e_zexp[1]).abs().max()) < 1e-12)
+assert_eq(r_zexp[1].to_list(), [0.0, 0.0, 0.0])
+true
+"#;
+    assert_eq!(
+        eval_source(src).expect("PowScalar edge-case guards"),
+        Value::Bool(true)
+    );
+}

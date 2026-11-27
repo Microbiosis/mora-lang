@@ -735,6 +735,42 @@ pub(crate) fn fused_flash_attention_into(
     dtype: DType,
     out: &mut Vec<f64>,
 ) -> MoraResult<()> {
+    fused_flash_attention_with_lse_into(
+        q_vals,
+        k_vals,
+        v_vals,
+        mask,
+        q_shape,
+        k_shape,
+        v_shape,
+        out_shape,
+        scale,
+        k_is_transposed,
+        dtype,
+        out,
+        None,
+    )
+}
+
+/// Execute `FusedFlashAttention` and optionally emit per-row log-sum-exp
+/// `L[b, i] = m_i + ln(l_i)` (`shape = [...batch_out, Sq]`, `O(Sq)` memory)
+/// for tiled FlashAttention-2 backward without ever materializing `O(Sq * Sk)`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fused_flash_attention_with_lse_into(
+    q_vals: &[f64],
+    k_vals: &[f64],
+    v_vals: &[f64],
+    mask: Option<(&[f64], &[usize])>,
+    q_shape: &[usize],
+    k_shape: &[usize],
+    v_shape: &[usize],
+    out_shape: &[usize],
+    scale: f64,
+    k_is_transposed: bool,
+    dtype: DType,
+    out: &mut Vec<f64>,
+    mut lse_out: Option<&mut Vec<f64>>,
+) -> MoraResult<()> {
     let q_rank = q_shape.len();
     let k_rank = k_shape.len();
     let v_rank = v_shape.len();
@@ -773,8 +809,11 @@ pub(crate) fn fused_flash_attention_into(
     let mat_v = s_k * d_v;
     let mat_o = s_q * d_v;
     out.resize(batch_count * mat_o, 0.0);
+    if let Some(ref mut lse) = lse_out {
+        lse.resize(batch_count * s_q, f64::NEG_INFINITY);
+    }
 
-    let run_one_batch = |b_idx: usize, o_slice: &mut [f64]| {
+    let run_one_batch = |b_idx: usize, o_slice: &mut [f64], mut lse_slice: Option<&mut [f64]>| {
         let q_base = map_broadcast_batch(b_idx, batch_out, batch_q) * mat_q;
         let k_base = map_broadcast_batch(b_idx, batch_out, batch_k) * mat_k;
         let v_base = map_broadcast_batch(b_idx, batch_out, batch_v) * mat_v;
@@ -877,8 +916,15 @@ pub(crate) fn fused_flash_attention_into(
                 }
             }
 
-            // 3. Final normalization & dtype quantization into output tile
+            // 3. Final normalization, optional LSE save, & dtype quantization into output tile
             for r in 0..br {
+                if let Some(ref mut lse) = lse_slice {
+                    lse[q0 + r] = if l_running[r] > 0.0 && m_running[r].is_finite() {
+                        m_running[r] + l_running[r].ln()
+                    } else {
+                        f64::NEG_INFINITY
+                    };
+                }
                 let inv_l = if l_running[r] > 0.0 {
                     1.0 / l_running[r]
                 } else {
@@ -901,21 +947,42 @@ pub(crate) fn fused_flash_attention_into(
     if workers > 1 && batch_count >= 2 && total_work >= PARALLEL_FLOP_THRESHOLD {
         let b_chunk = batch_count.div_ceil(workers).max(1);
         std::thread::scope(|s| {
-            for (c_idx, o_chunk) in out.chunks_mut(b_chunk * mat_o).enumerate() {
-                let b_start = c_idx * b_chunk;
-                let count_here = o_chunk.len() / mat_o;
-                s.spawn(move || {
-                    for local_b in 0..count_here {
-                        let o_slice = &mut o_chunk[local_b * mat_o..(local_b + 1) * mat_o];
-                        run_one_batch(b_start + local_b, o_slice);
-                    }
-                });
+            if let Some(lse_vec) = lse_out.as_deref_mut() {
+                for (c_idx, (o_chunk, l_chunk)) in out
+                    .chunks_mut(b_chunk * mat_o)
+                    .zip(lse_vec.chunks_mut(b_chunk * s_q))
+                    .enumerate()
+                {
+                    let b_start = c_idx * b_chunk;
+                    let count_here = o_chunk.len() / mat_o;
+                    s.spawn(move || {
+                        for local_b in 0..count_here {
+                            let o_slice = &mut o_chunk[local_b * mat_o..(local_b + 1) * mat_o];
+                            let l_slice = &mut l_chunk[local_b * s_q..(local_b + 1) * s_q];
+                            run_one_batch(b_start + local_b, o_slice, Some(l_slice));
+                        }
+                    });
+                }
+            } else {
+                for (c_idx, o_chunk) in out.chunks_mut(b_chunk * mat_o).enumerate() {
+                    let b_start = c_idx * b_chunk;
+                    let count_here = o_chunk.len() / mat_o;
+                    s.spawn(move || {
+                        for local_b in 0..count_here {
+                            let o_slice = &mut o_chunk[local_b * mat_o..(local_b + 1) * mat_o];
+                            run_one_batch(b_start + local_b, o_slice, None);
+                        }
+                    });
+                }
             }
         });
     } else {
         for b_idx in 0..batch_count {
             let o_slice = &mut out[b_idx * mat_o..(b_idx + 1) * mat_o];
-            run_one_batch(b_idx, o_slice);
+            let l_slice = lse_out
+                .as_deref_mut()
+                .map(|v| &mut v[b_idx * s_q..(b_idx + 1) * s_q]);
+            run_one_batch(b_idx, o_slice, l_slice);
         }
     }
 
@@ -1001,6 +1068,23 @@ fn eval_ew_chunk(
                 FusedEwStep::Sin(a) => reg_buf[a].sin(),
                 FusedEwStep::Cos(a) => reg_buf[a].cos(),
                 FusedEwStep::Abs(a) => reg_buf[a].abs(),
+                FusedEwStep::StepPos(a) => {
+                    if reg_buf[a] > 0.0 {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
+                FusedEwStep::Sign(a) => {
+                    let x = reg_buf[a];
+                    if x > 0.0 {
+                        1.0
+                    } else if x < 0.0 {
+                        -1.0
+                    } else {
+                        0.0
+                    }
+                }
             };
             reg_buf[n_in + s_idx] = val;
         }

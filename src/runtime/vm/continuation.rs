@@ -528,10 +528,13 @@ pub enum CombinatorFrame {
         leaf_tangents: Vec<Arc<crate::value::tensor::Tensor>>,
         scalar_out_dtype: Option<crate::common::DType>,
     },
-    /// Compute graph tracing wrapper (`trace_dag(f, example_inputs...)`).
+    /// Compute graph tracing wrapper (`trace_dag(f, example_inputs...)` and
+    /// `trace_value_and_grad_dag(f, params, extra_inputs...)`).
     TraceDagEval {
         tape_id: u64,
         leaf_nodes: Vec<usize>,
+        /// When `Some(wrt)`, immediately runs `dag.autodiff(Some(&wrt))` on the traced forward DAG.
+        autodiff_wrt: Option<Vec<usize>>,
     },
     /// Evaluates omitted `struct` field default initializers on the VM stack.
     StructInit(Box<StructInitState>),

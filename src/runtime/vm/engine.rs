@@ -710,34 +710,44 @@ impl<'a> VmEngine<'a> {
             CombinatorFrame::TraceDagEval {
                 tape_id,
                 leaf_nodes,
+                autodiff_wrt,
             } => {
+                let ctx_name = if autodiff_wrt.is_some() {
+                    "trace_value_and_grad_dag"
+                } else {
+                    "trace_dag"
+                };
                 let tape = self
                     .core
                     .session
                     .autograd
                     .pop_tape(tape_id)
                     .ok_or_else(|| {
-                        MoraError::Runtime(
-                            "trace_dag: active tape missing on completion".to_string(),
-                        )
+                        MoraError::Runtime(format!("{ctx_name}: active tape missing on completion"))
                     })?;
                 let Value::Tensor(t) = &reply else {
                     return Err(MoraError::Runtime(format!(
-                        "trace_dag: traced function must return a Tensor, got {}",
+                        "{ctx_name}: traced function must return a Tensor, got {}",
                         crate::flow::type_name(&reply)
                     )));
                 };
                 let Some(out_idx) = t.node_on_tape(tape_id) else {
-                    return Err(MoraError::Runtime(
-                        "trace_dag: output tensor is disconnected from traced inputs".to_string(),
-                    ));
+                    return Err(MoraError::Runtime(format!(
+                        "{ctx_name}: output tensor is disconnected from traced inputs"
+                    )));
                 };
                 let dag = crate::runtime::compute_dag::TensorComputeDag::from_tape(
                     &tape,
                     out_idx,
                     &leaf_nodes,
                 )?;
-                Ok(Some(Value::ComputeDag(Arc::new(dag))))
+                let final_dag = if let Some(wrt) = autodiff_wrt {
+                    let fused_fwd = dag.fuse();
+                    fused_fwd.autodiff(Some(&wrt))?
+                } else {
+                    dag
+                };
+                Ok(Some(Value::ComputeDag(Arc::new(final_dag))))
             }
             CombinatorFrame::StructInit(mut st) => {
                 st.fields.insert(st.current_field, reply);

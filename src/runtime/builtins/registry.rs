@@ -53,6 +53,7 @@ pub const RUNTIME_BUILTIN_NAMES: &[&str] = &[
     "tls_connect",
     "tls_listen",
     "trace_dag",
+    "trace_value_and_grad_dag",
     "try_call",
     "type_of",
     "uncurry",

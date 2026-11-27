@@ -87,6 +87,7 @@ pub(crate) fn eval_pure_builtin(
         | BuiltinFnId::TlsListen
         | BuiltinFnId::Jvp
         | BuiltinFnId::TraceDag
+        | BuiltinFnId::TraceValueAndGradDag
         | BuiltinFnId::KvAllocator
         | BuiltinFnId::MemoryPool
         | BuiltinFnId::ProcessGroup

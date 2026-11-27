@@ -469,6 +469,7 @@ fn encode_builtin_fn_id(id: BuiltinFnId) -> u8 {
         BuiltinFnId::TryCall => 50,
         BuiltinFnId::FbipStats => 51,
         BuiltinFnId::FbipResetStats => 52,
+        BuiltinFnId::TraceValueAndGradDag => 53,
     }
 }
 
@@ -527,6 +528,7 @@ fn decode_builtin_fn_id(tag: u8) -> MoraResult<BuiltinFnId> {
         50 => BuiltinFnId::TryCall,
         51 => BuiltinFnId::FbipStats,
         52 => BuiltinFnId::FbipResetStats,
+        53 => BuiltinFnId::TraceValueAndGradDag,
         other => return Err(corrupt(format!("invalid BuiltinFnId tag {other}"))),
     })
 }
@@ -3193,5 +3195,34 @@ let st = fbip_stats()
             }
             other => panic!("expected int borrowed call count, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn morabc02_roundtrips_trace_value_and_grad_dag_builtin_tag_53() {
+        let src = r#"
+let x = tensor([1.0, -2.0, 3.0])
+let dag = trace_value_and_grad_dag(fn(a) (a * a + a.relu()).sum() end, x)
+let out = dag.run_multi(x)
+[out.len(), float(out[0].item()), float(out[1][0]), float(out[1][1]), float(out[1][2])]
+"#;
+        let (prog, _) = ParserV3::compile(src).expect("compile trace_value_and_grad_dag");
+        let pkg = CompiledPackage {
+            opt_level: 2,
+            entry: prog,
+            modules: BTreeMap::new(),
+        };
+        let encoded = encode_package(&pkg).expect("encode MORABC02 with tag 53");
+        let decoded = decode_package(&encoded).expect("decode MORABC02 with tag 53");
+        let mut core = CoreRuntime::default();
+        let (val, _) =
+            execute_program(Arc::new(decoded.entry), &mut core).expect("execute decoded tag 53");
+        let Value::List(items) = val else {
+            panic!("expected list result");
+        };
+        assert_eq!(items.get(0), Some(&Value::Int(2)));
+        assert_eq!(items.get(1), Some(&Value::Float(18.0)));
+        assert_eq!(items.get(2), Some(&Value::Float(3.0)));
+        assert_eq!(items.get(3), Some(&Value::Float(-4.0)));
+        assert_eq!(items.get(4), Some(&Value::Float(7.0)));
     }
 }

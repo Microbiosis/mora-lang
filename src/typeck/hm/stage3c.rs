@@ -2561,16 +2561,18 @@ impl HMInference {
         Ok((Type::List(Box::new(elem_ty)), acc_row))
     }
 
-    /// Wave 4: Static HM check for `trace_dag(f, example_inputs...)`.
+    /// Wave 4 / P6-2: Static HM check for `trace_dag(f, example_inputs...)` and
+    /// `trace_value_and_grad_dag(f, params, extra_inputs...)`.
     pub(super) fn infer_trace_dag_builtin(
         &mut self,
+        fn_name: &str,
         args: &[MirWitness],
         named_args: &[(String, MirWitness)],
         span: Span,
     ) -> Result<(Type, EffectRow), Vec<TypeError>> {
         if !named_args.is_empty() {
             return Err(vec![TypeError::UnificationFailure {
-                expected: "positional arguments for trace_dag(f, inputs...)".to_string(),
+                expected: format!("positional arguments for {fn_name}(f, inputs...)"),
                 got: format!("keyword argument '{}'", named_args[0].0),
                 span: Some(named_args[0].1.span),
             }]);
@@ -2606,7 +2608,7 @@ impl HMInference {
         }
         if fn_eff_row.labels().contains(&ambient::TENSOR_MUTATE_LABEL) {
             return Err(vec![TypeError::UnificationFailure {
-                expected: "pure/out-of-place tensor function for trace_dag(f, ...)".to_string(),
+                expected: format!("pure/out-of-place tensor function for {fn_name}(f, ...)"),
                 got: format!(
                     "function performs in-place tensor mutation ('{}' effect)",
                     ambient::TENSOR_MUTATE_LABEL

@@ -1764,6 +1764,94 @@ impl Tensor {
         )
     }
 
+    /// Numerically stable log-softmax along the last axis.
+    pub fn log_softmax(&self) -> MoraResult<Arc<Self>> {
+        if !self.dtype.is_float() {
+            return Err(MoraError::Runtime(format!(
+                "Tensor.log_softmax requires a floating-point dtype, got {}",
+                self.dtype
+            )));
+        }
+        let last_dim = *self.shape.last().unwrap_or(&1);
+        let mut flat = self.to_flat_vec();
+        for row in flat.chunks_mut(last_dim) {
+            let max_v = row.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let sum_exp: f64 = row.iter().map(|&v| (v - max_v).exp()).sum();
+            let log_sum_exp = max_v + sum_exp.ln();
+            for v in row.iter_mut() {
+                *v = quantize_for_dtype(*v - log_sum_exp, self.dtype);
+            }
+        }
+        Self::from_raw(
+            flat,
+            self.shape.clone(),
+            self.dtype,
+            self.device.clone(),
+            self.requires_grad,
+        )
+    }
+
+    /// Contiguous N-D slice `[starts[d]..ends[d]]` with zero-overhead metadata.
+    pub(crate) fn slice_contiguous(
+        &self,
+        starts: &[usize],
+        ends: &[usize],
+    ) -> MoraResult<Arc<Self>> {
+        let rank = self.shape.len();
+        if starts.len() != rank || ends.len() != rank {
+            return Err(MoraError::Runtime(format!(
+                "Tensor::slice_contiguous: rank mismatch ({rank} vs starts={} ends={})",
+                starts.len(),
+                ends.len()
+            )));
+        }
+        let mut out_shape = Vec::with_capacity(rank);
+        for d in 0..rank {
+            if starts[d] >= ends[d] || ends[d] > self.shape[d] {
+                return Err(MoraError::Runtime(format!(
+                    "Tensor::slice_contiguous: invalid range {}..{} for dim {} of size {}",
+                    starts[d], ends[d], d, self.shape[d]
+                )));
+            }
+            out_shape.push(ends[d] - starts[d]);
+        }
+        let src = self.to_flat_vec();
+        let data = crate::runtime::autograd::slice_flat(&src, &self.shape, starts, ends);
+        Self::from_raw(
+            data,
+            out_shape,
+            self.dtype,
+            self.device.clone(),
+            self.requires_grad,
+        )
+    }
+
+    /// Zero-pad each axis `d` by `(pads[d].0, pads[d].1)`.
+    pub(crate) fn pad_zeros(&self, pads: &[(usize, usize)]) -> MoraResult<Arc<Self>> {
+        let rank = self.shape.len();
+        if pads.len() != rank {
+            return Err(MoraError::Runtime(format!(
+                "Tensor::pad_zeros: rank mismatch ({rank} vs pads={})",
+                pads.len()
+            )));
+        }
+        let out_shape: Vec<usize> = self
+            .shape
+            .iter()
+            .zip(pads.iter())
+            .map(|(&s, &(lo, hi))| s + lo + hi)
+            .collect();
+        let src = self.to_flat_vec();
+        let data = crate::runtime::autograd::pad_flat(&src, &self.shape, pads, &out_shape);
+        Self::from_raw(
+            data,
+            out_shape,
+            self.dtype,
+            self.device.clone(),
+            self.requires_grad,
+        )
+    }
+
     /// Root Mean Square Layer Normalization (`RMSNorm`) along the last axis.
     pub fn rms_norm(&self, eps: f64) -> MoraResult<Arc<Self>> {
         RowNorm::Rms.allocated(self, eps)
@@ -2057,7 +2145,33 @@ impl Tensor {
             return Ok(guard.get_value(new_offset as usize));
         }
 
-        let indices_opt = if is_tracked {
+        let contiguous_slice_bounds = if is_tracked && new_shape.len() == self.shape.len() {
+            let mut starts = Vec::with_capacity(self.shape.len());
+            let mut ends = Vec::with_capacity(self.shape.len());
+            let mut all_unit = true;
+            for (d, am) in axis_maps.iter().enumerate() {
+                match *am {
+                    AxisMap::Linear {
+                        out_axis,
+                        start,
+                        step: 1,
+                    } if out_axis == d && start >= 0 => {
+                        let s = start as usize;
+                        starts.push(s);
+                        ends.push(s + new_shape[d]);
+                    }
+                    _ => {
+                        all_unit = false;
+                        break;
+                    }
+                }
+            }
+            if all_unit { Some((starts, ends)) } else { None }
+        } else {
+            None
+        };
+
+        let indices_opt = if is_tracked && contiguous_slice_bounds.is_none() {
             Some(build_gather_indices())
         } else {
             None
@@ -2073,14 +2187,26 @@ impl Tensor {
             is_view: true,
             grad_nodes: Vec::new(),
         });
-        if let (Some(ag), Some(indices)) = (autograd, indices_opt) {
-            let src_numel = self.numel();
-            let tracked = ag.record_unary(self, view, |src_node| TapeOp::Gather {
-                a: src_node,
-                src_numel,
-                src_flat_indices: indices.clone(),
-            });
-            return Ok(Value::Tensor(tracked));
+        if let Some(ag) = autograd {
+            if let Some((starts, ends)) = contiguous_slice_bounds {
+                let orig_shape = self.shape.clone();
+                let tracked = ag.record_unary(self, view, |src_node| TapeOp::Slice {
+                    a: src_node,
+                    starts: starts.clone(),
+                    ends: ends.clone(),
+                    orig_shape: orig_shape.clone(),
+                });
+                return Ok(Value::Tensor(tracked));
+            }
+            if let Some(indices) = indices_opt {
+                let src_numel = self.numel();
+                let tracked = ag.record_unary(self, view, |src_node| TapeOp::Gather {
+                    a: src_node,
+                    src_numel,
+                    src_flat_indices: indices.clone(),
+                });
+                return Ok(Value::Tensor(tracked));
+            }
         }
 
         Ok(Value::Tensor(view))
@@ -2700,7 +2826,36 @@ pub fn call_tensor_associated(
                     raw as isize
                 }
             };
-            Ok(Value::Tensor(Tensor::cat(&tensors, axis)?))
+            let out = Tensor::cat(&tensors, axis)?;
+            let rank = tensors[0].shape.len() as isize;
+            let resolved_ax = if axis < 0 { axis + rank } else { axis } as usize;
+            if core.session.autograd.is_recording()
+                && tensors.iter().any(|t| !t.grad_nodes.is_empty())
+            {
+                let input_shapes: Vec<Vec<usize>> =
+                    tensors.iter().map(|t| t.shape.clone()).collect();
+                let tracked = core.session.autograd.record_nary(&tensors, out, |mapped| {
+                    let const_tensors: Vec<Option<Arc<Tensor>>> = mapped
+                        .iter()
+                        .enumerate()
+                        .map(|(i, m)| {
+                            if m.is_none() {
+                                Some(Arc::clone(&tensors[i]))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    TapeOp::Cat {
+                        inputs: mapped,
+                        const_tensors,
+                        input_shapes: input_shapes.clone(),
+                        axis: resolved_ax,
+                    }
+                });
+                return Ok(Value::Tensor(tracked));
+            }
+            Ok(Value::Tensor(out))
         }
         _ => Err(MoraError::Runtime(format!(
             "Tensor has no associated function 'Tensor::{assoc}'"
@@ -2905,6 +3060,7 @@ pub(crate) fn call_tensor_method_fbip(
             | "tanh"
             | "sigmoid"
             | "softmax"
+            | "log_softmax"
             | "rms_norm"
             | "layer_norm"
     ) {
@@ -3211,6 +3367,23 @@ pub(crate) fn call_tensor_method_fbip(
                 let out_vals = out.to_flat_vec();
                 return Ok(Value::Tensor(ag.record_unary(&t, out, |src| {
                     TapeOp::Softmax {
+                        a: src,
+                        out_vals: out_vals.clone(),
+                        last_dim,
+                    }
+                })));
+            }
+            Ok(Value::Tensor(out))
+        }
+        "log_softmax" => {
+            let out = t.log_softmax()?;
+            if let Some(ag) = autograd.as_deref_mut()
+                && is_tracked
+            {
+                let last_dim = t.shape.last().copied().unwrap_or(1);
+                let out_vals = out.to_flat_vec();
+                return Ok(Value::Tensor(ag.record_unary(&t, out, |src| {
+                    TapeOp::LogSoftmax {
                         a: src,
                         out_vals: out_vals.clone(),
                         last_dim,

@@ -464,6 +464,8 @@ static inline float mora_eval_ew_op(uint op, float a, float b, float imm) {
         case 22u: return sin(a);
         case 23u: return cos(a);
         case 24u: return fabs(a);
+        case 25u: return (a > 0.0f) ? 1.0f : 0.0f;
+        case 26u: return (a > 0.0f) ? 1.0f : ((a < 0.0f) ? -1.0f : 0.0f);
         default: return a;
     }
 }
@@ -1013,6 +1015,8 @@ mod macos_impl {
                 FusedEwStep::Sin(a) => (22, a as u32, 0, 0.0),
                 FusedEwStep::Cos(a) => (23, a as u32, 0, 0.0),
                 FusedEwStep::Abs(a) => (24, a as u32, 0, 0.0),
+                FusedEwStep::StepPos(a) => (25, a as u32, 0, 0.0),
+                FusedEwStep::Sign(a) => (26, a as u32, 0, 0.0),
             };
             ops.push(op);
             arg_a.push(a);

@@ -1349,7 +1349,9 @@ EW_STEP_LOOP:
     setp.eq.u32 %p0, %r10, 21; @%p0 bra OP_SQRT;
     setp.eq.u32 %p0, %r10, 22; @%p0 bra OP_SIN;
     setp.eq.u32 %p0, %r10, 23; @%p0 bra OP_COS;
-    bra OP_ABS;
+    setp.eq.u32 %p0, %r10, 24; @%p0 bra OP_ABS;
+    setp.eq.u32 %p0, %r10, 25; @%p0 bra OP_STEPPOS;
+    bra OP_SIGN;
 
 OP_ADD: add.rn.f64 %fd3, %fd0, %fd1; bra EW_STORE_SLOT;
 OP_SUB: sub.rn.f64 %fd3, %fd0, %fd1; bra EW_STORE_SLOT;
@@ -1400,7 +1402,16 @@ OP_COS:
     cos.approx.f32 %f1, %f0;
     cvt.f64.f32 %fd3, %f1;
     bra EW_STORE_SLOT;
-OP_ABS: abs.f64 %fd3, %fd0;
+OP_ABS: abs.f64 %fd3, %fd0; bra EW_STORE_SLOT;
+OP_STEPPOS:
+    setp.gt.f64 %p0, %fd0, 0d0000000000000000;
+    selp.f64 %fd3, 0d3FF0000000000000, 0d0000000000000000, %p0;
+    bra EW_STORE_SLOT;
+OP_SIGN:
+    setp.gt.f64 %p0, %fd0, 0d0000000000000000;
+    selp.f64 %fd3, 0d3FF0000000000000, 0d0000000000000000, %p0;
+    setp.lt.f64 %p0, %fd0, 0d0000000000000000;
+    selp.f64 %fd3, 0dBFF0000000000000, %fd3, %p0;
 
 EW_STORE_SLOT:
     add.u32 %r14, %r1, %r9;
@@ -2563,6 +2574,8 @@ impl CudaDeviceBackend {
                 FusedEwStep::Sin(a) => (22, a as u32, 0, 0.0),
                 FusedEwStep::Cos(a) => (23, a as u32, 0, 0.0),
                 FusedEwStep::Abs(a) => (24, a as u32, 0, 0.0),
+                FusedEwStep::StepPos(a) => (25, a as u32, 0, 0.0),
+                FusedEwStep::Sign(a) => (26, a as u32, 0, 0.0),
             };
             ops.push(op);
             arg_a.push(a);

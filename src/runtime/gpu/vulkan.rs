@@ -1320,6 +1320,8 @@ impl VulkanDeviceBackend {
                 FusedEwStep::Sin(a) => (22, a as u32, 0, 0.0),
                 FusedEwStep::Cos(a) => (23, a as u32, 0, 0.0),
                 FusedEwStep::Abs(a) => (24, a as u32, 0, 0.0),
+                FusedEwStep::StepPos(a) => (25, a as u32, 0, 0.0),
+                FusedEwStep::Sign(a) => (26, a as u32, 0, 0.0),
             };
             ops.push(op);
             arg_a.push(a);

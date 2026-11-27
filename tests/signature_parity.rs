@@ -132,6 +132,9 @@ fn call_for(name: &str) -> Option<&'static str> {
         "value_and_grad" => "value_and_grad(fn(x) x end)",
         "jvp" => "jvp(fn(x) x end, 1.0, 1.0)",
         "trace_dag" => "trace_dag(fn(x) x * 2.0 end, tensor([1.0]))",
+        "trace_value_and_grad_dag" => {
+            "trace_value_and_grad_dag(fn(x) (x * x).sum() end, tensor([1.0]))"
+        }
         "kv_allocator" => "kv_allocator(4, 4, 2, 4)",
         "memory_pool" => "memory_pool(1024)",
         "process_group" => "process_group(2)",

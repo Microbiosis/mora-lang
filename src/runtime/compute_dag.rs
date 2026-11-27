@@ -20,7 +20,7 @@
 //! - Kernels run on a [`DeviceBackend`]: the host CPU SIMD backend, a live hardware GPU backend
 //!   (`CUDA` / `Vulkan` / `Metal`) when a driver is present, or the host-emulated backend otherwise.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,10 +30,17 @@ use crate::common::sync::{Mutex, RwLock};
 use crate::common::{DType, Device};
 use crate::error::{MoraError, MoraResult};
 use crate::runtime::autograd::{
-    AutogradTape, TapeOp, scatter_add_flat, sum_axis_flat, transpose_flat,
+    AutogradTape, TapeOp, cat_flat, pad_flat, scatter_add_flat, slice_flat, sum_axis_flat,
+    transpose_flat,
 };
 use crate::runtime::simd_kernels;
 use crate::value::tensor::{AlignedByteBuffer, RowNorm, Tensor, checked_numel, quantize_for_dtype};
+
+mod autodiff;
+mod checkpoint;
+mod flash_bwd;
+
+pub use flash_bwd::FlashAttnGradTarget;
 
 /// Live VRAM residency, transfer, and native low-precision dispatch counters for a [`DeviceBackend`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -132,6 +139,8 @@ pub enum FusedEwStep {
     Sin(usize),
     Cos(usize),
     Abs(usize),
+    StepPos(usize),
+    Sign(usize),
 }
 
 /// Abstract hardware execution backend for [`TensorComputeDag`] kernels.
@@ -692,6 +701,20 @@ pub enum DagOp {
     /// Exact signum (`1.0` if `x > 0.0`, `-1.0` if `x < 0.0`, else `0.0`) used by IR-level AD of `Abs`.
     Sign(usize),
     Softmax(usize),
+    LogSoftmax(usize),
+    Slice {
+        src: usize,
+        starts: Vec<usize>,
+        ends: Vec<usize>,
+    },
+    Pad {
+        src: usize,
+        pads: Vec<(usize, usize)>,
+    },
+    Cat {
+        inputs: Vec<usize>,
+        axis: usize,
+    },
     RmsNorm(usize, f64),
     LayerNorm(usize, f64),
     FusedLinearAct {
@@ -715,6 +738,31 @@ pub enum DagOp {
         mask: Option<usize>,
         scale: f64,
         k_is_transposed: bool,
+    },
+    /// Per-row log-sum-exp `L[...batch, Sq]` (`O(Sq)` memory) paired with `FusedFlashAttention`
+    /// for tiled FlashAttention-2 backward without ever materializing `O(Sq * Sk)` attention matrices.
+    FlashAttentionLse {
+        q: usize,
+        k: usize,
+        v: usize,
+        mask: Option<usize>,
+        scale: f64,
+        k_is_transposed: bool,
+    },
+    /// Tiled FlashAttention-2 symbolic backward kernel (`O(Br * Bc)` scratch) emitting `dQ`, `dK`,
+    /// `dV`, or `dMask`. Sibling nodes sharing identical `(q,k,v,mask,out,lse,dout,scale)` share one
+    /// cached backward sweep per DAG execution.
+    FlashAttentionGrad {
+        q: usize,
+        k: usize,
+        v: usize,
+        mask: Option<usize>,
+        out: usize,
+        lse: usize,
+        dout: usize,
+        scale: f64,
+        k_is_transposed: bool,
+        target: FlashAttnGradTarget,
     },
     FusedElementwise {
         inputs: Vec<usize>,
@@ -761,11 +809,17 @@ impl DagOp {
             Self::StepPos(_) => "StepPos",
             Self::Sign(_) => "Sign",
             Self::Softmax(_) => "Softmax",
+            Self::LogSoftmax(_) => "LogSoftmax",
+            Self::Slice { .. } => "Slice",
+            Self::Pad { .. } => "Pad",
+            Self::Cat { .. } => "Cat",
             Self::RmsNorm(_, _) => "RmsNorm",
             Self::LayerNorm(_, _) => "LayerNorm",
             Self::FusedLinearAct { .. } => "FusedLinearAct",
             Self::FusedRmsNormLinear { .. } => "FusedRmsNormLinear",
             Self::FusedFlashAttention { .. } => "FusedFlashAttention",
+            Self::FlashAttentionLse { .. } => "FlashAttentionLse",
+            Self::FlashAttentionGrad { target, .. } => target.name(),
             Self::FusedElementwise { .. } => "FusedElementwise",
         }
     }
@@ -776,6 +830,7 @@ impl DagOp {
             Self::FusedLinearAct { .. }
                 | Self::FusedRmsNormLinear { .. }
                 | Self::FusedFlashAttention { .. }
+                | Self::FlashAttentionGrad { .. }
                 | Self::FusedElementwise { .. }
         )
     }
@@ -817,8 +872,12 @@ impl DagOp {
             | Self::StepPos(a)
             | Self::Sign(a)
             | Self::Softmax(a)
+            | Self::LogSoftmax(a)
+            | Self::Slice { src: a, .. }
+            | Self::Pad { src: a, .. }
             | Self::RmsNorm(a, _)
             | Self::LayerNorm(a, _) => vec![*a],
+            Self::Cat { inputs, .. } => inputs.clone(),
             Self::FusedLinearAct { x, w, bias, .. } => {
                 let mut v = vec![*x, *w];
                 if let Some(b) = bias {
@@ -839,12 +898,32 @@ impl DagOp {
                 }
                 v
             }
-            Self::FusedFlashAttention { q, k, v, mask, .. } => {
+            Self::FusedFlashAttention { q, k, v, mask, .. }
+            | Self::FlashAttentionLse { q, k, v, mask, .. } => {
                 let mut out = vec![*q, *k, *v];
                 if let Some(m) = mask {
                     out.push(*m);
                 }
                 out
+            }
+            Self::FlashAttentionGrad {
+                q,
+                k,
+                v,
+                mask,
+                out,
+                lse,
+                dout,
+                ..
+            } => {
+                let mut res = vec![*q, *k, *v];
+                if let Some(m) = mask {
+                    res.push(*m);
+                }
+                res.push(*out);
+                res.push(*lse);
+                res.push(*dout);
+                res
             }
             Self::FusedElementwise { inputs, .. } => inputs.clone(),
         }
@@ -891,8 +970,16 @@ impl DagOp {
             | Self::StepPos(a)
             | Self::Sign(a)
             | Self::Softmax(a)
+            | Self::LogSoftmax(a)
+            | Self::Slice { src: a, .. }
+            | Self::Pad { src: a, .. }
             | Self::RmsNorm(a, _)
             | Self::LayerNorm(a, _) => m(a),
+            Self::Cat { inputs, .. } => {
+                for i in inputs {
+                    m(i);
+                }
+            }
             Self::FusedLinearAct { x, w, bias, .. } => {
                 m(x);
                 m(w);
@@ -912,13 +999,34 @@ impl DagOp {
                     m(b);
                 }
             }
-            Self::FusedFlashAttention { q, k, v, mask, .. } => {
+            Self::FusedFlashAttention { q, k, v, mask, .. }
+            | Self::FlashAttentionLse { q, k, v, mask, .. } => {
                 m(q);
                 m(k);
                 m(v);
                 if let Some(mk) = mask {
                     m(mk);
                 }
+            }
+            Self::FlashAttentionGrad {
+                q,
+                k,
+                v,
+                mask,
+                out,
+                lse,
+                dout,
+                ..
+            } => {
+                m(q);
+                m(k);
+                m(v);
+                if let Some(mk) = mask {
+                    m(mk);
+                }
+                m(out);
+                m(lse);
+                m(dout);
             }
             Self::FusedElementwise { inputs, .. } => {
                 for i in inputs {
@@ -936,6 +1044,9 @@ pub struct DagNode {
     pub shape: Vec<usize>,
     pub dtype: DType,
     pub device: Device,
+    /// When `true`, Pass 0 CSE must not merge this node with an earlier identical expression
+    /// (used by cost-guided activation checkpointing so rematerialized nodes stay local to backward).
+    pub(crate) no_cse: bool,
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -955,7 +1066,7 @@ pub struct BufferSlotPlan {
 /// Compile-time linear-scan liveness & scratch buffer reuse plan for a [`TensorComputeDag`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DagMemoryPlan {
-    /// Per-node scratch slot assignment (`None` for `Input`, `ConstTensor`, and final `output`).
+    /// Per-node scratch slot assignment (`None` for `Input`, `ConstTensor`, and terminal outputs).
     pub node_slots: Vec<Option<usize>>,
     /// Minimal physical scratch buffer pool allocated once and reused across non-overlapping nodes.
     pub slots: Vec<BufferSlotPlan>,
@@ -974,6 +1085,12 @@ impl DagMemoryPlan {
     /// Perform linear-scan liveness analysis and best-fit scratch buffer assignment for `dag`.
     pub fn build(dag: &TensorComputeDag) -> Self {
         let n = dag.nodes.len();
+        let mut is_output = vec![false; n];
+        for &o in &dag.outputs {
+            if o < n {
+                is_output[o] = true;
+            }
+        }
         let mut last_use = vec![0usize; n];
         for (idx, node) in dag.nodes.iter().enumerate() {
             last_use[idx] = idx;
@@ -982,9 +1099,6 @@ impl DagMemoryPlan {
                     last_use[pred] = idx;
                 }
             }
-        }
-        if dag.output < n {
-            last_use[dag.output] = n;
         }
         // Zero-copy view ops (`Reshape` / `Identity`) may alias their input VRAM buffer;
         // extend source liveness through any alias chain so physical VRAM slots never overwrite live views.
@@ -1006,7 +1120,10 @@ impl DagMemoryPlan {
         let mut naive_peak_bytes = 0usize;
 
         for (idx, node) in dag.nodes.iter().enumerate() {
-            if idx == dag.output || matches!(node.op, DagOp::Input(_) | DagOp::ConstTensor(_)) {
+            if matches!(node.op, DagOp::Input(_) | DagOp::ConstTensor(_)) {
+                continue;
+            }
+            if is_output[idx] && last_use[idx] == idx {
                 continue;
             }
             total_intermediates += 1;
@@ -1092,13 +1209,13 @@ struct DagWorkspace {
     slots: Vec<Vec<f64>>,
     /// Persistent physical GPU VRAM scratch buffers keyed by `DagMemoryPlan` slot id.
     /// Allocated lazily once per slot at `slot.bytes` capacity and reused across non-overlapping
-    /// nodes within each run AND across repeated `CompiledDagPlan::execute` calls.
+    /// nodes within each run AND across repeated `CompiledDagPlan::execute` / `execute_multi` calls.
     vram_slots: Vec<Option<Arc<dyn DeviceVramBuffer>>>,
     output_buf: Vec<f64>,
 }
 
 impl DagWorkspace {
-    fn from_plan(plan: &DagMemoryPlan, output_numel: usize) -> Self {
+    fn from_plan(plan: &DagMemoryPlan, max_output_numel: usize) -> Self {
         let slots = plan
             .slots
             .iter()
@@ -1108,7 +1225,7 @@ impl DagWorkspace {
         Self {
             slots,
             vram_slots,
-            output_buf: Vec::with_capacity(output_numel),
+            output_buf: Vec::with_capacity(max_output_numel),
         }
     }
 }
@@ -1121,7 +1238,7 @@ pub struct CompiledDagPlan {
     pub dag: TensorComputeDag,
     pub memory_plan: DagMemoryPlan,
     const_flats: Vec<Option<Vec<f64>>>,
-    output_numel: usize,
+    max_output_numel: usize,
     workspace: Mutex<Option<DagWorkspace>>,
     vram_scratch_allocs: AtomicU64,
     vram_buffer_reuses: AtomicU64,
@@ -1140,18 +1257,20 @@ impl CompiledDagPlan {
                 _ => None,
             })
             .collect();
-        let output_numel = fused_dag
-            .nodes
-            .get(fused_dag.output)
-            .and_then(|n| checked_numel(&n.shape).ok())
+        let max_output_numel = fused_dag
+            .outputs
+            .iter()
+            .filter_map(|&oid| fused_dag.nodes.get(oid))
+            .filter_map(|n| checked_numel(&n.shape).ok())
+            .max()
             .unwrap_or(1);
-        let ws = DagWorkspace::from_plan(&memory_plan, output_numel);
+        let ws = DagWorkspace::from_plan(&memory_plan, max_output_numel);
         Self {
             fingerprint,
             dag: fused_dag,
             memory_plan,
             const_flats,
-            output_numel,
+            max_output_numel,
             workspace: Mutex::new(Some(ws)),
             vram_scratch_allocs: AtomicU64::new(0),
             vram_buffer_reuses: AtomicU64::new(0),
@@ -1166,15 +1285,14 @@ impl CompiledDagPlan {
         )
     }
 
-    /// Execute this compiled plan using its pooled reusable [`DagWorkspace`] (falling back to a
-    /// private workspace if another `spawn`ed task is concurrently executing the exact same plan).
-    pub(crate) fn execute(&self, inputs: &[Arc<Tensor>]) -> MoraResult<Arc<Tensor>> {
+    /// Execute this compiled plan and return all output tensors (`outputs.len() >= 1`).
+    pub(crate) fn execute_multi(&self, inputs: &[Arc<Tensor>]) -> MoraResult<Vec<Arc<Tensor>>> {
         let mut ws = self
             .workspace
             .try_lock()
             .and_then(|mut guard| guard.take())
-            .unwrap_or_else(|| DagWorkspace::from_plan(&self.memory_plan, self.output_numel));
-        let res = execute_dag_with_workspace(
+            .unwrap_or_else(|| DagWorkspace::from_plan(&self.memory_plan, self.max_output_numel));
+        let res = execute_dag_multi_with_workspace(
             &self.dag,
             &self.memory_plan,
             &self.const_flats,
@@ -1188,6 +1306,19 @@ impl CompiledDagPlan {
             *guard = Some(ws);
         }
         res
+    }
+
+    /// Execute this single-output compiled plan using its pooled reusable [`DagWorkspace`].
+    pub(crate) fn execute(&self, inputs: &[Arc<Tensor>]) -> MoraResult<Arc<Tensor>> {
+        if self.dag.outputs.len() != 1 {
+            return Err(MoraError::Runtime(format!(
+                "ComputeDag.run expects a single-output DAG, got {} outputs (use .run_multi())",
+                self.dag.outputs.len()
+            )));
+        }
+        let mut outs = self.execute_multi(inputs)?;
+        outs.pop()
+            .ok_or_else(|| MoraError::Runtime("ComputeDag.run: missing output tensor".to_string()))
     }
 }
 
@@ -1267,10 +1398,14 @@ impl DagPlanCache {
 pub struct TensorComputeDag {
     pub input_specs: Vec<(Vec<usize>, DType, Device)>,
     pub nodes: Vec<DagNode>,
-    pub output: usize,
+    /// Output node indices (`outputs.len() == 1` for single-output graphs; `[loss, grads...]` for
+    /// joint forward+backward graphs produced by `autodiff` / `autodiff_checkpointed`).
+    pub outputs: Vec<usize>,
     pub fused: bool,
-    /// P4-3: Number of DType-safe algebraic / layout simplifications applied during optimization.
+    /// P4-3: Number of DType-safe algebraic / layout / CSE simplifications applied during optimization.
     pub(crate) algebraic_rewrites: usize,
+    /// P6-2: Number of forward nodes rematerialized by cost-guided activation checkpointing.
+    pub(crate) rematerialized_nodes: usize,
     compiled_plan: Option<Arc<CompiledDagPlan>>,
 }
 
@@ -1327,7 +1462,9 @@ impl DagCostModel {
             | FusedEwStep::DivScalar(_, _, _)
             | FusedEwStep::Neg(_)
             | FusedEwStep::Relu(_)
-            | FusedEwStep::Abs(_) => 1,
+            | FusedEwStep::Abs(_)
+            | FusedEwStep::StepPos(_)
+            | FusedEwStep::Sign(_) => 1,
             FusedEwStep::Sqrt(_)
             | FusedEwStep::Exp(_)
             | FusedEwStep::Ln(_)
@@ -1397,8 +1534,14 @@ impl DagCostModel {
                 | DagOp::ConstTensor(_)
                 | DagOp::Reshape(_, _)
                 | DagOp::Identity(_) => (0, 0, 0, 0),
-                DagOp::Transpose(a, _, _) | DagOp::Gather(a, _) | DagOp::ScatterAdd(a, _, _) => {
-                    (0, node_bytes(*a), out_bytes, 0)
+                DagOp::Transpose(a, _, _)
+                | DagOp::Gather(a, _)
+                | DagOp::ScatterAdd(a, _, _)
+                | DagOp::Slice { src: a, .. }
+                | DagOp::Pad { src: a, .. } => (0, node_bytes(*a), out_bytes, 0),
+                DagOp::Cat { inputs, .. } => {
+                    let read_b: u64 = inputs.iter().map(|&i| node_bytes(i)).sum();
+                    (0, read_b, out_bytes, 0)
                 }
                 DagOp::Add(a, b) | DagOp::Sub(a, b) | DagOp::Mul(a, b) | DagOp::Div(a, b) => {
                     (out_elems, node_bytes(*a) + node_bytes(*b), out_bytes, 0)
@@ -1428,7 +1571,9 @@ impl DagCostModel {
                     let in_elems = checked_numel(&dag.nodes[*a].shape).unwrap_or(1) as u64;
                     (in_elems, node_bytes(*a), out_bytes, 0)
                 }
-                DagOp::Softmax(a) => (out_elems * 5, node_bytes(*a), out_bytes, 0),
+                DagOp::Softmax(a) | DagOp::LogSoftmax(a) => {
+                    (out_elems * 5, node_bytes(*a), out_bytes, 0)
+                }
                 DagOp::RmsNorm(a, _) => (out_elems * 6, node_bytes(*a), out_bytes, 0),
                 DagOp::LayerNorm(a, _) => (out_elems * 8, node_bytes(*a), out_bytes, 0),
                 DagOp::MatMul(a, b) => {
@@ -1531,6 +1676,54 @@ impl DagCostModel {
                     let saved = score_bytes.saturating_mul(4);
                     (qk_flops + sm_flops + pv_flops, read_b, out_bytes, saved)
                 }
+                DagOp::FlashAttentionLse { .. } => {
+                    // Paired with `FusedFlashAttention` forward sweep (O(Sq) write only).
+                    (0, 0, out_bytes, 0)
+                }
+                DagOp::FlashAttentionGrad {
+                    q,
+                    k,
+                    v,
+                    mask,
+                    out,
+                    lse,
+                    dout,
+                    k_is_transposed,
+                    ..
+                } => {
+                    let q_sh = &dag.nodes[*q].shape;
+                    let k_sh = &dag.nodes[*k].shape;
+                    let v_sh = &dag.nodes[*v].shape;
+                    let qr = q_sh.len();
+                    let kr = k_sh.len();
+                    let vr = v_sh.len();
+                    let batches: u64 = q_sh[..qr.saturating_sub(2)]
+                        .iter()
+                        .map(|&d| d as u64)
+                        .product::<u64>()
+                        .max(1);
+                    let s_q = q_sh.get(qr.saturating_sub(2)).copied().unwrap_or(1) as u64;
+                    let d_k = q_sh.get(qr.saturating_sub(1)).copied().unwrap_or(1) as u64;
+                    let s_k = if *k_is_transposed {
+                        k_sh.get(kr.saturating_sub(1)).copied().unwrap_or(1) as u64
+                    } else {
+                        k_sh.get(kr.saturating_sub(2)).copied().unwrap_or(1) as u64
+                    };
+                    let d_v = v_sh.get(vr.saturating_sub(1)).copied().unwrap_or(1) as u64;
+                    let score_elems = batches.saturating_mul(s_q).saturating_mul(s_k);
+                    let bwd_flops = score_elems.saturating_mul(2 * d_k + 2 * d_v + 4);
+                    let mut read_b = node_bytes(*q)
+                        + node_bytes(*k)
+                        + node_bytes(*v)
+                        + node_bytes(*out)
+                        + node_bytes(*lse)
+                        + node_bytes(*dout);
+                    if let Some(m) = mask {
+                        read_b += node_bytes(*m);
+                    }
+                    let score_bytes = node.dtype.storage_bytes(score_elems as usize) as u64;
+                    (bwd_flops, read_b, out_bytes, score_bytes.saturating_mul(4))
+                }
                 DagOp::FusedElementwise { inputs, steps } => {
                     if node.device == Device::Cpu
                         && crate::runtime::native_jit::is_chain_supported(inputs.len(), steps)
@@ -1607,8 +1800,9 @@ impl PartialEq for TensorComputeDag {
     fn eq(&self, other: &Self) -> bool {
         self.input_specs == other.input_specs
             && self.nodes == other.nodes
-            && self.output == other.output
+            && self.outputs == other.outputs
             && self.fused == other.fused
+            && self.rematerialized_nodes == other.rematerialized_nodes
     }
 }
 
@@ -1653,6 +1847,7 @@ impl TensorComputeDag {
                 shape: shape.to_vec(),
                 dtype: dt,
                 device: dev.clone(),
+                no_cse: false,
             });
             Ok(id)
         }
@@ -1849,6 +2044,50 @@ impl TensorComputeDag {
                 TapeOp::Cos { a, .. } => DagOp::Cos(tape_to_dag[*a].expect("mapped")),
                 TapeOp::Abs { a, .. } => DagOp::Abs(tape_to_dag[*a].expect("mapped")),
                 TapeOp::Softmax { a, .. } => DagOp::Softmax(tape_to_dag[*a].expect("mapped")),
+                TapeOp::LogSoftmax { a, .. } => DagOp::LogSoftmax(tape_to_dag[*a].expect("mapped")),
+                TapeOp::Slice {
+                    a, starts, ends, ..
+                } => DagOp::Slice {
+                    src: tape_to_dag[*a].expect("mapped"),
+                    starts: starts.clone(),
+                    ends: ends.clone(),
+                },
+                TapeOp::Pad { a, pads, .. } => DagOp::Pad {
+                    src: tape_to_dag[*a].expect("mapped"),
+                    pads: pads.clone(),
+                },
+                TapeOp::Cat {
+                    inputs,
+                    const_tensors,
+                    axis,
+                    ..
+                } => {
+                    let mut dag_inputs = Vec::with_capacity(inputs.len());
+                    for (i, inp_opt) in inputs.iter().enumerate() {
+                        if let Some(ti) = inp_opt {
+                            dag_inputs.push(tape_to_dag[*ti].expect("mapped"));
+                        } else {
+                            let ct = const_tensors[i].as_ref().ok_or_else(|| {
+                                MoraError::Runtime(
+                                    "trace_dag: missing constant tensor in Cat".to_string(),
+                                )
+                            })?;
+                            let id = nodes.len();
+                            nodes.push(DagNode {
+                                op: DagOp::ConstTensor(Arc::clone(ct)),
+                                shape: ct.shape.clone(),
+                                dtype: ct.dtype,
+                                device: ct.device.clone(),
+                                no_cse: false,
+                            });
+                            dag_inputs.push(id);
+                        }
+                    }
+                    DagOp::Cat {
+                        inputs: dag_inputs,
+                        axis: *axis,
+                    }
+                }
                 TapeOp::RmsNorm { a, eps, .. } => {
                     DagOp::RmsNorm(tape_to_dag[*a].expect("mapped"), *eps)
                 }
@@ -1862,6 +2101,7 @@ impl TensorComputeDag {
                 shape: tn.shape.clone(),
                 dtype: tn.dtype,
                 device: tn.device.clone(),
+                no_cse: false,
             });
             tape_to_dag[t_idx] = Some(dag_id);
         }
@@ -1872,9 +2112,10 @@ impl TensorComputeDag {
         Ok(Self {
             input_specs,
             nodes,
-            output: dag_out,
+            outputs: vec![dag_out],
             fused: false,
             algebraic_rewrites: 0,
+            rematerialized_nodes: 0,
             compiled_plan: None,
         })
     }
@@ -1882,8 +2123,9 @@ impl TensorComputeDag {
     /// Compute a deterministic 64-bit FNV-1a structural fingerprint of this DAG (including constants).
     pub fn fingerprint(&self) -> u64 {
         let mut h = FnvHasher::new();
-        h.write_u64(self.output as u64);
+        h.write_usize_slice(&self.outputs);
         h.write_u8(u8::from(self.fused));
+        h.write_u64(self.rematerialized_nodes as u64);
         h.write_u64(self.input_specs.len() as u64);
         for (shape, dt, dev) in &self.input_specs {
             h.write_usize_slice(shape);
@@ -1896,6 +2138,7 @@ impl TensorComputeDag {
             h.write_usize_slice(&node.shape);
             h.write_str(node.dtype.short_name());
             h.write_str(&node.device.to_string());
+            h.write_u8(u8::from(node.no_cse));
             for inp in node.op.inputs() {
                 h.write_u64(inp as u64);
             }
@@ -1926,6 +2169,18 @@ impl TensorComputeDag {
                     h.write_u64(*d1 as u64);
                 }
                 DagOp::Gather(_, idxs) | DagOp::ScatterAdd(_, _, idxs) => h.write_usize_slice(idxs),
+                DagOp::Slice { starts, ends, .. } => {
+                    h.write_usize_slice(starts);
+                    h.write_usize_slice(ends);
+                }
+                DagOp::Pad { pads, .. } => {
+                    h.write_u64(pads.len() as u64);
+                    for &(lo, hi) in pads {
+                        h.write_u64(lo as u64);
+                        h.write_u64(hi as u64);
+                    }
+                }
+                DagOp::Cat { axis, .. } => h.write_u64(*axis as u64),
                 DagOp::FusedLinearAct { act, .. } => h.write_str(act.name()),
                 DagOp::FusedRmsNormLinear { eps, act, .. } => {
                     h.write_u64(eps.to_bits());
@@ -1935,9 +2190,24 @@ impl TensorComputeDag {
                     scale,
                     k_is_transposed,
                     ..
+                }
+                | DagOp::FlashAttentionLse {
+                    scale,
+                    k_is_transposed,
+                    ..
                 } => {
                     h.write_u64(scale.to_bits());
                     h.write_u8(u8::from(*k_is_transposed));
+                }
+                DagOp::FlashAttentionGrad {
+                    scale,
+                    k_is_transposed,
+                    target,
+                    ..
+                } => {
+                    h.write_u64(scale.to_bits());
+                    h.write_u8(u8::from(*k_is_transposed));
+                    h.write_u8(target.tag());
                 }
                 DagOp::FusedElementwise { steps, .. } => {
                     h.write_u64(steps.len() as u64);
@@ -1959,13 +2229,18 @@ impl TensorComputeDag {
         self.nodes.iter().filter(|n| n.op.is_fused()).count()
     }
 
+    pub fn output_count(&self) -> usize {
+        self.outputs.len()
+    }
+
     pub fn op_names(&self) -> Vec<&'static str> {
         self.nodes.iter().map(|n| n.op.name()).collect()
     }
 
     pub(crate) fn output_device(&self) -> Device {
-        self.nodes
-            .get(self.output)
+        self.outputs
+            .first()
+            .and_then(|&oid| self.nodes.get(oid))
             .map(|n| n.device.clone())
             .unwrap_or(Device::Cpu)
     }
@@ -2022,24 +2297,151 @@ impl TensorComputeDag {
         out
     }
 
-    /// Apply Pass 0 DType-safe algebraic & layout simplification followed by all 4 operator-fusion
+    /// Apply Pass 0 DType-safe algebraic/layout simplification + CSE followed by all 4 operator-fusion
     /// passes (`FusedFlashAttention`, `FusedRmsNormLinear`, `FusedLinearAct`, `FusedElementwise`)
-    /// and dead-node elimination.
+    /// and multi-output dead-node elimination.
     pub fn fuse(&self) -> Self {
         let mut nodes = self.nodes.clone();
-        let mut out_id = self.output;
+        let mut outputs = self.outputs.clone();
         let mut algebraic_rewrites = self.algebraic_rewrites;
+        let rematerialized_nodes = self.rematerialized_nodes;
 
-        // ── Pass 0: DType-Safe Algebraic Simplification & Layout Cancellation ──
+        // ── Pass 0: DType-Safe Algebraic Simplification, Layout Cancellation, and Pure CSE ──
         // Strictly guards integer identities (`x + 0`, `x - 0`, `x * 1`, `x / 1`) by
         // `dtype.is_int()` so IEEE-754 floating-point semantics (`NaN`, `±Inf`, `-0.0 + 0.0`)
         // are NEVER broken.
         {
+            #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+            enum CseOpKey {
+                Input(usize),
+                SmallConst(Vec<u64>),
+                Add(usize, usize),
+                Sub(usize, usize),
+                Mul(usize, usize),
+                Div(usize, usize),
+                Pow(usize, usize),
+                AddScalar(usize, u64),
+                SubScalar(usize, u64, bool),
+                MulScalar(usize, u64),
+                DivScalar(usize, u64, bool),
+                PowScalar(usize, u64, bool),
+                Neg(usize),
+                MatMul(usize, usize),
+                Sum(usize),
+                Mean(usize),
+                SumAxis(usize, usize, bool),
+                Reshape(usize, Vec<usize>),
+                Transpose(usize, usize, usize),
+                Gather(usize, Vec<usize>),
+                ScatterAdd(usize, usize, Vec<usize>),
+                Slice(usize, Vec<usize>, Vec<usize>),
+                Pad(usize, Vec<(usize, usize)>),
+                Cat(Vec<usize>, usize),
+                Relu(usize),
+                Gelu(usize),
+                Silu(usize),
+                Tanh(usize),
+                Sigmoid(usize),
+                Exp(usize),
+                Ln(usize),
+                Sqrt(usize),
+                Sin(usize),
+                Cos(usize),
+                Abs(usize),
+                StepPos(usize),
+                Sign(usize),
+                Softmax(usize),
+                LogSoftmax(usize),
+                RmsNorm(usize, u64),
+                LayerNorm(usize, u64),
+                FlashAttentionLse(usize, usize, usize, Option<usize>, u64, bool),
+            }
+
+            let cse_key_of = |node: &DagNode| -> Option<(CseOpKey, Vec<usize>, DType, Device)> {
+                if node.no_cse {
+                    return None;
+                }
+                let op_k = match &node.op {
+                    DagOp::Input(s) => CseOpKey::Input(*s),
+                    DagOp::ConstTensor(t) if t.numel() <= 16 => {
+                        let bits: Vec<u64> =
+                            t.to_flat_vec().into_iter().map(f64::to_bits).collect();
+                        CseOpKey::SmallConst(bits)
+                    }
+                    DagOp::Add(a, b) => CseOpKey::Add((*a).min(*b), (*a).max(*b)),
+                    DagOp::Sub(a, b) => CseOpKey::Sub(*a, *b),
+                    DagOp::Mul(a, b) => CseOpKey::Mul((*a).min(*b), (*a).max(*b)),
+                    DagOp::Div(a, b) => CseOpKey::Div(*a, *b),
+                    DagOp::Pow(a, b) => CseOpKey::Pow(*a, *b),
+                    DagOp::AddScalar(a, c) => CseOpKey::AddScalar(*a, c.to_bits()),
+                    DagOp::SubScalar(a, c, r) => CseOpKey::SubScalar(*a, c.to_bits(), *r),
+                    DagOp::MulScalar(a, c) => CseOpKey::MulScalar(*a, c.to_bits()),
+                    DagOp::DivScalar(a, c, r) => CseOpKey::DivScalar(*a, c.to_bits(), *r),
+                    DagOp::PowScalar(a, c, r) => CseOpKey::PowScalar(*a, c.to_bits(), *r),
+                    DagOp::Neg(a) => CseOpKey::Neg(*a),
+                    DagOp::MatMul(a, b) => CseOpKey::MatMul(*a, *b),
+                    DagOp::Sum(a) => CseOpKey::Sum(*a),
+                    DagOp::Mean(a) => CseOpKey::Mean(*a),
+                    DagOp::SumAxis(a, ax, kd) => CseOpKey::SumAxis(*a, *ax, *kd),
+                    DagOp::Reshape(a, sh) => CseOpKey::Reshape(*a, sh.clone()),
+                    DagOp::Transpose(a, d0, d1) => {
+                        CseOpKey::Transpose(*a, (*d0).min(*d1), (*d0).max(*d1))
+                    }
+                    DagOp::Gather(a, idxs) if idxs.len() <= 64 => {
+                        CseOpKey::Gather(*a, idxs.clone())
+                    }
+                    DagOp::ScatterAdd(a, n, idxs) if idxs.len() <= 64 => {
+                        CseOpKey::ScatterAdd(*a, *n, idxs.clone())
+                    }
+                    DagOp::Slice { src, starts, ends } => {
+                        CseOpKey::Slice(*src, starts.clone(), ends.clone())
+                    }
+                    DagOp::Pad { src, pads } => CseOpKey::Pad(*src, pads.clone()),
+                    DagOp::Cat { inputs, axis } => CseOpKey::Cat(inputs.clone(), *axis),
+                    DagOp::Relu(a) => CseOpKey::Relu(*a),
+                    DagOp::Gelu(a) => CseOpKey::Gelu(*a),
+                    DagOp::Silu(a) => CseOpKey::Silu(*a),
+                    DagOp::Tanh(a) => CseOpKey::Tanh(*a),
+                    DagOp::Sigmoid(a) => CseOpKey::Sigmoid(*a),
+                    DagOp::Exp(a) => CseOpKey::Exp(*a),
+                    DagOp::Ln(a) => CseOpKey::Ln(*a),
+                    DagOp::Sqrt(a) => CseOpKey::Sqrt(*a),
+                    DagOp::Sin(a) => CseOpKey::Sin(*a),
+                    DagOp::Cos(a) => CseOpKey::Cos(*a),
+                    DagOp::Abs(a) => CseOpKey::Abs(*a),
+                    DagOp::StepPos(a) => CseOpKey::StepPos(*a),
+                    DagOp::Sign(a) => CseOpKey::Sign(*a),
+                    DagOp::Softmax(a) => CseOpKey::Softmax(*a),
+                    DagOp::LogSoftmax(a) => CseOpKey::LogSoftmax(*a),
+                    DagOp::RmsNorm(a, eps) => CseOpKey::RmsNorm(*a, eps.to_bits()),
+                    DagOp::LayerNorm(a, eps) => CseOpKey::LayerNorm(*a, eps.to_bits()),
+                    DagOp::FlashAttentionLse {
+                        q,
+                        k,
+                        v,
+                        mask,
+                        scale,
+                        k_is_transposed,
+                    } => CseOpKey::FlashAttentionLse(
+                        *q,
+                        *k,
+                        *v,
+                        *mask,
+                        scale.to_bits(),
+                        *k_is_transposed,
+                    ),
+                    _ => return None,
+                };
+                Some((op_k, node.shape.clone(), node.dtype, node.device.clone()))
+            };
+
             let mut changed = true;
             let mut rounds = 0usize;
             while changed && rounds < 4 {
                 changed = false;
                 rounds += 1;
+                let mut cse_table: HashMap<(CseOpKey, Vec<usize>, DType, Device), usize> =
+                    HashMap::new();
                 for idx in 0..nodes.len() {
                     let dt = nodes[idx].dtype;
                     let new_op = match &nodes[idx].op {
@@ -2098,6 +2500,14 @@ impl TensorComputeDag {
                         nodes[idx].op = op;
                         algebraic_rewrites += 1;
                         changed = true;
+                    } else if let Some(key) = cse_key_of(&nodes[idx]) {
+                        if let Some(&prev_id) = cse_table.get(&key) {
+                            nodes[idx].op = DagOp::Identity(prev_id);
+                            algebraic_rewrites += 1;
+                            changed = true;
+                        } else {
+                            cse_table.insert(key, idx);
+                        }
                     }
                 }
                 // Forward all `DagOp::Identity` references directly to their root source!
@@ -2120,17 +2530,21 @@ impl TensorComputeDag {
                             node.op.remap_inputs(&forward);
                         }
                     }
-                    out_id = forward[out_id];
+                    for o in &mut outputs {
+                        *o = forward[*o];
+                    }
                 }
             }
-            let (simplified_nodes, simplified_out) = compact_live_nodes(nodes, out_id);
+            let (simplified_nodes, simplified_outs) = compact_live_nodes(nodes, &outputs);
             nodes = simplified_nodes;
-            out_id = simplified_out;
+            outputs = simplified_outs;
         }
 
-        let count_uses = |ns: &[DagNode], out: usize| -> Vec<usize> {
+        let count_uses = |ns: &[DagNode], outs: &[usize]| -> Vec<usize> {
             let mut uses = vec![0usize; ns.len()];
-            uses[out] += 1;
+            for &out in outs {
+                uses[out] += 1;
+            }
             for n in ns {
                 for u in n.op.inputs() {
                     uses[u] += 1;
@@ -2142,7 +2556,7 @@ impl TensorComputeDag {
         // ── Pass 1: Fuse Scaled Dot-Product Attention into `FusedFlashAttention` ──
         // Matches: MatMul(Softmax(Add?(Scale?(MatMul(Q, Transpose?(K))), Mask?)), V)
         {
-            let uses = count_uses(&nodes, out_id);
+            let uses = count_uses(&nodes, &outputs);
             for idx in 0..nodes.len() {
                 let DagOp::MatMul(probs_id, v_id) = nodes[idx].op else {
                     continue;
@@ -2238,12 +2652,12 @@ impl TensorComputeDag {
             }
         }
 
-        let (mut nodes, compacted_out) = compact_live_nodes(nodes, out_id);
-        out_id = compacted_out;
+        let (mut nodes, compacted_outs) = compact_live_nodes(nodes, &outputs);
+        outputs = compacted_outs;
 
         // ── Pass 2: Fuse `FusedRmsNormLinear` & `FusedLinearAct` (2D and batched ND `[..., M, K] @ [K, N]`) ──
         {
-            let uses = count_uses(&nodes, out_id);
+            let uses = count_uses(&nodes, &outputs);
             let as_act = |op: &DagOp| -> Option<(usize, FusedAct)> {
                 match *op {
                     DagOp::Relu(a) => Some((a, FusedAct::Relu)),
@@ -2307,6 +2721,7 @@ impl TensorComputeDag {
                             && let Some(fused_op) =
                                 make_fused_linear_op(&nodes, &uses, x, w, Some(rhs), act)
                         {
+                            nodes[idx].no_cse |= nodes[inner].no_cse || nodes[lhs].no_cse;
                             nodes[idx].op = fused_op;
                             continue;
                         }
@@ -2316,6 +2731,7 @@ impl TensorComputeDag {
                             && let Some(fused_op) =
                                 make_fused_linear_op(&nodes, &uses, x, w, Some(lhs), act)
                         {
+                            nodes[idx].no_cse |= nodes[inner].no_cse || nodes[rhs].no_cse;
                             nodes[idx].op = fused_op;
                             continue;
                         }
@@ -2323,6 +2739,7 @@ impl TensorComputeDag {
                     if let Some((x, w)) = is_linear_matmul(&nodes, inner)
                         && let Some(fused_op) = make_fused_linear_op(&nodes, &uses, x, w, None, act)
                     {
+                        nodes[idx].no_cse |= nodes[inner].no_cse;
                         nodes[idx].op = fused_op;
                         continue;
                     }
@@ -2334,6 +2751,7 @@ impl TensorComputeDag {
                         && let Some(fused_op) =
                             make_fused_linear_op(&nodes, &uses, x, w, Some(rhs), FusedAct::None)
                     {
+                        nodes[idx].no_cse |= nodes[lhs].no_cse;
                         nodes[idx].op = fused_op;
                         continue;
                     }
@@ -2343,6 +2761,7 @@ impl TensorComputeDag {
                         && let Some(fused_op) =
                             make_fused_linear_op(&nodes, &uses, x, w, Some(lhs), FusedAct::None)
                     {
+                        nodes[idx].no_cse |= nodes[rhs].no_cse;
                         nodes[idx].op = fused_op;
                         continue;
                     }
@@ -2352,17 +2771,18 @@ impl TensorComputeDag {
                     && let Some(fused_op) =
                         make_fused_linear_op(&nodes, &uses, x, w, None, FusedAct::None)
                 {
+                    nodes[idx].no_cse |= nodes[x].no_cse;
                     nodes[idx].op = fused_op;
                 }
             }
         }
 
         // Compact dead nodes before elementwise chain fusion.
-        let (mut nodes, compacted_out) = compact_live_nodes(nodes, out_id);
-        out_id = compacted_out;
+        let (mut nodes, compacted_outs) = compact_live_nodes(nodes, &outputs);
+        outputs = compacted_outs;
 
         // ── Pass 3: Fuse maximal single-consumer chains of elementwise operations ──
-        let uses = count_uses(&nodes, out_id);
+        let uses = count_uses(&nodes, &outputs);
         let is_elementwise = |op: &DagOp| -> bool {
             matches!(
                 op,
@@ -2388,6 +2808,8 @@ impl TensorComputeDag {
                     | DagOp::Sin(_)
                     | DagOp::Cos(_)
                     | DagOp::Abs(_)
+                    | DagOp::StepPos(_)
+                    | DagOp::Sign(_)
             )
         };
 
@@ -2446,7 +2868,9 @@ impl TensorComputeDag {
             };
 
             let mut steps = Vec::with_capacity(cluster.len());
+            let mut any_no_cse = false;
             for &nid in &cluster {
+                any_no_cse |= nodes[nid].no_cse;
                 if nid != idx {
                     absorbed[nid] = true;
                 }
@@ -2473,23 +2897,27 @@ impl TensorComputeDag {
                     DagOp::Sin(a) => FusedEwStep::Sin(resolve_ref(a)),
                     DagOp::Cos(a) => FusedEwStep::Cos(resolve_ref(a)),
                     DagOp::Abs(a) => FusedEwStep::Abs(resolve_ref(a)),
+                    DagOp::StepPos(a) => FusedEwStep::StepPos(resolve_ref(a)),
+                    DagOp::Sign(a) => FusedEwStep::Sign(resolve_ref(a)),
                     _ => unreachable!("only elementwise ops enter cluster"),
                 };
                 steps.push(step);
             }
+            nodes[idx].no_cse = any_no_cse;
             nodes[idx].op = DagOp::FusedElementwise {
                 inputs: ext_inputs,
                 steps,
             };
         }
 
-        let (final_nodes, final_out) = compact_live_nodes(nodes, out_id);
+        let (final_nodes, final_outs) = compact_live_nodes(nodes, &outputs);
         Self {
             input_specs: self.input_specs.clone(),
             nodes: final_nodes,
-            output: final_out,
+            outputs: final_outs,
             fused: true,
             algebraic_rewrites,
+            rematerialized_nodes,
             compiled_plan: None,
         }
     }
@@ -2558,11 +2986,10 @@ impl TensorComputeDag {
             .map_or((0, 0), |p| p.vram_reuse_stats())
     }
 
-    /// Execute this compute graph on `inputs` using attached [`CompiledDagPlan`] if present,
-    /// otherwise building a [`DagMemoryPlan`] + scratch workspace directly.
-    pub fn run(&self, inputs: &[Arc<Tensor>]) -> MoraResult<Arc<Tensor>> {
+    /// Execute this multi-output compute graph on `inputs`, returning all output tensors in order.
+    pub fn run_multi(&self, inputs: &[Arc<Tensor>]) -> MoraResult<Vec<Arc<Tensor>>> {
         if let Some(plan) = &self.compiled_plan {
-            return plan.execute(inputs);
+            return plan.execute_multi(inputs);
         }
         let mem = DagMemoryPlan::build(self);
         let const_flats: Vec<Option<Vec<f64>>> = self
@@ -2573,13 +3000,32 @@ impl TensorComputeDag {
                 _ => None,
             })
             .collect();
-        let out_numel = self
-            .nodes
-            .get(self.output)
-            .and_then(|n| checked_numel(&n.shape).ok())
+        let max_out_numel = self
+            .outputs
+            .iter()
+            .filter_map(|&oid| self.nodes.get(oid))
+            .filter_map(|n| checked_numel(&n.shape).ok())
+            .max()
             .unwrap_or(1);
-        let mut ws = DagWorkspace::from_plan(&mem, out_numel);
-        execute_dag_with_workspace(self, &mem, &const_flats, &mut ws, inputs, None)
+        let mut ws = DagWorkspace::from_plan(&mem, max_out_numel);
+        execute_dag_multi_with_workspace(self, &mem, &const_flats, &mut ws, inputs, None)
+    }
+
+    /// Execute this single-output compute graph on `inputs` using attached [`CompiledDagPlan`] if
+    /// present, otherwise building a [`DagMemoryPlan`] + scratch workspace directly.
+    pub fn run(&self, inputs: &[Arc<Tensor>]) -> MoraResult<Arc<Tensor>> {
+        if self.outputs.len() != 1 {
+            return Err(MoraError::Runtime(format!(
+                "ComputeDag.run expects a single-output DAG, got {} outputs (use .run_multi())",
+                self.outputs.len()
+            )));
+        }
+        if let Some(plan) = &self.compiled_plan {
+            return plan.execute(inputs);
+        }
+        let mut outs = self.run_multi(inputs)?;
+        outs.pop()
+            .ok_or_else(|| MoraError::Runtime("ComputeDag.run: missing output tensor".to_string()))
     }
 
     /// Execute this compute graph using the runtime's [`DagPlanCache`] when compiled/fused,
@@ -2589,6 +3035,12 @@ impl TensorComputeDag {
         cache: &DagPlanCache,
         inputs: &[Arc<Tensor>],
     ) -> MoraResult<Arc<Tensor>> {
+        if self.outputs.len() != 1 {
+            return Err(MoraError::Runtime(format!(
+                "ComputeDag.run expects a single-output DAG, got {} outputs (use .run_multi())",
+                self.outputs.len()
+            )));
+        }
         if let Some(plan) = &self.compiled_plan {
             return plan.execute(inputs);
         }
@@ -2597,6 +3049,22 @@ impl TensorComputeDag {
             return plan.execute(inputs);
         }
         self.run(inputs)
+    }
+
+    /// Execute this multi-output compute graph using the runtime's [`DagPlanCache`] when compiled/fused.
+    pub(crate) fn run_multi_with_cache(
+        &self,
+        cache: &DagPlanCache,
+        inputs: &[Arc<Tensor>],
+    ) -> MoraResult<Vec<Arc<Tensor>>> {
+        if let Some(plan) = &self.compiled_plan {
+            return plan.execute_multi(inputs);
+        }
+        if self.fused {
+            let plan = cache.get_or_compile(self);
+            return plan.execute_multi(inputs);
+        }
+        self.run_multi(inputs)
     }
 }
 
@@ -2930,18 +3398,34 @@ fn try_eval_node_vram(
         DagOp::Sin(a) => run_ew_vram(&[*a], &[FusedEwStep::Sin(0)], safe_dst),
         DagOp::Cos(a) => run_ew_vram(&[*a], &[FusedEwStep::Cos(0)], safe_dst),
         DagOp::Abs(a) => run_ew_vram(&[*a], &[FusedEwStep::Abs(0)], safe_dst),
+        DagOp::StepPos(a) => run_ew_vram(&[*a], &[FusedEwStep::StepPos(0)], safe_dst),
+        DagOp::Sign(a) => run_ew_vram(&[*a], &[FusedEwStep::Sign(0)], safe_dst),
         _ => Ok(None),
     }
 }
 
-fn execute_dag_with_workspace(
+type FlashFwdKey = (usize, usize, usize, Option<usize>, u64, bool);
+type FlashBwdKey = (
+    usize,
+    usize,
+    usize,
+    Option<usize>,
+    usize,
+    usize,
+    usize,
+    u64,
+    bool,
+    DType,
+);
+
+fn execute_dag_multi_with_workspace(
     dag: &TensorComputeDag,
     mem: &DagMemoryPlan,
     const_flats: &[Option<Vec<f64>>],
     ws: &mut DagWorkspace,
     inputs: &[Arc<Tensor>],
     vram_stats: Option<(&AtomicU64, &AtomicU64)>,
-) -> MoraResult<Arc<Tensor>> {
+) -> MoraResult<Vec<Arc<Tensor>>> {
     if inputs.len() != dag.input_specs.len() {
         return Err(MoraError::Runtime(format!(
             "ComputeDag.run: expected {} input tensor(s), got {}",
@@ -2965,6 +3449,33 @@ fn execute_dag_with_workspace(
         }
     }
 
+    let n = dag.nodes.len();
+    let mut out_positions: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (pos, &oid) in dag.outputs.iter().enumerate() {
+        if oid < n {
+            out_positions[oid].push(pos);
+        }
+    }
+    let mut out_tensors: Vec<Option<Arc<Tensor>>> = vec![None; dag.outputs.len()];
+
+    // Pre-scan `FlashAttentionLse` nodes so `FusedFlashAttention` computes `out + lse` in one pass!
+    let mut lse_needed: HashSet<FlashFwdKey> = HashSet::new();
+    for node in &dag.nodes {
+        if let DagOp::FlashAttentionLse {
+            q,
+            k,
+            v,
+            mask,
+            scale,
+            k_is_transposed,
+        } = node.op
+        {
+            lse_needed.insert((q, k, v, mask, scale.to_bits(), k_is_transposed));
+        }
+    }
+    let mut flash_fwd_lse_cache: HashMap<FlashFwdKey, Vec<f64>> = HashMap::new();
+    let mut flash_bwd_cache: HashMap<FlashBwdKey, flash_bwd::FlashBwdResult> = HashMap::new();
+
     // Lazily decoded host views of inputs (never materialized on pure VRAM-to-VRAM GPU execution!).
     let mut input_flats: Vec<Option<Vec<f64>>> = vec![None; inputs.len()];
     let mut slot_vram: Vec<Option<Arc<dyn DeviceVramBuffer>>> = vec![None; mem.slots.len()];
@@ -2972,13 +3483,17 @@ fn execute_dag_with_workspace(
     let mut slot_meta: Vec<(usize, DType)> = vec![(0, DType::F64); mem.slots.len()];
 
     for (idx, node) in dag.nodes.iter().enumerate() {
+        let is_out = !out_positions[idx].is_empty();
         if matches!(node.op, DagOp::Input(_) | DagOp::ConstTensor(_)) {
-            if idx == dag.output {
-                return match &node.op {
-                    DagOp::Input(slot) => Ok(Arc::clone(&inputs[*slot])),
-                    DagOp::ConstTensor(t) => Ok(Arc::clone(t)),
+            if is_out {
+                let t = match &node.op {
+                    DagOp::Input(slot) => Arc::clone(&inputs[*slot]),
+                    DagOp::ConstTensor(t) => Arc::clone(t),
                     _ => unreachable!(),
                 };
+                for &pos in &out_positions[idx] {
+                    out_tensors[pos] = Some(Arc::clone(&t));
+                }
             }
             continue;
         }
@@ -2989,8 +3504,10 @@ fn execute_dag_with_workspace(
         let backend = backend_for_device(&node.device);
         if backend.supports_vram_residency() {
             let is_view_alias = matches!(node.op, DagOp::Reshape(_, _) | DagOp::Identity(_));
+            // Never pass a reusable pooled VRAM slot as the write target for an output node so
+            // returned `Arc<Tensor>`s can never be mutated by subsequent `run` / `run_multi` calls.
             let (pooled_dst, was_reused_slot) = if !is_view_alias
-                && idx != dag.output
+                && !is_out
                 && let Some(s_id) = dst_slot_opt
             {
                 let slot_plan = &mem.slots[s_id];
@@ -3029,14 +3546,23 @@ fn execute_dag_with_workspace(
                 {
                     reuses.fetch_add(1, Ordering::Relaxed);
                 }
-                if idx == dag.output {
-                    return Tensor::from_vram_output(
-                        out_vram,
+                if is_out {
+                    let out_h = out_vram.raw_handle();
+                    for pool_slot in &mut ws.vram_slots {
+                        if pool_slot.as_ref().is_some_and(|b| b.raw_handle() == out_h) {
+                            *pool_slot = None;
+                        }
+                    }
+                    let out_t = Tensor::from_vram_output(
+                        Arc::clone(&out_vram),
                         node.shape.clone(),
                         node.dtype,
                         node.device.clone(),
                         false,
-                    );
+                    )?;
+                    for &pos in &out_positions[idx] {
+                        out_tensors[pos] = Some(Arc::clone(&out_t));
+                    }
                 }
                 if let Some(s_id) = dst_slot_opt {
                     let numel = checked_numel(&node.shape)?;
@@ -3102,6 +3628,9 @@ fn execute_dag_with_workspace(
             const_flats,
             mem,
             &ws.slots,
+            &lse_needed,
+            &mut flash_fwd_lse_cache,
+            &mut flash_bwd_cache,
             &mut dst_buf,
         );
 
@@ -3118,16 +3647,17 @@ fn execute_dag_with_workspace(
             return Err(e);
         }
 
-        if idx == dag.output {
-            let out_tensor = Tensor::from_raw(
+        if is_out {
+            let out_t = Tensor::from_raw(
                 dst_buf.clone(),
                 node.shape.clone(),
                 node.dtype,
                 node.device.clone(),
                 false,
-            );
-            finalize_slot(ws, dst_buf);
-            return out_tensor;
+            )?;
+            for &pos in &out_positions[idx] {
+                out_tensors[pos] = Some(Arc::clone(&out_t));
+            }
         }
         finalize_slot(ws, dst_buf);
         if let Some(s_id) = dst_slot_opt {
@@ -3136,9 +3666,14 @@ fn execute_dag_with_workspace(
         }
     }
 
-    Err(MoraError::Runtime(
-        "ComputeDag.run: missing output tensor".to_string(),
-    ))
+    let mut result = Vec::with_capacity(out_tensors.len());
+    for (pos, maybe_t) in out_tensors.into_iter().enumerate() {
+        let t = maybe_t.ok_or_else(|| {
+            MoraError::Runtime(format!("ComputeDag.run: missing output tensor #{pos}"))
+        })?;
+        result.push(t);
+    }
+    Ok(result)
 }
 
 #[inline]
@@ -3164,6 +3699,7 @@ fn read_node_slice<'a>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn eval_node_into(
     dag: &TensorComputeDag,
     node: &DagNode,
@@ -3171,6 +3707,9 @@ fn eval_node_into(
     const_flats: &[Option<Vec<f64>>],
     mem: &DagMemoryPlan,
     slots: &[Vec<f64>],
+    lse_needed: &HashSet<FlashFwdKey>,
+    flash_fwd_lse_cache: &mut HashMap<FlashFwdKey, Vec<f64>>,
+    flash_bwd_cache: &mut HashMap<FlashBwdKey, flash_bwd::FlashBwdResult>,
     dst: &mut Vec<f64>,
 ) -> MoraResult<()> {
     let backend = backend_for_device(&node.device);
@@ -3240,20 +3779,144 @@ fn eval_node_into(
             k_is_transposed,
         } => {
             let mask_arg = mask.map(|m| (get(m), shape_of(m)));
-            backend.run_fused_flash_attention_into(
+            let key: FlashFwdKey = (*q, *k, *v, *mask, scale.to_bits(), *k_is_transposed);
+            if lse_needed.contains(&key) && node.device == Device::Cpu {
+                let mut lse_buf = Vec::new();
+                simd_kernels::fused_flash_attention_with_lse_into(
+                    get(*q),
+                    get(*k),
+                    get(*v),
+                    mask_arg,
+                    shape_of(*q),
+                    shape_of(*k),
+                    shape_of(*v),
+                    &node.shape,
+                    *scale,
+                    *k_is_transposed,
+                    node.dtype,
+                    dst,
+                    Some(&mut lse_buf),
+                )?;
+                flash_fwd_lse_cache.insert(key, lse_buf);
+                Ok(())
+            } else {
+                backend.run_fused_flash_attention_into(
+                    get(*q),
+                    get(*k),
+                    get(*v),
+                    mask_arg,
+                    shape_of(*q),
+                    shape_of(*k),
+                    shape_of(*v),
+                    &node.shape,
+                    *scale,
+                    *k_is_transposed,
+                    node.dtype,
+                    dst,
+                )
+            }
+        }
+        DagOp::FlashAttentionLse {
+            q,
+            k,
+            v,
+            mask,
+            scale,
+            k_is_transposed,
+        } => {
+            let key: FlashFwdKey = (*q, *k, *v, *mask, scale.to_bits(), *k_is_transposed);
+            if let Some(cached) = flash_fwd_lse_cache.get(&key) {
+                dst.clear();
+                dst.extend_from_slice(cached);
+                return Ok(());
+            }
+            let mask_arg = mask.map(|m| (get(m), shape_of(m)));
+            let v_sh = shape_of(*v);
+            let d_v = *v_sh.last().unwrap_or(&1);
+            let mut full_out_shape = node.shape.clone();
+            full_out_shape.push(d_v);
+            let mut tmp_out = Vec::new();
+            simd_kernels::fused_flash_attention_with_lse_into(
                 get(*q),
                 get(*k),
                 get(*v),
                 mask_arg,
                 shape_of(*q),
                 shape_of(*k),
-                shape_of(*v),
-                &node.shape,
+                v_sh,
+                &full_out_shape,
                 *scale,
                 *k_is_transposed,
                 node.dtype,
-                dst,
-            )
+                &mut tmp_out,
+                Some(dst),
+            )?;
+            flash_fwd_lse_cache.insert(key, dst.clone());
+            Ok(())
+        }
+        DagOp::FlashAttentionGrad {
+            q,
+            k,
+            v,
+            mask,
+            out,
+            lse,
+            dout,
+            scale,
+            k_is_transposed,
+            target,
+        } => {
+            let bwd_key: FlashBwdKey = (
+                *q,
+                *k,
+                *v,
+                *mask,
+                *out,
+                *lse,
+                *dout,
+                scale.to_bits(),
+                *k_is_transposed,
+                node.dtype,
+            );
+            if let std::collections::hash_map::Entry::Vacant(entry) = flash_bwd_cache.entry(bwd_key)
+            {
+                let mask_arg = mask.map(|m| (get(m), shape_of(m)));
+                let res = flash_bwd::fused_flash_attention_backward(
+                    get(*q),
+                    get(*k),
+                    get(*v),
+                    mask_arg,
+                    get(*out),
+                    get(*lse),
+                    get(*dout),
+                    shape_of(*q),
+                    shape_of(*k),
+                    shape_of(*v),
+                    shape_of(*out),
+                    *scale,
+                    *k_is_transposed,
+                    node.dtype,
+                )?;
+                entry.insert(res);
+            }
+            let cached = flash_bwd_cache
+                .get(&bwd_key)
+                .expect("flash_bwd_cache populated above");
+            dst.clear();
+            match target {
+                FlashAttnGradTarget::DQ => dst.extend_from_slice(&cached.dq),
+                FlashAttnGradTarget::DK => dst.extend_from_slice(&cached.dk),
+                FlashAttnGradTarget::DV => dst.extend_from_slice(&cached.dv),
+                FlashAttnGradTarget::DMask => {
+                    let dm = cached.dmask.as_deref().ok_or_else(|| {
+                        MoraError::Runtime(
+                            "FlashAttentionGrad(dMask): mask tensor missing".to_string(),
+                        )
+                    })?;
+                    dst.extend_from_slice(dm);
+                }
+            }
+            Ok(())
         }
         DagOp::FusedElementwise { inputs: ids, steps } => {
             let flats: Vec<&[f64]> = ids.iter().map(|&id| get(id)).collect();
@@ -3466,32 +4129,24 @@ fn eval_node_into(
             out_numel,
             dst,
         ),
-        DagOp::StepPos(a) => {
-            let src = get(*a);
-            dst.clear();
-            dst.reserve(src.len());
-            for &v in src {
-                let out_v = if v > 0.0 { 1.0 } else { 0.0 };
-                dst.push(quantize_for_dtype(out_v, node.dtype));
-            }
-            Ok(())
-        }
-        DagOp::Sign(a) => {
-            let src = get(*a);
-            dst.clear();
-            dst.reserve(src.len());
-            for &v in src {
-                let out_v = if v > 0.0 {
-                    1.0
-                } else if v < 0.0 {
-                    -1.0
-                } else {
-                    0.0
-                };
-                dst.push(quantize_for_dtype(out_v, node.dtype));
-            }
-            Ok(())
-        }
+        DagOp::StepPos(a) => run_single_ew_into(
+            backend.as_ref(),
+            get(*a),
+            shape_of(*a),
+            FusedEwStep::StepPos(0),
+            node,
+            out_numel,
+            dst,
+        ),
+        DagOp::Sign(a) => run_single_ew_into(
+            backend.as_ref(),
+            get(*a),
+            shape_of(*a),
+            FusedEwStep::Sign(0),
+            node,
+            out_numel,
+            dst,
+        ),
         DagOp::MatMul(a, b) => backend.run_matmul_into(
             get(*a),
             get(*b),
@@ -3549,6 +4204,26 @@ fn eval_node_into(
             dst.extend_from_slice(&sc);
             Ok(())
         }
+        DagOp::Slice { src, starts, ends } => {
+            let sl = slice_flat(get(*src), shape_of(*src), starts, ends);
+            dst.clear();
+            dst.extend_from_slice(&sl);
+            Ok(())
+        }
+        DagOp::Pad { src, pads } => {
+            let pd = pad_flat(get(*src), shape_of(*src), pads, &node.shape);
+            dst.clear();
+            dst.extend_from_slice(&pd);
+            Ok(())
+        }
+        DagOp::Cat { inputs, axis } => {
+            let slices: Vec<&[f64]> = inputs.iter().map(|&id| get(id)).collect();
+            let shapes: Vec<&[usize]> = inputs.iter().map(|&id| shape_of(id)).collect();
+            let cat = cat_flat(&slices, &shapes, *axis, &node.shape);
+            dst.clear();
+            dst.extend_from_slice(&cat);
+            Ok(())
+        }
         DagOp::Softmax(a) => {
             let src = get(*a);
             let d = node.shape.last().copied().unwrap_or(1).max(1);
@@ -3566,6 +4241,22 @@ fn eval_node_into(
                 let inv = if sum_e > 0.0 { 1.0 / sum_e } else { 0.0 };
                 for j in 0..d {
                     dst[base + j] = quantize_for_dtype(dst[base + j] * inv, node.dtype);
+                }
+            }
+            Ok(())
+        }
+        DagOp::LogSoftmax(a) => {
+            let src = get(*a);
+            let d = node.shape.last().copied().unwrap_or(1).max(1);
+            dst.resize(src.len(), 0.0);
+            for row in 0..(src.len() / d) {
+                let base = row * d;
+                let row_in = &src[base..base + d];
+                let max_v = row_in.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let sum_e: f64 = row_in.iter().map(|&v| (v - max_v).exp()).sum();
+                let lse = max_v + sum_e.ln();
+                for j in 0..d {
+                    dst[base + j] = quantize_for_dtype(row_in[j] - lse, node.dtype);
                 }
             }
             Ok(())
@@ -3607,9 +4298,9 @@ fn run_single_ew_into(
     )
 }
 
-fn compact_live_nodes(nodes: Vec<DagNode>, output: usize) -> (Vec<DagNode>, usize) {
+fn compact_live_nodes(nodes: Vec<DagNode>, outputs: &[usize]) -> (Vec<DagNode>, Vec<usize>) {
     let mut live = vec![false; nodes.len()];
-    let mut stack = vec![output];
+    let mut stack: Vec<usize> = outputs.to_vec();
     while let Some(id) = stack.pop() {
         if live[id] {
             continue;
@@ -3629,7 +4320,8 @@ fn compact_live_nodes(nodes: Vec<DagNode>, output: usize) -> (Vec<DagNode>, usiz
         remap[old_id] = compacted.len();
         compacted.push(node);
     }
-    (compacted, remap[output])
+    let new_outputs: Vec<usize> = outputs.iter().map(|&o| remap[o]).collect();
+    (compacted, new_outputs)
 }
 
 /// Deterministic 64-bit FNV-1a hasher for structural DAG caching (stable across runs & platforms).
@@ -3778,6 +4470,14 @@ fn hash_ew_step(h: &mut FnvHasher, step: &FusedEwStep) {
             h.write_u8(22);
             h.write_u64(a as u64);
         }
+        FusedEwStep::StepPos(a) => {
+            h.write_u8(23);
+            h.write_u64(a as u64);
+        }
+        FusedEwStep::Sign(a) => {
+            h.write_u8(24);
+            h.write_u64(a as u64);
+        }
     }
 }
 
@@ -3867,6 +4567,7 @@ impl DagIrBuilder {
             shape,
             dtype,
             device,
+            no_cse: false,
         });
         id
     }
@@ -4153,6 +4854,10 @@ impl TensorComputeDag {
                             FusedEwStep::Sin(s0) => b.unary(DagOp::Sin(slots[s0]), slots[s0]),
                             FusedEwStep::Cos(s0) => b.unary(DagOp::Cos(slots[s0]), slots[s0]),
                             FusedEwStep::Abs(s0) => b.unary(DagOp::Abs(slots[s0]), slots[s0]),
+                            FusedEwStep::StepPos(s0) => {
+                                b.unary(DagOp::StepPos(slots[s0]), slots[s0])
+                            }
+                            FusedEwStep::Sign(s0) => b.unary(DagOp::Sign(slots[s0]), slots[s0]),
                         };
                         slots.push(step_id);
                     }
@@ -4171,24 +4876,32 @@ impl TensorComputeDag {
         Ok(Self {
             input_specs: self.input_specs.clone(),
             nodes: b.nodes,
-            output: map[self.output],
+            outputs: self.outputs.iter().map(|&o| map[o]).collect(),
             fused: false,
             algebraic_rewrites: 0,
+            rematerialized_nodes: self.rematerialized_nodes,
             compiled_plan: None,
         })
     }
 
     fn build_vjp_internal(&self, input_idx: usize, seed_ones: bool) -> MoraResult<Self> {
+        let method = if seed_ones { "grad" } else { "vjp" };
+        if self.outputs.len() != 1 {
+            return Err(MoraError::Runtime(format!(
+                "ComputeDag.{method} requires a single-output DAG, got {} outputs",
+                self.outputs.len()
+            )));
+        }
         if input_idx >= self.input_specs.len() {
             return Err(MoraError::Runtime(format!(
-                "ComputeDag.{}: input index {input_idx} out of bounds (graph has {} input(s))",
-                if seed_ones { "grad" } else { "vjp" },
+                "ComputeDag.{method}: input index {input_idx} out of bounds (graph has {} input(s))",
                 self.input_specs.len()
             )));
         }
         let prim = self.unfuse_to_primitives()?;
+        let prim_out = prim.outputs[0];
         let n_fwd = prim.nodes.len();
-        let out_node = &prim.nodes[prim.output];
+        let out_node = &prim.nodes[prim_out];
         let out_shape = out_node.shape.clone();
         let out_dtype = out_node.dtype;
         let out_dev = out_node.device.clone();
@@ -4205,7 +4918,7 @@ impl TensorComputeDag {
         };
 
         let mut adj: Vec<Option<usize>> = vec![None; n_fwd];
-        adj[prim.output] = Some(seed_id);
+        adj[prim_out] = Some(seed_id);
 
         let acc = |adj: &mut [Option<usize>],
                    target: usize,
@@ -4567,6 +5280,87 @@ impl TensorComputeDag {
                     let da = b.mul(inv_std, diff)?;
                     acc(&mut adj, a, da, &mut b)?;
                 }
+                DagOp::LogSoftmax(a) => {
+                    let sh = b.shape(a);
+                    let rank = sh.len();
+                    let p = b.unary(DagOp::Exp(idx), idx);
+                    let sum_g = if rank == 0 {
+                        g
+                    } else {
+                        b.sum_axis(g, rank - 1, true)
+                    };
+                    let corr = b.mul(p, sum_g)?;
+                    let da = b.sub(g, corr)?;
+                    acc(&mut adj, a, da, &mut b)?;
+                }
+                DagOp::Slice { src, starts, .. } => {
+                    let src_sh = b.shape(src);
+                    let out_sh = b.shape(idx);
+                    let pads: Vec<(usize, usize)> = starts
+                        .iter()
+                        .enumerate()
+                        .map(|(d, &s)| (s, src_sh[d] - (s + out_sh[d])))
+                        .collect();
+                    let dt = b.dtype(src);
+                    let dev = b.device(src);
+                    let da = b.push(DagOp::Pad { src: g, pads }, src_sh, dt, dev);
+                    acc(&mut adj, src, da, &mut b)?;
+                }
+                DagOp::Pad { src, pads } => {
+                    let src_sh = b.shape(src);
+                    let starts: Vec<usize> = pads.iter().map(|&(lo, _)| lo).collect();
+                    let ends: Vec<usize> = pads
+                        .iter()
+                        .enumerate()
+                        .map(|(d, &(lo, _))| lo + src_sh[d])
+                        .collect();
+                    let dt = b.dtype(src);
+                    let dev = b.device(src);
+                    let da = b.push(
+                        DagOp::Slice {
+                            src: g,
+                            starts,
+                            ends,
+                        },
+                        src_sh,
+                        dt,
+                        dev,
+                    );
+                    acc(&mut adj, src, da, &mut b)?;
+                }
+                DagOp::Cat { inputs, axis } => {
+                    let out_sh = b.shape(idx);
+                    let rank = out_sh.len();
+                    let mut offset = 0usize;
+                    for inp in inputs {
+                        let in_sh = b.shape(inp);
+                        let dim = in_sh[axis];
+                        let mut starts = vec![0usize; rank];
+                        let mut ends = out_sh.clone();
+                        starts[axis] = offset;
+                        ends[axis] = offset + dim;
+                        let dt = b.dtype(inp);
+                        let dev = b.device(inp);
+                        let da = b.push(
+                            DagOp::Slice {
+                                src: g,
+                                starts,
+                                ends,
+                            },
+                            in_sh,
+                            dt,
+                            dev,
+                        );
+                        acc(&mut adj, inp, da, &mut b)?;
+                        offset += dim;
+                    }
+                }
+                DagOp::FlashAttentionLse { .. } => {}
+                DagOp::FlashAttentionGrad { .. } => {
+                    return Err(MoraError::Runtime(
+                        "ComputeDag.vjp: higher-order differentiation through FlashAttentionGrad requires unfused attention".to_string(),
+                    ));
+                }
                 DagOp::FusedLinearAct { .. }
                 | DagOp::FusedRmsNormLinear { .. }
                 | DagOp::FusedFlashAttention { .. }
@@ -4596,13 +5390,14 @@ impl TensorComputeDag {
                 b.const_filled(0.0, sh, dt, dev)?
             }
         };
-        let (nodes, output) = compact_live_nodes(b.nodes, raw_out);
+        let (nodes, outputs) = compact_live_nodes(b.nodes, &[raw_out]);
         Ok(Self {
             input_specs: new_input_specs,
             nodes,
-            output,
+            outputs,
             fused: false,
             algebraic_rewrites: 0,
+            rematerialized_nodes: 0,
             compiled_plan: None,
         })
     }
@@ -4623,6 +5418,12 @@ impl TensorComputeDag {
     /// Build a first-class symbolic forward-mode JVP [`TensorComputeDag`] with respect to
     /// `input_idx`. The returned DAG takes `(x_0, ..., x_{N-1}, dx)` and computes `J_f(x) dx`.
     pub(crate) fn build_jvp(&self, input_idx: usize) -> MoraResult<Self> {
+        if self.outputs.len() != 1 {
+            return Err(MoraError::Runtime(format!(
+                "ComputeDag.jvp requires a single-output DAG, got {} outputs",
+                self.outputs.len()
+            )));
+        }
         if input_idx >= self.input_specs.len() {
             return Err(MoraError::Runtime(format!(
                 "ComputeDag.jvp: input index {input_idx} out of bounds (graph has {} input(s))",
@@ -4968,6 +5769,91 @@ impl TensorComputeDag {
                         Some(b.mul(inv_std, diff)?)
                     }
                 },
+                DagOp::LogSoftmax(a) => match tan[*a] {
+                    None => None,
+                    Some(ta) => {
+                        let sh = b.shape(*a);
+                        let rank = sh.len();
+                        let p = b.unary(DagOp::Exp(idx), idx);
+                        let pta = b.mul(p, ta)?;
+                        let dot = if rank == 0 {
+                            pta
+                        } else {
+                            b.sum_axis(pta, rank - 1, true)
+                        };
+                        Some(b.sub(ta, dot)?)
+                    }
+                },
+                DagOp::Slice { src, starts, ends } => match tan[*src] {
+                    None => None,
+                    Some(ts) => {
+                        let dt = b.dtype(idx);
+                        let dev = b.device(idx);
+                        Some(b.push(
+                            DagOp::Slice {
+                                src: ts,
+                                starts: starts.clone(),
+                                ends: ends.clone(),
+                            },
+                            y_sh.clone(),
+                            dt,
+                            dev,
+                        ))
+                    }
+                },
+                DagOp::Pad { src, pads } => match tan[*src] {
+                    None => None,
+                    Some(ts) => {
+                        let dt = b.dtype(idx);
+                        let dev = b.device(idx);
+                        Some(b.push(
+                            DagOp::Pad {
+                                src: ts,
+                                pads: pads.clone(),
+                            },
+                            y_sh.clone(),
+                            dt,
+                            dev,
+                        ))
+                    }
+                },
+                DagOp::Cat { inputs, axis } => {
+                    let any_tan = inputs.iter().any(|&i| tan[i].is_some());
+                    if !any_tan {
+                        None
+                    } else {
+                        let mut parts = Vec::with_capacity(inputs.len());
+                        for &inp in inputs {
+                            let part = match tan[inp] {
+                                Some(t) => t,
+                                None => {
+                                    let sh = b.shape(inp);
+                                    let dt = b.dtype(inp);
+                                    let dev = b.device(inp);
+                                    b.const_filled(0.0, &sh, dt, &dev)?
+                                }
+                            };
+                            parts.push(part);
+                        }
+                        let dt = b.dtype(idx);
+                        let dev = b.device(idx);
+                        Some(b.push(
+                            DagOp::Cat {
+                                inputs: parts,
+                                axis: *axis,
+                            },
+                            y_sh.clone(),
+                            dt,
+                            dev,
+                        ))
+                    }
+                }
+                DagOp::FlashAttentionLse { .. } => None,
+                DagOp::FlashAttentionGrad { .. } => {
+                    return Err(MoraError::Runtime(
+                        "ComputeDag.jvp: differentiation through FlashAttentionGrad requires unfused attention".to_string(),
+                    ));
+                }
                 DagOp::FusedLinearAct { .. }
                 | DagOp::FusedRmsNormLinear { .. }
                 | DagOp::FusedFlashAttention { .. }
@@ -4977,20 +5863,22 @@ impl TensorComputeDag {
             };
         }
 
-        let raw_out = match tan[prim.output] {
+        let prim_out = prim.outputs[0];
+        let raw_out = match tan[prim_out] {
             Some(id) => id,
             None => {
-                let out_n = &prim.nodes[prim.output];
+                let out_n = &prim.nodes[prim_out];
                 b.const_filled(0.0, &out_n.shape, out_n.dtype, &out_n.device)?
             }
         };
-        let (nodes, output) = compact_live_nodes(b.nodes, raw_out);
+        let (nodes, outputs) = compact_live_nodes(b.nodes, &[raw_out]);
         Ok(Self {
             input_specs: new_input_specs,
             nodes,
-            output,
+            outputs,
             fused: false,
             algebraic_rewrites: 0,
+            rematerialized_nodes: 0,
             compiled_plan: None,
         })
     }

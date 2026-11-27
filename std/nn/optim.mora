@@ -208,3 +208,77 @@ export impl AdamW
     return AdamWStepResult(params = next_params, state = next_state)
   end
 end
+
+-- P6-2: Compiled joint forward+backward training step backed by a fused multi-output ComputeDag.
+-- Traces `loss_fn(params, extra_inputs...)` once into a fused `[loss, grad_p0, ...]` compute graph,
+-- optionally applying cost-guided activation checkpointing (`vram_budget_bytes > 0`), and composes
+-- cleanly with `AdamW`, `clip_grad_norm`, and `ProcessGroup.all_reduce_async`.
+export struct CompiledStepGrads
+  loss: any
+  grads: list<any>
+end
+
+export struct CompiledAdamWResult
+  loss: any
+  params: list<any>
+  grads: list<any>
+  state: AdamW
+end
+
+export struct CompiledTrainStep
+  dag: compute_dag
+  param_count: int
+  vram_budget_bytes: int = 0
+end
+
+export task compiled_train_step_new(loss_fn: any, params: list<any>, extra_inputs: list<any> = [], vram_budget_bytes: int = 0): CompiledTrainStep
+  let trace_args: list<any> = [loss_fn, params]
+  for extra in extra_inputs
+    assign trace_args = trace_args.push(extra)
+  end
+  let base_dag = apply(trace_value_and_grad_dag, trace_args)
+  let compiled_dag = if vram_budget_bytes > 0 then base_dag.checkpoint(vram_budget_bytes) else base_dag.compile() end
+  return CompiledTrainStep(dag = compiled_dag, param_count = params.len(), vram_budget_bytes = vram_budget_bytes)
+end
+
+export impl CompiledTrainStep
+  task forward_backward(self, params: list<any>, extra_inputs: list<any> = []): CompiledStepGrads
+    let flat_inputs: list<any> = []
+    for p in params
+      assign flat_inputs = flat_inputs.push(p)
+    end
+    for extra in extra_inputs
+      assign flat_inputs = flat_inputs.push(extra)
+    end
+    let outs = self.dag.run_multi(flat_inputs)
+    let loss = outs[0]
+    let grads: list<any> = []
+    let i = 1
+    while i < outs.len()
+      assign grads = grads.push(outs[i])
+      assign i = i + 1
+    end
+    return CompiledStepGrads(loss = loss, grads = grads)
+  end
+
+  task step_adamw(self, opt: AdamW, params: list<any>, extra_inputs: list<any> = [], max_grad_norm: float = 0.0, lr_override: float = -1.0, pg: any = nil): CompiledAdamWResult
+    let fb = self.forward_backward(params, extra_inputs)
+    let grads = fb.grads
+    if pg != nil then
+      let handles: list<any> = []
+      for g in grads
+        assign handles = handles.push(pg.all_reduce_async(g, "mean"))
+      end
+      let synced: list<any> = []
+      for h in handles
+        assign synced = synced.push(h.join())
+      end
+      assign grads = synced
+    end
+    if max_grad_norm > 0.0 then
+      assign grads = clip_grad_norm(grads, max_grad_norm)
+    end
+    let res = opt.step(params, grads, lr_override)
+    return CompiledAdamWResult(loss = fb.loss, params = res.params, grads = grads, state = res.state)
+  end
+end

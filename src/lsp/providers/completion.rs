@@ -108,7 +108,7 @@ const STAGE3B_TYPES_AND_CTORS: &[(&str, &str)] = &[
     ),
     (
         "compute_dag",
-        "Fused TensorComputeDag compute graph type (trace_dag)",
+        "Fused multi-output TensorComputeDag compute graph type (trace_dag / trace_value_and_grad_dag)",
     ),
     (
         "kv_allocator",

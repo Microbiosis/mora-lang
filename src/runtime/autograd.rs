@@ -191,6 +191,28 @@ pub enum TapeOp {
         out_vals: Vec<f64>,
         last_dim: usize,
     },
+    LogSoftmax {
+        a: usize,
+        out_vals: Vec<f64>,
+        last_dim: usize,
+    },
+    Slice {
+        a: usize,
+        starts: Vec<usize>,
+        ends: Vec<usize>,
+        orig_shape: Vec<usize>,
+    },
+    Pad {
+        a: usize,
+        pads: Vec<(usize, usize)>,
+        orig_shape: Vec<usize>,
+    },
+    Cat {
+        inputs: Vec<Option<usize>>,
+        const_tensors: Vec<Option<Arc<Tensor>>>,
+        input_shapes: Vec<Vec<usize>>,
+        axis: usize,
+    },
     RmsNorm {
         a: usize,
         a_vals: Vec<f64>,
@@ -216,6 +238,7 @@ pub(crate) struct TapeNode {
     pub(crate) saved_a: Option<Arc<Tensor>>,
     pub(crate) saved_b: Option<Arc<Tensor>>,
     pub(crate) saved_out: Option<Arc<Tensor>>,
+    pub(crate) saved_inputs: Option<Vec<Arc<Tensor>>>,
 }
 
 /// One reverse-mode Wengert tape corresponding to a single `grad` / `value_and_grad` / `jvp` / `trace_dag` call.
@@ -247,6 +270,7 @@ impl AutogradTape {
             saved_a: None,
             saved_b: None,
             saved_out: None,
+            saved_inputs: None,
         });
         idx
     }
@@ -719,6 +743,71 @@ impl AutogradTape {
                     }
                     accum_grad(&mut grads, *a, &ga);
                 }
+                TapeOp::LogSoftmax {
+                    a,
+                    out_vals,
+                    last_dim,
+                } => {
+                    let d = (*last_dim).max(1);
+                    let mut ga = vec![0.0; g_out.len()];
+                    for row in 0..(g_out.len() / d) {
+                        let base = row * d;
+                        let sum_g: f64 = (0..d).map(|j| g_out[base + j]).sum();
+                        for j in 0..d {
+                            ga[base + j] = g_out[base + j] - out_vals[base + j].exp() * sum_g;
+                        }
+                    }
+                    accum_grad(&mut grads, *a, &ga);
+                }
+                TapeOp::Slice {
+                    a,
+                    starts,
+                    ends: _,
+                    orig_shape,
+                } => {
+                    let pads: Vec<(usize, usize)> = starts
+                        .iter()
+                        .enumerate()
+                        .map(|(d, &s)| (s, orig_shape[d] - (s + node.shape[d])))
+                        .collect();
+                    let ga = pad_flat(&g_out, &node.shape, &pads, orig_shape);
+                    accum_grad(&mut grads, *a, &ga);
+                }
+                TapeOp::Pad {
+                    a,
+                    pads,
+                    orig_shape,
+                } => {
+                    let starts: Vec<usize> = pads.iter().map(|&(lo, _)| lo).collect();
+                    let ends: Vec<usize> = pads
+                        .iter()
+                        .enumerate()
+                        .map(|(d, &(lo, _))| lo + orig_shape[d])
+                        .collect();
+                    let ga = slice_flat(&g_out, &node.shape, &starts, &ends);
+                    accum_grad(&mut grads, *a, &ga);
+                }
+                TapeOp::Cat {
+                    inputs,
+                    input_shapes,
+                    axis,
+                    ..
+                } => {
+                    let rank = node.shape.len();
+                    let mut offset = 0usize;
+                    for (inp_opt, in_sh) in inputs.iter().zip(input_shapes.iter()) {
+                        let dim = in_sh[*axis];
+                        if let Some(a_idx) = *inp_opt {
+                            let mut starts = vec![0usize; rank];
+                            let mut ends = node.shape.clone();
+                            starts[*axis] = offset;
+                            ends[*axis] = offset + dim;
+                            let ga = slice_flat(&g_out, &node.shape, &starts, &ends);
+                            accum_grad(&mut grads, a_idx, &ga);
+                        }
+                        offset += dim;
+                    }
+                }
                 TapeOp::RmsNorm {
                     a,
                     a_vals,
@@ -1178,6 +1267,77 @@ impl AutogradTape {
                     }
                     out
                 }),
+                TapeOp::LogSoftmax {
+                    a,
+                    out_vals,
+                    last_dim,
+                } => tangents[*a].as_ref().map(|da| {
+                    let d = (*last_dim).max(1);
+                    let mut out = vec![0.0; da.len()];
+                    for row in 0..(da.len() / d) {
+                        let base = row * d;
+                        let dot: f64 = (0..d)
+                            .map(|j| da[base + j] * out_vals[base + j].exp())
+                            .sum();
+                        for j in 0..d {
+                            out[base + j] = da[base + j] - dot;
+                        }
+                    }
+                    out
+                }),
+                TapeOp::Slice {
+                    a,
+                    starts,
+                    ends,
+                    orig_shape,
+                } => tangents[*a]
+                    .as_ref()
+                    .map(|da| slice_flat(da, orig_shape, starts, ends)),
+                TapeOp::Pad {
+                    a,
+                    pads,
+                    orig_shape,
+                } => tangents[*a]
+                    .as_ref()
+                    .map(|da| pad_flat(da, orig_shape, pads, &node.shape)),
+                TapeOp::Cat {
+                    inputs,
+                    input_shapes,
+                    axis,
+                    ..
+                } => {
+                    let any_tan = inputs
+                        .iter()
+                        .any(|opt| opt.is_some_and(|i| tangents[i].is_some()));
+                    if !any_tan {
+                        None
+                    } else {
+                        let mut owned_zeros: Vec<Option<Vec<f64>>> =
+                            Vec::with_capacity(inputs.len());
+                        for (opt, sh) in inputs.iter().zip(input_shapes.iter()) {
+                            if opt.and_then(|i| tangents[i].as_ref()).is_some() {
+                                owned_zeros.push(None);
+                            } else {
+                                let n = checked_numel(sh)?;
+                                owned_zeros.push(Some(vec![0.0; n]));
+                            }
+                        }
+                        let mut slices: Vec<&[f64]> = Vec::with_capacity(inputs.len());
+                        let mut shape_refs: Vec<&[usize]> = Vec::with_capacity(inputs.len());
+                        for (k, (opt, sh)) in inputs.iter().zip(input_shapes.iter()).enumerate() {
+                            let s = if let Some(t) = opt.and_then(|i| tangents[i].as_deref()) {
+                                t
+                            } else {
+                                owned_zeros[k]
+                                    .as_deref()
+                                    .expect("zero tangent materialized")
+                            };
+                            slices.push(s);
+                            shape_refs.push(sh.as_slice());
+                        }
+                        Some(cat_flat(&slices, &shape_refs, *axis, &node.shape))
+                    }
+                }
                 TapeOp::RmsNorm {
                     a,
                     a_vals,
@@ -1375,6 +1535,130 @@ impl AutogradContext {
         }
         tracked_out
     }
+
+    /// Record an n-ary operation (such as `Tensor::cat`) on EVERY active tape tracking at least one
+    /// input tensor.
+    pub(crate) fn record_nary(
+        &mut self,
+        inputs: &[Arc<Tensor>],
+        out: Arc<Tensor>,
+        mut make_op: impl FnMut(Vec<Option<usize>>) -> TapeOp,
+    ) -> Arc<Tensor> {
+        if !self.is_recording() || inputs.iter().all(|t| t.grad_nodes.is_empty()) {
+            return out;
+        }
+        let multi = self.tapes.len() > 1;
+        let mut new_nodes = Vec::with_capacity(self.tapes.len());
+        let mut inner_locs = Vec::new();
+        for (t_pos, tape) in self.tapes.iter_mut().enumerate() {
+            let mapped: Vec<Option<usize>> =
+                inputs.iter().map(|t| t.node_on_tape(tape.id)).collect();
+            if mapped.iter().any(Option::is_some) {
+                let op = make_op(mapped);
+                let node_idx = tape.push_node(op, out.shape.clone(), out.dtype, out.device.clone());
+                new_nodes.push((tape.id, node_idx));
+                if multi && t_pos > 0 {
+                    inner_locs.push((t_pos, node_idx));
+                }
+            }
+        }
+        if new_nodes.is_empty() {
+            return out;
+        }
+        let tracked_out = out.with_grad_nodes(new_nodes);
+        for (t_pos, node_idx) in inner_locs {
+            let node = &mut self.tapes[t_pos].nodes[node_idx];
+            node.saved_inputs = Some(inputs.to_vec());
+            node.saved_out = Some(Arc::clone(&tracked_out));
+        }
+        tracked_out
+    }
+}
+
+pub(crate) fn slice_flat(
+    vals: &[f64],
+    orig_shape: &[usize],
+    starts: &[usize],
+    ends: &[usize],
+) -> Vec<f64> {
+    let rank = orig_shape.len();
+    let out_shape: Vec<usize> = (0..rank).map(|d| ends[d] - starts[d]).collect();
+    let out_numel: usize = out_shape.iter().copied().product::<usize>().max(1);
+    let mut src_strides = vec![1usize; rank];
+    for d in (0..rank.saturating_sub(1)).rev() {
+        src_strides[d] = src_strides[d + 1] * orig_shape[d + 1];
+    }
+    let mut out = Vec::with_capacity(out_numel);
+    let mut coords = vec![0usize; rank];
+    for mut lin in 0..out_numel {
+        for d in (0..rank).rev() {
+            coords[d] = lin % out_shape[d];
+            lin /= out_shape[d];
+        }
+        let mut src_lin = 0usize;
+        for d in 0..rank {
+            src_lin += (starts[d] + coords[d]) * src_strides[d];
+        }
+        out.push(vals[src_lin]);
+    }
+    out
+}
+
+pub(crate) fn pad_flat(
+    vals: &[f64],
+    src_shape: &[usize],
+    pads: &[(usize, usize)],
+    out_shape: &[usize],
+) -> Vec<f64> {
+    let rank = src_shape.len();
+    let src_numel: usize = src_shape.iter().copied().product::<usize>().max(1);
+    let out_numel: usize = out_shape.iter().copied().product::<usize>().max(1);
+    let mut out_strides = vec![1usize; rank];
+    for d in (0..rank.saturating_sub(1)).rev() {
+        out_strides[d] = out_strides[d + 1] * out_shape[d + 1];
+    }
+    let mut out = vec![0.0; out_numel];
+    let mut coords = vec![0usize; rank];
+    for (mut lin, &v) in vals.iter().enumerate().take(src_numel) {
+        for d in (0..rank).rev() {
+            coords[d] = lin % src_shape[d];
+            lin /= src_shape[d];
+        }
+        let mut dst_lin = 0usize;
+        for d in 0..rank {
+            dst_lin += (pads[d].0 + coords[d]) * out_strides[d];
+        }
+        out[dst_lin] = v;
+    }
+    out
+}
+
+pub(crate) fn cat_flat(
+    inputs: &[&[f64]],
+    input_shapes: &[&[usize]],
+    axis: usize,
+    out_shape: &[usize],
+) -> Vec<f64> {
+    let outer: usize = out_shape[..axis].iter().copied().product::<usize>().max(1);
+    let out_axis = out_shape[axis];
+    let inner: usize = out_shape[axis + 1..]
+        .iter()
+        .copied()
+        .product::<usize>()
+        .max(1);
+    let mut out = vec![0.0; outer * out_axis * inner];
+    let mut axis_offset = 0usize;
+    for (vals, sh) in inputs.iter().zip(input_shapes.iter()) {
+        let d = sh[axis];
+        let chunk = d * inner;
+        for o in 0..outer {
+            let src_start = o * chunk;
+            let dst_start = (o * out_axis + axis_offset) * inner;
+            out[dst_start..dst_start + chunk].copy_from_slice(&vals[src_start..src_start + chunk]);
+        }
+        axis_offset += d;
+    }
+    out
 }
 
 pub(crate) fn scatter_add_flat(

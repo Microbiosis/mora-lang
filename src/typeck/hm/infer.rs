@@ -1178,8 +1178,8 @@ impl HMInference {
             if name == "jvp" {
                 return self.infer_jvp_builtin(args, named_args, span);
             }
-            if name == "trace_dag" {
-                return self.infer_trace_dag_builtin(args, named_args, span);
+            if name == "trace_dag" || name == "trace_value_and_grad_dag" {
+                return self.infer_trace_dag_builtin(name, args, named_args, span);
             }
             if name == "try_call" {
                 return self.infer_try_call_builtin(args, named_args, span);
@@ -1868,7 +1868,9 @@ impl HMInference {
 
         if let Some(sig) = resolved_sig {
             let user_arity = sig.params.len().saturating_sub(1);
-            let min_arity = {
+            let min_arity = if let Some(m) = sig.min_arity {
+                m.saturating_sub(1)
+            } else {
                 let mut min = user_arity;
                 while min > 0 {
                     let ty = &sig.params[min].1;
@@ -3722,7 +3724,9 @@ impl HMInference {
                 },
                 "reshape" | "transpose" | "contiguous" | "to" | "to_dtype" | "to_device"
                 | "abs" | "sqrt" | "exp" | "ln" | "relu" | "gelu" | "silu" | "tanh" | "sigmoid"
-                | "softmax" | "rms_norm" | "layer_norm" => self.expr_produces_grad_tensor(receiver),
+                | "softmax" | "log_softmax" | "rms_norm" | "layer_norm" => {
+                    self.expr_produces_grad_tensor(receiver)
+                }
                 _ => false,
             },
             WitnessKind::Binary { left, right, .. } => {
@@ -5183,7 +5187,7 @@ impl HMInference {
                 Ok((Type::Bool, acc_row))
             }
             "contiguous" | "abs" | "sqrt" | "exp" | "ln" | "log" | "sin" | "cos" | "relu"
-            | "gelu" | "silu" | "tanh" | "sigmoid" | "softmax" => {
+            | "gelu" | "silu" | "tanh" | "sigmoid" | "softmax" | "log_softmax" => {
                 if !args.is_empty() {
                     return Err(vec![TypeError::ArityMismatch {
                         expected: 0,
@@ -5191,12 +5195,12 @@ impl HMInference {
                         span,
                     }]);
                 }
-                if method == "softmax"
+                if (method == "softmax" || method == "log_softmax")
                     && let Some(dt) = cur_dtype.as_dtype()
                     && !dt.is_float()
                 {
                     return Err(vec![TypeError::UnificationFailure {
-                        expected: "floating-point tensor DType for softmax()".to_string(),
+                        expected: format!("floating-point tensor DType for {method}()"),
                         got: cur_dtype.name(),
                         span: Some(span),
                     }]);

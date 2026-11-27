@@ -2,7 +2,23 @@
 
 All notable changes to Mora will be documented in this file.
 
-## [Unreleased] — Phase P6-1：Lean 4 Perceus / FBIP 最后使用所有权转移与零拷贝原地复用
+## [Unreleased] — Phase P6（P6-1 Perceus/FBIP + P6-2 SciLean 符号自动微分 `TensorComputeDag`）
+
+### P6-2：SciLean 风格符号伴随 `TensorComputeDag`、前后向联合融合与成本引导重算检查点（`tests/p6_symbolic_dag_autodiff.rs`）
+
+- **多输出 `TensorComputeDag` 架构收口（`src/runtime/compute_dag.rs`）**：
+  - 将 `TensorComputeDag` 输出泛化为 `outputs: Vec<usize>`，新增 `dag.output_count()` 与 `dag.run_multi(inputs...) -> list<Tensor>`，保留单输出 `dag.run(inputs...)` 并在多输出图上返回明确错误；同步升级 `DagMemoryPlan` 活跃区间、静态缓冲池着色、`DagPlanCache`、DAG 指纹/DOT 导出与全部 5 套执行后端，确保多输出 VRAM 槽彼此零别名、跨次 `run_multi` 零覆写。
+- **全算子符号反向传播与图级联合融合（`src/runtime/compute_dag/autodiff.rs`、`src/runtime/autograd.rs`、`src/value/tensor.rs`）**：
+  - 新增 `dag.autodiff(wrt_indices?)` 与一等内建 `trace_value_and_grad_dag(f, params, extra_inputs...)`（贯通 `BuiltinFnId::TraceValueAndGradDag`、`MORABC02` 编解码 tag 53、VM、LSP 及静态 HM `tensor_mutate` 纯度校验，并顺带修复 `infer_method_call` 长期忽略 `Signature::min_arity` 的类型检查缺陷）。
+  - 补齐 `Tensor.log_softmax()` 及可追踪连续 `Slice ↔ Pad`、`Cat ↔ Slice`（`TapeOp`/`AutogradTape`/高阶微分/DAG 全链路）与全部 `DagOp` 符号 VJP 规则（含广播轴 `SumAxis`、`Gather ↔ ScatterAdd`、`Softmax`/`LogSoftmax`/`RmsNorm`/`LayerNorm`、`FusedLinearAct` 全 6 种激活解析求导与 `FusedRmsNormLinear`）；对非 `wrt` 输入自动执行死伴随裁剪，融合管线新增 Pass 0 纯子表达式 CSE 消除。
+- **分块 FlashAttention-2 符号反向与全 5 后端 `StepPos`/`Sign` 算子融合（`src/runtime/compute_dag/flash_bwd.rs`、`src/runtime/simd_kernels.rs`、`src/runtime/native_jit.rs`、`src/runtime/gpu/{cuda,vulkan,vulkan_spirv,metal}.rs`）**：
+  - 前向 `FusedFlashAttention` 保持不解融，按需配对发射 $O(S_q)$ 行级 `FlashAttentionLse` 与分块 `FlashAttentionGrad`（`dQ`/`dK`/`dV`/`dMask`），以 $O(B_r \cdot B_c)$ 局部栈分块重算注意力权重（支持 GQA/MQA、`k_is_transposed` 与广播因果掩码），零 $O(S_q \cdot S_k)$ 矩阵物化，单次执行内按输入元组缓存前向 LSE 与四梯度结果。
+  - 在 CPU SIMD、严格 W^X x86-64 AVX2/SSE2 `native_jit`（`f64`/`f32` 无分支比较掩码，经 `native_wx_jit_step_pos_and_sign_avx2_sse2_f64_f32_exact` 含 `±0.0`/`±Inf`/`NaN` 逐位验证）与 CUDA PTX / Vulkan SPIR-V / Metal MSL（opcodes `25`/`26`）全后端落地 `FusedEwStep::StepPos`（ReLU 导数）与 `FusedEwStep::Sign`（Abs 导数），让反向激活导数直接融合进 `FusedElementwise` 命中原生 JIT 与 GPU 融合内核。
+- **成本引导激活重算检查点（`src/runtime/compute_dag/checkpoint.rs`）**：
+  - 新增 `dag.autodiff_checkpointed(wrt_indices?, vram_budget_bytes)` 与 `dag.checkpoint(vram_budget_bytes)`，基于 `DagCostModel` FLOPs/(bytes·span) 评分贪心挑选廉价长寿命前向中间节点，将其纯依赖闭包克隆至反向首个使用点之前（标记 `no_cse` 防止被融合 Pass 合并回前向），严格降低 `memory_plan()["planned_peak_bytes"]` 并暴露 `rematerialized_nodes` 统计。
+- **纯 Mora `std/nn/optim.mora` `CompiledTrainStep`**：
+  - 新增 `CompiledTrainStep` / `CompiledStepGrads` / `CompiledAdamWResult` 与 `compiled_train_step_new` / `forward_backward` / `step_adamw`（完整组合 `AdamW`、`clip_grad_norm` 与 `ProcessGroup.all_reduce_async`），端到端编译完整 `CausalLM`（RoPE + RMSNorm + GQA FlashAttention + SwiGLU）前反向联合图并在 6 步训练中与 eager `value_and_grad` + `AdamW` 数值对齐。
+- **`tests/pub_fn_zero_ref_census.rs` 复核**：P6-2 净增 5 个已完整接线的公开方法（`autodiff`/`autodiff_checkpointed`/`log_softmax`/`output_count`/`run_multi`，总计 544，零引用保持 22 不变），普查上界收紧抬至 550。
 
 ### P6-1：Perceus / FBIP 最后使用所有权、借用推断与原地复用（`tests/p6_perceus_fbip_reuse.rs`）
 

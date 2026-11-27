@@ -95,6 +95,9 @@ fn probe_source(name: &str) -> Option<&'static str> {
         "value_and_grad" => "let v: string = value_and_grad(fn(x: float) x end)\n",
         "jvp" => "let v: string = jvp(fn(x: float) x end, 1.0, 1.0)\n",
         "trace_dag" => "let v: string = trace_dag(fn(x) x * 2.0 end, tensor([1.0]))\n",
+        "trace_value_and_grad_dag" => {
+            "let v: string = trace_value_and_grad_dag(fn(x) (x * x).sum() end, tensor([1.0]))\n"
+        }
         "kv_allocator" => "let v: string = kv_allocator(4, 4, 2, 4)\n",
         "memory_pool" => "let v: string = memory_pool(1024)\n",
         "process_group" => "let v: string = process_group(2)\n",
@@ -143,6 +146,7 @@ const CONCRETE_RETURN: &[&str] = &[
     "value_and_grad",
     "jvp",
     "trace_dag",
+    "trace_value_and_grad_dag",
     "kv_allocator",
     "memory_pool",
     "process_group",

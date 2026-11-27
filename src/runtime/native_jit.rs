@@ -112,7 +112,9 @@ pub(crate) fn is_step_supported(step: &FusedEwStep) -> bool {
         | FusedEwStep::Neg(_)
         | FusedEwStep::Abs(_)
         | FusedEwStep::Sqrt(_)
-        | FusedEwStep::Relu(_) => true,
+        | FusedEwStep::Relu(_)
+        | FusedEwStep::StepPos(_)
+        | FusedEwStep::Sign(_) => true,
         // `x / c` with non-zero finite/infinite `c` never triggers division-by-zero error;
         // `Div(a, b)` and `c / a` fall back to `simd_kernels` to preserve exact div-by-zero errors.
         FusedEwStep::DivScalar(_, c, false) => c != 0.0,
@@ -557,6 +559,12 @@ mod x86_64_impl {
             self.emit(&[0xC4, 0xE1, b2, opcode, 0xC0 | (dst << 3) | src2]);
         }
 
+        /// 3-operand AVX2 `op ymm_d, ymm_s1, ymm_s2, imm8` (e.g. `vcmppd` opcode `0xC2`)
+        fn vex_pd_rrr_imm8(&mut self, opcode: u8, dst: u8, src1: u8, src2: u8, imm8: u8) {
+            self.vex_pd_rrr(opcode, dst, src1, src2);
+            self.emit(&[imm8]);
+        }
+
         /// `vsqrtpd ymm_d, ymm_s`
         fn vsqrtpd_rr(&mut self, dst: u8, src: u8) {
             debug_assert!(dst < 8 && src < 8);
@@ -615,6 +623,12 @@ mod x86_64_impl {
             self.emit(&[0xF2, 0x0F, opcode, 0xC0 | (dst << 3) | src]);
         }
 
+        /// `op xmm_d, xmm_s, imm8` (`F2 0F opcode ModRM imm8`, e.g. `cmpsd` `0xC2`)
+        fn sse2_sd_rr_imm8(&mut self, opcode: u8, dst: u8, src: u8, imm8: u8) {
+            self.sse2_sd_rr(opcode, dst, src);
+            self.emit(&[imm8]);
+        }
+
         /// `op xmm_d, xmm_s` (`66 0F opcode ModRM` — `xorpd`/`andpd`)
         fn sse2_pd_rr(&mut self, opcode: u8, dst: u8, src: u8) {
             debug_assert!(dst < 8 && src < 8);
@@ -667,6 +681,12 @@ mod x86_64_impl {
             debug_assert!(dst < 8 && src1 < 8 && src2 < 8);
             let b2 = ((0x0F ^ src1) << 3) | 0x04; // W=0, ~vvvv, L=1 (256-bit), pp=00 (NP)
             self.emit(&[0xC4, 0xE1, b2, opcode, 0xC0 | (dst << 3) | src2]);
+        }
+
+        /// 3-operand AVX2 `op ymm_d, ymm_s1, ymm_s2, imm8` (e.g. `vcmpps` opcode `0xC2`)
+        fn vex_ps_rrr_imm8(&mut self, opcode: u8, dst: u8, src1: u8, src2: u8, imm8: u8) {
+            self.vex_ps_rrr(opcode, dst, src1, src2);
+            self.emit(&[imm8]);
         }
 
         /// `vsqrtps ymm_d, ymm_s`
@@ -722,6 +742,12 @@ mod x86_64_impl {
             self.emit(&[0xF3, 0x0F, opcode, 0xC0 | (dst << 3) | src]);
         }
 
+        /// `op xmm_d, xmm_s, imm8` (`F3 0F opcode ModRM imm8`, e.g. `cmpss` `0xC2`)
+        fn sse_ss_rr_imm8(&mut self, opcode: u8, dst: u8, src: u8, imm8: u8) {
+            self.sse_ss_rr(opcode, dst, src);
+            self.emit(&[imm8]);
+        }
+
         /// `op xmm_d, xmm_s` (`0F opcode ModRM` — `xorps`/`andps`)
         fn sse_ps_rr(&mut self, opcode: u8, dst: u8, src: u8) {
             debug_assert!(dst < 8 && src < 8);
@@ -735,11 +761,12 @@ mod x86_64_impl {
         steps: &[FusedEwStep],
         use_avx2: bool,
     ) -> (Vec<u8>, Vec<f64>) {
-        // Reserve consts[0]=+0.0, consts[1]=sign_mask, consts[2]=abs_mask, then step immediates.
+        // Reserve consts[0]=+0.0, consts[1]=sign_mask, consts[2]=abs_mask, consts[3]=+1.0, then step immediates.
         let mut consts = vec![
             0.0_f64,
             f64::from_bits(0x8000_0000_0000_0000),
             f64::from_bits(0x7FFF_FFFF_FFFF_FFFF),
+            1.0_f64,
         ];
         let mut step_const_idx: Vec<usize> = Vec::with_capacity(steps.len());
         for step in steps {
@@ -794,6 +821,7 @@ mod x86_64_impl {
             a.vbroadcastsd_r8_disp(2, 0); // ymm2 = [+0.0; 4]
             a.vbroadcastsd_r8_disp(3, 8); // ymm3 = [sign_mask; 4]
             a.vbroadcastsd_r8_disp(4, 16); // ymm4 = [abs_mask; 4]
+            a.vbroadcastsd_r8_disp(5, 24); // ymm5 = [+1.0; 4]
 
             let avx_loop = a.pos();
             a.emit(&[0x48, 0x8D, 0x48, 0x04]); // lea rcx, [rax + 4]
@@ -876,6 +904,21 @@ mod x86_64_impl {
                         a.vmovapd_load_rsp(0, slot_off(lhs));
                         a.vex_pd_rrr(0x5F, 0, 0, 2);
                     }
+                    FusedEwStep::StepPos(lhs) => {
+                        // `(0.0 < x) & 1.0`: ordered LT mask returns 1.0 iff `x > 0.0`, else 0.0 (incl. NaN).
+                        a.vmovapd_load_rsp(1, slot_off(lhs));
+                        a.vex_pd_rrr_imm8(0xC2, 0, 2, 1, 0x01); // vcmppd ymm0, ymm2 (+0.0), ymm1 (x), LT
+                        a.vex_pd_rrr(0x54, 0, 0, 5); // vandpd ymm0, ymm0, ymm5 (+1.0)
+                    }
+                    FusedEwStep::Sign(lhs) => {
+                        // `((0.0 < x) & 1.0) - ((x < 0.0) & 1.0)` matches exact signum for all IEEE-754 inputs.
+                        a.vmovapd_load_rsp(1, slot_off(lhs));
+                        a.vex_pd_rrr_imm8(0xC2, 0, 2, 1, 0x01); // ymm0 = (0.0 < x)
+                        a.vex_pd_rrr(0x54, 0, 0, 5); // ymm0 = pos
+                        a.vex_pd_rrr_imm8(0xC2, 1, 1, 2, 0x01); // ymm1 = (x < 0.0)
+                        a.vex_pd_rrr(0x54, 1, 1, 5); // ymm1 = neg
+                        a.vex_pd_rrr(0x5C, 0, 0, 1); // ymm0 = pos - neg
+                    }
                     _ => unreachable!("is_chain_supported pre-filtered unsupported step"),
                 }
                 a.vmovapd_store_rsp(0, slot_off(dst_slot));
@@ -898,6 +941,7 @@ mod x86_64_impl {
         a.movsd_load_r8_disp(2, 0); // xmm2 = +0.0
         a.movsd_load_r8_disp(3, 8); // xmm3 = sign_mask
         a.movsd_load_r8_disp(4, 16); // xmm4 = abs_mask
+        a.movsd_load_r8_disp(5, 24); // xmm5 = +1.0
 
         let scalar_loop = a.pos();
         a.emit(&[0x4C, 0x39, 0xC8]); // cmp rax, r9
@@ -975,6 +1019,21 @@ mod x86_64_impl {
                     a.movsd_load_rsp(0, slot_off(lhs));
                     a.sse2_sd_rr(0x5F, 0, 2); // maxsd xmm0, xmm2 (+0.0)
                 }
+                FusedEwStep::StepPos(lhs) => {
+                    a.sse2_pd_rr(0x28, 0, 2); // movapd xmm0, xmm2 (+0.0)
+                    a.movsd_load_rsp(1, slot_off(lhs));
+                    a.sse2_sd_rr_imm8(0xC2, 0, 1, 0x01); // cmpsd xmm0, xmm1, LT
+                    a.sse2_pd_rr(0x54, 0, 5); // andpd xmm0, xmm5 (+1.0)
+                }
+                FusedEwStep::Sign(lhs) => {
+                    a.sse2_pd_rr(0x28, 0, 2); // movapd xmm0, xmm2 (+0.0)
+                    a.movsd_load_rsp(1, slot_off(lhs));
+                    a.sse2_sd_rr_imm8(0xC2, 0, 1, 0x01); // xmm0 = (0.0 < x)
+                    a.sse2_pd_rr(0x54, 0, 5); // xmm0 = pos
+                    a.sse2_sd_rr_imm8(0xC2, 1, 2, 0x01); // xmm1 = (x < 0.0)
+                    a.sse2_pd_rr(0x54, 1, 5); // xmm1 = neg
+                    a.sse2_sd_rr(0x5C, 0, 1); // subsd xmm0, xmm1
+                }
                 _ => unreachable!("is_chain_supported pre-filtered unsupported step"),
             }
             a.movsd_store_rsp(0, slot_off(dst_slot));
@@ -1005,11 +1064,12 @@ mod x86_64_impl {
         steps: &[FusedEwStep],
         use_avx2: bool,
     ) -> (Vec<u8>, Vec<f32>) {
-        // Reserve consts[0]=+0.0f, consts[1]=sign_mask, consts[2]=abs_mask, then step immediates.
+        // Reserve consts[0]=+0.0f, consts[1]=sign_mask, consts[2]=abs_mask, consts[3]=+1.0f, then step immediates.
         let mut consts = vec![
             0.0_f32,
             f32::from_bits(0x8000_0000),
             f32::from_bits(0x7FFF_FFFF),
+            1.0_f32,
         ];
         let mut step_const_idx: Vec<usize> = Vec::with_capacity(steps.len());
         for step in steps {
@@ -1064,6 +1124,7 @@ mod x86_64_impl {
             a.vbroadcastss_r8_disp(2, 0); // ymm2 = [+0.0f; 8]
             a.vbroadcastss_r8_disp(3, 4); // ymm3 = [sign_mask; 8]
             a.vbroadcastss_r8_disp(4, 8); // ymm4 = [abs_mask; 8]
+            a.vbroadcastss_r8_disp(5, 12); // ymm5 = [+1.0f; 8]
 
             let avx_loop = a.pos();
             a.emit(&[0x48, 0x8D, 0x48, 0x08]); // lea rcx, [rax + 8]
@@ -1142,6 +1203,19 @@ mod x86_64_impl {
                         a.vmovaps_load_rsp(0, slot_off(lhs));
                         a.vex_ps_rrr(0x5F, 0, 0, 2); // vmaxps ymm0, ymm0, +0.0f
                     }
+                    FusedEwStep::StepPos(lhs) => {
+                        a.vmovaps_load_rsp(1, slot_off(lhs));
+                        a.vex_ps_rrr_imm8(0xC2, 0, 2, 1, 0x01); // vcmpps ymm0, ymm2 (+0.0f), ymm1 (x), LT
+                        a.vex_ps_rrr(0x54, 0, 0, 5); // vandps ymm0, ymm0, ymm5 (+1.0f)
+                    }
+                    FusedEwStep::Sign(lhs) => {
+                        a.vmovaps_load_rsp(1, slot_off(lhs));
+                        a.vex_ps_rrr_imm8(0xC2, 0, 2, 1, 0x01); // ymm0 = (0.0f < x)
+                        a.vex_ps_rrr(0x54, 0, 0, 5); // ymm0 = pos
+                        a.vex_ps_rrr_imm8(0xC2, 1, 1, 2, 0x01); // ymm1 = (x < 0.0f)
+                        a.vex_ps_rrr(0x54, 1, 1, 5); // ymm1 = neg
+                        a.vex_ps_rrr(0x5C, 0, 0, 1); // ymm0 = pos - neg
+                    }
                     _ => unreachable!("is_chain_supported pre-filtered unsupported step"),
                 }
                 a.vmovaps_store_rsp(0, slot_off(dst_slot));
@@ -1163,6 +1237,7 @@ mod x86_64_impl {
         a.movss_load_r8_disp(2, 0); // xmm2 = +0.0f
         a.movss_load_r8_disp(3, 4); // xmm3 = sign_mask
         a.movss_load_r8_disp(4, 8); // xmm4 = abs_mask
+        a.movss_load_r8_disp(5, 12); // xmm5 = +1.0f
 
         let scalar_loop = a.pos();
         a.emit(&[0x4C, 0x39, 0xC8]); // cmp rax, r9
@@ -1239,6 +1314,21 @@ mod x86_64_impl {
                 FusedEwStep::Relu(lhs) => {
                     a.movss_load_rsp(0, slot_off(lhs));
                     a.sse_ss_rr(0x5F, 0, 2); // maxss xmm0, +0.0f
+                }
+                FusedEwStep::StepPos(lhs) => {
+                    a.sse_ps_rr(0x28, 0, 2); // movaps xmm0, xmm2 (+0.0f)
+                    a.movss_load_rsp(1, slot_off(lhs));
+                    a.sse_ss_rr_imm8(0xC2, 0, 1, 0x01); // cmpss xmm0, xmm1, LT
+                    a.sse_ps_rr(0x54, 0, 5); // andps xmm0, xmm5 (+1.0f)
+                }
+                FusedEwStep::Sign(lhs) => {
+                    a.sse_ps_rr(0x28, 0, 2); // movaps xmm0, xmm2 (+0.0f)
+                    a.movss_load_rsp(1, slot_off(lhs));
+                    a.sse_ss_rr_imm8(0xC2, 0, 1, 0x01); // xmm0 = (0.0f < x)
+                    a.sse_ps_rr(0x54, 0, 5); // xmm0 = pos
+                    a.sse_ss_rr_imm8(0xC2, 1, 2, 0x01); // xmm1 = (x < 0.0f)
+                    a.sse_ps_rr(0x54, 1, 5); // xmm1 = neg
+                    a.sse_ss_rr(0x5C, 0, 1); // subss xmm0, xmm1
                 }
                 _ => unreachable!("is_chain_supported pre-filtered unsupported step"),
             }
@@ -1331,6 +1421,14 @@ mod x86_64_impl {
                 }
                 FusedEwStep::Relu(a) => {
                     mix(&mut h, 11);
+                    mix(&mut h, a as u64);
+                }
+                FusedEwStep::StepPos(a) => {
+                    mix(&mut h, 12);
+                    mix(&mut h, a as u64);
+                }
+                FusedEwStep::Sign(a) => {
+                    mix(&mut h, 13);
                     mix(&mut h, a as u64);
                 }
                 _ => mix(&mut h, 0xFF),
@@ -2471,6 +2569,74 @@ mod tests {
                 stats().gemm_native_dispatches > before_gemm,
                 "expected gemm_native_dispatches to increment on AVX2+FMA CPU"
             );
+        }
+    }
+
+    #[test]
+    fn native_wx_jit_step_pos_and_sign_avx2_sse2_f64_f32_exact() {
+        // 13 elements: exercises AVX2 vector loop (4×f64 / 8×f32) AND SSE2 scalar tail + IEEE-754 edges!
+        let x: Vec<f64> = vec![
+            -3.5,
+            -0.001,
+            -0.0,
+            0.0,
+            0.001,
+            4.25,
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+            f64::NAN,
+            -1.0,
+            1.0,
+            -7.0,
+            2.5,
+        ];
+        let g: Vec<f64> = vec![
+            2.0, -1.5, 3.0, 4.0, -2.5, 0.5, 1.0, -1.0, 5.0, 6.0, -3.0, 0.25, 8.0,
+        ];
+        // Chain: `g * StepPos(x) + Sign(x)` — exercises both P6-2 backward activation ops!
+        let steps = vec![
+            FusedEwStep::StepPos(0),
+            FusedEwStep::Mul(1, 2),
+            FusedEwStep::Sign(0),
+            FusedEwStep::Add(3, 4),
+        ];
+        for dtype in [DType::F64, DType::F32] {
+            let before = stats().native_dispatches;
+            let mut out_jit = Vec::new();
+            let ran = try_run_fused_elementwise_into(
+                &[&x, &g],
+                &[&[x.len()], &[g.len()]],
+                &steps,
+                &[x.len()],
+                x.len(),
+                dtype,
+                &mut out_jit,
+            )
+            .expect("StepPos/Sign JIT");
+            let mut out_ref = Vec::new();
+            simd_kernels::fused_elementwise_into(
+                &[&x, &g],
+                &[&[x.len()], &[g.len()]],
+                &steps,
+                &[x.len()],
+                x.len(),
+                dtype,
+                &mut out_ref,
+            )
+            .expect("StepPos/Sign SIMD ref");
+            assert!(ran, "StepPos/Sign chain must be JIT-eligible on x86-64");
+            assert_eq!(out_jit.len(), out_ref.len());
+            for (i, (&jv, &rv)) in out_jit.iter().zip(out_ref.iter()).enumerate() {
+                assert_eq!(
+                    jv.to_bits(),
+                    rv.to_bits(),
+                    "StepPos/Sign JIT mismatch dtype={dtype:?} idx={i}: jit={jv} vs ref={rv}"
+                );
+            }
+            #[cfg(target_arch = "x86_64")]
+            if is_enabled() {
+                assert!(stats().native_dispatches > before);
+            }
         }
     }
 }

@@ -1640,7 +1640,7 @@ pub(super) fn emit_spirv_fused_elementwise_f32() -> Vec<u32> {
     let lbl_step_cont = b.alloc_id();
     let lbl_step_exit = b.alloc_id();
     let lbl_exit = b.alloc_id();
-    let op_lbls: Vec<u32> = (0..25).map(|_| b.alloc_id()).collect();
+    let op_lbls: Vec<u32> = (0..27).map(|_| b.alloc_id()).collect();
 
     b.inst(OP_LABEL, &[lbl_entry]);
     // All SC_FUNCTION local variables MUST be at the start of the entry block!
@@ -1892,9 +1892,9 @@ pub(super) fn emit_spirv_fused_elementwise_f32() -> Vec<u32> {
         r2
     };
 
-    // Structured 25-way OpSwitch over opcodes 0..=24 (default = 24 Abs)
-    let mut sw_ops = vec![op_v, op_lbls[24]];
-    for code in 0..24u32 {
+    // Structured 27-way OpSwitch over opcodes 0..=26 (default = 26 Sign)
+    let mut sw_ops = vec![op_v, op_lbls[26]];
+    for code in 0..26u32 {
         sw_ops.push(code);
         sw_ops.push(op_lbls[code as usize]);
     }
@@ -2085,10 +2085,32 @@ pub(super) fn emit_spirv_fused_elementwise_f32() -> Vec<u32> {
     b.inst(OP_EXT_INST, &[ty_f32, r, glsl_ext, GLSL_COS, va]);
     finish_case(&mut b, r);
 
-    // 24: Abs (default)
+    // 24: Abs
     b.inst(OP_LABEL, &[op_lbls[24]]);
     let r = b.alloc_id();
     b.inst(OP_EXT_INST, &[ty_f32, r, glsl_ext, GLSL_FABS, va]);
+    finish_case(&mut b, r);
+
+    // 25: StepPos (1.0 if va > 0.0 else 0.0)
+    b.inst(OP_LABEL, &[op_lbls[25]]);
+    let is_gt = b.alloc_id();
+    b.inst(OP_FORD_GREATER_THAN, &[ty_bool, is_gt, va, c_f0]);
+    let r = b.alloc_id();
+    b.inst(OP_SELECT, &[ty_f32, r, is_gt, c_f1, c_f0]);
+    finish_case(&mut b, r);
+
+    // 26: Sign (1.0 if va > 0.0, -1.0 if va < 0.0, else 0.0; default)
+    b.inst(OP_LABEL, &[op_lbls[26]]);
+    let s_gt = b.alloc_id();
+    b.inst(OP_FORD_GREATER_THAN, &[ty_bool, s_gt, va, c_f0]);
+    let s_lt = b.alloc_id();
+    b.inst(OP_FORD_GREATER_THAN, &[ty_bool, s_lt, c_f0, va]);
+    let s_pos = b.alloc_id();
+    b.inst(OP_SELECT, &[ty_f32, s_pos, s_gt, c_f1, c_f0]);
+    let s_neg = b.alloc_id();
+    b.inst(OP_SELECT, &[ty_f32, s_neg, s_lt, c_f1, c_f0]);
+    let r = b.alloc_id();
+    b.inst(OP_FSUB, &[ty_f32, r, s_pos, s_neg]);
     finish_case(&mut b, r);
 
     b.inst(OP_LABEL, &[lbl_step_merge]);
@@ -3134,7 +3156,7 @@ pub(super) fn emit_spirv_fused_elementwise_half(is_bf16: bool) -> Vec<u32> {
     let lbl_lane_cont = b.alloc_id();
     let lbl_lane_exit = b.alloc_id();
     let lbl_exit = b.alloc_id();
-    let op_lbls: Vec<u32> = (0..25).map(|_| b.alloc_id()).collect();
+    let op_lbls: Vec<u32> = (0..27).map(|_| b.alloc_id()).collect();
 
     b.inst(OP_LABEL, &[lbl_entry]);
     let var_slots = b.alloc_id();
@@ -3425,8 +3447,8 @@ pub(super) fn emit_spirv_fused_elementwise_half(is_bf16: bool) -> Vec<u32> {
         r2
     };
 
-    let mut sw_ops = vec![op_v, op_lbls[24]];
-    for code in 0..24u32 {
+    let mut sw_ops = vec![op_v, op_lbls[26]];
+    for code in 0..26u32 {
         sw_ops.push(code);
         sw_ops.push(op_lbls[code as usize]);
     }
@@ -3596,6 +3618,26 @@ pub(super) fn emit_spirv_fused_elementwise_half(is_bf16: bool) -> Vec<u32> {
     b.inst(OP_LABEL, &[op_lbls[24]]);
     let r = b.alloc_id();
     b.inst(OP_EXT_INST, &[ty_f32, r, glsl_ext, GLSL_FABS, va]);
+    finish_case(&mut b, r);
+
+    b.inst(OP_LABEL, &[op_lbls[25]]);
+    let is_gt = b.alloc_id();
+    b.inst(OP_FORD_GREATER_THAN, &[ty_bool, is_gt, va, c_f0]);
+    let r = b.alloc_id();
+    b.inst(OP_SELECT, &[ty_f32, r, is_gt, c_f1, c_f0]);
+    finish_case(&mut b, r);
+
+    b.inst(OP_LABEL, &[op_lbls[26]]);
+    let s_gt = b.alloc_id();
+    b.inst(OP_FORD_GREATER_THAN, &[ty_bool, s_gt, va, c_f0]);
+    let s_lt = b.alloc_id();
+    b.inst(OP_FORD_GREATER_THAN, &[ty_bool, s_lt, c_f0, va]);
+    let s_pos = b.alloc_id();
+    b.inst(OP_SELECT, &[ty_f32, s_pos, s_gt, c_f1, c_f0]);
+    let s_neg = b.alloc_id();
+    b.inst(OP_SELECT, &[ty_f32, s_neg, s_lt, c_f1, c_f0]);
+    let r = b.alloc_id();
+    b.inst(OP_FSUB, &[ty_f32, r, s_pos, s_neg]);
     finish_case(&mut b, r);
 
     b.inst(OP_LABEL, &[lbl_step_merge]);

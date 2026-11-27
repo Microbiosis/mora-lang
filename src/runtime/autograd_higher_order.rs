@@ -232,6 +232,60 @@ fn t_scatter_add(
     a.scatter_add_tracked(out_shape, dst_flat_indices, Some(ag))
 }
 
+fn t_slice(
+    a: &Arc<Tensor>,
+    starts: Vec<usize>,
+    ends: Vec<usize>,
+    ag: &mut AutogradContext,
+) -> MoraResult<Arc<Tensor>> {
+    let orig = a.shape.clone();
+    let out = a.slice_contiguous(&starts, &ends)?;
+    Ok(ag.record_unary(a, out, |src| TapeOp::Slice {
+        a: src,
+        starts: starts.clone(),
+        ends: ends.clone(),
+        orig_shape: orig.clone(),
+    }))
+}
+
+fn t_pad(
+    a: &Arc<Tensor>,
+    pads: Vec<(usize, usize)>,
+    ag: &mut AutogradContext,
+) -> MoraResult<Arc<Tensor>> {
+    let orig = a.shape.clone();
+    let out = a.pad_zeros(&pads)?;
+    Ok(ag.record_unary(a, out, |src| TapeOp::Pad {
+        a: src,
+        pads: pads.clone(),
+        orig_shape: orig.clone(),
+    }))
+}
+
+fn t_cat(inputs: &[Arc<Tensor>], axis: usize, ag: &mut AutogradContext) -> MoraResult<Arc<Tensor>> {
+    let out = Tensor::cat(inputs, axis as isize)?;
+    let input_shapes: Vec<Vec<usize>> = inputs.iter().map(|t| t.shape.clone()).collect();
+    Ok(ag.record_nary(inputs, out, |mapped| {
+        let const_tensors: Vec<Option<Arc<Tensor>>> = mapped
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                if m.is_none() {
+                    Some(Arc::clone(&inputs[i]))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        TapeOp::Cat {
+            inputs: mapped,
+            const_tensors,
+            input_shapes: input_shapes.clone(),
+            axis,
+        }
+    }))
+}
+
 /// Broadcast-aware tracked reduction matching `g_out` down to `target_shape`.
 fn t_unbroadcast(
     g_out: Arc<Tensor>,
@@ -941,6 +995,68 @@ pub(crate) fn backward_tracked(
                 let ga = softmax_jvp_or_vjp_tracked(&y, &g_out, ag)?;
                 accum_tracked(&mut grads, *a, ga, ag)?;
             }
+            TapeOp::LogSoftmax { a, out_vals, .. } => {
+                let y = resolve_saved_out(node, out_vals)?;
+                let p = t_unary(&y, "exp", ag)?;
+                let last_ax = y.shape.len().saturating_sub(1);
+                let sum_g = if y.shape.is_empty() {
+                    Arc::clone(&g_out)
+                } else {
+                    t_sum_axis(&g_out, last_ax, true, ag)?
+                };
+                let corr = t_mul(&p, &sum_g, ag)?;
+                let ga = t_sub(&g_out, &corr, ag)?;
+                accum_tracked(&mut grads, *a, ga, ag)?;
+            }
+            TapeOp::Slice {
+                a,
+                starts,
+                orig_shape,
+                ..
+            } => {
+                let pads: Vec<(usize, usize)> = starts
+                    .iter()
+                    .enumerate()
+                    .map(|(d, &s)| (s, orig_shape[d] - (s + node.shape[d])))
+                    .collect();
+                let ga = t_pad(&g_out, pads, ag)?;
+                accum_tracked(&mut grads, *a, ga, ag)?;
+            }
+            TapeOp::Pad {
+                a,
+                pads,
+                orig_shape,
+            } => {
+                let starts: Vec<usize> = pads.iter().map(|&(lo, _)| lo).collect();
+                let ends: Vec<usize> = pads
+                    .iter()
+                    .enumerate()
+                    .map(|(d, &(lo, _))| lo + orig_shape[d])
+                    .collect();
+                let ga = t_slice(&g_out, starts, ends, ag)?;
+                accum_tracked(&mut grads, *a, ga, ag)?;
+            }
+            TapeOp::Cat {
+                inputs,
+                input_shapes,
+                axis,
+                ..
+            } => {
+                let rank = node.shape.len();
+                let mut offset = 0usize;
+                for (inp_opt, in_sh) in inputs.iter().zip(input_shapes.iter()) {
+                    let dim = in_sh[*axis];
+                    if let Some(a_idx) = *inp_opt {
+                        let mut starts = vec![0usize; rank];
+                        let mut ends = node.shape.clone();
+                        starts[*axis] = offset;
+                        ends[*axis] = offset + dim;
+                        let ga = t_slice(&g_out, starts, ends, ag)?;
+                        accum_tracked(&mut grads, a_idx, ga, ag)?;
+                    }
+                    offset += dim;
+                }
+            }
             TapeOp::RmsNorm {
                 a,
                 a_vals,
@@ -1384,6 +1500,56 @@ pub(crate) fn forward_jvp_tracked(
                     Some(softmax_jvp_or_vjp_tracked(&y, da, ag)?)
                 }
             },
+            TapeOp::LogSoftmax { a, out_vals, .. } => match &tangents[*a] {
+                None => None,
+                Some(da) => {
+                    let y = resolve_saved_out(node, out_vals)?;
+                    let p = t_unary(&y, "exp", ag)?;
+                    let prod = t_mul(&p, da, ag)?;
+                    let last_ax = y.shape.len().saturating_sub(1);
+                    let dot = if y.shape.is_empty() {
+                        prod
+                    } else {
+                        t_sum_axis(&prod, last_ax, true, ag)?
+                    };
+                    Some(t_sub(da, &dot, ag)?)
+                }
+            },
+            TapeOp::Slice {
+                a, starts, ends, ..
+            } => match &tangents[*a] {
+                None => None,
+                Some(da) => Some(t_slice(da, starts.clone(), ends.clone(), ag)?),
+            },
+            TapeOp::Pad { a, pads, .. } => match &tangents[*a] {
+                None => None,
+                Some(da) => Some(t_pad(da, pads.clone(), ag)?),
+            },
+            TapeOp::Cat {
+                inputs,
+                input_shapes,
+                axis,
+                ..
+            } => {
+                let any_tan = inputs
+                    .iter()
+                    .any(|opt| opt.is_some_and(|i| tangents[i].is_some()));
+                if !any_tan {
+                    None
+                } else {
+                    let mut parts = Vec::with_capacity(inputs.len());
+                    for (opt, sh) in inputs.iter().zip(input_shapes.iter()) {
+                        let part = match opt.and_then(|i| tangents[i].as_ref()) {
+                            Some(t) => Arc::clone(t),
+                            None => {
+                                Tensor::zeros(sh.clone(), node.dtype, node.device.clone(), false)?
+                            }
+                        };
+                        parts.push(part);
+                    }
+                    Some(t_cat(&parts, *axis, ag)?)
+                }
+            }
             TapeOp::RmsNorm {
                 a,
                 a_vals,

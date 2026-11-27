@@ -1071,9 +1071,138 @@ pub fn resolve_builtin_call_named(
                 combinator: Box::new(CombinatorFrame::TraceDagEval {
                     tape_id,
                     leaf_nodes,
+                    autodiff_wrt: None,
                 }),
                 callee: func,
                 args: tracked_args,
+            })
+        }
+        BuiltinFnId::TraceValueAndGradDag => {
+            if args.len() < 2 {
+                return Err(MoraError::Runtime(format!(
+                    "trace_value_and_grad_dag(f, params, extra_inputs...) expects at least 2 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let func = args[0].clone();
+            let to_example_tensor = |v: Value,
+                                     label: &str|
+             -> MoraResult<Arc<crate::value::tensor::Tensor>> {
+                match v {
+                    Value::Tensor(t) => Ok(t),
+                    Value::Float(f) => crate::value::tensor::Tensor::from_raw(
+                        vec![f],
+                        Vec::new(),
+                        crate::common::DType::F64,
+                        crate::common::Device::Cpu,
+                        true,
+                    ),
+                    Value::Scalar(s) => crate::value::tensor::Tensor::from_raw(
+                        vec![s.as_f64()],
+                        Vec::new(),
+                        s.dtype(),
+                        crate::common::Device::Cpu,
+                        true,
+                    ),
+                    other => Err(MoraError::Runtime(format!(
+                        "trace_value_and_grad_dag: {label} must be Tensor or numeric scalar, got {}",
+                        crate::flow::dynamic_type_name(&other)
+                    ))),
+                }
+            };
+
+            let tape_id = core.session.autograd.push_tape();
+            let mut leaf_nodes: Vec<usize> = Vec::new();
+            let mut call_args: Vec<Value> = Vec::with_capacity(args.len() - 1);
+            let mut alloc_leaf = |t: Arc<crate::value::tensor::Tensor>| -> MoraResult<Value> {
+                let Some((_, leaf_idx)) = core.session.autograd.register_leaf(
+                    tape_id,
+                    t.shape.clone(),
+                    t.dtype,
+                    t.device.clone(),
+                ) else {
+                    return Err(MoraError::Runtime(
+                        "trace_value_and_grad_dag: failed to allocate input leaf".to_string(),
+                    ));
+                };
+                leaf_nodes.push(leaf_idx);
+                Ok(Value::Tensor(t.with_pushed_grad_node((tape_id, leaf_idx))))
+            };
+
+            let param_count = match args[1].clone() {
+                Value::List(xs) => {
+                    if xs.is_empty() {
+                        core.session.autograd.pop_tape(tape_id);
+                        return Err(MoraError::Runtime(
+                            "trace_value_and_grad_dag: params list must be non-empty".to_string(),
+                        ));
+                    }
+                    let mut tracked_params = Vec::with_capacity(xs.len());
+                    for (i, item) in xs.iter().cloned().enumerate() {
+                        let t = match to_example_tensor(item, &format!("param #{i}")) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                core.session.autograd.pop_tape(tape_id);
+                                return Err(e);
+                            }
+                        };
+                        match alloc_leaf(t) {
+                            Ok(v) => tracked_params.push(v),
+                            Err(e) => {
+                                core.session.autograd.pop_tape(tape_id);
+                                return Err(e);
+                            }
+                        }
+                    }
+                    let count = tracked_params.len();
+                    call_args.push(Value::List(tracked_params.into()));
+                    count
+                }
+                single => {
+                    let t = match to_example_tensor(single, "params") {
+                        Ok(t) => t,
+                        Err(e) => {
+                            core.session.autograd.pop_tape(tape_id);
+                            return Err(e);
+                        }
+                    };
+                    match alloc_leaf(t) {
+                        Ok(v) => call_args.push(v),
+                        Err(e) => {
+                            core.session.autograd.pop_tape(tape_id);
+                            return Err(e);
+                        }
+                    }
+                    1
+                }
+            };
+
+            for (i, extra) in args[2..].iter().cloned().enumerate() {
+                let t = match to_example_tensor(extra, &format!("extra input #{i}")) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        core.session.autograd.pop_tape(tape_id);
+                        return Err(e);
+                    }
+                };
+                match alloc_leaf(t) {
+                    Ok(v) => call_args.push(v),
+                    Err(e) => {
+                        core.session.autograd.pop_tape(tape_id);
+                        return Err(e);
+                    }
+                }
+            }
+
+            let wrt: Vec<usize> = (0..param_count).collect();
+            Ok(CallAction::PushCombinator {
+                combinator: Box::new(CombinatorFrame::TraceDagEval {
+                    tape_id,
+                    leaf_nodes,
+                    autodiff_wrt: Some(wrt),
+                }),
+                callee: func,
+                args: call_args,
             })
         }
         BuiltinFnId::KvAllocator => {
@@ -2913,6 +3042,112 @@ fn resolve_compute_dag_method(
             let compiled = dag.compile_with_cache(core.shared().dag_cache());
             Ok(CallAction::Done(Value::ComputeDag(Arc::new(compiled))))
         }
+        "autodiff" => {
+            if args.len() > 1 {
+                return Err(MoraError::Runtime(format!(
+                    "ComputeDag.autodiff(wrt_indices?) expects 0 or 1 argument, got {}",
+                    args.len()
+                )));
+            }
+            let wrt_opt: Option<Vec<usize>> = match args.first() {
+                None | Some(Value::Nil) => None,
+                Some(Value::Int(i)) if *i >= 0 => Some(vec![*i as usize]),
+                Some(Value::List(xs)) => {
+                    let mut idxs = Vec::with_capacity(xs.len());
+                    for (pos, item) in xs.iter().enumerate() {
+                        match item {
+                            Value::Int(i) if *i >= 0 => idxs.push(*i as usize),
+                            other => {
+                                return Err(MoraError::Runtime(format!(
+                                    "ComputeDag.autodiff: wrt_indices[{pos}] must be a non-negative Int, got {}",
+                                    crate::flow::dynamic_type_name(other)
+                                )));
+                            }
+                        }
+                    }
+                    Some(idxs)
+                }
+                Some(other) => {
+                    return Err(MoraError::Runtime(format!(
+                        "ComputeDag.autodiff: wrt_indices must be list<int>, int, or nil, got {}",
+                        crate::flow::dynamic_type_name(other)
+                    )));
+                }
+            };
+            let diff_dag = dag.autodiff(wrt_opt.as_deref())?;
+            let compiled = diff_dag.compile_with_cache(core.shared().dag_cache());
+            Ok(CallAction::Done(Value::ComputeDag(Arc::new(compiled))))
+        }
+        "autodiff_checkpointed" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(MoraError::Runtime(format!(
+                    "ComputeDag.autodiff_checkpointed(wrt_indices?, vram_budget_bytes) expects 1 or 2 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let (wrt_opt, budget_val): (Option<Vec<usize>>, &Value) = if args.len() == 1 {
+                (None, &args[0])
+            } else {
+                let parsed_wrt = match &args[0] {
+                    Value::Nil => None,
+                    Value::Int(i) if *i >= 0 => Some(vec![*i as usize]),
+                    Value::List(xs) => {
+                        let mut idxs = Vec::with_capacity(xs.len());
+                        for (pos, item) in xs.iter().enumerate() {
+                            match item {
+                                Value::Int(i) if *i >= 0 => idxs.push(*i as usize),
+                                other => {
+                                    return Err(MoraError::Runtime(format!(
+                                        "ComputeDag.autodiff_checkpointed: wrt_indices[{pos}] must be a non-negative Int, got {}",
+                                        crate::flow::dynamic_type_name(other)
+                                    )));
+                                }
+                            }
+                        }
+                        Some(idxs)
+                    }
+                    other => {
+                        return Err(MoraError::Runtime(format!(
+                            "ComputeDag.autodiff_checkpointed: wrt_indices must be list<int>, int, or nil, got {}",
+                            crate::flow::dynamic_type_name(other)
+                        )));
+                    }
+                };
+                (parsed_wrt, &args[1])
+            };
+            let budget_bytes = match budget_val {
+                Value::Int(b) if *b >= 0 => *b as usize,
+                other => {
+                    return Err(MoraError::Runtime(format!(
+                        "ComputeDag.autodiff_checkpointed: vram_budget_bytes must be a non-negative Int, got {}",
+                        crate::flow::dynamic_type_name(other)
+                    )));
+                }
+            };
+            let diff_dag = dag.autodiff_checkpointed(wrt_opt.as_deref(), budget_bytes)?;
+            let compiled = diff_dag.compile_with_cache(core.shared().dag_cache());
+            Ok(CallAction::Done(Value::ComputeDag(Arc::new(compiled))))
+        }
+        "checkpoint" => {
+            if args.len() != 1 {
+                return Err(MoraError::Runtime(format!(
+                    "ComputeDag.checkpoint(vram_budget_bytes) expects 1 argument, got {}",
+                    args.len()
+                )));
+            }
+            let budget_bytes = match &args[0] {
+                Value::Int(b) if *b >= 0 => *b as usize,
+                other => {
+                    return Err(MoraError::Runtime(format!(
+                        "ComputeDag.checkpoint: vram_budget_bytes must be a non-negative Int, got {}",
+                        crate::flow::dynamic_type_name(other)
+                    )));
+                }
+            };
+            let ckpt = dag.checkpoint_joint(budget_bytes);
+            let compiled = ckpt.compile_with_cache(core.shared().dag_cache());
+            Ok(CallAction::Done(Value::ComputeDag(Arc::new(compiled))))
+        }
         "vjp" | "grad" | "jvp" => {
             if args.len() > 1 {
                 return Err(MoraError::Runtime(format!(
@@ -2938,7 +3173,7 @@ fn resolve_compute_dag_method(
             };
             Ok(CallAction::Done(Value::ComputeDag(Arc::new(diff_dag))))
         }
-        "run" => {
+        "run" | "run_multi" => {
             let raw_inputs: Vec<Value> = if args.len() == 1
                 && let Value::List(xs) = &args[0]
             {
@@ -2966,14 +3201,20 @@ fn resolve_compute_dag_method(
                     )?),
                     other => {
                         return Err(MoraError::Runtime(format!(
-                            "ComputeDag.run: argument #{i} must be Tensor or numeric scalar, got {}",
+                            "ComputeDag.{method}: argument #{i} must be Tensor or numeric scalar, got {}",
                             crate::flow::dynamic_type_name(&other)
                         )));
                     }
                 }
             }
-            let out = dag.run_with_cache(core.shared().dag_cache(), &tensors)?;
-            Ok(CallAction::Done(Value::Tensor(out)))
+            if method == "run_multi" {
+                let outs = dag.run_multi_with_cache(core.shared().dag_cache(), &tensors)?;
+                let vals: Vec<Value> = outs.into_iter().map(Value::Tensor).collect();
+                Ok(CallAction::Done(Value::List(vals.into())))
+            } else {
+                let out = dag.run_with_cache(core.shared().dag_cache(), &tensors)?;
+                Ok(CallAction::Done(Value::Tensor(out)))
+            }
         }
         "run_profiled" => {
             let raw_inputs: Vec<Value> = if args.len() == 1
@@ -3042,6 +3283,14 @@ fn resolve_compute_dag_method(
                 ));
             }
             Ok(CallAction::Done(Value::Int(dag.fused_count() as i64)))
+        }
+        "output_count" => {
+            if !args.is_empty() {
+                return Err(MoraError::Runtime(
+                    "ComputeDag.output_count() expects 0 arguments".to_string(),
+                ));
+            }
+            Ok(CallAction::Done(Value::Int(dag.output_count() as i64)))
         }
         "is_fused" => {
             if !args.is_empty() {
@@ -3128,6 +3377,10 @@ fn resolve_compute_dag_method(
                 "vram_buffer_reuses".to_string(),
                 Value::Int(vram_reuses as i64),
             );
+            m.insert(
+                "rematerialized_nodes".to_string(),
+                Value::Int(dag.rematerialized_nodes as i64),
+            );
             Ok(CallAction::Done(Value::Dict(m.into())))
         }
         "cost_report" => {
@@ -3138,6 +3391,14 @@ fn resolve_compute_dag_method(
             }
             let rep = dag.cost_report();
             let mut m = std::collections::HashMap::new();
+            m.insert(
+                "output_count".to_string(),
+                Value::Int(dag.output_count() as i64),
+            );
+            m.insert(
+                "rematerialized_nodes".to_string(),
+                Value::Int(dag.rematerialized_nodes as i64),
+            );
             m.insert(
                 "total_flops".to_string(),
                 Value::Int(rep.total_flops as i64),

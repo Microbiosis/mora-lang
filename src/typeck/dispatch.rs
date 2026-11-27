@@ -371,6 +371,16 @@ pub fn builtin_signatures() -> Vec<(String, Signature)> {
             ),
         ),
         (
+            "trace_value_and_grad_dag".to_string(),
+            Signature::variadic(
+                vec![
+                    ("f".to_string(), Type::Any),
+                    ("params".to_string(), Type::Any),
+                ],
+                Type::ComputeDag,
+            ),
+        ),
+        (
             "kv_allocator".to_string(),
             Signature::with_min_arity(
                 vec![
@@ -1401,7 +1411,38 @@ fn method_signature_builtin(receiver: &Type, method: &str) -> Option<Signature> 
             ],
             Type::any_tensor(),
         )),
-        (Type::ComputeDag, "node_count" | "fused_count") => Some(Signature::new(
+        (Type::ComputeDag, "run_multi") => Some(Signature::variadic(
+            vec![
+                ("self".to_string(), Type::ComputeDag),
+                ("input".to_string(), Type::Any),
+            ],
+            Type::List(Box::new(Type::any_tensor())),
+        )),
+        (Type::ComputeDag, "autodiff") => Some(Signature::with_min_arity(
+            vec![
+                ("self".to_string(), Type::ComputeDag),
+                ("wrt_indices".to_string(), Type::Any),
+            ],
+            1,
+            Type::ComputeDag,
+        )),
+        (Type::ComputeDag, "autodiff_checkpointed") => Some(Signature::with_min_arity(
+            vec![
+                ("self".to_string(), Type::ComputeDag),
+                ("arg1".to_string(), Type::Any),
+                ("arg2".to_string(), Type::Any),
+            ],
+            2,
+            Type::ComputeDag,
+        )),
+        (Type::ComputeDag, "checkpoint") => Some(Signature::new(
+            vec![
+                ("self".to_string(), Type::ComputeDag),
+                ("vram_budget_bytes".to_string(), Type::Int),
+            ],
+            Type::ComputeDag,
+        )),
+        (Type::ComputeDag, "node_count" | "fused_count" | "output_count") => Some(Signature::new(
             vec![("self".to_string(), Type::ComputeDag)],
             Type::Int,
         )),
@@ -1874,7 +1915,7 @@ fn method_signature_builtin(receiver: &Type, method: &str) -> Option<Signature> 
         (
             Type::Tensor { .. },
             "contiguous" | "abs" | "sqrt" | "exp" | "ln" | "log" | "sin" | "cos" | "relu" | "gelu"
-            | "silu" | "tanh" | "sigmoid" | "softmax",
+            | "silu" | "tanh" | "sigmoid" | "softmax" | "log_softmax",
         ) => Some(Signature::new(
             vec![("self".to_string(), receiver.clone())],
             receiver.clone(),

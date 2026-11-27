@@ -3908,7 +3908,7 @@ impl HMInference {
                     };
                     let merged = match (&da, &db) {
                         (DimExpr::Known(1), other) | (other, DimExpr::Known(1)) => other.clone(),
-                        (x, y) if x == y => x.clone(),
+                        (x, y) if x == y || super::omega::dims_equiv(x, y) => x.clone(),
                         (DimExpr::Symbolic(s), other) | (other, DimExpr::Symbolic(s))
                             if s == "_" =>
                         {
@@ -4252,6 +4252,73 @@ impl HMInference {
         Some(dims)
     }
 
+    pub(super) fn collect_shape_symbol_names(shape: &crate::typeck::ShapeType) -> HashSet<String> {
+        let mut syms = HashSet::new();
+        if let crate::typeck::ShapeType::Ranked(dims) = shape {
+            let mut vars = Vec::new();
+            for d in dims {
+                d.collect_vars(&mut vars);
+            }
+            for v in vars {
+                if let TypeVarId::Rigid(s) = v {
+                    syms.insert(s);
+                }
+            }
+        }
+        syms
+    }
+
+    /// Extract a static or symbolic [`DimExpr`] from an expression witness (integer literals,
+    /// active const-generic / shape symbols, and `+`/`-`/`*`/`/` arithmetic over them).
+    pub(super) fn extract_dim_expr_from_witness(
+        &self,
+        w: &MirWitness,
+        shape_syms: &HashSet<String>,
+    ) -> Option<crate::typeck::DimExpr> {
+        use crate::common::BinaryOp;
+        use crate::typeck::{DimExpr, DimOp};
+        if let Some(n) = Self::extract_static_int_literal(w) {
+            return (n >= 0).then_some(DimExpr::Known(n as usize));
+        }
+        match &w.kind {
+            WitnessKind::Variable(name) => {
+                if self.active_const_params.contains(name) || shape_syms.contains(name) {
+                    Some(DimExpr::Symbolic(name.clone()))
+                } else {
+                    None
+                }
+            }
+            WitnessKind::Binary { left, op, right } => {
+                let dim_op = match op {
+                    BinaryOp::Add => DimOp::Add,
+                    BinaryOp::Sub => DimOp::Sub,
+                    BinaryOp::Mul => DimOp::Mul,
+                    BinaryOp::Div => DimOp::Div,
+                    _ => return None,
+                };
+                let l = self.extract_dim_expr_from_witness(left, shape_syms)?;
+                let r = self.extract_dim_expr_from_witness(right, shape_syms)?;
+                Some(DimExpr::BinOp(dim_op, Box::new(l), Box::new(r)).simplify())
+            }
+            _ => None,
+        }
+    }
+
+    fn extract_dim_expr_shape_list(
+        &self,
+        w: &MirWitness,
+        shape_syms: &HashSet<String>,
+    ) -> Option<Vec<crate::typeck::DimExpr>> {
+        let WitnessKind::List(items) = &w.kind else {
+            return None;
+        };
+        let mut dims = Vec::with_capacity(items.len());
+        for item in items {
+            dims.push(self.extract_dim_expr_from_witness(item, shape_syms)?);
+        }
+        Some(dims)
+    }
+
     fn extract_nested_list_shape_and_dtype(
         w: &MirWitness,
     ) -> Result<(crate::typeck::ShapeType, Option<Type>), Vec<TypeError>> {
@@ -4401,6 +4468,10 @@ impl HMInference {
                 name: format!("Tensor::{ctor}"),
                 span,
             }]);
+        }
+
+        if ctor == "cat" {
+            return self.infer_tensor_cat_call(args, named_args, span);
         }
 
         let mut acc_row = crate::mir::effect::EffectRow::Empty;
@@ -4720,54 +4791,265 @@ impl HMInference {
                     acc_row,
                 ))
             }
-            "cat" => {
-                let Some(list_w) = slots.first().copied().flatten() else {
-                    return Err(vec![TypeError::ArityMismatch {
-                        expected: 1,
-                        actual: 0,
-                        span,
-                    }]);
-                };
-                let list_ty = slot_types[0]
-                    .as_ref()
-                    .map(|t| self.subst.apply(t))
-                    .unwrap_or(Type::Any);
-                let elem_ty = match list_ty {
-                    Type::List(inner) => self.subst.apply(&inner),
-                    Type::Any | Type::Error | Type::TypeVar(_) => Type::any_tensor(),
-                    other => {
-                        return Err(vec![TypeError::UnificationFailure {
-                            expected: "list<Tensor> for Tensor::cat".to_string(),
-                            got: other.name(),
-                            span: Some(list_w.span),
-                        }]);
-                    }
-                };
-                if let Some(ax_w) = slots.get(1).copied().flatten() {
-                    let ax_ty = slot_types[1]
-                        .as_ref()
-                        .map(|t| self.subst.apply(t))
-                        .unwrap_or(Type::Any);
-                    self.constraints.push(SpannedConstraint::new(
-                        Constraint::Subtype {
-                            sub: Box::new(ax_ty),
-                            sup: Box::new(Type::Union(vec![Type::Int, Type::Nil])),
-                        },
-                        ax_w.span,
-                    ));
-                }
-                let ret = match elem_ty {
-                    Type::Tensor { dtype, device, .. } => Type::Tensor {
-                        dtype,
-                        shape: ShapeType::Unranked(None),
-                        device,
-                    },
-                    _ => Type::any_tensor(),
-                };
-                Ok((ret, acc_row))
-            }
             _ => unreachable!(),
         }
+    }
+
+    /// P6-3: Static shape-arithmetic typing for `Tensor::cat(tensors, axis?)`.
+    /// When `tensors` is a list literal `[t0, t1, ...]`, infers each tensor independently without
+    /// forcing identical extent along `axis`, unifies `dtype`, `device`, rank, and every non-cat
+    /// axis via HM/`omega`, and computes the exact symbolic sum `D0 + D1 + ...` along `axis`.
+    fn infer_tensor_cat_call(
+        &mut self,
+        args: &[MirWitness],
+        named_args: &[(String, MirWitness)],
+        span: Span,
+    ) -> Result<(Type, crate::mir::effect::EffectRow), Vec<TypeError>> {
+        use crate::typeck::{DimExpr, DimOp, ShapeType};
+        let (list_w, axis_w) = if named_args.is_empty() {
+            if args.is_empty() || args.len() > 2 {
+                return Err(vec![TypeError::ArityMismatch {
+                    expected: 1,
+                    actual: args.len(),
+                    span,
+                }]);
+            }
+            (&args[0], args.get(1))
+        } else {
+            let slots = Self::normalize_tensor_ctor_args("cat", args, named_args, span)?;
+            let Some(lw) = slots.first().copied().flatten() else {
+                return Err(vec![TypeError::ArityMismatch {
+                    expected: 1,
+                    actual: 0,
+                    span,
+                }]);
+            };
+            (lw, slots.get(1).copied().flatten())
+        };
+
+        let mut acc_row = crate::mir::effect::EffectRow::Empty;
+        let static_axis: Option<i64> = match axis_w {
+            None => Some(0),
+            Some(aw) => {
+                let (ax_ty, ax_row) = self.infer_recover(aw);
+                acc_row = self.merge_rows(acc_row, ax_row, span);
+                let ax_resolved = self.subst.apply(&ax_ty);
+                self.constraints.push(SpannedConstraint::new(
+                    Constraint::Subtype {
+                        sub: Box::new(ax_resolved),
+                        sup: Box::new(Type::Union(vec![Type::Int, Type::Nil])),
+                    },
+                    aw.span,
+                ));
+                if matches!(
+                    aw.kind,
+                    WitnessKind::Literal(crate::common::Literal::Nil(_))
+                ) {
+                    Some(0)
+                } else {
+                    Self::extract_static_int_literal(aw)
+                }
+            }
+        };
+
+        if let WitnessKind::List(items) = &list_w.kind {
+            if items.is_empty() {
+                return Ok((Type::any_tensor(), acc_row));
+            }
+            let mut item_tys: Vec<(Type, Span)> = Vec::with_capacity(items.len());
+            for item in items {
+                let (t, r) = self.infer_recover(item);
+                acc_row = self.merge_rows(acc_row, r, span);
+                item_tys.push((self.subst.apply(&t), item.span));
+            }
+
+            let mut common_dtype: Option<Type> = None;
+            let mut common_device: Option<crate::typeck::DeviceType> = None;
+            let mut ranked_shapes: Option<Vec<(Vec<DimExpr>, Span)>> =
+                Some(Vec::with_capacity(items.len()));
+
+            for (ty, ispan) in &item_tys {
+                match ty {
+                    Type::Tensor {
+                        dtype,
+                        shape,
+                        device,
+                    } => {
+                        let dt = self.subst.apply(dtype);
+                        let dev = self.subst.apply_device(device);
+                        let sh = self.subst.apply_shape(shape);
+                        if let Some(prev_dt) = &common_dtype {
+                            let eq = SpannedConstraint::new(
+                                Constraint::Eq(Box::new(prev_dt.clone()), Box::new(dt.clone())),
+                                *ispan,
+                            );
+                            match unify::solve_spanned(&eq, &self.subst) {
+                                Ok(next_s) => {
+                                    self.subst = next_s;
+                                    common_dtype = Some(self.subst.apply(prev_dt));
+                                }
+                                Err(e) => return Err(vec![e]),
+                            }
+                        } else {
+                            common_dtype = Some(dt);
+                        }
+                        if let Some(prev_dev) = &common_device {
+                            let merged = self.unify_tensor_devices(prev_dev, &dev, *ispan)?;
+                            common_device = Some(merged);
+                        } else {
+                            common_device = Some(dev);
+                        }
+                        match (&mut ranked_shapes, sh) {
+                            (Some(vec), ShapeType::Ranked(dims)) => vec.push((dims, *ispan)),
+                            _ => ranked_shapes = None,
+                        }
+                    }
+                    Type::Any | Type::Error | Type::TypeVar(_) => {
+                        ranked_shapes = None;
+                    }
+                    other => {
+                        return Err(vec![TypeError::UnificationFailure {
+                            expected: "Tensor element in Tensor::cat list".to_string(),
+                            got: other.name(),
+                            span: Some(*ispan),
+                        }]);
+                    }
+                }
+            }
+
+            let out_dtype = common_dtype
+                .map(|d| self.subst.apply(&d))
+                .unwrap_or(Type::Any);
+            let out_device = common_device
+                .map(|d| self.subst.apply_device(&d))
+                .unwrap_or(crate::typeck::DeviceType::Any);
+
+            let out_shape = if let (Some(shapes), Some(raw_ax)) = (ranked_shapes, static_axis) {
+                let rank = shapes[0].0.len();
+                if rank == 0 {
+                    return Err(vec![TypeError::UnsatisfiedDimConstraint {
+                        constraint: "rank >= 1".to_string(),
+                        context: "Tensor::cat cannot concatenate 0D scalar tensors".to_string(),
+                        span: Some(span),
+                    }]);
+                }
+                let rank_i = rank as i64;
+                let adj = if raw_ax < 0 { raw_ax + rank_i } else { raw_ax };
+                if adj < 0 || adj >= rank_i {
+                    return Err(vec![TypeError::UnsatisfiedDimConstraint {
+                        constraint: format!("-{rank} <= axis < {rank}"),
+                        context: format!(
+                            "Tensor::cat axis {raw_ax} is out of bounds for rank-{rank} tensors"
+                        ),
+                        span: Some(axis_w.map_or(span, |w| w.span)),
+                    }]);
+                }
+                let ax = adj as usize;
+                let mut out_dims: Vec<DimExpr> = shapes[0]
+                    .0
+                    .iter()
+                    .map(|d| self.subst.apply_dim(d))
+                    .collect();
+
+                for (dims_i, ispan) in shapes.iter().skip(1) {
+                    if dims_i.len() != rank {
+                        return Err(vec![TypeError::UnificationFailure {
+                            expected: format!(
+                                "rank-{rank} tensor matching first Tensor::cat input ({})",
+                                ShapeType::Ranked(out_dims.clone())
+                            ),
+                            got: format!(
+                                "rank-{} tensor ({})",
+                                dims_i.len(),
+                                ShapeType::Ranked(dims_i.clone())
+                            ),
+                            span: Some(*ispan),
+                        }]);
+                    }
+                    for j in 0..rank {
+                        let di = self.subst.apply_dim(&dims_i[j]);
+                        if j == ax {
+                            out_dims[ax] = DimExpr::BinOp(
+                                DimOp::Add,
+                                Box::new(out_dims[ax].clone()),
+                                Box::new(di),
+                            )
+                            .simplify();
+                        } else {
+                            let dj = self.subst.apply_dim(&out_dims[j]);
+                            if dj != di && !super::omega::dims_equiv(&dj, &di) {
+                                let d1_ty = Type::Tensor {
+                                    dtype: Box::new(Type::Any),
+                                    shape: ShapeType::Ranked(vec![dj.clone()]),
+                                    device: crate::typeck::DeviceType::Any,
+                                };
+                                let d2_ty = Type::Tensor {
+                                    dtype: Box::new(Type::Any),
+                                    shape: ShapeType::Ranked(vec![di.clone()]),
+                                    device: crate::typeck::DeviceType::Any,
+                                };
+                                let eq_c = SpannedConstraint::new(
+                                    Constraint::Eq(Box::new(d1_ty), Box::new(d2_ty)),
+                                    *ispan,
+                                );
+                                match unify::solve_spanned(&eq_c, &self.subst) {
+                                    Ok(new_s) => {
+                                        self.subst = new_s;
+                                        out_dims[j] = self.subst.apply_dim(&dj);
+                                    }
+                                    Err(_) => {
+                                        return Err(vec![TypeError::UnsatisfiedDimConstraint {
+                                            constraint: format!("{dj} == {di}"),
+                                            context: format!(
+                                                "Tensor::cat non-concatenation axis {j} mismatch (concatenating along axis {ax})"
+                                            ),
+                                            span: Some(*ispan),
+                                        }]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                ShapeType::Ranked(out_dims)
+            } else {
+                ShapeType::Unranked(None)
+            };
+
+            return Ok((
+                Type::Tensor {
+                    dtype: Box::new(out_dtype),
+                    shape: out_shape,
+                    device: out_device,
+                },
+                acc_row,
+            ));
+        }
+
+        // Fallback for non-literal list variable (e.g. `Tensor::cat(xs, axis)`).
+        let (list_ty_raw, list_row) = self.infer_recover(list_w);
+        acc_row = self.merge_rows(acc_row, list_row, span);
+        let list_ty = self.subst.apply(&list_ty_raw);
+        let elem_ty = match list_ty {
+            Type::List(inner) => self.subst.apply(&inner),
+            Type::Any | Type::Error | Type::TypeVar(_) => Type::any_tensor(),
+            other => {
+                return Err(vec![TypeError::UnificationFailure {
+                    expected: "list<Tensor> for Tensor::cat".to_string(),
+                    got: other.name(),
+                    span: Some(list_w.span),
+                }]);
+            }
+        };
+        let ret = match elem_ty {
+            Type::Tensor { dtype, device, .. } => Type::Tensor {
+                dtype,
+                shape: ShapeType::Unranked(None),
+                device,
+            },
+            _ => Type::any_tensor(),
+        };
+        Ok((ret, acc_row))
     }
 
     fn infer_tensor_constructor_positional(
@@ -5074,46 +5356,6 @@ impl HMInference {
                     acc_row,
                 ))
             }
-            "cat" => {
-                if args.is_empty() || args.len() > 2 {
-                    return Err(vec![TypeError::ArityMismatch {
-                        expected: 1,
-                        actual: args.len(),
-                        span,
-                    }]);
-                }
-                let list_ty = self.subst.apply(&arg_types[0]);
-                let elem_ty = match list_ty {
-                    Type::List(inner) => self.subst.apply(&inner),
-                    Type::Any | Type::Error | Type::TypeVar(_) => Type::any_tensor(),
-                    other => {
-                        return Err(vec![TypeError::UnificationFailure {
-                            expected: "list<Tensor> for Tensor::cat".to_string(),
-                            got: other.name(),
-                            span: Some(args[0].span),
-                        }]);
-                    }
-                };
-                if let Some(ax_ty) = arg_types.get(1) {
-                    let ax_resolved = self.subst.apply(ax_ty);
-                    self.constraints.push(SpannedConstraint::new(
-                        Constraint::Subtype {
-                            sub: Box::new(ax_resolved),
-                            sup: Box::new(Type::Union(vec![Type::Int, Type::Nil])),
-                        },
-                        args[1].span,
-                    ));
-                }
-                let ret = match elem_ty {
-                    Type::Tensor { dtype, device, .. } => Type::Tensor {
-                        dtype,
-                        shape: ShapeType::Unranked(None),
-                        device,
-                    },
-                    _ => Type::any_tensor(),
-                };
-                Ok((ret, acc_row))
-            }
             _ => Err(vec![TypeError::UnboundVariable {
                 name: format!("Tensor::{ctor}"),
                 span,
@@ -5367,20 +5609,19 @@ impl HMInference {
                         span,
                     }]);
                 }
+                let shape_syms = Self::collect_shape_symbol_names(&cur_shape);
                 let target_dims_opt = if args.len() == 1 {
-                    Self::extract_static_shape_list(&args[0]).or_else(|| {
-                        Self::extract_static_int_literal(&args[0])
-                            .filter(|&n| n >= 0)
-                            .map(|n| vec![DimExpr::Known(n as usize)])
-                    })
+                    self.extract_dim_expr_shape_list(&args[0], &shape_syms)
+                        .or_else(|| {
+                            self.extract_dim_expr_from_witness(&args[0], &shape_syms)
+                                .map(|d| vec![d])
+                        })
                 } else {
                     let mut dims = Vec::with_capacity(args.len());
                     let mut ok = true;
                     for a in args {
-                        if let Some(n) = Self::extract_static_int_literal(a)
-                            && n >= 0
-                        {
-                            dims.push(DimExpr::Known(n as usize));
+                        if let Some(d) = self.extract_dim_expr_from_witness(a, &shape_syms) {
+                            dims.push(d);
                         } else {
                             ok = false;
                             break;
@@ -5392,34 +5633,21 @@ impl HMInference {
                 let new_shape = match target_dims_opt {
                     Some(target_dims) => {
                         if let ShapeType::Ranked(cur_dims) = &cur_shape
-                            && cur_dims.iter().all(|d| matches!(d, DimExpr::Known(_)))
+                            && let super::omega::VolumeCheck::ProvablyUnequal {
+                                lhs_residual,
+                                rhs_residual,
+                            } = super::omega::check_reshape_volume(cur_dims, &target_dims)
                         {
-                            let cur_numel: usize = cur_dims
-                                .iter()
-                                .map(|d| match d {
-                                    DimExpr::Known(n) => *n,
-                                    _ => 1,
-                                })
-                                .product();
-                            let target_numel: usize = target_dims
-                                .iter()
-                                .map(|d| match d {
-                                    DimExpr::Known(n) => *n,
-                                    _ => 1,
-                                })
-                                .product();
-                            if cur_numel != target_numel {
-                                return Err(vec![TypeError::UnificationFailure {
-                                    expected: format!(
-                                        "reshape target with {cur_numel} elements (matching source shape {cur_shape})"
-                                    ),
-                                    got: format!(
-                                        "shape {} with {target_numel} elements",
-                                        ShapeType::Ranked(target_dims)
-                                    ),
-                                    span: Some(span),
-                                }]);
-                            }
+                            return Err(vec![TypeError::UnsatisfiedDimConstraint {
+                                constraint: format!(
+                                    "volume({cur_shape}) == volume({})",
+                                    ShapeType::Ranked(target_dims)
+                                ),
+                                context: format!(
+                                    "reshape volume mismatch (reduced `{lhs_residual}` != `{rhs_residual}`)"
+                                ),
+                                span: Some(span),
+                            }]);
                         }
                         ShapeType::Ranked(target_dims)
                     }

@@ -20,6 +20,7 @@ pub mod env;
 pub mod error;
 pub mod generalize;
 mod infer;
+pub(crate) mod omega;
 pub mod row;
 mod stage3c;
 pub mod unify;
@@ -183,6 +184,8 @@ pub struct HMInference {
     pub no_grad_depth: usize,
     /// Static byte quotas tracked for `let pool = memory_pool(max_bytes, ...)` variables.
     pub pool_byte_quotas: HashMap<String, usize>,
+    /// P6-3: Active const-generic parameter names in the current `impl`/`task` body scope.
+    pub active_const_params: HashSet<String>,
 }
 
 impl HMInference {

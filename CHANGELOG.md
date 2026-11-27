@@ -2,7 +2,18 @@
 
 All notable changes to Mora will be documented in this file.
 
-## [Unreleased] — Phase P6（P6-1 Perceus/FBIP + P6-2 SciLean 符号自动微分 `TensorComputeDag`）
+## [Unreleased] — Phase P6（P6-1 Perceus/FBIP + P6-2 SciLean 符号自动微分 `TensorComputeDag` + P6-3A `omega`-lite 形状求解器与静态形状算术）
+
+### P6-3A：零依赖 Presburger 形状求解器（`omega`-lite）与静态形状算术（`tests/p6_omega_solver_and_shapes.rs`）
+
+- **零依赖仿射 / 单项式正规形（`src/typeck/hm/omega.rs`）**：新增 `AffineExpr`（$c_0 + \sum_i c_i v_i$，`i128` 溢出安全）与 `MonomialProduct`（交换单项式乘积，提取仿射因子内容 GCD 并按正维度消去公共因子）。`DimExpr::simplify` / `compatible_with` 统一改走 `omega::canonicalize_dim` / `dims_equiv`，从而静态证明加法交换/结合（`S1 + S2 == S2 + S1`）、逆元消去（`(S + P) - P == S`）、合并同类项（`D + D == 2 * D`）、常数分配（`2 * (A + B) == 2 * A + 2 * B`）与精确整除（`(2 * D + 4) / 2 == D + 2`），广播形状检查同样识别代数等价。
+- **可判定整数线性求解器 `OmegaContext`**：Pugh 式整数高斯 + 幺模模数消元处理等式（含 GCD 不可满足判定，如 `2 * X == 3`）、GCD 向上取整收紧与反平行对收缩处理不等式、精确 Fourier-Motzkin 投影 + Real/Dark/Gray Shadow 整数完备检验；所有超步数 / 溢出 / 组合爆炸路径一律 fail-closed 返回 `Unknown`（绝不乐观判 True/False）。`unify_dim_at` 接入线性/单项式合一：唯一元变量求解（`2 * _d0 + 4 == 2 * S + 8 ⇒ _d0 = S + 2`）、整除性矛盾拒绝（`2 * D == 5` 编译期报错）、单项式消去（`H * DH == DH * H`），其余情形保留原结构化兜底。
+- **静态 `Tensor::cat` 形状算术**：列表字面量输入逐项推断，仅对拼接轴累加 `D0 + D1 + ...`，其余轴经 HM/`omega` 合一（支持负轴归一化），并静态拒绝非拼接轴不匹配、越界轴、秩不一致与 DType/Device 不一致——`Tensor<f32, [B, S1, D], cpu>` 与 `Tensor<f32, [B, S2, D], cpu>` 沿轴 1 直接得到 `Tensor<f32, [B, S1 + S2, D], cpu>`，无需再绕行 `list<any>`。
+- **静态 `reshape` 符号体积守恒**：`impl<const ...>` 作用域跟踪 `active_const_params`，目标形状可含符号维度；`omega::check_reshape_volume` 证明体积守恒（`[B, S, H * DH] ↔ [B, S, H, DH]`、`[B, 2 * S, D] ↔ [B, S, 2 * D]`），可证不等直接报错（`[B, S, H * DH] → [B, S, H, DH * 2]` 约简为 `1 != 2`）；`Unknown` 时保留签名但不做虚假断言。
+- **符号切片 / 下标推导**：`stage3c::infer_tensor_slice` 在 `omega` 证明 `0 <= start < stop <= dim` 时精确推导符号切片长度 `stop - start`（`[B, S1 + S2, D][:, S1:, :] → [B, S2, D]`），静态拒绝可证空切片（`S1:S1`、`(S1 + 1):S1`）与可证越界符号下标（`x[0, S1 + S2, 0]`）；无法证明时保持原有动态路径（运行时边界检查仍为兜底）。
+- **结构化维度诊断**：新增 `TypeError::UnsatisfiedDimConstraint { constraint, context, span }`，经 `check_mir::hm_to_external` 贯通到对外诊断（避免把维度矛盾伪装成普通类型不匹配）。
+- **范围约束**：P6-3A 严格收敛在 `src/typeck/` 内，**零解析器 / 零字节码 / 零 VM / 零新语法**；`where` 维度守卫、`fin<N>` 有界索引与 GPU `kernel` 共享内存边界证明分别留待 P6-3B/C/D。
+- **验证**：新增 [p6_omega_solver_and_shapes.rs](tests/p6_omega_solver_and_shapes.rs)（4 项：符号代数/广播、cat 形状算术与错误守卫、reshape 体积守恒、符号切片/下标）与 `omega.rs` 内 4 项单元测试；全仓 `cargo test --all-targets -j 4 --no-fail-fast` **233 套件 / 1688 passed / 0 failed / 1 ignored**，`cargo fmt --all -- --check` 0 diff、`cargo clippy --all-targets --all-features -- -D warnings` 0 warning；`pub_fn_zero_ref_census` 通过（0 新增零引用 `pub fn`），`Cargo.lock` 仍为 1 包（0 外部依赖）。
 
 ### P6-2：SciLean 风格符号伴随 `TensorComputeDag`、前后向联合融合与成本引导重算检查点（`tests/p6_symbolic_dag_autodiff.rs`）
 

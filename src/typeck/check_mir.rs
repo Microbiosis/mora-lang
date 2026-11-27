@@ -212,6 +212,14 @@ pub(super) fn hm_to_external(err: HmError) -> TypeError {
             let (l, c) = span.map(|s| (s.line, s.column)).unwrap_or((0, 0));
             (l, c, Some(expected.clone()), Some(got.clone()))
         }
+        UnsatisfiedDimConstraint {
+            constraint,
+            context,
+            span,
+        } => {
+            let (l, c) = span.map(|s| (s.line, s.column)).unwrap_or((0, 0));
+            (l, c, Some(constraint.clone()), Some(context.clone()))
+        }
         WithHint { .. } => unreachable!("handled above"),
     };
     let message = err.to_string();

@@ -616,47 +616,82 @@ fn unify_dim_at(
             }
             Ok(())
         }
-        // Linear dimension constraint solver: solve `expr op Known(c) == Known(k)`.
-        (DimExpr::BinOp(op, lhs, rhs), DimExpr::Known(k))
-        | (DimExpr::Known(k), DimExpr::BinOp(op, lhs, rhs)) => {
-            if let DimExpr::Known(c) = rhs.as_ref() {
-                let solved = match op {
-                    DimOp::Add if *k >= *c => Some(DimExpr::Known(*k - *c)),
-                    DimOp::Sub => Some(DimExpr::Known(k.saturating_add(*c))),
-                    DimOp::Mul if *c > 0 && *k % *c == 0 => Some(DimExpr::Known(*k / *c)),
-                    DimOp::Div if *c > 0 => Some(DimExpr::Known(k.saturating_mul(*c))),
-                    _ => None,
-                };
-                if let Some(target) = solved {
-                    return unify_dim_at(lhs, &target, subst, full_t1, full_t2, span);
+        _ => {
+            // P6-3: Presburger linear & commutative monomial dimension solver (`omega`-lite).
+            match super::omega::unify_dim_linear(&a, &b) {
+                super::omega::DimUnifyOutcome::Equal => return Ok(()),
+                super::omega::DimUnifyOutcome::Bind(id, solved) => {
+                    if solved.contains_var(id) {
+                        return Err(TypeError::UnificationFailure {
+                            expected: format_type(&subst.apply(full_t1)),
+                            got: format_type(&subst.apply(full_t2)),
+                            span,
+                        });
+                    }
+                    let canon = solved.simplify();
+                    subst.dim_mapping.insert(id, canon.clone());
+                    if let DimExpr::Known(n) = canon {
+                        subst
+                            .mapping
+                            .entry(TypeVarId::Meta(id))
+                            .or_insert(Type::ConstInt(n as i64));
+                    }
+                    return Ok(());
                 }
-            } else if let DimExpr::Known(c) = lhs.as_ref() {
-                let solved = match op {
-                    DimOp::Add if *k >= *c => Some(DimExpr::Known(*k - *c)),
-                    DimOp::Sub if *c >= *k => Some(DimExpr::Known(*c - *k)),
-                    DimOp::Mul if *c > 0 && *k % *c == 0 => Some(DimExpr::Known(*k / *c)),
-                    DimOp::Div if *k > 0 && *c % *k == 0 => Some(DimExpr::Known(*c / *k)),
-                    _ => None,
-                };
-                if let Some(target) = solved {
-                    return unify_dim_at(rhs, &target, subst, full_t1, full_t2, span);
+                super::omega::DimUnifyOutcome::Contradiction(_) => {
+                    return Err(TypeError::UnificationFailure {
+                        expected: format_type(&subst.apply(full_t1)),
+                        got: format_type(&subst.apply(full_t2)),
+                        span,
+                    });
                 }
+                super::omega::DimUnifyOutcome::Defer => {}
             }
-            Err(TypeError::UnificationFailure {
-                expected: format_type(&subst.apply(full_t1)),
-                got: format_type(&subst.apply(full_t2)),
-                span,
-            })
+            // Fallback for non-linear / opaque expressions: solve `expr op Known(c) == Known(k)`
+            // or structural BinOp recursion.
+            match (&a, &b) {
+                (DimExpr::BinOp(op, lhs, rhs), DimExpr::Known(k))
+                | (DimExpr::Known(k), DimExpr::BinOp(op, lhs, rhs)) => {
+                    if let DimExpr::Known(c) = rhs.as_ref() {
+                        let solved = match op {
+                            DimOp::Add if *k >= *c => Some(DimExpr::Known(*k - *c)),
+                            DimOp::Sub => Some(DimExpr::Known(k.saturating_add(*c))),
+                            DimOp::Mul if *c > 0 && *k % *c == 0 => Some(DimExpr::Known(*k / *c)),
+                            DimOp::Div if *c > 0 => Some(DimExpr::Known(k.saturating_mul(*c))),
+                            _ => None,
+                        };
+                        if let Some(target) = solved {
+                            return unify_dim_at(lhs, &target, subst, full_t1, full_t2, span);
+                        }
+                    } else if let DimExpr::Known(c) = lhs.as_ref() {
+                        let solved = match op {
+                            DimOp::Add if *k >= *c => Some(DimExpr::Known(*k - *c)),
+                            DimOp::Sub if *c >= *k => Some(DimExpr::Known(*c - *k)),
+                            DimOp::Mul if *c > 0 && *k % *c == 0 => Some(DimExpr::Known(*k / *c)),
+                            DimOp::Div if *k > 0 && *c % *k == 0 => Some(DimExpr::Known(*c / *k)),
+                            _ => None,
+                        };
+                        if let Some(target) = solved {
+                            return unify_dim_at(rhs, &target, subst, full_t1, full_t2, span);
+                        }
+                    }
+                    Err(TypeError::UnificationFailure {
+                        expected: format_type(&subst.apply(full_t1)),
+                        got: format_type(&subst.apply(full_t2)),
+                        span,
+                    })
+                }
+                (DimExpr::BinOp(op1, l1, r1), DimExpr::BinOp(op2, l2, r2)) if op1 == op2 => {
+                    unify_dim_at(l1, l2, subst, full_t1, full_t2, span)?;
+                    unify_dim_at(r1, r2, subst, full_t1, full_t2, span)
+                }
+                _ => Err(TypeError::UnificationFailure {
+                    expected: format_type(&subst.apply(full_t1)),
+                    got: format_type(&subst.apply(full_t2)),
+                    span,
+                }),
+            }
         }
-        (DimExpr::BinOp(op1, l1, r1), DimExpr::BinOp(op2, l2, r2)) if op1 == op2 => {
-            unify_dim_at(l1, l2, subst, full_t1, full_t2, span)?;
-            unify_dim_at(r1, r2, subst, full_t1, full_t2, span)
-        }
-        _ => Err(TypeError::UnificationFailure {
-            expected: format_type(&subst.apply(full_t1)),
-            got: format_type(&subst.apply(full_t2)),
-            span,
-        }),
     }
 }
 

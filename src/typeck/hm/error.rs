@@ -84,6 +84,13 @@ pub enum TypeError {
         span: Option<Span>,
     },
 
+    /// P6-3: Presburger dimension / static index constraint could not be satisfied.
+    UnsatisfiedDimConstraint {
+        constraint: String,
+        context: String,
+        span: Option<Span>,
+    },
+
     /// Contextual hint attached by a constraint origin.
     WithHint {
         inner: Box<TypeError>,
@@ -200,6 +207,22 @@ impl std::fmt::Display for TypeError {
                 span,
             } => {
                 write!(f, "Effect row mismatch: expected {}, got {}", expected, got)?;
+                if let Some(s) = span {
+                    write!(f, " at line {}, column {}", s.line, s.column)
+                } else {
+                    Ok(())
+                }
+            }
+            TypeError::UnsatisfiedDimConstraint {
+                constraint,
+                context,
+                span,
+            } => {
+                write!(
+                    f,
+                    "Unsatisfied dimension constraint '{}': {}",
+                    constraint, context
+                )?;
                 if let Some(s) = span {
                     write!(f, " at line {}, column {}", s.line, s.column)
                 } else {

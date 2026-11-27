@@ -78,91 +78,9 @@ pub enum DimExpr {
 }
 
 impl DimExpr {
-    /// Algebraically normalize and constant-fold linear dimension expressions.
+    /// Algebraically normalize and constant-fold linear/monomial dimension expressions via `omega`.
     pub(crate) fn simplify(&self) -> DimExpr {
-        match self {
-            DimExpr::Known(_) | DimExpr::Symbolic(_) | DimExpr::Var(_) => self.clone(),
-            DimExpr::BinOp(op, lhs, rhs) => {
-                let l = lhs.simplify();
-                let r = rhs.simplify();
-                match (*op, l, r) {
-                    // Constant folding
-                    (DimOp::Add, DimExpr::Known(a), DimExpr::Known(b)) => {
-                        DimExpr::Known(a.saturating_add(b))
-                    }
-                    (DimOp::Sub, DimExpr::Known(a), DimExpr::Known(b)) if a >= b => {
-                        DimExpr::Known(a - b)
-                    }
-                    (DimOp::Mul, DimExpr::Known(a), DimExpr::Known(b)) => {
-                        DimExpr::Known(a.saturating_mul(b))
-                    }
-                    (DimOp::Div, DimExpr::Known(a), DimExpr::Known(b)) if b > 0 && a % b == 0 => {
-                        DimExpr::Known(a / b)
-                    }
-                    // Algebraic identities & canonical ordering (Known on right for commutative ops)
-                    (DimOp::Add, x, DimExpr::Known(0)) | (DimOp::Add, DimExpr::Known(0), x) => x,
-                    (DimOp::Sub, x, DimExpr::Known(0)) => x,
-                    (DimOp::Mul, x, DimExpr::Known(1)) | (DimOp::Mul, DimExpr::Known(1), x) => x,
-                    (DimOp::Mul, _, DimExpr::Known(0)) | (DimOp::Mul, DimExpr::Known(0), _) => {
-                        DimExpr::Known(0)
-                    }
-                    (DimOp::Div, x, DimExpr::Known(1)) => x,
-                    (DimOp::Add, DimExpr::Known(k), x) => {
-                        DimExpr::BinOp(DimOp::Add, Box::new(x), Box::new(DimExpr::Known(k)))
-                            .simplify()
-                    }
-                    (DimOp::Mul, DimExpr::Known(k), x) => {
-                        DimExpr::BinOp(DimOp::Mul, Box::new(x), Box::new(DimExpr::Known(k)))
-                            .simplify()
-                    }
-                    // Associativity & inverse cancellation
-                    (DimOp::Add, DimExpr::BinOp(DimOp::Add, inner, c1), DimExpr::Known(b)) => {
-                        if let DimExpr::Known(a) = *c1 {
-                            DimExpr::BinOp(
-                                DimOp::Add,
-                                inner,
-                                Box::new(DimExpr::Known(a.saturating_add(b))),
-                            )
-                            .simplify()
-                        } else {
-                            DimExpr::BinOp(
-                                DimOp::Add,
-                                Box::new(DimExpr::BinOp(DimOp::Add, inner, c1)),
-                                Box::new(DimExpr::Known(b)),
-                            )
-                        }
-                    }
-                    (DimOp::Sub, DimExpr::BinOp(DimOp::Add, inner, c1), DimExpr::Known(b)) if matches!(*c1, DimExpr::Known(a) if a == b) => {
-                        *inner
-                    }
-                    (DimOp::Add, DimExpr::BinOp(DimOp::Sub, inner, c1), DimExpr::Known(b)) if matches!(*c1, DimExpr::Known(a) if a == b) => {
-                        *inner
-                    }
-                    (DimOp::Mul, DimExpr::BinOp(DimOp::Mul, inner, c1), DimExpr::Known(b)) => {
-                        if let DimExpr::Known(a) = *c1 {
-                            DimExpr::BinOp(
-                                DimOp::Mul,
-                                inner,
-                                Box::new(DimExpr::Known(a.saturating_mul(b))),
-                            )
-                            .simplify()
-                        } else {
-                            DimExpr::BinOp(
-                                DimOp::Mul,
-                                Box::new(DimExpr::BinOp(DimOp::Mul, inner, c1)),
-                                Box::new(DimExpr::Known(b)),
-                            )
-                        }
-                    }
-                    (DimOp::Div, DimExpr::BinOp(DimOp::Mul, inner, c1), DimExpr::Known(b))
-                        if b > 0 && matches!(*c1, DimExpr::Known(a) if a == b) =>
-                    {
-                        *inner
-                    }
-                    (op, l, r) => DimExpr::BinOp(op, Box::new(l), Box::new(r)),
-                }
-            }
-        }
+        crate::typeck::hm::omega::canonicalize_dim(self)
     }
 
     /// Recursively transform every leaf (`Known` / `Symbolic` / `Var`) and simplify.
@@ -204,6 +122,9 @@ impl DimExpr {
     pub fn compatible_with(&self, other: &DimExpr) -> bool {
         let a = self.simplify();
         let b = other.simplify();
+        if crate::typeck::hm::omega::dims_equiv(&a, &b) {
+            return true;
+        }
         match (&a, &b) {
             (DimExpr::Known(x), DimExpr::Known(y)) => x == y,
             (DimExpr::Var(_), _) | (_, DimExpr::Var(_)) => true,

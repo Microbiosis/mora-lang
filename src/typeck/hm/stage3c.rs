@@ -660,12 +660,14 @@ impl HMInference {
         }
 
         // 2. Type-check every method body inside `impl` (with const-generic params bound as `int`).
+        let saved_consts = self.active_const_params.clone();
         let saved_env = if active_consts.is_empty() {
             None
         } else {
             let prev = self.env.clone();
             for cname in &active_consts {
                 self.env.add(cname.clone(), Type::Int);
+                self.active_const_params.insert(cname.clone());
             }
             Some(prev)
         };
@@ -776,6 +778,7 @@ impl HMInference {
         if let Some(prev) = saved_env {
             self.env = prev;
         }
+        self.active_const_params = saved_consts;
         Ok((Type::Nil, EffectRow::Empty))
     }
 
@@ -1993,6 +1996,8 @@ impl HMInference {
                         } else {
                             0
                         };
+                        let shape_syms =
+                            Self::collect_shape_symbol_names(&ShapeType::Ranked(dims.clone()));
                         let mut out_dims: Vec<DimExpr> = Vec::new();
                         let mut src_axis = 0usize;
                         for ax in axes {
@@ -2022,6 +2027,29 @@ impl HMInference {
                                                 span: Some(idx_w.span),
                                             }]);
                                         }
+                                    } else if let Some(idx_dim) =
+                                        self.extract_dim_expr_from_witness(idx_w, &shape_syms)
+                                        && let (Some(d_aff), Some(i_aff)) = (
+                                            super::omega::AffineExpr::from_dim(dim),
+                                            super::omega::AffineExpr::from_dim(&idx_dim),
+                                        )
+                                    {
+                                        // P6-3: Symbolic non-negative index bounds check via `omega`.
+                                        let ctx =
+                                            super::omega::positive_dim_context(&[dim, &idx_dim]);
+                                        if ctx.entails_le(&d_aff, &i_aff)
+                                            == super::omega::SolveResult::True
+                                        {
+                                            return Err(vec![
+                                                TypeError::UnsatisfiedDimConstraint {
+                                                    constraint: format!("0 <= {idx_dim} < {dim}"),
+                                                    context: format!(
+                                                        "symbolic index `{idx_dim}` is provably out of bounds for axis {src_axis} of size `{dim}`"
+                                                    ),
+                                                    span: Some(idx_w.span),
+                                                },
+                                            ]);
+                                        }
                                     }
                                     src_axis += 1;
                                 }
@@ -2044,6 +2072,66 @@ impl HMInference {
                                             DimExpr::Known(static_slice_axis_len(*n, s, e, st))
                                         }
                                         (d, Some(None), Some(None), Some(1)) => d.clone(),
+                                        (d, _, _, Some(1)) => {
+                                            // P6-3: Symbolic slice bounds & length via `omega`:
+                                            // When `0 <= start < stop <= dim` is provable under positive
+                                            // dims, output length is exact `stop - start` (no clamping).
+                                            // When `stop <= start` is provable, reject provably empty slice.
+                                            let s_dim = match start.as_deref() {
+                                                None => Some(DimExpr::Known(0)),
+                                                Some(w) => self
+                                                    .extract_dim_expr_from_witness(w, &shape_syms),
+                                            };
+                                            let e_dim = match stop.as_deref() {
+                                                None => Some(d.clone()),
+                                                Some(w) => self
+                                                    .extract_dim_expr_from_witness(w, &shape_syms),
+                                            };
+                                            let mut resolved_sym: Option<DimExpr> = None;
+                                            if let (Some(sd), Some(ed)) = (s_dim, e_dim)
+                                                && let (Some(d_aff), Some(s_aff), Some(e_aff)) = (
+                                                    super::omega::AffineExpr::from_dim(d),
+                                                    super::omega::AffineExpr::from_dim(&sd),
+                                                    super::omega::AffineExpr::from_dim(&ed),
+                                                )
+                                            {
+                                                let ctx = super::omega::positive_dim_context(&[
+                                                    d, &sd, &ed,
+                                                ]);
+                                                if ctx.entails_le(&e_aff, &s_aff)
+                                                    == super::omega::SolveResult::True
+                                                {
+                                                    return Err(vec![
+                                                        TypeError::UnsatisfiedDimConstraint {
+                                                            constraint: format!("{sd} < {ed}"),
+                                                            context: format!(
+                                                                "tensor slice on axis {src_axis} of size {d} is provably empty"
+                                                            ),
+                                                            span: Some(span),
+                                                        },
+                                                    ]);
+                                                }
+                                                if ctx.entails_in_bounds(&s_aff, &e_aff)
+                                                    == super::omega::SolveResult::True
+                                                    && ctx.entails_le(&e_aff, &d_aff)
+                                                        == super::omega::SolveResult::True
+                                                {
+                                                    resolved_sym = Some(
+                                                        DimExpr::BinOp(
+                                                            crate::typeck::DimOp::Sub,
+                                                            Box::new(ed),
+                                                            Box::new(sd),
+                                                        )
+                                                        .simplify(),
+                                                    );
+                                                }
+                                            }
+                                            resolved_sym.unwrap_or_else(|| {
+                                                let id = self.fresh_counter;
+                                                self.fresh_counter += 1;
+                                                DimExpr::Var(id)
+                                            })
+                                        }
                                         _ => {
                                             let id = self.fresh_counter;
                                             self.fresh_counter += 1;

@@ -18,6 +18,10 @@ use crate::common::kernel_ir::{
 use crate::common::{BinaryOp, DType, Literal};
 use crate::error::{MoraError, MoraResult};
 use crate::mir::witness::{BuiltinOp, MirWitness, WitnessCallee, WitnessKind};
+use crate::typeck::hm::kernel_bounds::{
+    MAX_KERNEL_BLOCK_DIM, MAX_KERNEL_GRID_DIM, SharedAccessSafety, SharedBoundsProofs,
+    analyze_kernel_shared_bounds_for_codegen,
+};
 
 /// Runtime value of a compiled first-class GPU `kernel` (`Value::GpuKernel`).
 #[derive(Debug, Clone)]
@@ -933,7 +937,7 @@ pub(crate) fn lower_witness_kernel(
 // 2. Backend 1: CUDA PTX ISA 7.0 Emitter (Pure ASCII, sm_50+)
 // ============================================================================
 
-struct PtxEmitter {
+struct PtxEmitter<'a> {
     body: String,
     n_pred: u32,
     n_b16: u32,
@@ -947,10 +951,15 @@ struct PtxEmitter {
     param_tys: Vec<KernelParamType>,
     shared_decls: Vec<KernelSharedArray>,
     local_regs: HashMap<String, (KernelScalarType, String)>,
+    shared_proofs: SharedBoundsProofs<'a>,
 }
 
-impl PtxEmitter {
-    fn new(params: &[KernelParam], shared: &[KernelSharedArray]) -> Self {
+impl<'a> PtxEmitter<'a> {
+    fn new(
+        params: &[KernelParam],
+        shared: &[KernelSharedArray],
+        shared_proofs: SharedBoundsProofs<'a>,
+    ) -> Self {
         Self {
             body: String::with_capacity(1024),
             n_pred: 1,
@@ -965,6 +974,7 @@ impl PtxEmitter {
             param_tys: params.iter().map(|p| p.ty).collect(),
             shared_decls: shared.to_vec(),
             local_regs: HashMap::new(),
+            shared_proofs,
         }
     }
 
@@ -1035,7 +1045,7 @@ impl PtxEmitter {
         let _ = writeln!(self.body, "    {op} {dst}, {src};");
     }
 
-    fn emit_stmts(&mut self, stmts: &[KernelStmt]) {
+    fn emit_stmts(&mut self, stmts: &'a [KernelStmt]) {
         for s in stmts {
             match s {
                 KernelStmt::Let { name, ty, expr } => {
@@ -1122,7 +1132,10 @@ impl PtxEmitter {
                 } => {
                     let idx_reg = self.emit_expr(index);
                     let val_reg = self.emit_expr(value);
-                    let elem_ty = self.shared_decls[*shared_idx].elem_ty;
+                    let safety = self.shared_proofs.safety_for_store(s);
+                    let sh = &self.shared_decls[*shared_idx];
+                    let elem_ty = sh.elem_ty;
+                    let sh_len = sh.len as i32;
                     let base = self.alloc_u64();
                     let off = self.alloc_u64();
                     let ptr = self.alloc_u64();
@@ -1134,7 +1147,21 @@ impl PtxEmitter {
                     let _ = writeln!(self.body, "    mov.u64 {base}, _sh_{shared_idx};");
                     let _ = writeln!(self.body, "    mul.wide.s32 {off}, {idx_reg}, {stride};");
                     let _ = writeln!(self.body, "    add.u64 {ptr}, {base}, {off};");
-                    let _ = writeln!(self.body, "    {st_op} [{ptr}], {val_reg};");
+                    match safety {
+                        SharedAccessSafety::ProvenInBounds => {
+                            let _ = writeln!(self.body, "    {st_op} [{ptr}], {val_reg};");
+                        }
+                        SharedAccessSafety::NeedsRuntimeGuard => {
+                            let p_lo = self.alloc_pred();
+                            let p_hi = self.alloc_pred();
+                            let p_ok = self.alloc_pred();
+                            let _ = writeln!(self.body, "    setp.ge.s32 {p_lo}, {idx_reg}, 0;");
+                            let _ =
+                                writeln!(self.body, "    setp.lt.s32 {p_hi}, {idx_reg}, {sh_len};");
+                            let _ = writeln!(self.body, "    and.pred {p_ok}, {p_lo}, {p_hi};");
+                            let _ = writeln!(self.body, "    @{p_ok} {st_op} [{ptr}], {val_reg};");
+                        }
+                    }
                 }
                 KernelStmt::SyncThreads => {
                     let _ = writeln!(self.body, "    bar.sync 0;");
@@ -1247,7 +1274,7 @@ impl PtxEmitter {
         out
     }
 
-    fn emit_expr(&mut self, expr: &KernelExpr) -> String {
+    fn emit_expr(&mut self, expr: &'a KernelExpr) -> String {
         match expr {
             KernelExpr::ConstI32(v) => {
                 let r = self.alloc_s32();
@@ -1399,18 +1426,39 @@ impl PtxEmitter {
                 elem_ty,
             } => {
                 let idx_reg = self.emit_expr(index);
+                let safety = self.shared_proofs.safety_for_load(expr);
+                let sh_len = self.shared_decls[*shared_idx].len as i32;
                 let base = self.alloc_u64();
                 let off = self.alloc_u64();
                 let ptr = self.alloc_u64();
-                let (stride, ld_op, dst) = match elem_ty {
-                    KernelScalarType::F32 => (4, "ld.shared.f32", self.alloc_f32()),
-                    KernelScalarType::F64 => (8, "ld.shared.f64", self.alloc_f64()),
-                    _ => (4, "ld.shared.s32", self.alloc_s32()),
+                let (stride, ld_op, dst, zero_inst) = match elem_ty {
+                    KernelScalarType::F32 => (4, "ld.shared.f32", self.alloc_f32(), "mov.f32"),
+                    KernelScalarType::F64 => (8, "ld.shared.f64", self.alloc_f64(), "mov.f64"),
+                    _ => (4, "ld.shared.s32", self.alloc_s32(), "mov.s32"),
                 };
                 let _ = writeln!(self.body, "    mov.u64 {base}, _sh_{shared_idx};");
                 let _ = writeln!(self.body, "    mul.wide.s32 {off}, {idx_reg}, {stride};");
                 let _ = writeln!(self.body, "    add.u64 {ptr}, {base}, {off};");
-                let _ = writeln!(self.body, "    {ld_op} {dst}, [{ptr}];");
+                match safety {
+                    SharedAccessSafety::ProvenInBounds => {
+                        let _ = writeln!(self.body, "    {ld_op} {dst}, [{ptr}];");
+                    }
+                    SharedAccessSafety::NeedsRuntimeGuard => {
+                        let p_lo = self.alloc_pred();
+                        let p_hi = self.alloc_pred();
+                        let p_ok = self.alloc_pred();
+                        let zero_lit = match elem_ty {
+                            KernelScalarType::F32 => "0f00000000",
+                            KernelScalarType::F64 => "0d0000000000000000",
+                            _ => "0",
+                        };
+                        let _ = writeln!(self.body, "    {zero_inst} {dst}, {zero_lit};");
+                        let _ = writeln!(self.body, "    setp.ge.s32 {p_lo}, {idx_reg}, 0;");
+                        let _ = writeln!(self.body, "    setp.lt.s32 {p_hi}, {idx_reg}, {sh_len};");
+                        let _ = writeln!(self.body, "    and.pred {p_ok}, {p_lo}, {p_hi};");
+                        let _ = writeln!(self.body, "    @{p_ok} {ld_op} {dst}, [{ptr}];");
+                    }
+                }
                 dst
             }
             KernelExpr::Unary { op, arg, ty } => {
@@ -1704,7 +1752,14 @@ impl PtxEmitter {
 
 /// Compile a typed [`KernelProgram`] to pure-ASCII CUDA PTX ISA 7.0 (`sm_50+`).
 pub(crate) fn emit_ptx(program: &KernelProgram) -> String {
-    let mut em = PtxEmitter::new(&program.params, &program.shared);
+    emit_ptx_for_block(program, None)
+}
+
+/// Compile a typed [`KernelProgram`] to pure-ASCII CUDA PTX ISA 7.0 (`sm_50+`),
+/// specializing Omega shared-memory bounds proofs for optional static `block_dims`.
+pub(crate) fn emit_ptx_for_block(program: &KernelProgram, block_dims: Option<[u32; 3]>) -> String {
+    let shared_proofs = analyze_kernel_shared_bounds_for_codegen(program, block_dims);
+    let mut em = PtxEmitter::new(&program.params, &program.shared, shared_proofs);
     let mut param_decls = Vec::with_capacity(program.params.len());
     for (idx, p) in program.params.iter().enumerate() {
         let pname = format!("param_{idx}");
@@ -1916,7 +1971,7 @@ pub(crate) fn vulkan_kernel_layout(program: &KernelProgram) -> VulkanKernelLayou
     }
 }
 
-struct SpvEmitter {
+struct SpvEmitter<'a> {
     next_id: u32,
     header_words: Vec<u32>,
     deco_words: Vec<u32>,
@@ -1960,13 +2015,14 @@ struct SpvEmitter {
     local_size: [u32; 3],
 
     buf_vars: HashMap<usize, (u32, KernelParamType)>,
-    shared_vars: Vec<(u32, KernelScalarType)>,
+    shared_vars: Vec<(u32, KernelScalarType, u32)>,
     scalar_var: Option<u32>,
     scalar_offsets: HashMap<usize, u32>,
     local_vars: HashMap<String, (KernelScalarType, u32)>,
+    shared_proofs: SharedBoundsProofs<'a>,
 }
 
-impl SpvEmitter {
+impl<'a> SpvEmitter<'a> {
     fn alloc_id(&mut self) -> u32 {
         let id = self.next_id;
         self.next_id += 1;
@@ -2086,7 +2142,7 @@ impl SpvEmitter {
         var_id
     }
 
-    fn emit_stmts(&mut self, stmts: &[KernelStmt]) {
+    fn emit_stmts(&mut self, stmts: &'a [KernelStmt]) {
         for s in stmts {
             match s {
                 KernelStmt::Let { name, ty, expr } => {
@@ -2118,19 +2174,68 @@ impl SpvEmitter {
                 } => {
                     let idx_id = self.emit_expr(index);
                     let val_id = self.emit_expr(value);
-                    let (sh_var, elem_ty) = self.shared_vars[*shared_idx];
+                    let safety = self.shared_proofs.safety_for_store(s);
+                    let (sh_var, elem_ty, sh_len) = self.shared_vars[*shared_idx];
                     let ptr_ty = match elem_ty {
                         KernelScalarType::F64 => self.ty_ptr_wg_f64,
                         KernelScalarType::F32 => self.ty_ptr_wg_f32,
                         _ => self.ty_ptr_wg_i32,
                     };
-                    let ptr = self.alloc_id();
-                    Self::emit(
-                        &mut self.code_words,
-                        SPV_OP_ACCESS_CHAIN,
-                        &[ptr_ty, ptr, sh_var, idx_id],
-                    );
-                    Self::emit(&mut self.code_words, SPV_OP_STORE, &[ptr, val_id]);
+                    match safety {
+                        SharedAccessSafety::ProvenInBounds => {
+                            let ptr = self.alloc_id();
+                            Self::emit(
+                                &mut self.code_words,
+                                SPV_OP_ACCESS_CHAIN,
+                                &[ptr_ty, ptr, sh_var, idx_id],
+                            );
+                            Self::emit(&mut self.code_words, SPV_OP_STORE, &[ptr, val_id]);
+                        }
+                        SharedAccessSafety::NeedsRuntimeGuard => {
+                            let c_zero = self.const_i32(0);
+                            let c_len = self.const_i32(sh_len as i32);
+                            let ge_zero = self.alloc_id();
+                            let lt_len = self.alloc_id();
+                            let in_bounds = self.alloc_id();
+                            Self::emit(
+                                &mut self.code_words,
+                                SPV_OP_SGREATER_THAN_EQUAL,
+                                &[self.ty_bool, ge_zero, idx_id, c_zero],
+                            );
+                            Self::emit(
+                                &mut self.code_words,
+                                SPV_OP_SLESS_THAN,
+                                &[self.ty_bool, lt_len, idx_id, c_len],
+                            );
+                            Self::emit(
+                                &mut self.code_words,
+                                SPV_OP_LOGICAL_AND,
+                                &[self.ty_bool, in_bounds, ge_zero, lt_len],
+                            );
+                            let lbl_ok = self.alloc_id();
+                            let lbl_merge = self.alloc_id();
+                            Self::emit(
+                                &mut self.code_words,
+                                SPV_OP_SELECTION_MERGE,
+                                &[lbl_merge, 0],
+                            );
+                            Self::emit(
+                                &mut self.code_words,
+                                SPV_OP_BRANCH_CONDITIONAL,
+                                &[in_bounds, lbl_ok, lbl_merge],
+                            );
+                            Self::emit(&mut self.code_words, SPV_OP_LABEL, &[lbl_ok]);
+                            let ptr = self.alloc_id();
+                            Self::emit(
+                                &mut self.code_words,
+                                SPV_OP_ACCESS_CHAIN,
+                                &[ptr_ty, ptr, sh_var, idx_id],
+                            );
+                            Self::emit(&mut self.code_words, SPV_OP_STORE, &[ptr, val_id]);
+                            Self::emit(&mut self.code_words, SPV_OP_BRANCH, &[lbl_merge]);
+                            Self::emit(&mut self.code_words, SPV_OP_LABEL, &[lbl_merge]);
+                        }
+                    }
                 }
                 KernelStmt::SyncThreads => {
                     let c_wg = self.const_u32(2); // Scope::Workgroup
@@ -2707,7 +2812,7 @@ impl SpvEmitter {
         }
     }
 
-    fn emit_expr(&mut self, expr: &KernelExpr) -> u32 {
+    fn emit_expr(&mut self, expr: &'a KernelExpr) -> u32 {
         match expr {
             KernelExpr::ConstI32(v) => self.const_i32(*v),
             KernelExpr::ConstF32(v) => self.const_f32(*v),
@@ -2803,21 +2908,74 @@ impl SpvEmitter {
                 elem_ty,
             } => {
                 let idx_id = self.emit_expr(index);
-                let (sh_var, _) = self.shared_vars[*shared_idx];
+                let safety = self.shared_proofs.safety_for_load(expr);
+                let (sh_var, _, sh_len) = self.shared_vars[*shared_idx];
                 let (ptr_ty, val_ty) = match elem_ty {
                     KernelScalarType::F64 => (self.ty_ptr_wg_f64, self.ty_f64),
                     KernelScalarType::F32 => (self.ty_ptr_wg_f32, self.ty_f32),
                     _ => (self.ty_ptr_wg_i32, self.ty_i32),
                 };
-                let ptr = self.alloc_id();
-                let val = self.alloc_id();
-                Self::emit(
-                    &mut self.code_words,
-                    SPV_OP_ACCESS_CHAIN,
-                    &[ptr_ty, ptr, sh_var, idx_id],
-                );
-                Self::emit(&mut self.code_words, SPV_OP_LOAD, &[val_ty, val, ptr]);
-                val
+                match safety {
+                    SharedAccessSafety::ProvenInBounds => {
+                        let ptr = self.alloc_id();
+                        let val = self.alloc_id();
+                        Self::emit(
+                            &mut self.code_words,
+                            SPV_OP_ACCESS_CHAIN,
+                            &[ptr_ty, ptr, sh_var, idx_id],
+                        );
+                        Self::emit(&mut self.code_words, SPV_OP_LOAD, &[val_ty, val, ptr]);
+                        val
+                    }
+                    SharedAccessSafety::NeedsRuntimeGuard => {
+                        let c_zero = self.const_i32(0);
+                        let c_len = self.const_i32(sh_len as i32);
+                        let ge_zero = self.alloc_id();
+                        let lt_len = self.alloc_id();
+                        let in_bounds = self.alloc_id();
+                        let safe_idx = self.alloc_id();
+                        Self::emit(
+                            &mut self.code_words,
+                            SPV_OP_SGREATER_THAN_EQUAL,
+                            &[self.ty_bool, ge_zero, idx_id, c_zero],
+                        );
+                        Self::emit(
+                            &mut self.code_words,
+                            SPV_OP_SLESS_THAN,
+                            &[self.ty_bool, lt_len, idx_id, c_len],
+                        );
+                        Self::emit(
+                            &mut self.code_words,
+                            SPV_OP_LOGICAL_AND,
+                            &[self.ty_bool, in_bounds, ge_zero, lt_len],
+                        );
+                        Self::emit(
+                            &mut self.code_words,
+                            SPV_OP_SELECT,
+                            &[self.ty_i32, safe_idx, in_bounds, idx_id, c_zero],
+                        );
+                        let ptr = self.alloc_id();
+                        let loaded = self.alloc_id();
+                        Self::emit(
+                            &mut self.code_words,
+                            SPV_OP_ACCESS_CHAIN,
+                            &[ptr_ty, ptr, sh_var, safe_idx],
+                        );
+                        Self::emit(&mut self.code_words, SPV_OP_LOAD, &[val_ty, loaded, ptr]);
+                        let zero_val = match elem_ty {
+                            KernelScalarType::F64 => self.const_f64(0.0),
+                            KernelScalarType::F32 => self.const_f32(0.0),
+                            _ => c_zero,
+                        };
+                        let res = self.alloc_id();
+                        Self::emit(
+                            &mut self.code_words,
+                            SPV_OP_SELECT,
+                            &[val_ty, res, in_bounds, loaded, zero_val],
+                        );
+                        res
+                    }
+                }
             }
             KernelExpr::Unary { op, arg, ty } => {
                 let src = self.emit_expr(arg);
@@ -3043,8 +3201,15 @@ pub(crate) fn emit_spirv_words(
         local_size[1].max(1),
         local_size[2].max(1),
     ];
+    if local_size.iter().any(|&d| d > MAX_KERNEL_BLOCK_DIM) {
+        return Err(MoraError::Runtime(format!(
+            "kernel '{}': SPIR-V local_size {local_size:?} exceeds maximum per-axis workgroup size ({MAX_KERNEL_BLOCK_DIM})",
+            program.name
+        )));
+    }
     let uses_f64 = program.uses_f64();
     let layout = vulkan_kernel_layout(program);
+    let shared_proofs = analyze_kernel_shared_bounds_for_codegen(program, Some(local_size));
 
     let mut em = SpvEmitter {
         next_id: 1,
@@ -3090,6 +3255,7 @@ pub(crate) fn emit_spirv_words(
         scalar_var: None,
         scalar_offsets: layout.scalar_word_offsets.clone(),
         local_vars: HashMap::new(),
+        shared_proofs,
     };
 
     // Capabilities & GLSL.std.450 import
@@ -3430,7 +3596,7 @@ pub(crate) fn emit_spirv_words(
             SPV_OP_VARIABLE,
             &[ty_ptr_arr, var_id, SPV_SC_WORKGROUP],
         );
-        em.shared_vars.push((var_id, sh.elem_ty));
+        em.shared_vars.push((var_id, sh.elem_ty, sh.len));
     }
 
     // Optional trailing scalar parameter buffer at binding = buf_bindings.len()
@@ -3503,6 +3669,13 @@ pub(crate) fn emit_spirv_words(
 
 /// Compile a typed [`KernelProgram`] to Metal Shading Language (MSL) compute source.
 pub(crate) fn emit_msl(program: &KernelProgram) -> String {
+    emit_msl_for_block(program, None)
+}
+
+/// Compile a typed [`KernelProgram`] to Metal Shading Language (MSL) compute source,
+/// specializing Omega shared-memory bounds proofs for optional static `block_dims`.
+pub(crate) fn emit_msl_for_block(program: &KernelProgram, block_dims: Option<[u32; 3]>) -> String {
+    let shared_proofs = analyze_kernel_shared_bounds_for_codegen(program, block_dims);
     let mut out = String::with_capacity(1024);
     let _ = writeln!(out, "#include <metal_stdlib>");
     let _ = writeln!(out, "using namespace metal;");
@@ -3600,12 +3773,18 @@ pub(crate) fn emit_msl(program: &KernelProgram) -> String {
         };
         let _ = writeln!(out, "    threadgroup {mty} _sh_{sidx}[{}];", sh.len);
     }
-    emit_msl_stmts(&mut out, program, &program.body, 1);
+    emit_msl_stmts(&mut out, program, &program.body, 1, &shared_proofs);
     let _ = writeln!(out, "}}");
     out
 }
 
-fn emit_msl_stmts(out: &mut String, program: &KernelProgram, stmts: &[KernelStmt], indent: usize) {
+fn emit_msl_stmts<'a>(
+    out: &mut String,
+    program: &'a KernelProgram,
+    stmts: &'a [KernelStmt],
+    indent: usize,
+    proofs: &SharedBoundsProofs<'a>,
+) {
     let pad = "    ".repeat(indent);
     for s in stmts {
         match s {
@@ -3615,11 +3794,11 @@ fn emit_msl_stmts(out: &mut String, program: &KernelProgram, stmts: &[KernelStmt
                     KernelScalarType::F32 | KernelScalarType::F64 => "float",
                     KernelScalarType::Bool => "bool",
                 };
-                let e = emit_msl_expr(program, expr);
+                let e = emit_msl_expr(program, expr, proofs);
                 let _ = writeln!(out, "{pad}{mty} {name} = {e};");
             }
             KernelStmt::Assign { name, expr } => {
-                let e = emit_msl_expr(program, expr);
+                let e = emit_msl_expr(program, expr, proofs);
                 let _ = writeln!(out, "{pad}{name} = {e};");
             }
             KernelStmt::Store {
@@ -3629,8 +3808,8 @@ fn emit_msl_stmts(out: &mut String, program: &KernelProgram, stmts: &[KernelStmt
             } => {
                 let p = &program.params[*buf_param];
                 let bname = &p.name;
-                let idx = emit_msl_expr(program, index);
-                let val = emit_msl_expr(program, value);
+                let idx = emit_msl_expr(program, index, proofs);
+                let val = emit_msl_expr(program, value, proofs);
                 match p.ty {
                     KernelParamType::BufF16 => {
                         let _ = writeln!(out, "{pad}{bname}[{idx}] = half({val});");
@@ -3651,9 +3830,21 @@ fn emit_msl_stmts(out: &mut String, program: &KernelProgram, stmts: &[KernelStmt
                 index,
                 value,
             } => {
-                let idx = emit_msl_expr(program, index);
-                let val = emit_msl_expr(program, value);
-                let _ = writeln!(out, "{pad}_sh_{shared_idx}[{idx}] = {val};");
+                let idx = emit_msl_expr(program, index, proofs);
+                let val = emit_msl_expr(program, value, proofs);
+                let safety = proofs.safety_for_store(s);
+                let sh_len = program.shared[*shared_idx].len;
+                match safety {
+                    SharedAccessSafety::ProvenInBounds => {
+                        let _ = writeln!(out, "{pad}_sh_{shared_idx}[{idx}] = {val};");
+                    }
+                    SharedAccessSafety::NeedsRuntimeGuard => {
+                        let _ = writeln!(
+                            out,
+                            "{pad}{{ int _sh_i = ({idx}); if (_sh_i >= 0 && _sh_i < {sh_len}) {{ _sh_{shared_idx}[_sh_i] = {val}; }} }}"
+                        );
+                    }
+                }
             }
             KernelStmt::SyncThreads => {
                 let _ = writeln!(out, "{pad}threadgroup_barrier(mem_flags::mem_threadgroup);");
@@ -3663,28 +3854,32 @@ fn emit_msl_stmts(out: &mut String, program: &KernelProgram, stmts: &[KernelStmt
                 then_body,
                 else_body,
             } => {
-                let c = emit_msl_expr(program, cond);
+                let c = emit_msl_expr(program, cond, proofs);
                 let _ = writeln!(out, "{pad}if ({c}) {{");
-                emit_msl_stmts(out, program, then_body, indent + 1);
+                emit_msl_stmts(out, program, then_body, indent + 1, proofs);
                 if else_body.is_empty() {
                     let _ = writeln!(out, "{pad}}}");
                 } else {
                     let _ = writeln!(out, "{pad}}} else {{");
-                    emit_msl_stmts(out, program, else_body, indent + 1);
+                    emit_msl_stmts(out, program, else_body, indent + 1, proofs);
                     let _ = writeln!(out, "{pad}}}");
                 }
             }
             KernelStmt::While { cond, body } => {
-                let c = emit_msl_expr(program, cond);
+                let c = emit_msl_expr(program, cond, proofs);
                 let _ = writeln!(out, "{pad}while ({c}) {{");
-                emit_msl_stmts(out, program, body, indent + 1);
+                emit_msl_stmts(out, program, body, indent + 1, proofs);
                 let _ = writeln!(out, "{pad}}}");
             }
         }
     }
 }
 
-fn emit_msl_expr(program: &KernelProgram, expr: &KernelExpr) -> String {
+fn emit_msl_expr<'a>(
+    program: &'a KernelProgram,
+    expr: &'a KernelExpr,
+    proofs: &SharedBoundsProofs<'a>,
+) -> String {
     match expr {
         KernelExpr::ConstI32(v) => format!("{v}"),
         KernelExpr::ConstF32(v) => format!("{v:?}f"),
@@ -3711,7 +3906,7 @@ fn emit_msl_expr(program: &KernelProgram, expr: &KernelExpr) -> String {
             buf_param, index, ..
         } => {
             let p = &program.params[*buf_param];
-            let idx = emit_msl_expr(program, index);
+            let idx = emit_msl_expr(program, index, proofs);
             match p.ty {
                 KernelParamType::BufF16 => format!("float({}[{idx}])", p.name),
                 KernelParamType::BufBF16 => format!("_mora_bf16_to_f32({}[{idx}])", p.name),
@@ -3720,12 +3915,28 @@ fn emit_msl_expr(program: &KernelProgram, expr: &KernelExpr) -> String {
             }
         }
         KernelExpr::LoadShared {
-            shared_idx, index, ..
+            shared_idx,
+            index,
+            elem_ty,
         } => {
-            format!("_sh_{shared_idx}[{}]", emit_msl_expr(program, index))
+            let idx = emit_msl_expr(program, index, proofs);
+            let safety = proofs.safety_for_load(expr);
+            let sh_len = program.shared[*shared_idx].len;
+            match safety {
+                SharedAccessSafety::ProvenInBounds => format!("_sh_{shared_idx}[{idx}]"),
+                SharedAccessSafety::NeedsRuntimeGuard => {
+                    let zero = match elem_ty {
+                        KernelScalarType::F32 | KernelScalarType::F64 => "0.0f",
+                        _ => "0",
+                    };
+                    format!(
+                        "(({idx}) >= 0 && ({idx}) < {sh_len} ? _sh_{shared_idx}[({idx})] : {zero})"
+                    )
+                }
+            }
         }
         KernelExpr::Unary { op, arg, .. } => {
-            let a = emit_msl_expr(program, arg);
+            let a = emit_msl_expr(program, arg, proofs);
             match op {
                 KernelUnaryOp::Neg => format!("(-({a}))"),
                 KernelUnaryOp::Not => format!("(!({a}))"),
@@ -3738,8 +3949,8 @@ fn emit_msl_expr(program: &KernelProgram, expr: &KernelExpr) -> String {
             }
         }
         KernelExpr::Binary { op, lhs, rhs, .. } => {
-            let l = emit_msl_expr(program, lhs);
-            let r = emit_msl_expr(program, rhs);
+            let l = emit_msl_expr(program, lhs, proofs);
+            let r = emit_msl_expr(program, rhs, proofs);
             match op {
                 KernelBinOp::Min => format!("min({l}, {r})"),
                 KernelBinOp::Max => format!("max({l}, {r})"),
@@ -3853,6 +4064,18 @@ pub(crate) fn launch_compiled_kernel(
     if grid.contains(&0) || block.contains(&0) {
         return Err(MoraError::Runtime(format!(
             "kernel '{}': grid ({grid:?}) and block ({block:?}) dimensions must all be positive",
+            kernel.name()
+        )));
+    }
+    if block.iter().any(|&d| d > MAX_KERNEL_BLOCK_DIM) {
+        return Err(MoraError::Runtime(format!(
+            "kernel '{}': block dimensions ({block:?}) exceed maximum supported per-axis workgroup size ({MAX_KERNEL_BLOCK_DIM})",
+            kernel.name()
+        )));
+    }
+    if grid.iter().any(|&d| d > MAX_KERNEL_GRID_DIM) {
+        return Err(MoraError::Runtime(format!(
+            "kernel '{}': grid dimensions ({grid:?}) exceed maximum signed i32 grid dimension ({MAX_KERNEL_GRID_DIM})",
             kernel.name()
         )));
     }
@@ -4387,39 +4610,30 @@ fn step_cpu_thread_until_barrier<'a>(
                             &th.locals,
                             kernel_name,
                         )?;
-                        if idx < 0 {
-                            return Err(MoraError::Runtime(format!(
-                                "kernel '{kernel_name}': negative shared store index {idx}"
-                            )));
-                        }
-                        let ui = idx as usize;
+                        // P6-3B: Match CUDA PTX / Vulkan SPIR-V / Metal MSL predicated guard semantics
+                        // on runtime-guarded shared-memory stores (OOB store is a safe no-op).
+                        let in_range = usize::try_from(idx).ok();
                         match (&mut shared[*shared_idx], val) {
                             (CpuSharedBuf::F32(buf), CpuScalar::F32(v)) => {
-                                if ui >= buf.len() {
-                                    return Err(MoraError::Runtime(format!(
-                                        "kernel '{kernel_name}': shared store index {ui} out of bounds (len {})",
-                                        buf.len()
-                                    )));
+                                if let Some(ui) = in_range
+                                    && let Some(slot) = buf.get_mut(ui)
+                                {
+                                    *slot = v;
                                 }
-                                buf[ui] = v;
                             }
                             (CpuSharedBuf::F64(buf), CpuScalar::F64(v)) => {
-                                if ui >= buf.len() {
-                                    return Err(MoraError::Runtime(format!(
-                                        "kernel '{kernel_name}': shared store index {ui} out of bounds (len {})",
-                                        buf.len()
-                                    )));
+                                if let Some(ui) = in_range
+                                    && let Some(slot) = buf.get_mut(ui)
+                                {
+                                    *slot = v;
                                 }
-                                buf[ui] = v;
                             }
                             (CpuSharedBuf::I32(buf), CpuScalar::I32(v)) => {
-                                if ui >= buf.len() {
-                                    return Err(MoraError::Runtime(format!(
-                                        "kernel '{kernel_name}': shared store index {ui} out of bounds (len {})",
-                                        buf.len()
-                                    )));
+                                if let Some(ui) = in_range
+                                    && let Some(slot) = buf.get_mut(ui)
+                                {
+                                    *slot = v;
                                 }
-                                buf[ui] = v;
                             }
                             _ => {
                                 return Err(MoraError::Runtime(format!(
@@ -4624,38 +4838,20 @@ fn eval_cpu_expr(
                     "kernel '{kernel_name}': non-i32 shared load index"
                 )));
             };
-            if idx < 0 {
-                return Err(MoraError::Runtime(format!(
-                    "kernel '{kernel_name}': negative shared load index {idx}"
-                )));
-            }
-            let ui = idx as usize;
-            match &shared[*shared_idx] {
+            // P6-3B: Match CUDA PTX / Vulkan SPIR-V / Metal MSL predicated guard semantics
+            // on runtime-guarded shared-memory loads (OOB load yields zero).
+            let in_range = usize::try_from(idx).ok();
+            Ok(match &shared[*shared_idx] {
                 CpuSharedBuf::F32(buf) => {
-                    buf.get(ui).copied().map(CpuScalar::F32).ok_or_else(|| {
-                        MoraError::Runtime(format!(
-                            "kernel '{kernel_name}': shared load index {ui} out of bounds (len {})",
-                            buf.len()
-                        ))
-                    })
+                    CpuScalar::F32(in_range.and_then(|ui| buf.get(ui).copied()).unwrap_or(0.0))
                 }
                 CpuSharedBuf::F64(buf) => {
-                    buf.get(ui).copied().map(CpuScalar::F64).ok_or_else(|| {
-                        MoraError::Runtime(format!(
-                            "kernel '{kernel_name}': shared load index {ui} out of bounds (len {})",
-                            buf.len()
-                        ))
-                    })
+                    CpuScalar::F64(in_range.and_then(|ui| buf.get(ui).copied()).unwrap_or(0.0))
                 }
                 CpuSharedBuf::I32(buf) => {
-                    buf.get(ui).copied().map(CpuScalar::I32).ok_or_else(|| {
-                        MoraError::Runtime(format!(
-                            "kernel '{kernel_name}': shared load index {ui} out of bounds (len {})",
-                            buf.len()
-                        ))
-                    })
+                    CpuScalar::I32(in_range.and_then(|ui| buf.get(ui).copied()).unwrap_or(0))
                 }
-            }
+            })
         }
         KernelExpr::Unary { op, arg, .. } => {
             let v = eval_cpu_expr(arg, coords, args, shared, locals, kernel_name)?;

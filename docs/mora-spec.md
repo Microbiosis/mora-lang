@@ -328,7 +328,7 @@ Int(i) ⊑ Float(f) ⟺ i =_exact f        （i 装不下 f64 时恒为 false）
    - 底层存储 `AlignedByteBuffer` 采用 64 字节缓存行对齐分配；支持零拷贝步幅视图（`transpose`、`reshape`、多维切片 `t[0..4, :, None, ::-1]`）。
 2. **编译期 5 项 AI-Native 静态检查**（`src/typeck/hm/`）：
    - **DType 检查**：禁止不同精度张量隐式混算，算子输入满足硬件位宽契约。
-   - **Shape 检查**：符号维度合一（`[M, K] @ [K, N] -> [M, N]`）、广播兼容性与静态切片越界拦截。
+   - **Shape 检查**：符号维度合一（`[M, K] @ [K, N] -> [M, N]`）、广播兼容性、基于 Presburger 线性算术求解器（`src/typeck/hm/omega.rs`）的 `Tensor::cat` / `reshape` 体积守恒与静态切片越界拦截，以及 GPU `kernel` 共享内存路径敏感边界证明与越界守卫消除（`src/typeck/hm/kernel_bounds.rs`；按 32 位回绕 `i32` 语义逐算子校验无溢出侧条件并由运行时 `launch` 强制 `1 <= block_dim <= 65535`、`1 <= grid_dim <= i32::MAX`，证明结果按 Kernel IR 访问点身份直接绑定）。所有张量维度均满足 `dim >= 1` 域不变量（静态 `omega::positive_dim_context` 与运行时 `src/value/tensor.rs::checked_numel`、`Tensor::slice_nd` 互为依据；静态符号切片/下标检查为编译期精度增强，被接受的符号下标仍由 `Tensor::slice_nd` 运行时边界检查兜底）。
    - **Device 检查**：静态追踪设备位置（`cpu`、`cuda:N`、`vulkan:N`、`metal:N`），禁止未显式 `.to_device(...)` 的跨设备混算。
    - **Resource 检查**：作用域资源配额与自动微分磁带期间的原位修改（`tensor_mutate`）/ 别名安全校验。
    - **Effect 检查**：封闭效果行包含校验，静态拦截对含原位变异或非纯副作用函数求导。

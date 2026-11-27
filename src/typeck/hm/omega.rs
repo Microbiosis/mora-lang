@@ -934,7 +934,6 @@ impl OmegaContext {
     }
 
     /// Assume `atom >= 0` (index / `fin<N>` / GPU thread index domain invariant).
-    #[cfg(test)]
     pub(crate) fn assume_non_negative(&mut self, atom: DimAtom) {
         self.assume_le(&AffineExpr::constant(0), &AffineExpr::atom(atom));
     }
@@ -945,7 +944,6 @@ impl OmegaContext {
     }
 
     /// Assume `lhs == rhs`.
-    #[cfg(test)]
     pub(crate) fn assume_eq(&mut self, lhs: &AffineExpr, rhs: &AffineExpr) {
         if let Some(diff) = lhs.sub(rhs) {
             self.equalities.push(LinForm::from_affine(&diff));
@@ -1580,6 +1578,15 @@ fn solve_system(
 
 /// Build an [`OmegaContext`] seeded with positivity (`>= 1`) for every symbolic/meta atom
 /// referenced in `dims`.
+///
+/// # Domain Invariant Cross-Reference
+/// The `dim >= 1` invariant for all Mora tensor dimensions is enforced at runtime by:
+/// - [`crate::value::tensor::checked_numel`] (`"Tensor shape dimensions must be positive (> 0)"`)
+/// - [`crate::value::tensor::Tensor::slice_nd`] (`"Tensor slice produces empty dimension (size 0)"`)
+///
+/// Static symbolic slice/index proofs built on this context are a compile-time precision
+/// enhancement (rejecting provably empty slices and provably out-of-bounds indices); accepted
+/// symbolic indices remain guarded by runtime bounds checks in `Tensor::slice_nd`.
 pub(crate) fn positive_dim_context(dims: &[&DimExpr]) -> OmegaContext {
     let mut ctx = OmegaContext::new();
     let mut seen = std::collections::HashSet::new();

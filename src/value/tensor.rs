@@ -660,6 +660,9 @@ pub fn contiguous_strides(shape: &[usize]) -> Vec<isize> {
 }
 
 /// Checked total element count of `shape`.
+///
+/// Enforces Mora's runtime `dim >= 1` tensor dimension invariant, which backs the compile-time
+/// positivity assumption in [`crate::typeck::hm::omega::positive_dim_context`].
 pub fn checked_numel(shape: &[usize]) -> MoraResult<usize> {
     if shape.is_empty() {
         return Ok(1);
@@ -1935,6 +1938,10 @@ impl Tensor {
     }
 
     /// Stage 3C: Zero-copy multi-dimensional strided slicing `t[0..4, :, -1]`, `t[1:5:2, ..., None]`.
+    ///
+    /// Enforces non-empty output dimensions (`dim >= 1`, paired with
+    /// [`crate::typeck::hm::omega::positive_dim_context`]) and acts as the runtime bounds-check
+    /// backstop for symbolic indices accepted by compile-time HM slice verification.
     pub fn slice_nd(
         self: &Arc<Self>,
         axes: &[RuntimeSliceAxis],

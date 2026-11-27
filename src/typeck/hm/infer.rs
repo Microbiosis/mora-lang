@@ -1652,7 +1652,12 @@ impl HMInference {
             }
         }
         if let Type::GpuKernel(ref sig) = resolved_recv {
+            let recv_name = receiver_witness.and_then(|w| match &w.kind {
+                WitnessKind::Variable(name) => Some(name.as_str()),
+                _ => None,
+            });
             return self.infer_gpu_kernel_method(
+                recv_name,
                 sig.as_deref(),
                 method,
                 args,

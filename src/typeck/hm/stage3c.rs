@@ -3317,14 +3317,29 @@ impl HMInference {
         body: &[MirWitness],
         span: Span,
     ) -> Result<(Type, EffectRow), Vec<TypeError>> {
-        if let Err(err) =
-            crate::runtime::gpu::kernel_compiler::lower_witness_kernel(name, params, shared, body)
+        match crate::runtime::gpu::kernel_compiler::lower_witness_kernel(name, params, shared, body)
         {
-            self.errors.push(TypeError::UnificationFailure {
-                expected: format!("valid GPU kernel definition '{name}'"),
-                got: err.to_string(),
-                span: Some(span),
-            });
+            Ok(kprog) => {
+                if let Err(violations) =
+                    crate::typeck::hm::kernel_bounds::verify_kernel_shared_bounds(&kprog, None)
+                {
+                    for v in violations {
+                        self.errors.push(TypeError::UnsatisfiedDimConstraint {
+                            constraint: v.constraint,
+                            context: v.context,
+                            span: Some(span),
+                        });
+                    }
+                }
+                self.kernel_programs.insert(name.to_string(), kprog);
+            }
+            Err(err) => {
+                self.errors.push(TypeError::UnificationFailure {
+                    expected: format!("valid GPU kernel definition '{name}'"),
+                    got: err.to_string(),
+                    span: Some(span),
+                });
+            }
         }
         let sig: Vec<crate::common::kernel_ir::KernelParamType> =
             params.iter().map(|p| p.ty).collect();
@@ -3334,9 +3349,40 @@ impl HMInference {
         Ok((Type::Nil, EffectRow::Empty))
     }
 
+    fn extract_static_kernel_block_dims(arg: &MirWitness) -> Option<[u32; 3]> {
+        fn const_pos_u32(w: &MirWitness) -> Option<u32> {
+            match &w.kind {
+                WitnessKind::Literal(crate::common::Literal::Int(v, _))
+                    if *v >= 1
+                        && *v
+                            <= i64::from(
+                                crate::typeck::hm::kernel_bounds::MAX_KERNEL_BLOCK_DIM,
+                            ) =>
+                {
+                    u32::try_from(*v).ok()
+                }
+                _ => None,
+            }
+        }
+        if let Some(bx) = const_pos_u32(arg) {
+            return Some([bx, 1, 1]);
+        }
+        if let WitnessKind::List(items) = &arg.kind {
+            match items.as_slice() {
+                [x] => Some([const_pos_u32(x)?, 1, 1]),
+                [x, y] => Some([const_pos_u32(x)?, const_pos_u32(y)?, 1]),
+                [x, y, z] => Some([const_pos_u32(x)?, const_pos_u32(y)?, const_pos_u32(z)?]),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn infer_gpu_kernel_method(
         &mut self,
+        recv_name: Option<&str>,
         sig: Option<&[crate::common::kernel_ir::KernelParamType]>,
         method: &str,
         args: &[MirWitness],
@@ -3403,6 +3449,23 @@ impl HMInference {
                             Err(e) => self.errors.push(e),
                         }
                     }
+                    if let Some(kname) = recv_name
+                        && let Some(kprog) = self.kernel_programs.get(kname)
+                        && let Some(block_dims) = Self::extract_static_kernel_block_dims(a)
+                        && let Err(violations) =
+                            crate::typeck::hm::kernel_bounds::verify_kernel_shared_bounds(
+                                kprog,
+                                Some(block_dims),
+                            )
+                    {
+                        for v in violations {
+                            self.errors.push(TypeError::UnsatisfiedDimConstraint {
+                                constraint: v.constraint,
+                                context: v.context,
+                                span: Some(a.span),
+                            });
+                        }
+                    }
                 }
                 Ok((Type::List(Box::new(Type::Int)), acc_row))
             }
@@ -3434,6 +3497,24 @@ impl HMInference {
                             Ok(s) => self.subst = s,
                             Err(e) => self.errors.push(e),
                         }
+                    }
+                }
+                // P6-3B: Re-verify shared-memory bounds when `block` geometry is statically known.
+                if let Some(kname) = recv_name
+                    && let Some(kprog) = self.kernel_programs.get(kname)
+                    && let Some(block_dims) = Self::extract_static_kernel_block_dims(&args[1])
+                    && let Err(violations) =
+                        crate::typeck::hm::kernel_bounds::verify_kernel_shared_bounds(
+                            kprog,
+                            Some(block_dims),
+                        )
+                {
+                    for v in violations {
+                        self.errors.push(TypeError::UnsatisfiedDimConstraint {
+                            constraint: v.constraint,
+                            context: v.context,
+                            span: Some(args[1].span),
+                        });
                     }
                 }
                 let kargs = &args[2..];

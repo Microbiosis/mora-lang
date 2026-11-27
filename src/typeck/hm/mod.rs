@@ -20,6 +20,7 @@ pub mod env;
 pub mod error;
 pub mod generalize;
 mod infer;
+pub(crate) mod kernel_bounds;
 pub(crate) mod omega;
 pub mod row;
 mod stage3c;
@@ -186,6 +187,8 @@ pub struct HMInference {
     pub pool_byte_quotas: HashMap<String, usize>,
     /// P6-3: Active const-generic parameter names in the current `impl`/`task` body scope.
     pub active_const_params: HashSet<String>,
+    /// P6-3B: Compiled GPU kernel IRs keyed by kernel name for launch-time static shared-bounds verification.
+    pub kernel_programs: HashMap<String, crate::common::kernel_ir::KernelProgram>,
 }
 
 impl HMInference {

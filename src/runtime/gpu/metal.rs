@@ -683,7 +683,7 @@ mod macos_impl {
     use crate::runtime::compute_dag::{
         DeviceBackend, DeviceVramBuffer, FusedAct, FusedEwStep, VramTelemetry,
     };
-    use crate::runtime::gpu::kernel_compiler::{KernelLaunchArg, emit_msl};
+    use crate::runtime::gpu::kernel_compiler::{KernelLaunchArg, emit_msl_for_block};
     use crate::runtime::gpu::{DynLib, GpuDeviceInfo, HardwareBackendEntry, VramCounters};
     use crate::runtime::simd_kernels;
 
@@ -822,7 +822,7 @@ mod macos_impl {
         pipe_fused_ew_f16: Id,
         pipe_fused_ew_bf16: Id,
         dummy_buf: Id,
-        custom_pipes: HashMap<u64, Id>,
+        custom_pipes: HashMap<(u64, [u32; 3]), Id>,
     }
 
     struct MetalDeviceInner {
@@ -2633,12 +2633,25 @@ mod macos_impl {
             if kernel.uses_f64() {
                 return Ok(false);
             }
-            let hash = kernel.content_hash();
+            let local_size = [block[0].max(1), block[1].max(1), block[2].max(1)];
+            let block_key = if kernel.shared.is_empty() {
+                [0, 0, 0]
+            } else {
+                local_size
+            };
+            let cache_key = (kernel.content_hash(), block_key);
             let mut st = self.inner.state.lock();
-            let pipeline = if let Some(&p) = st.custom_pipes.get(&hash) {
+            let pipeline = if let Some(&p) = st.custom_pipes.get(&cache_key) {
                 p
             } else {
-                let msl_src = emit_msl(kernel);
+                let msl_src = emit_msl_for_block(
+                    kernel,
+                    if kernel.shared.is_empty() {
+                        None
+                    } else {
+                        Some(local_size)
+                    },
+                );
                 // SAFETY: Compiles generated MSL source on `st.mtl_dev` via `newLibraryWithSource:options:error:`
                 // and extracts the named compute pipeline state, releasing temporary ObjC objects immediately.
                 let compiled = unsafe {
@@ -2670,7 +2683,7 @@ mod macos_impl {
                         ))
                     })?
                 };
-                st.custom_pipes.insert(hash, compiled);
+                st.custom_pipes.insert(cache_key, compiled);
                 compiled
             };
 

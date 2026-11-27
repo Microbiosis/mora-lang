@@ -280,8 +280,9 @@ struct CudaContextState {
     ctx: CuContext,
     kernels: CudaKernels,
     arena: CudaVramArena,
-    /// P4-1B: Cached compiled user-defined GPU `kernel` modules keyed by `KernelProgram::content_hash()`.
-    custom_modules: HashMap<u64, (CuModule, CuFunction)>,
+    /// P4-1B/P6-3B: Cached compiled user-defined GPU `kernel` modules keyed by
+    /// `(KernelProgram::content_hash(), block_key)` (block geometry specialization when shared memory is used).
+    custom_modules: HashMap<(u64, [u32; 3]), (CuModule, CuFunction)>,
 }
 
 struct CudaDeviceInner {
@@ -4188,18 +4189,31 @@ impl DeviceBackend for CudaDeviceBackend {
         block: [u32; 3],
         args: &[crate::runtime::gpu::kernel_compiler::KernelLaunchArg],
     ) -> MoraResult<bool> {
-        use crate::runtime::gpu::kernel_compiler::{KernelLaunchArg, emit_ptx};
+        use crate::runtime::gpu::kernel_compiler::{KernelLaunchArg, emit_ptx_for_block};
 
         let mut st = self.inner.state.lock();
         // SAFETY: Bind retained primary CUDA context before compiling/launching custom kernel.
         let rc_ctx = unsafe { (self.inner.api.cu_ctx_set_current)(st.ctx) };
         cu_check(rc_ctx, "cuCtxSetCurrent(launch_custom_kernel)")?;
 
-        let hash = kernel.content_hash();
-        let func = if let Some(&(_, f)) = st.custom_modules.get(&hash) {
+        let local_size = [block[0].max(1), block[1].max(1), block[2].max(1)];
+        let block_key = if kernel.shared.is_empty() {
+            [0, 0, 0]
+        } else {
+            local_size
+        };
+        let cache_key = (kernel.content_hash(), block_key);
+        let func = if let Some(&(_, f)) = st.custom_modules.get(&cache_key) {
             f
         } else {
-            let ptx = emit_ptx(kernel);
+            let ptx = emit_ptx_for_block(
+                kernel,
+                if kernel.shared.is_empty() {
+                    None
+                } else {
+                    Some(local_size)
+                },
+            );
             let ptx_nul = CString::new(ptx).map_err(|e| {
                 MoraError::Runtime(format!("CUDA custom kernel PTX contains interior NUL: {e}"))
             })?;
@@ -4254,7 +4268,7 @@ impl DeviceBackend for CudaDeviceBackend {
                     return Err(e);
                 }
             };
-            st.custom_modules.insert(hash, (module, f));
+            st.custom_modules.insert(cache_key, (module, f));
             f
         };
 

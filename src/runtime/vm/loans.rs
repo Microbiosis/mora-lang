@@ -101,6 +101,9 @@ impl ScriptFrame {
     }
 
     pub(crate) fn borrow_local(&mut self, dst: VReg, local: LocalSlot, parents: &[CallFrame]) {
+        if let Some(i) = self.loans.registers.iter().position(|(r, _)| *r == dst) {
+            self.loans.registers.swap_remove(i);
+        }
         let source = self.local_address(local, parents.len());
         match source.resolve(parents, self) {
             RegSlot::Heap(_) => {
@@ -142,6 +145,20 @@ impl ScriptFrame {
 
     pub(crate) fn has_borrowed_parameters(&self) -> bool {
         !self.loans.parameters.is_empty()
+    }
+
+    /// Resolve `local` for reflective `eval` snapshots, following an active parameter loan
+    /// rather than reading the `Nil` placeholder stored in `self.locals`.
+    pub(crate) fn snapshot_local_value(
+        &self,
+        local: LocalSlot,
+        parents: &[CallFrame],
+    ) -> crate::value::Value {
+        if let Some((_, source)) = self.loans.parameters.iter().find(|(p, _)| *p == local) {
+            source.resolve(parents, self).to_value()
+        } else {
+            self.locals[local.0 as usize].get()
+        }
     }
 
     /// 续延可能离开创建它的调用栈，先把外部引用解析为可独立复制的值。

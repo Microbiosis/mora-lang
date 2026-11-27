@@ -83,6 +83,26 @@ pub(crate) fn collect_pattern_globals(pat: &CompiledPattern, out: &mut HashSet<G
     }
 }
 
+/// True when `inst` may overwrite, clear, move out of, or rebind `slot`.
+///
+/// Single source of truth shared by `opt.rs` (`coalesce_struct_projection_loads` and
+/// `promote_borrowed_call_loads`) and `ir.rs` (`verify_perceus_slot_moves`) so optimizer
+/// and verifier agree on every instruction that invalidates a `BorrowLocal` loan or a
+/// coalesced projection span.
+pub(crate) fn inst_clobbers_local(inst: &ControlInst, slot: LocalSlot) -> bool {
+    matches!(
+        inst,
+        ControlInst::StoreLocal(w, _)
+            | ControlInst::MoveLocal(_, w)
+            | ControlInst::FreshLocalCell(w)
+            | ControlInst::DropLocal(w)
+            if *w == slot
+    ) || matches!(
+        inst,
+        ControlInst::MatchPattern { pattern, .. } if pattern_mentions_local(pattern, slot)
+    )
+}
+
 /// Collect the parent local slots captured by a closure / handler / worker capture list.
 pub(crate) fn collect_captured_locals(caps: &[CaptureSource], out: &mut Vec<LocalSlot>) {
     for c in caps {
@@ -552,7 +572,8 @@ pub(crate) fn is_projecting_method(m: &str) -> bool {
     matches!(m, "get" | "first" | "last" | "keys" | "values")
 }
 
-/// Borrow summary of the matching `ImplMethod` implementations for parameter slot `slot_idx`.
+/// Borrow summary of the matching `ImplMethod` / `TraitDefault` implementations for parameter
+/// slot `slot_idx`.
 ///
 /// `None` means no matching implementation exists, so the caller falls back to the built-in
 /// name tables. `Some(all)` means every matching implementation borrows that slot; a single
@@ -571,7 +592,10 @@ fn impl_slot_borrows(
     let suffix = format!("::{}", symbols.resolve(method));
     let mut found = false;
     for (idx, f) in all_funcs.iter().enumerate() {
-        if f.kind != FunctionKind::ImplMethod {
+        if !matches!(
+            f.kind,
+            FunctionKind::ImplMethod | FunctionKind::TraitDefault
+        ) {
             continue;
         }
         let Some(nsym) = f.name else {

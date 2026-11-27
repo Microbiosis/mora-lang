@@ -21,9 +21,9 @@ use crate::value::Value;
 
 use super::liveness::{
     SlotLiveness, collect_pattern_globals, compute_private_main_globals, compute_slot_liveness,
-    compute_terminator_kill_mask, compute_vreg_live_in, inst_local_uses, is_borrowing_builtin,
-    is_projecting_method, is_valid_borrow_inst, is_valid_borrow_terminator, method_arg_borrows,
-    method_receiver_borrows, pattern_mentions_local, program_mentions_eval,
+    compute_terminator_kill_mask, compute_vreg_live_in, inst_clobbers_local, inst_local_uses,
+    is_borrowing_builtin, is_projecting_method, is_valid_borrow_inst, is_valid_borrow_terminator,
+    method_arg_borrows, method_receiver_borrows, pattern_mentions_local, program_mentions_eval,
 };
 
 /// Optimization level for Control SSA optimization passes.
@@ -1398,19 +1398,7 @@ fn coalesce_struct_projection_loads(
             {
                 match cslot {
                     CoalesceSlot::Local(slot) => {
-                        if pc > first_load_pc
-                            && (matches!(
-                                inst,
-                                ControlInst::StoreLocal(s, _)
-                                    | ControlInst::FreshLocalCell(s)
-                                    | ControlInst::DropLocal(s)
-                                    if *s == slot
-                            ) || matches!(
-                                inst,
-                                ControlInst::MatchPattern { pattern, .. }
-                                    if pattern_mentions_local(pattern, slot)
-                            ))
-                        {
+                        if pc > first_load_pc && inst_clobbers_local(inst, slot) {
                             conflict = true;
                             break;
                         }
@@ -1533,12 +1521,9 @@ fn promote_borrowed_call_loads(
                 continue;
             }
             let end_excl = target_pc.saturating_add(1).min(block.insts.len());
-            let clobbered = block.insts[pc + 1..end_excl].iter().any(|inner| {
-                matches!(
-                    inner,
-                    ControlInst::StoreLocal(w, _) | ControlInst::MoveLocal(_, w) if *w == slot
-                )
-            });
+            let clobbered = block.insts[pc + 1..end_excl]
+                .iter()
+                .any(|inner| inst_clobbers_local(inner, slot));
             if !clobbered {
                 upgrades.push((pc, dst, slot));
             }

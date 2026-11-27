@@ -1546,3 +1546,358 @@ out.push(total).push(stats.get("regslot_heap_clones")).push(stats.get("borrowed_
         int(&v[2])
     );
 }
+
+#[test]
+fn p6_1_trait_default_method_borrow_summary_handles_escape_and_borrow() {
+    let src = r#"
+struct BoxVal
+  payload: dict<string, int>
+end
+
+trait ProbeTrait
+  task size(self): int
+
+  task is_ok(self): any
+    return self
+  end
+
+  task peek_len(self): int
+    return self.size()
+  end
+end
+
+impl ProbeTrait for BoxVal
+  task size(self): int
+    return type_of(self).len()
+  end
+end
+
+task wrap_default(b: BoxVal): any
+  return b.is_ok()
+end
+
+task read_default(b: BoxVal): int
+  return b.peek_len()
+end
+
+task run_loop(same: BoxVal): list<any>
+  fbip_reset_stats()
+  let i = 0
+  let total = 0
+  while i < 6
+    assign total = total + read_default(same)
+    assign i = i + 1
+  end
+  let stats = fbip_stats()
+  let out: list<any> = []
+  return out.push(total).push(same.payload.len()).push(stats.get("regslot_heap_clones")).push(stats.get("borrowed_call_elisions"))
+end
+
+let item = BoxVal(payload = {"a": 1, "b": 2})
+let same = wrap_default(item)
+run_loop(same)
+"#;
+    let (mut prog, witnesses) =
+        ParserV3::compile(src).expect("compile trait default borrow summary program");
+    let errs = check_program_witnesses(&witnesses);
+    assert!(errs.is_empty(), "unexpected type errors: {errs:?}");
+    optimize_program(&mut prog, OptLevel::None);
+    let borrows_of = |pred: &dyn Fn(&str) -> bool| -> Vec<bool> {
+        prog.functions
+            .iter()
+            .find(|f| f.name.map(|s| prog.symbols.resolve(s)).is_some_and(pred))
+            .unwrap_or_else(|| panic!("function not found"))
+            .param_borrows
+            .clone()
+    };
+    assert_eq!(
+        borrows_of(&|n| n.ends_with("::is_ok")),
+        vec![false],
+        "escaping trait default method colliding with built-in is_ok must not borrow self"
+    );
+    assert_eq!(
+        borrows_of(&|n| n == "wrap_default"),
+        vec![false],
+        "wrapper returning an escaping trait default result must not borrow its argument"
+    );
+    assert_eq!(
+        borrows_of(&|n| n.ends_with("::peek_len")),
+        vec![true],
+        "read-only trait default method must infer borrowed self"
+    );
+    assert_eq!(
+        borrows_of(&|n| n == "read_default"),
+        vec![true],
+        "wrapper over read-only trait default method must infer borrowed argument"
+    );
+    let v = items(run(src));
+    // "BoxVal".len() == 6, summed 6 times == 36
+    assert_eq!(int(&v[0]), 36);
+    assert_eq!(int(&v[1]), 2);
+    assert_eq!(
+        int(&v[2]),
+        0,
+        "borrowing trait default call chain must not clone the outer Arc<Value>"
+    );
+    assert!(
+        int(&v[3]) >= 18,
+        "expected >= 18 borrowed call elisions across read_default -> peek_len -> size -> type_of, got {}",
+        int(&v[3])
+    );
+}
+
+#[test]
+fn p6_1_verifier_rejects_clobbered_borrow_mutated_borrowed_param_and_unsound_project_field() {
+    use mora::mir::control::{
+        CompiledPattern, ControlConst, ControlTerminator, LocalSlot, PatternTarget, VReg,
+        verify_program,
+    };
+
+    // 1. Clobbering a `BorrowLocal` source via DropLocal / FreshLocalCell / MatchPattern must fail verification.
+    let borrow_src = r#"
+task inspect(d: dict<string, int>): int
+  return d.len()
+end
+
+task caller(): int
+  let d = {"a": 1}
+  let n = inspect(d)
+  return n + d.len()
+end
+
+caller()
+"#;
+    let (mut base_borrow, _) = ParserV3::compile(borrow_src).expect("compile borrow program");
+    optimize_program(&mut base_borrow, OptLevel::None);
+    verify_program(&base_borrow).expect("baseline program verifies");
+
+    let caller_idx = base_borrow
+        .functions
+        .iter()
+        .position(|f| f.name.map(|s| base_borrow.symbols.resolve(s)) == Some("caller"))
+        .expect("caller fn");
+    let (bb_idx, borrow_pc, borrowed_slot) = base_borrow.functions[caller_idx]
+        .blocks
+        .iter()
+        .enumerate()
+        .find_map(|(bi, b)| {
+            b.insts.iter().enumerate().find_map(|(pc, inst)| {
+                if let ControlInst::BorrowLocal(_, slot) = inst {
+                    Some((bi, pc, *slot))
+                } else {
+                    None
+                }
+            })
+        })
+        .expect("expected BorrowLocal in caller");
+
+    for (label, clobber_inst) in [
+        ("DropLocal", ControlInst::DropLocal(borrowed_slot)),
+        ("FreshLocalCell", ControlInst::FreshLocalCell(borrowed_slot)),
+        (
+            "MatchPattern",
+            ControlInst::MatchPattern {
+                dst_ok: VReg(base_borrow.functions[caller_idx].n_regs),
+                val: VReg(0),
+                pattern: CompiledPattern::Bind(PatternTarget::Local(borrowed_slot)),
+            },
+        ),
+    ] {
+        let mut bad = base_borrow.clone();
+        let func = &mut bad.functions[caller_idx];
+        if matches!(clobber_inst, ControlInst::MatchPattern { .. }) {
+            let nil_r = VReg(func.n_regs);
+            let ok_r = VReg(func.n_regs + 1);
+            func.n_regs += 2;
+            let blk = &mut func.blocks[bb_idx];
+            blk.insts
+                .insert(borrow_pc + 1, ControlInst::Const(nil_r, ControlConst::Nil));
+            blk.insts.insert(
+                borrow_pc + 2,
+                ControlInst::MatchPattern {
+                    dst_ok: ok_r,
+                    val: nil_r,
+                    pattern: CompiledPattern::Bind(PatternTarget::Local(borrowed_slot)),
+                },
+            );
+            blk.inst_kill_masks.clear();
+        } else {
+            let blk = &mut func.blocks[bb_idx];
+            blk.insts.insert(borrow_pc + 1, clobber_inst);
+            blk.inst_kill_masks.clear();
+        }
+        let err = verify_program(&bad).expect_err(&format!(
+            "verify_program must reject {label} clobbering a BorrowLocal slot"
+        ));
+        assert!(
+            err.to_string().contains("clobbered"),
+            "{label}: unexpected verifier error: {err}"
+        );
+    }
+
+    // 2. Mutating a `param_borrows[0] == true` parameter via StoreLocal / FreshLocalCell / MatchPattern must fail.
+    let inspect_idx = base_borrow
+        .functions
+        .iter()
+        .position(|f| f.name.map(|s| base_borrow.symbols.resolve(s)) == Some("inspect"))
+        .expect("inspect fn");
+    assert_eq!(base_borrow.functions[inspect_idx].param_borrows, vec![true]);
+
+    for label in ["StoreLocal", "FreshLocalCell", "MatchPattern"] {
+        let mut bad = base_borrow.clone();
+        let func = &mut bad.functions[inspect_idx];
+        let tmp = VReg(func.n_regs);
+        let ok = VReg(func.n_regs + 1);
+        func.n_regs += 2;
+        let blk = &mut func.blocks[0];
+        blk.inst_kill_masks.clear();
+        match label {
+            "StoreLocal" => {
+                blk.insts
+                    .insert(0, ControlInst::Const(tmp, ControlConst::Nil));
+                blk.insts
+                    .insert(1, ControlInst::StoreLocal(LocalSlot(0), tmp));
+            }
+            "FreshLocalCell" => {
+                blk.insts
+                    .insert(0, ControlInst::FreshLocalCell(LocalSlot(0)));
+            }
+            "MatchPattern" => {
+                blk.insts
+                    .insert(0, ControlInst::Const(tmp, ControlConst::Nil));
+                blk.insts.insert(
+                    1,
+                    ControlInst::MatchPattern {
+                        dst_ok: ok,
+                        val: tmp,
+                        pattern: CompiledPattern::Bind(PatternTarget::Local(LocalSlot(0))),
+                    },
+                );
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            verify_program(&bad).is_err(),
+            "verify_program must reject {label} on a borrowed parameter"
+        );
+    }
+
+    // 3. `ProjectField` followed by a non-ProjectField use, duplicate field read, or block escape must fail.
+    let proj_src = r#"
+struct Pair
+  a: int
+  b: int
+end
+
+task extract(p: Pair): int
+  return p.a + p.b
+end
+
+extract(Pair(a = 1, b = 2))
+"#;
+    let (mut base_proj, _) = ParserV3::compile(proj_src).expect("compile project program");
+    optimize_program(&mut base_proj, OptLevel::None);
+    verify_program(&base_proj).expect("baseline projection verifies");
+
+    let ext_idx = base_proj
+        .functions
+        .iter()
+        .position(|f| f.name.map(|s| base_proj.symbols.resolve(s)) == Some("extract"))
+        .expect("extract fn");
+    let (pbb, ppc, recv_reg, field_sym) = base_proj.functions[ext_idx]
+        .blocks
+        .iter()
+        .enumerate()
+        .find_map(|(bi, b)| {
+            b.insts.iter().enumerate().find_map(|(pc, inst)| {
+                if let ControlInst::ProjectField {
+                    receiver, field, ..
+                } = inst
+                {
+                    Some((bi, pc, *receiver, *field))
+                } else {
+                    None
+                }
+            })
+        })
+        .expect("expected ProjectField in extract");
+
+    // 3a: duplicate projection of the same field
+    {
+        let mut bad = base_proj.clone();
+        let func = &mut bad.functions[ext_idx];
+        let dup_dst = VReg(func.n_regs);
+        func.n_regs += 1;
+        let blk = &mut func.blocks[pbb];
+        blk.insts.insert(
+            ppc + 1,
+            ControlInst::ProjectField {
+                dst: dup_dst,
+                receiver: recv_reg,
+                field: field_sym,
+            },
+        );
+        blk.inst_kill_masks.clear();
+        let err = verify_program(&bad).expect_err("duplicate ProjectField must be rejected");
+        assert!(err.to_string().contains("duplicate ProjectField"), "{err}");
+    }
+
+    // 3b: non-projection use of receiver after ProjectField
+    {
+        let mut bad = base_proj.clone();
+        let func = &mut bad.functions[ext_idx];
+        let copy_dst = VReg(func.n_regs);
+        func.n_regs += 1;
+        let blk = &mut func.blocks[pbb];
+        blk.insts
+            .insert(ppc + 1, ControlInst::Copy(copy_dst, recv_reg));
+        blk.inst_kill_masks.clear();
+        let err =
+            verify_program(&bad).expect_err("non-projection use after ProjectField must fail");
+        assert!(err.to_string().contains("non-projection"), "{err}");
+    }
+
+    // 3c: receiver returned directly in terminator after destructive ProjectField
+    {
+        let mut bad = base_proj.clone();
+        let blk = &mut bad.functions[ext_idx].blocks[pbb];
+        blk.inst_kill_masks.clear();
+        blk.term_kill_mask = Default::default();
+        blk.terminator = ControlTerminator::Return(Some(recv_reg));
+        let err =
+            verify_program(&bad).expect_err("returning destructively projected struct must fail");
+        assert!(err.to_string().contains("escapes block"), "{err}");
+    }
+}
+
+#[test]
+fn p6_1_borrowed_param_survives_first_class_eval_snapshot() {
+    let dir = TempDir::new("p6_borrowed_eval");
+    let helper_path = dir.path().join("helper.mora");
+    let helper_src = r#"
+export task inner(d: dict<string, int>, cb: any): int
+  let n = d.len()
+  return n + cb("d.len()")
+end
+
+export task outer(cb: any): int
+  let d = {"a": 1, "b": 2}
+  let r = inner(d, cb)
+  return r + d.len()
+end
+"#;
+    std::fs::write(&helper_path, helper_src).expect("write helper.mora");
+    let helper_lit = helper_path.to_string_lossy().replace('\\', "/");
+    let main_src = format!(
+        r#"
+import "{helper_lit}"
+outer(eval)
+"#
+    );
+    let (mut prog, _witnesses) = ParserV3::compile(&main_src).expect("compile main");
+    optimize_program(&mut prog, OptLevel::None);
+    let mut core = CoreRuntime::default();
+    let (val, _) =
+        execute_program(Arc::new(prog), &mut core).expect("execute eval with borrowed param");
+    assert_eq!(int(&val), 6);
+}

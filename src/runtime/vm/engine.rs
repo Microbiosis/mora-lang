@@ -1103,11 +1103,14 @@ impl<'a> VmEngine<'a> {
             .map_err(|e| e.with_prefix("eval: compile error: "))?;
         let mut child_env = Environment::with_parent_of(Arc::new(self.core.environment.clone()));
         // Snapshot any visible lexical globals/locals/upvalues from nearest active ScriptFrame.
-        let caller = self.frames.iter().rev().find_map(|f| match f {
-            CallFrame::Script(sf) => Some(sf),
-            _ => None,
+        let caller = self.frames.iter().enumerate().rev().find_map(|(idx, f)| {
+            if let CallFrame::Script(sf) = f {
+                Some((idx, sf))
+            } else {
+                None
+            }
         });
-        if let Some(sf) = caller {
+        if let Some((caller_idx, sf)) = caller {
             for (idx, meta) in sf.program.globals.iter().enumerate() {
                 child_env.define(meta.name.clone(), sf.globals[idx].lock().0.clone(), false);
             }
@@ -1116,10 +1119,13 @@ impl<'a> VmEngine<'a> {
                 let name = sf.program.symbols.resolve(uv_desc.sym);
                 child_env.define(name.to_string(), sf.upvalues[idx].get(), false);
             }
+            let parents = &self.frames[..caller_idx];
             for (idx, sym) in func.local_names.iter().enumerate() {
                 let name = sf.program.symbols.resolve(*sym);
-                if let Some(cell) = sf.locals.get(idx) {
-                    child_env.define(name.to_string(), cell.get(), false);
+                if idx < sf.locals.len() {
+                    let val = sf
+                        .snapshot_local_value(crate::mir::control::LocalSlot(idx as u16), parents);
+                    child_env.define(name.to_string(), val, false);
                 }
             }
         }

@@ -1973,6 +1973,7 @@ fn verify_function(
     }
 
     verify_perceus_kills(func, &reachable)?;
+    verify_perceus_project_fields(func, &reachable)?;
     verify_perceus_slot_moves(
         func,
         all_funcs,
@@ -1982,6 +1983,103 @@ fn verify_function(
         private_main_globals,
         exit_globals,
     )?;
+    Ok(())
+}
+
+/// P6-1 Perceus/FBIP soundness verifier for destructive in-place `ProjectField` reads.
+///
+/// `VmEngine` extracts nominal fields out of a uniquely owned `StructInstance` in place even
+/// before the receiver's last use so coalesced sibling projections (`p.a`, `p.b`) remain $O(1)$
+/// in any field order. That mutation is sound iff a `ProjectField` whose `receiver` stays live
+/// after `pc` never escapes the basic block and is only followed in the same block by sibling
+/// `ProjectField`s projecting strictly distinct fields.
+fn verify_perceus_project_fields(
+    func: &ControlFunction,
+    reachable: &HashSet<BlockId>,
+) -> MoraResult<()> {
+    use crate::mir::control::liveness;
+
+    let has_project = func.blocks.iter().any(|b| {
+        b.insts
+            .iter()
+            .any(|i| matches!(i, ControlInst::ProjectField { .. }))
+    });
+    if !has_project {
+        return Ok(());
+    }
+
+    let live_in = liveness::compute_vreg_live_in(func, reachable);
+    for &bid in reachable {
+        let block = &func.blocks[bid.0 as usize];
+        let mut live_out: HashSet<VReg> = HashSet::new();
+        for succ in block.terminator.successors() {
+            if reachable.contains(&succ) {
+                let sblk = &func.blocks[succ.0 as usize];
+                for &r in &live_in[succ.0 as usize] {
+                    if !sblk.params.contains(&r) {
+                        live_out.insert(r);
+                    }
+                }
+            }
+        }
+        let term_inputs = block.terminator.input_regs();
+        let mut live = live_out.clone();
+        for &r in &term_inputs {
+            live.insert(r);
+        }
+
+        for (pc, inst) in block.insts.iter().enumerate().rev() {
+            if let ControlInst::DropReg(r) = inst {
+                live.remove(r);
+                continue;
+            }
+            if let Some(d) = inst.dst() {
+                live.remove(&d);
+            }
+            if let ControlInst::ProjectField {
+                receiver, field, ..
+            } = inst
+                && live.contains(receiver)
+            {
+                if live_out.contains(receiver) || term_inputs.contains(receiver) {
+                    return Err(MoraError::Parse(format!(
+                        "fn {:?} {:?} pc {pc}: ProjectField receiver {:?} escapes block after destructive projection",
+                        func.id, bid, receiver
+                    )));
+                }
+                for (next_pc, later) in block.insts.iter().enumerate().skip(pc + 1) {
+                    if matches!(later, ControlInst::DropReg(r) if r == receiver) {
+                        break;
+                    }
+                    if !later.input_regs().contains(receiver) {
+                        continue;
+                    }
+                    match later {
+                        ControlInst::ProjectField {
+                            receiver: r2,
+                            field: f2,
+                            ..
+                        } if r2 == receiver && f2 != field => {}
+                        ControlInst::ProjectField { field: f2, .. } if f2 == field => {
+                            return Err(MoraError::Parse(format!(
+                                "fn {:?} {:?} pc {pc}: duplicate ProjectField of field {:?} on receiver {:?} at pc {next_pc}",
+                                func.id, bid, field, receiver
+                            )));
+                        }
+                        _ => {
+                            return Err(MoraError::Parse(format!(
+                                "fn {:?} {:?} pc {pc}: ProjectField receiver {:?} used by non-projection instruction at pc {next_pc}",
+                                func.id, bid, receiver
+                            )));
+                        }
+                    }
+                }
+            }
+            for r in inst.input_regs() {
+                live.insert(r);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2106,12 +2204,9 @@ fn verify_perceus_slot_moves(
                     };
                     let end_excl = upc.saturating_add(1).min(block.insts.len());
                     for inner in &block.insts[pc + 1..end_excl] {
-                        if matches!(
-                            inner,
-                            ControlInst::StoreLocal(w, _) | ControlInst::MoveLocal(_, w) if w == s
-                        ) {
+                        if liveness::inst_clobbers_local(inner, *s) {
                             return Err(MoraError::Parse(format!(
-                                "fn {:?} {:?} pc {pc}: slot {:?} mutated or moved before BorrowLocal consumer at pc {upc}",
+                                "fn {:?} {:?} pc {pc}: slot {:?} clobbered before BorrowLocal consumer at pc {upc}",
                                 func.id, bid, s
                             )));
                         }
@@ -2365,7 +2460,10 @@ fn verify_inst_slots(
             }
             if matches!(
                 inst,
-                ControlInst::MoveLocal(_, _) | ControlInst::DropLocal(_)
+                ControlInst::MoveLocal(_, _)
+                    | ControlInst::DropLocal(_)
+                    | ControlInst::StoreLocal(_, _)
+                    | ControlInst::FreshLocalCell(_)
             ) && func
                 .param_borrows
                 .get(l.0 as usize)
@@ -2373,9 +2471,24 @@ fn verify_inst_slots(
                 .unwrap_or(false)
             {
                 return Err(MoraError::Parse(format!(
-                    "fn {:?}: MoveLocal/DropLocal forbidden on borrowed parameter {:?}",
+                    "fn {:?}: MoveLocal/DropLocal/StoreLocal/FreshLocalCell forbidden on borrowed parameter {:?}",
                     func.id, l
                 )));
+            }
+        }
+        ControlInst::MatchPattern { pattern, .. } => {
+            for (idx, &borrowed) in func.param_borrows.iter().enumerate() {
+                if borrowed
+                    && crate::mir::control::liveness::pattern_mentions_local(
+                        pattern,
+                        LocalSlot(idx as u16),
+                    )
+                {
+                    return Err(MoraError::Parse(format!(
+                        "fn {:?}: MatchPattern binding forbidden on borrowed parameter LocalSlot({idx})",
+                        func.id
+                    )));
+                }
             }
         }
         ControlInst::LoadUpvalue(_, u) | ControlInst::StoreUpvalue(u, _) => {
